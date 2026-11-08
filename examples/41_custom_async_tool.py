@@ -1,146 +1,91 @@
-"""41 · 自定义异步唤醒工具 / Custom async-wake tool (the extension recipe)
+"""41 · A host job schedules a read-only result check through the timer backend.
 
-How to build YOUR OWN long-running tool that kicks off async work, returns immediately, and brings
-the result back into the agent — using only public, callable APIs (no magic). This is the pattern
-behind ``background_run`` / timers, applied to your own system.
-
-What you learn / 你将学到
---------------------------
-- ``ToolDefinition`` + an **async def** handler + ``ToolRegistry.register`` — the tool seam
-- ``get_tool_runtime_context()`` inside a handler → ``store`` / ``session_id`` / ``loop`` / ``config``
-- waking the agent when async work finishes: ``loop.schedule_timer(sid, delay_s=…, note=…)`` →
-  a ``TimerRunner`` delivers the note via ``follow_up`` → the agent takes another round
-- the agent reads the result back with a second custom tool — the result re-enters the loop
-
-设计要点 / Design notes
------------------------
-- power-loop runs **no daemon**: the host drives every wake. Here the wake is a durable timer; it
-  could equally be a ``follow_up`` from your own "job done" callback.
-- the handler MUST be ``async def`` (a sync lambda returning a coroutine is run as sync and never
-  awaited — see docs/user-guide/async-orchestration.md).
-
-Run / 运行
-----------
-    python examples/41_custom_async_tool.py        # needs .env with POWER_LOOP_*
+The host owns its job and task lifetime. The timer only asks for the saved result;
+an unavailable external result is unknown and is never automatically re-executed.
+Deployments replace this demo service with their own service and result lookup.
 """
-
-from __future__ import annotations
-
 import asyncio
-from tempfile import TemporaryDirectory
-from typing import Any
+import json
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
-    AgentLoopConfig,
-    StatefulAgentLoop,
-    TimerRunner,
+    InputRef,
+    LLMResponse,
+    LLMService,
     ToolDefinition,
     ToolRegistry,
     get_tool_runtime_context,
+    timer_context,
 )
 from power_loop.runtime.pricing import Free
 
-# A stand-in for "your async system" (a DB export, an HTTP job, a render farm…). Keyed by job id.
-_JOBS: dict[str, dict[str, Any]] = {}
-# Phrasing-independent signal that the agent re-checked after the wake (used by the real test).
-_CHECKED: list[str] = []
 
+class JobService:
+    def __init__(self):
+        self.task = None
+        self.result = 'unknown'
+        self.timer = None
+        self.checks = 0
 
-async def _start_job(label: str) -> str:
-    """Kick off async work, return immediately, and schedule a durable wake-up to check it."""
-    ctx = get_tool_runtime_context(required=True)  # the callable seam: store / session_id / loop
-    job_id = f"job-{len(_JOBS) + 1}"
-    _JOBS[job_id] = {"label": label, "status": "running", "result": None}
+    async def start(self, label):
+        if self.task is not None:
+            raise ValueError('This demo service accepts one job')
+        async def work():
+            await asyncio.sleep(.05)
+            self.result = f'processed {label}'
+        self.task = asyncio.create_task(work())
+        context = get_tool_runtime_context(required=True)
+        self.timer = await context.loop.timer_backend.create(await timer_context(), delay_s=.15,
+            note='Read the original job result with check_job')
+        return 'Accepted host-job-1'
 
-    async def _work() -> None:  # simulate slow async work finishing later
-        await asyncio.sleep(4)
-        _JOBS[job_id].update(status="done", result=f"processed {label!r} ✓")
+    async def check(self):
+        self.checks += 1
+        return self.result
 
-    asyncio.create_task(_work())
-    # Durable wake: when the work should be done, a timer fires its note via follow_up, which
-    # gives the agent another round to call check_job. (Alternatively, from _work's completion:
-    # await ctx.loop.follow_up(f"{job_id} is done", ctx.session_id).)
-    await ctx.loop.schedule_timer(
-        ctx.session_id, delay_s=5, note=f"{job_id} should be finished — call check_job('{job_id}') and report."
-    )
-    return f"Started {job_id} ({label}); I'll be reminded to check it shortly."
+    async def close(self):
+        if self.task:
+            await self.task
 
+class JobModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any(m.get('tool_call_id') == 'check' for m in request.messages):
+            return LLMResponse(raw_text=next(m['content'] for m in request.messages if m.get('tool_call_id') == 'check'))
+        if 'Read the original job result' in str(request.messages):
+            name, args, call_id = 'check_job', {}, 'check'
+        elif not any(m.get('role') == 'tool' for m in request.messages):
+            name, args, call_id = 'start_job', {'label':'nightly-report'}, 'start'
+        else:
+            return LLMResponse(raw_text='Job accepted; awaiting the timer.')
+        return LLMResponse(raw_text='', tool_calls=[{'id':call_id, 'type':'function',
+            'function':{'name':name, 'arguments':json.dumps(args)}}])
+    async def close(self):
+        pass
 
-async def _check_job(job_id: str) -> str:
-    _CHECKED.append(job_id)
-    job = _JOBS.get(job_id)
-    if job is None:
-        return f"No such job {job_id}."
-    return f"{job_id}: status={job['status']} result={job['result']!r}"
+async def main():
+    service = JobService()
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(name='start_job', description='Start one host job', pricing=Free('local demo'),
+        input_schema={'type':'object','properties':{'label':{'type':'string'}},'required':['label']}), service.start)
+    registry.register(ToolDefinition(name='check_job', description='Read the original result or unknown', pricing=Free('local demo')), service.check)
+    try:
+        async with demo_runtime(JobModel(), registry) as (runtime, loop, target, actor):
+            result = await loop.send(target, 'Start the report', message_id='start', actor=actor, deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed' and service.timer
+            timer = service.timer
+            ref = InputRef(runtime.store.store_id, target.session_id, f'timer-{timer.timer_id}-{timer.created_at}-0')
+            async with asyncio.timeout(10):
+                while (await runtime.store.get_timer(target.session_id, timer.timer_id)).status != 'fired':
+                    await asyncio.sleep(.05)
+            result = await runtime.client.wait(ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed' and result.final_text == 'processed nightly-report'
+            assert service.checks == 1
+            print(result.final_text)
+            return result.final_text
+    finally:
+        await service.close()
 
-
-def _build_registry() -> ToolRegistry:
-    reg = ToolRegistry()
-    reg.register(
-        ToolDefinition(
-            pricing=Free("local example tool"),
-            name="start_job",
-            description="Begin a long background job; you'll be reminded to check its result.",
-            input_schema={"type": "object", "properties": {"label": {"type": "string"}}, "required": ["label"]},
-            required_params=("label",),
-        ),
-        _start_job,
-    )
-    reg.register(
-        ToolDefinition(
-            pricing=Free("local example tool"),
-            name="check_job",
-            description="Check a job's status/result by its id.",
-            input_schema={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
-            required_params=("job_id",),
-        ),
-        _check_job,
-    )
-    return reg
-
-
-async def main() -> None:
-    with TemporaryDirectory() as tmp:
-        loop = StatefulAgentLoop(
-            llm=make_llm(),
-            db_path=f"{tmp}/sessions.db",
-            config=AgentLoopConfig(
-                system_prompt=(
-                    "You can run long jobs. Call start_job to begin one and tell the user. When you "
-                    "are later reminded that a job should be done, call check_job and report the result."
-                ),
-                max_rounds=6,
-            ),
-            tool_registry=_build_registry(),
-        )
-        sid = await loop.new_session()
-
-        # 1) The agent kicks off the job (returns immediately) — no result yet.
-        r1 = await loop.send("Please run a long job labelled 'nightly-report'.", session_id=sid)
-        print("after start:", r1.final_text[:100])
-        print("armed timers:", [(t.timer_id, t.note[:40]) for t in await loop.list_timers(sid)])
-
-        # 2) Drive the wake: the timer fires (~5s) → follow_up → the agent takes another round,
-        #    calls check_job, and reports. No daemon — the host runs the TimerRunner.
-        runner = TimerRunner(loop, scan_interval_s=1.0)
-        await runner.start()
-        try:
-            await asyncio.sleep(9)
-        finally:
-            await runner.stop()
-
-        msgs = await loop.get_messages(sid)
-        last = next((m for m in reversed(msgs) if m.get("role") == "assistant" and m.get("content")), None)
-        print("after wake-up:", (str(last.get("content"))[:140] if last else "(none)"))
-        await loop.aclose()
-        return {
-            "job_started": bool(_JOBS),                               # the agent kicked off the job
-            "job_done": any(j["status"] == "done" for j in _JOBS.values()),  # async work finished
-            "checked_after_wake": bool(_CHECKED),                     # woke → re-checked (no daemon)
-        }
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

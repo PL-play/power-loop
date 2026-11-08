@@ -1,18 +1,15 @@
-"""Atomic nudge admission and actual original-executor continuation."""
-from __future__ import annotations
-
+"""Nudges use the original task, current ownership and immutable message identity."""
 import asyncio
 import json
-from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from power_loop import LLMResponse, LLMTokenUsage
-from power_loop.core.agent_context import get_session_id, reset_session_id, set_session_id
+from power_loop import InputRef, JobRef, LLMResponse, LLMTokenUsage, RuntimeRequestError
+from power_loop.agent.runtime_store import now_ms
+from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import delegation
-from power_loop.runtime.jobs import JobActor, JobError, JobManager
 
 from .test_job_registry_192 import registry_store, runtime
 from .test_task_runtime_192 import finish, jobs, managed, receipt
@@ -67,189 +64,6 @@ async def nudge_case(runtime):
         child_actor=child_actor, receiver=receiver, origin=origin, accept=accept, consume=consume, binding=binding, connect=connect, now=now)
 
 
-async def test_atomic_nudge_receipt_call_and_inbox_survive_reopen_and_original_caller_close(nudge_case):
-    c = nudge_case
-    operation, replayed = await c.accept()
-    assert not replayed and operation.action == "nudge"
-    assert operation.result["job_id"] == c.target.job_id and operation.result["session_id"] == c.sid
-    seq = await c.store.append_message(c.actor.session_id, role="tool", content="accepted", tool_call_id="nudge-call", send_index=1)
-    await c.manager.bind_receipt(c.actor, operation.operation_id, await c.store.message_ref(c.actor.session_id, seq), caller=c.caller)
-    found = await c.manager.operation_for_call(c.actor, c.origin, "nudge-call")
-    assert found.operation_id == operation.operation_id and found.call_ref["id"] != found.receipt_ref["id"]
-    await c.manager.close_model_execution(c.actor, c.caller)
-    reopened = JobManager(await c.connect(), now_ms=lambda: c.now[0])
-    again, replayed = await reopened.accept_nudge(c.actor, c.target, caller=c.caller,
-        call_ref=c.origin, tool_call_id="nudge-call", session_id=c.sid, message="NUDGED-42")
-    assert replayed and again.operation_id == operation.operation_id
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 1
-
-
-@pytest.mark.parametrize("conflict", ["message", "session", "target_generation"])
-async def test_same_origin_changed_nudge_is_rejected_without_second_enqueue(nudge_case, conflict):
-    c = nudge_case
-    await c.accept()
-    kwargs = {"message": "different"} if conflict == "message" else {"session_id": "different"}
-    with pytest.raises(JobError, match="operation_conflict"):
-        if conflict == "target_generation":
-            await c.manager.accept_nudge(c.actor, replace(c.target, generation=c.target.generation+1), caller=c.caller,
-                call_ref=c.origin, tool_call_id="nudge-call", session_id=c.sid, message="NUDGED-42")
-        else:
-            await c.accept(**kwargs)
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 1
-
-
-@pytest.mark.parametrize("message", ["", "   \n", "\x00", "x" * 64001, None])
-async def test_invalid_nudge_has_no_durable_admission(nudge_case, message):
-    c = nudge_case
-    with pytest.raises(JobError, match="invalid_nudge_message"):
-        await c.accept(message=message)
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 0
-
-
-@pytest.mark.parametrize("barrier", ["target_cancel", "caller_cancel", "target_expired", "caller_expired", "target_closed", "wrong_sid", "missing_session", "wrong_role", "target_unknown"])
-async def test_nudge_fences_both_caller_and_target_and_original_session(nudge_case, barrier):
-    c = nudge_case
-    if barrier in ("target_cancel", "caller_cancel"):
-        await c.manager.request_cancel(c.actor, c.target.job_id if barrier == "target_cancel" else c.caller.job_id,
-                                       system_key="stop", reason="stop")
-    elif barrier in ("target_expired", "caller_expired"):
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET lease_until_ms=? WHERE job_id=?",
-            (c.now[0]-1, c.target.job_id if barrier == "target_expired" else c.caller.job_id))
-    elif barrier == "target_closed":
-        await c.manager.record_execution_result(c.child_actor, c.target, outcome="failed", result={}, resource_state="stopped")
-    elif barrier == "missing_session":
-        await c.store.close_session(c.sid, cascade=False)
-    elif barrier == "wrong_role":
-        await c.store.merge_session_metadata(c.sid, {"execution_role": "main"})
-    elif barrier == "target_unknown":
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET resource_state='unknown' WHERE job_id=?", (c.target.job_id,))
-    with pytest.raises(JobError):
-        await c.accept(**({"session_id": "wrong"} if barrier == "wrong_sid" else {}))
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 0
-
-
-@pytest.mark.parametrize("which", ["caller", "target", "tenant", "actor"])
-async def test_stale_or_foreign_proof_cannot_admit_nudge(nudge_case, which):
-    c = nudge_case
-    actor, caller, target = c.actor, c.caller, c.target
-    if which == "caller":
-        caller = replace(caller, generation=caller.generation+1)
-    elif which == "target":
-        target = replace(target, boot_id="old-boot")
-    elif which == "tenant":
-        actor = replace(actor, tenant_id="foreign")
-    else:
-        actor = JobActor(actor.tenant_id, actor.principal_id, await c.store.create_session())
-    with pytest.raises(JobError):
-        await c.manager.accept_nudge(actor, target, caller=caller, call_ref=c.origin,
-                                    tool_call_id="nudge-call", session_id=c.sid, message="NUDGED-42")
-
-
-@pytest.mark.parametrize("fault", ["rollback", "lost_ack"])
-async def test_admission_and_inbox_are_atomic_and_exact_replay_never_duplicates(nudge_case, monkeypatch, fault):
-    c = nudge_case
-    original = c.manager.db.transaction
-    failed = []
-
-    @asynccontextmanager
-    async def fail():
-        async with original() as tx:
-            yield tx
-            hit = not failed and await tx.fetchone(f"SELECT event_id FROM {c.manager.events} WHERE action='nudge'")
-            if hit:
-                failed.append(fault)
-            if hit and fault == "rollback":
-                raise RuntimeError("rollback operation and inbox")
-        if hit and fault == "lost_ack":
-            raise RuntimeError("commit ack lost")
-
-    monkeypatch.setattr(c.manager.db, "transaction", fail)
-    with pytest.raises(RuntimeError):
-        await c.accept()
-    assert failed == [fault]
-    assert (await c.store.inbox_counts(c.sid))["pending"] == (0 if fault == "rollback" else 1)
-    assert len(await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")) == 1
-    monkeypatch.setattr(c.manager.db, "transaction", original)
-    op, replayed = await c.accept()
-    assert replayed  # The exact source permission survived either target outcome.
-    assert not await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
-    same, repeated = await c.accept()
-    assert repeated and same.operation_id == op.operation_id and (await c.store.inbox_counts(c.sid))["pending"] == 1
-
-
-async def test_pending_or_history_only_input_blocks_success_until_original_receiver_decision_and_exit(nudge_case):
-    c = nudge_case
-    op, _ = await c.accept()
-    with pytest.raises(JobError, match="required_input_unhandled"):
-        await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
-    await c.consume(op, complete=False)
-    assert (await c.manager.get_job(c.child_actor, c.target.job_id)).result_status == "none"
-    with pytest.raises(JobError, match="required_input_unhandled"):
-        await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
-    from power_loop.runtime.result_consumption import finish as finish_consumption
-    await finish_consumption(c.binding)
-    await c.manager.close_model_execution(c.child_actor, c.receiver, evidence={"exit": "completed"})
-    await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={"answer": "NUDGED-42"},
-                                            resource_state="stopped", require_children_stopped=True)
-    saved = await c.manager.get_job(c.child_actor, c.target.job_id)
-    assert saved.outcome == "succeeded" and saved.result_status == "pending_delivery"
-
-
-@pytest.mark.parametrize("first", ["nudge", "close", "cancel"])
-async def test_admission_serializes_with_target_close_and_cancel(nudge_case, first):
-    from power_loop.runtime import nudges
-
-    c = nudge_case
-    original = c.manager._write
-    entered, release = asyncio.Event(), asyncio.Event()
-    initial = True
-    in_target = False
-    apply = nudges._apply_nudge_request
-
-    async def target_phase(*args, **kwargs):
-        nonlocal in_target
-        in_target = True
-        try:
-            return await apply(*args, **kwargs)
-        finally:
-            in_target = False
-
-    @asynccontextmanager
-    async def hold():
-        nonlocal initial
-        async with original() as tx:
-            if initial and (first != "nudge" or in_target):
-                initial = False
-                entered.set()
-                await release.wait()
-            yield tx
-
-    async def close():
-        return await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
-
-    async def cancel():
-        return await c.manager.request_cancel(c.actor, c.target.job_id, system_key="race", reason="stop")
-
-    # A completed model send is stopped, so only the nudge/close race remains.
-    await c.manager.close_model_execution(c.child_actor, c.receiver)
-    c.manager._write = hold
-    nudges._apply_nudge_request = target_phase
-    try:
-        one = asyncio.create_task(c.accept() if first == "nudge" else close() if first == "close" else cancel())
-        await asyncio.wait_for(entered.wait(), 2)
-        two = asyncio.create_task(close() if first == "nudge" else c.accept())
-        await asyncio.sleep(0)
-        release.set()
-        results = await asyncio.gather(one, two, return_exceptions=True)
-    finally:
-        release.set()
-        c.manager._write = original
-        nudges._apply_nudge_request = apply
-    assert not isinstance(results[0], BaseException)
-    assert isinstance(results[1], JobError)
-    assert (await c.store.inbox_counts(c.sid))["pending"] == (1 if first == "nudge" else 0)
-
-
 async def issue_nudge(fixture, monkeypatch, *, message="NUDGED-42", repeat=False):
     _, _, _, loop, model, parent, _ = fixture
     accepted = await receipt(fixture)
@@ -280,485 +94,70 @@ async def issue_nudge(fixture, monkeypatch, *, message="NUDGED-42", repeat=False
             return receipts[0]
 
         monkeypatch.setattr(delegation, "nudge", twice)
-    result = await loop.send("add a correction to the same child", parent)
+    result = await loop.send("add a correction to the same child")
     return accepted, result, receipts
 
 
-@pytest.mark.parametrize("repeat", [False, True])
-async def test_actual_nudge_retains_job_run_session_and_waits_for_original_receiver(managed, monkeypatch, repeat):
-    store, manager, runtime, loop, model, parent, connect = managed
-    runtime.lease_ms = 30000  # receiver identity/handling, not lease-expiry timing
-    assert (await loop.send("delegate", parent)).status == "completed"
-    await asyncio.wait_for(model.entered.wait(), 2)
-    accepted, result, repeats = await issue_nudge(managed, monkeypatch, repeat=repeat)
-    assert result.status == "completed"
-    source_tools = [row for row in await store.load_all_messages(parent) if row.role == "tool"]
-    steered = json.loads(source_tools[-1].content)
-    assert steered["status"] == "accepted" and steered["job_id"] == accepted["job_id"]
-    assert steered["run_id"] == accepted["run_id"] and steered["session_id"] == accepted["session_id"]
-    operation = await manager.get_operation(runtime.actor(parent), steered["operation_id"])
-    assert operation.receipt_ref["tool_call_id"] == "actual-nudge"
-    assert operation.call_ref["id"] != operation.receipt_ref["id"]
+@pytest.mark.parametrize('managed', [{'capacity':2}], indirect=True)
+@pytest.mark.parametrize('message', ['NUDGED-42', '  NUDGED-42\n    keep indentation\n'])
+@pytest.mark.parametrize('repeat', [False,True])
+async def test_actual_nudge_is_deduplicated_preserves_text_and_never_replaces_running_child(managed, monkeypatch, message, repeat):
+    store, manager, runtime, agent, model, sid, connect=managed
+    await agent.send('delegate')
+    await asyncio.wait_for(model.entered.wait(),5)
+    accepted,result,repeated=await issue_nudge(managed,monkeypatch,message=message,repeat=repeat)
+    assert result.status=='completed'
+    tools=[m for m in await store.load_all_messages(sid) if m.role=='tool']
+    sent=json.loads(tools[-1].content)
+    assert sent['target']['job_id']==accepted['job_id']
+    assert sent['input_ref']['session_id']==accepted['session_id']
     if repeat:
-        assert len(repeats) == 2 and repeats[0]["operation_id"] == repeats[1]["operation_id"]
-        assert not repeats[0]["replayed"] and repeats[1]["replayed"]
-    assert (await manager.get_job(runtime.actor(parent), accepted["job_id"])).result is None
+        assert repeated[0]['input_ref']==repeated[1]['input_ref']
+        assert repeated[0]['newly_accepted'] and not repeated[1]['newly_accepted']
+    queued=await agent.runtime.client.inputs.input(agent.runtime.client.inputs.db,InputRef(**sent['input_ref']))
+    assert json.loads(queued.row['content'])==message
+    assert (await manager.get_job(runtime.actor(sid),accepted['job_id'])).result is None
     await finish(managed)
-    reopened = JobManager(await connect())
-    saved = await reopened.get_job(runtime.actor(parent), accepted["job_id"])
-    assert saved.outcome == "succeeded" and saved.result["final_text"] == "NUDGED-42"
-    assert len([j for j in await jobs(managed) if j.kind == "subagent"]) == 1
-    inputs = await manager.db.fetchall(f"SELECT delivery_status FROM {manager.events} WHERE action='nudge'")
-    assert len(inputs) == 1 and inputs[0]["delivery_status"] == "handled"
+    saved=await agent.runtime.client.wait(JobRef(**accepted['job_ref']),actor=agent.actor,deadline_ms=now_ms()+1000)
+    assert saved.status=='completed' and saved.final_text=='NUDGED-42'
+    assert saved.job_ref.generation==1
+    assert saved.usage['total_tokens']==20 and model.child_calls==2
+    assert len([j for j in await jobs(managed) if j.kind=='subagent'])==1
+    assert sum(m.name=='follow_up' and message.strip() in m.content for m in await store.load_all_messages(accepted['session_id']))==1
 
 
-async def test_new_nudge_after_completion_does_not_resurrect_child(managed, monkeypatch):
-    _, _, _, loop, model, parent, _ = managed
-    await loop.send("delegate", parent)
-    await finish(managed)
-    previous = model.child_calls
-    accepted, result, _ = await issue_nudge(managed, monkeypatch)
-    assert result.status == "completed" and model.child_calls == previous
-    store = managed[0]
-    tool = [m for m in await store.load_all_messages(parent) if m.role == "tool"][-1]
-    assert "resume_result_unhandled" in tool.content
-    assert len([j for j in await jobs(managed) if j.kind == "subagent"]) == 1
-    assert accepted["session_id"] in {j.session_id for j in await jobs(managed) if j.kind == "subagent"}
-
-
-async def test_pending_permission_without_a_local_handle_recovers_input_without_resuming_the_child(managed, monkeypatch):
-    from power_loop.runtime import nudges, subagent_resume
-
-    store, manager, runtime, loop, model, parent, _ = managed
-    runtime.lease_ms = 30000
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    original = delegation.nudge
-    recovered = []
-
-    async def retry_after_permission(current, sid, message, **kwargs):
-        async def target_unavailable(*args, **options):
-            raise OSError("target storage unavailable after source permission")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(nudges, "_apply_nudge_request", target_unavailable)
-            with pytest.raises(OSError, match="target storage unavailable"):
-                await original(current, sid, message, **kwargs)
-        assert len(await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")) == 1
-        assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
-        key = (id(store), sid)
-        running = delegation._RUNNING.pop(key)
-
-        async def forbid_resume(*args, **options):
-            pytest.fail("a durable input permission must never allocate another execution")
-
-        try:
-            with monkeypatch.context() as patch:
-                patch.setattr(subagent_resume, "resume_locked", forbid_resume)
-                recovered.append(await original(current, sid, message, **kwargs))
-                return recovered[-1]
-        finally:
-            delegation._RUNNING[key] = running
-
-    monkeypatch.setattr(delegation, "nudge", retry_after_permission)
-    accepted, result, _ = await issue_nudge(managed, monkeypatch)
-    assert result.status == "completed" and len(recovered) == 1
-    assert recovered[0]["mode"] == "steer" and recovered[0]["replayed"]
-    assert (recovered[0]["job_id"], recovered[0]["session_id"], recovered[0]["run_id"]) == (
-        accepted["job_id"], accepted["session_id"], accepted["run_id"])
-    assert model.child_calls == 1
-    assert not await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")
-    await finish(managed)
-    saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
-    assert saved.generation == 1 and saved.outcome == "succeeded" and saved.result["final_text"] == "NUDGED-42"
-    operation = await manager.get_operation(runtime.actor(parent), recovered[0]["operation_id"])
-    assert operation.receipt_ref is not None
-
-
-@pytest.mark.parametrize("fault", ["lost_ack", "signal", "inbox_failure", "accepted_ack", "target_ack", "completed_ack"])
-async def test_actual_admission_failures_preserve_exact_result_and_never_repeat_admission(managed, monkeypatch, fault):
-    store, manager, runtime, loop, model, parent, _ = managed
-    runtime.lease_ms = 30000  # keep the injected admission failure as the only fault
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    calls = []
-    accept = manager.accept_nudge
-
-    async def wrapped(*args, **kwargs):
-        calls.append(1)
-        operation = await accept(*args, **kwargs)
-        if fault == "lost_ack":
-            raise RuntimeError("ACK lost after canonical acceptance")
-        return operation
-
-    monkeypatch.setattr(manager, "accept_nudge", wrapped)
-    if fault.endswith("_ack") and fault != "lost_ack":
-        from .test_nudge_request_trees import lose_input_ack
-        lost = lose_input_ack(manager, monkeypatch, fault.removesuffix("_ack"))
-    if fault == "signal":
-        signal = loop.steer_event
-
-        def fail_signal(sid):
-            if sid != parent:
-                raise RuntimeError("local notification failed")
-            return signal(sid)
-
-        monkeypatch.setattr(loop, "steer_event", fail_signal)
-    elif fault == "inbox_failure":
-        dialect = type(manager.db.dialect)
-        original = dialect.insert_ignore
-
-        def broken(self, table, cols):
-            if table == store.t.follow_up_queue:
-                raise RuntimeError("inbox insert unavailable")
-            return original(self, table, cols)
-
-        monkeypatch.setattr(dialect, "insert_ignore", broken)
-    accepted, _, _ = await issue_nudge(managed, monkeypatch)
-    assert len(calls) == 1
-    if fault == "inbox_failure":
-        operations = await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
-        assert not operations and (await store.inbox_counts(accepted["session_id"]))["pending"] == 0
-        monkeypatch.setattr(dialect, "insert_ignore", original)
+@pytest.mark.parametrize('barrier',['foreign_actor','old_generation','cancelled','closed'])
+async def test_control_refuses_wrong_actor_or_generation_and_does_not_reopen_closed_child(managed, barrier):
+    _,_,_,agent,model,_,_=managed
+    await agent.send('delegate')
+    await asyncio.wait_for(model.entered.wait(),5)
+    accepted=await receipt(managed)
+    ref=(await agent.runtime.client.inspect(JobRef(**accepted['job_ref']),actor=agent.actor)).job_ref
+    actor=agent.actor
+    if barrier=='foreign_actor':
+        actor=replace(actor,principal_id='foreign')
+    elif barrier=='old_generation':
+        ref=replace(ref,generation=0)
+    elif barrier=='cancelled':
+        await agent.runtime.client.cancel(ref,actor=actor)
+        await agent.drain()
     else:
-        op = await manager.operation_for_call(runtime.actor(parent),
-            await store.message_ref(parent, next(row.seq for row in await store.load_all_messages(parent)
-                if any(call["id"] == "actual-nudge" for call in row.tool_calls or []))), "actual-nudge")
-        assert op is not None and op.receipt_ref is not None
-    if fault == "signal":
-        monkeypatch.setattr(loop, "steer_event", signal)
-    await finish(managed)
-    saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
-    assert saved.outcome == "succeeded"
-    assert saved.result["final_text"] == ("CHILD-PROOF-42" if fault == "inbox_failure" else "NUDGED-42")
-    if fault.endswith("_ack") and fault != "lost_ack":
-        assert lost == [fault.removesuffix("_ack")]
-        assert not await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")
-
-
-async def test_same_invocation_replay_after_target_finishes_is_read_only(managed, monkeypatch):
-    _, manager, _, loop, model, parent, _ = managed
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    original = delegation.nudge
-    results = []
-
-    async def finish_then_replay(*args, **kwargs):
-        results.append(await original(*args, **kwargs))
         await finish(managed)
-        results.append(await original(*args, **kwargs))
-        return results[0]
-
-    monkeypatch.setattr(delegation, "nudge", finish_then_replay)
-    await issue_nudge(managed, monkeypatch)
-    assert len(results) == 2 and results[0]["operation_id"] == results[1]["operation_id"]
-    assert results[1]["replayed"] and model.child_calls == 2
-    assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")) == 1
+    with pytest.raises(RuntimeRequestError):
+        await agent.runtime.client.nudge(ref,'forbidden correction',message_id='wrong',actor=actor)
+    model.release.set()
+    await agent.drain()
+    assert model.child_calls==1
+    assert not any('forbidden correction' in (m.content or '') for m in await agent.runtime.store.load_all_messages(accepted['session_id']))
 
 
-@pytest.mark.parametrize("visibility", ["missing", "rewritten", "short_circuit"])
-async def test_receiver_cannot_ack_an_input_not_carried_by_its_request(nudge_case, visibility):
-    from power_loop.runtime.task_runtime import _SEND, observe_model_inputs
-    c = nudge_case
-    await c.accept()
-    rows = await c.store.inbox_claim(c.sid)
-    seq = await c.store.append_message(c.sid, role="user", content="NUDGED-42", send_index=1,
-        inbox={"claim_token": rows[0]["claim_token"], "ids": [r["id"] for r in rows]})
-    raw = {"seq": seq, "role": "user", "content": "NUDGED-42", "item_ids": [r["item_id"] for r in rows]}
-    message = {"role": "user", "content": "different" if visibility == "rewritten" else "NUDGED-42"}
-    pipeline = SimpleNamespace(session_id=c.sid, send_index=1, history=[message],
-        sink=SimpleNamespace(_history_seqs=[seq], _input_messages={seq: raw}))
-    token = _SEND.set(c.binding)
-    try:
-        await observe_model_inputs(pipeline, [] if visibility == "missing" else [message], 0,
-            provider_call=visibility != "short_circuit")
-    finally:
-        _SEND.reset(token)
-    assert not c.binding.consumed_inputs
-    with pytest.raises(JobError, match="required_input_unhandled"):
-        await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={},
-            resource_state="stopped", require_children_stopped=True)
-
-
-
-async def test_originating_parent_cannot_handle_the_receivers_input(nudge_case):
-    from power_loop.runtime.result_consumption import require_event_handled
-    c = nudge_case
-    operation, _ = await c.accept()
-    await c.consume(operation)
-    [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='nudge'")
-    with pytest.raises(JobError, match="required_input_unhandled"):
-        await require_event_handled(c.manager, c.manager.db, event,
-            session_id=c.actor.session_id, owner_job_id=c.caller.job_id)
-
-
-
-async def test_nudge_requires_current_model_send_and_persisted_invocation(managed):
-    _, _, _, loop, _, parent, _ = managed
-    with pytest.raises(ValueError, match="execution_role_unavailable"):
-        await delegation.nudge(loop, parent, "no execution")
-    token = set_session_id(parent)
-    try:
-        with pytest.raises(JobError, match="task_send_required"):
-            await delegation.nudge(loop, parent, "no execution")
-    finally:
-        reset_session_id(token)
-
-
-@pytest.mark.parametrize("first", ["accept", "finish"])
-async def test_actual_terminal_window_never_loses_an_accepted_input_or_resurrects_closed_task(managed, monkeypatch, first):
-    store, manager, runtime, loop, model, parent, _ = managed
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    reached, release = asyncio.Event(), asyncio.Event()
-    original = delegation._save_result
-
-    if first == "finish":
-        async def paused(*args, **kwargs):
-            reached.set()
-            await release.wait()
-            return await original(*args, **kwargs)
-        monkeypatch.setattr(delegation, "_save_result", paused)
-        model.release.set()
-        await asyncio.wait_for(reached.wait(), 2)
-        nudging = asyncio.create_task(issue_nudge(managed, monkeypatch))
-        await asyncio.sleep(0)
-        release.set()
-        accepted, _, _ = await nudging
-        await finish(managed)
-        tool = [m for m in await store.load_all_messages(parent) if m.role == "tool"][-1]
-        assert "resume_result_unhandled" in tool.content and "accepted" not in tool.content
-    else:
-        accepted, _, _ = await issue_nudge(managed, monkeypatch)
-        await finish(managed)
-    saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
-    assert saved.outcome == "succeeded"
-    assert saved.result["final_text"] == ("NUDGED-42" if first == "accept" else "CHILD-PROOF-42")
-    assert len([j for j in await jobs(managed) if j.kind == "subagent"]) == 1
-
-
-@pytest.mark.parametrize("case", ["source_scope", "source_subagent", "target_kind", "invalid_proof", "other_action"])
-async def test_nudge_rejects_wrong_execution_roles_kinds_and_conflicting_action(nudge_case, case):
-    c = nudge_case
-    if case == "source_scope":
-        with pytest.raises(JobError, match="nudge_caller_mismatch"):
-            await c.accept(caller=c.target)
-    elif case == "source_subagent":
-        seq = await c.store.append_message(c.child_actor.session_id, role="assistant", send_index=1, round_index=0,
-            tool_calls=[{"id": "forbidden-child", "type": "function", "function": {"name": "spawn_agent", "arguments": "{}"}}])
-        origin = await c.store.message_ref(c.child_actor.session_id, seq)
-        with pytest.raises(JobError, match="role_forbids_delegation"):
-            await c.manager.accept_nudge(c.child_actor, c.target, caller=c.receiver, call_ref=origin,
-                tool_call_id="forbidden-child", session_id=c.sid, message="no permission")
-    elif case == "target_kind":
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET kind='background_tool' WHERE job_id=?", (c.target.job_id,))
-        with pytest.raises(JobError, match="nudge_target_mismatch"):
-            await c.accept()
-    elif case == "invalid_proof":
-        with pytest.raises(JobError, match="execution_lease_required"):
-            await c.manager.accept_nudge(c.actor, None, caller=c.caller, call_ref=c.origin,
-                tool_call_id="nudge-call", session_id=c.sid, message="no proof")
-    else:
-        await c.manager.register_job(c.actor, kind="background_tool", independent=True, parent=c.caller,
-                                    call_ref=c.origin, tool_call_id="nudge-call")
-        with pytest.raises(JobError, match="operation_conflict"):
-            await c.accept()
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 0
-
-
-async def test_inbox_identity_collision_rolls_back_operation_and_keeps_original_item(nudge_case, monkeypatch):
-    c = nudge_case
-    operation_id = "op_" + "f" * 32
-    await c.store.inbox_put(c.sid, [{"item_id": "nudge:" + operation_id, "content": "original orphan"}])
-    import power_loop.runtime.jobs as module
-    monkeypatch.setattr(module.secrets, "token_hex", lambda size: "f" * (size * 2))
-    with pytest.raises(JobError, match="nudge_inbox_conflict"):
-        await c.accept()
-    assert await c.manager.db.fetchone(f"SELECT event_id FROM {c.manager.events} WHERE event_id=?", (operation_id,)) is None
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 1
-
-
-async def test_ambiguous_async_operations_cannot_bind_an_implicit_receipt(nudge_case):
-    c = nudge_case
-    await c.manager.register_job(c.actor, kind="background_tool", independent=True, parent=c.caller,
-                                call_ref=c.origin, tool_call_id="nudge-call")
-    await c.manager.register_operation(c.actor, c.target, caller=c.caller, action="steer", call_ref=c.origin,
-        tool_call_id="nudge-call", request={"message": "other"}, result={"status": "accepted"})
-    with pytest.raises(JobError, match="ambiguous_tool_operation"):
-        await c.manager.operation_for_call(c.actor, c.origin, "nudge-call")
-
-
-async def test_missing_original_invocation_does_not_admit_steering(managed, monkeypatch):
-    _, manager, _, loop, model, parent, _ = managed
-    from power_loop.runtime.invocation import invocation_context
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    original = delegation.nudge
-
-    async def missing(*args, **kwargs):
-        with invocation_context(None, None, None):
-            return await original(*args, **kwargs)
-
-    monkeypatch.setattr(delegation, "nudge", missing)
-    await issue_nudge(managed, monkeypatch)
-    assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
+@pytest.mark.parametrize('message',['', None, 42, '   '])
+async def test_tool_invalid_nudge_is_an_explicit_error_without_input(managed, monkeypatch, message):
+    store,_,_,agent,_,sid,_=managed
+    await agent.send('delegate')
     await finish(managed)
-
-
-
-
-async def test_actual_same_call_changed_message_conflicts_without_enqueuing_it(managed, monkeypatch):
-    _, manager, _, loop, model, parent, _ = managed
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    original = delegation.nudge
-
-    async def conflict(current, sid, message, **kwargs):
-        result = await original(current, sid, message, **kwargs)
-        with pytest.raises(JobError, match="operation_conflict"):
-            await original(current, sid, "different correction", **kwargs)
-        return result
-
-    monkeypatch.setattr(delegation, "nudge", conflict)
-    await issue_nudge(managed, monkeypatch)
-    await finish(managed)
-    assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")) == 1
-
-
-async def test_actual_call_with_another_admitted_action_cannot_accept_nudge(managed, monkeypatch):
-    store, manager, _, loop, model, parent, _ = managed
-    from power_loop.runtime.invocation import current_invocation
-    from power_loop.runtime.task_runtime import _SEND
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    original = delegation.nudge
-
-    async def conflicting_action(*args, **kwargs):
-        execution = _SEND.get()
-        seq, call_id = current_invocation(parent)
-        await manager.register_job(execution.actor, kind="background_tool", independent=True, parent=execution.lease,
-            call_ref=await store.message_ref(parent, seq), tool_call_id=call_id)
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(delegation, "nudge", conflicting_action)
-    # A different action was registered under this exact original call. The
-    # receipt cannot certify it as a nudge, even if the handler returns an error.
-    with pytest.raises(JobError, match="tool_call_plan_registration_changed"):
-        await issue_nudge(managed, monkeypatch)
-    assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
-    await finish(managed)
-
-
-async def test_another_main_session_cannot_nudge_a_foreign_live_executor(managed, monkeypatch):
-    store, manager, _, loop, model, parent, _ = managed
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    created = await receipt(managed)
-    foreign = await loop.new_session()
-    original = model.complete
-    called = False
-
-    async def complete(request, **kwargs):
-        nonlocal called
-        if get_session_id() != foreign:
-            return await original(request, **kwargs)
-        if called:
-            return LLMResponse(raw_text="done")
-        called = True
-        return LLMResponse(raw_text="", tool_calls=[{"id": "foreign-nudge", "type": "function", "function": {
-            "name": "spawn_agent", "arguments": json.dumps({"action": "nudge", "sub_session": created["session_id"], "message": "wrong owner"})}}])
-
-    monkeypatch.setattr(model, "complete", complete)
-    assert (await loop.send("nudge other session", foreign)).status == "completed"
-    tool = next(m for m in await store.load_all_messages(foreign) if m.role == "tool")
-    assert "nudge_target_mismatch" in tool.content
-    assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
-    await finish(managed)
-    assert (await store.inbox_counts(foreign))["pending"] == 0 and (await store.inbox_counts(parent))["pending"] == 1
-
-
-async def test_tool_preserves_original_nudge_text_including_indentation_and_newlines(managed, monkeypatch):
-    store, manager, _, loop, model, parent, _ = managed
-    await loop.send("delegate", parent)
-    await asyncio.wait_for(model.entered.wait(), 2)
-    text = "  NUDGED-42\n    preserve this indentation\n"
-    accepted, _, _ = await issue_nudge(managed, monkeypatch, message=text)
-    [event] = await manager.db.fetchall(f"SELECT event_id,payload_json FROM {manager.events} WHERE action='nudge'")
-    assert json.loads(event["payload_json"])["request"]["message"] == text
-    [inbox] = await manager.db.fetchall(f"SELECT content FROM {store.t.follow_up_queue} WHERE item_id=?", ("nudge:" + event["event_id"],))
-    assert inbox["content"] == text
-    await finish(managed)
-    assert accepted["session_id"] in {j.session_id for j in await jobs(managed) if j.kind == "subagent"}
-
-
-async def test_nudge_of_queued_child_is_durable_without_starting_a_second_executor(managed, monkeypatch):
-    store, manager, runtime, loop, model, parent, _ = managed
-    semaphore = asyncio.Semaphore(0)
-    start = delegation.start
-
-    async def queued(*args, **kwargs):
-        return await start(*args, admission=semaphore, **kwargs)
-
-    monkeypatch.setattr(delegation, "start", queued)
-    await loop.send("delegate", parent)
-    accepted, _, _ = await issue_nudge(managed, monkeypatch)
-    assert model.child_calls == 0 and (await store.inbox_counts(accepted["session_id"]))["pending"] == 1
-    running = delegation._RUNNING[(id(store), accepted["session_id"])]
-    assert running.phase == "queued"
-    semaphore.release()
-    await finish(managed)
-    saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
-    assert saved.outcome == "succeeded" and saved.result["final_text"] == "NUDGED-42"
-    assert model.child_calls == 1 and len([j for j in await jobs(managed) if j.kind == "subagent"]) == 1
-
-
-async def test_nudge_after_model_close_during_finalizer_uses_original_execution_and_session(managed, monkeypatch):
-    store, manager, runtime, loop, model, parent, _ = managed
-    from power_loop.tools import spawn_agent as tool_module
-    original = tool_module._finalize
-    reached, release = asyncio.Event(), asyncio.Event()
-    initial = True
-
-    async def finalizer(*args, **kwargs):
-        nonlocal initial
-        if initial:
-            initial = False
-            reached.set()
-            await release.wait()
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(tool_module, "_finalize", finalizer)
-    try:
-        await loop.send("delegate", parent)
-        await asyncio.wait_for(model.entered.wait(), 2)
-        model.release.set()
-        await asyncio.wait_for(reached.wait(), 2)
-        created = await receipt(managed)
-        running = delegation._RUNNING[(id(store), created["session_id"])]
-        prior_task = running.task
-        accepted, _, _ = await issue_nudge(managed, monkeypatch)
-        assert delegation._RUNNING[(id(store), accepted["session_id"])].task is prior_task
-        release.set()
-        await finish(managed)
-        saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
-        assert saved.outcome == "succeeded" and saved.result["final_text"] == "NUDGED-42"
-    finally:
-        release.set()
-
-
-async def test_nudge_cannot_borrow_a_previous_sends_persisted_tool_call(nudge_case):
-    c = nudge_case
-    seq = await c.store.append_message(c.actor.session_id, role="assistant", send_index=0, round_index=0,
-        tool_calls=[{"id": "old-call", "type": "function", "function": {"name": "spawn_agent", "arguments": "{}"}}])
-    with pytest.raises(JobError, match="nudge_caller_mismatch"):
-        await c.manager.accept_nudge(c.actor, c.target, caller=c.caller,
-            call_ref=await c.store.message_ref(c.actor.session_id, seq), tool_call_id="old-call", session_id=c.sid, message="old request")
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 0
-
-
-async def test_target_supervision_cancel_survives_a_fresh_caller_send(nudge_case):
-    c = nudge_case
-    await c.manager.request_cancel(c.actor, c.supervisor.job_id, system_key="stop-original-tree", reason="stop")
-    with pytest.raises(JobError, match="cancel_requested"):
-        await c.accept()
-    assert (await c.store.inbox_counts(c.sid))["pending"] == 0
+    accepted,_,_=await issue_nudge(managed,monkeypatch,message=message)
+    tool=[m for m in await store.load_all_messages(sid) if m.role=='tool'][-1]
+    assert 'error' in tool.content.lower()
+    assert len(await store.list_children(sid))==1
+    assert not (await store.inbox_counts(accepted['session_id']))['pending']

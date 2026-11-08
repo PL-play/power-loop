@@ -32,11 +32,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import StructuredOutputError, StructuredOutputSpec, parse_structured
-from power_loop._vendor.llm_client.interface import LLMRequest
+from power_loop import (
+    LLMResponse,
+    LLMService,
+    RequestOptions,
+    StructuredOutputError,
+    StructuredOutputSpec,
+    parse_structured,
+)
 
 # ── 1. 卡片 schema —— 关系洞察周报里可能用到的一小段 ─────────────────────
 #    Card schema — a small slice that might appear in a relationship insight report
@@ -60,26 +67,26 @@ SPEC = StructuredOutputSpec(
 )
 
 
+class CardModel(LLMService):
+    async def complete(self, request, **kwargs):
+        assert request.response_format == SPEC.to_openai_response_format()
+        return LLMResponse(raw_text='{"name":"Alan","favorite_number":37,"city":"Shanghai","tags":["hiking"]}')
+
+    async def close(self):
+        pass
+
+
 async def extract_card(user_text: str) -> dict:
-    llm = make_llm(max_tokens=200, temperature=0.0)
-    try:
-        req = LLMRequest(
-            messages=[{"role": "user", "content": user_text}],
-            system_prompt=(
-                "Extract the user's profile into a JSON object that matches "
-                "the schema. Output JSON only — no prose."
-            ),
-            response_format=SPEC.to_openai_response_format(),
-            max_tokens=200, temperature=0.0,
-        )
-        resp = await llm.complete(req)
-        return parse_structured(resp, schema=SCHEMA)
-    finally:
-        await llm.close()
+    async with demo_runtime(CardModel()) as (runtime, loop, target, actor):
+        result = await loop.send(target, user_text, message_id='card', actor=actor,
+            deadline_ms=int(time.time()*1000)+10000,
+            options=RequestOptions(response_format=SPEC.to_openai_response_format()))
+        assert result.status == 'completed'
+        return parse_structured(result.final_text, schema=SCHEMA)
 
 
 async def main() -> None:
-    # ── 1. 走真实 LLM 的正常路径 / Normal path via real LLM ──────────────
+    # ── 1. 走 Runtime 的确定性示例 / Deterministic Runtime example ──────────────
     card = await extract_card(
         "My name is Alan, I live in Shanghai, my favorite number is 37. "
         "Hobbies: hiking, coding, cooking."

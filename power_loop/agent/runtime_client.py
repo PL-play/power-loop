@@ -42,8 +42,8 @@ class RuntimeClient:
         self._slots = 0
         self._accepting = True
 
-    def _require_open(self):
-        if self._closed or not self._accepting:
+    def _require_open(self, *, reading=False):
+        if self._closed or (not reading and not self._accepting):
             raise RuntimeRequestError("session_closed")
 
     async def send(self, target, body, *, message_id, actor, options=None, descriptor=None, deadline_ms=None):
@@ -268,7 +268,7 @@ class RuntimeClient:
             success = await self._notify(target, receipt.message_id, input_ref, ['output'], {'kind': 'completed'})
             return replace(receipt, notification='published' if success else 'failed')
         success = await self._notify(TargetRef(target.store_id, target.session_id, job_ref.job_id),
-            receipt.message_id, input_ref, ["control"], {"generation": job_ref.generation})
+            receipt.message_id, input_ref, ["control"], {"generation": job_ref.generation, "cancelled": True})
         if parent_ref:
             success = await self._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
                 parent_ref.message_id, parent_ref, ["work", "activation"]) and success
@@ -290,11 +290,11 @@ class RuntimeClient:
         return replace(receipt, notification="published" if success else "failed")
 
     async def inspect(self, ref, *, actor):
-        self._require_open()
+        self._require_open(reading=True)
         return (await self.inputs.read(ref, actor))[0]
 
     async def list_jobs(self, target, *, actor, scope="self", unfinished=True, cursor=None, limit=100):
-        self._require_open()
+        self._require_open(reading=True)
         if scope not in {"self", "subtree"} or not 1 <= limit <= 1000:
             raise RuntimeRequestError("invalid_options")
         await self.inputs.authorize(self.inputs.db, target, actor)
@@ -332,7 +332,7 @@ class RuntimeClient:
         return await self._wait(ref, actor=actor, deadline_ms=deadline_ms)
 
     async def _wait(self, ref, *, actor, deadline_ms):
-        self._require_open()
+        self._require_open(reading=True)
         if self._slots >= 1024:
             raise CapacityError()
         self._slots += 1
@@ -373,7 +373,7 @@ class RuntimeClient:
                 await subscription.aclose()
 
     async def subscribe_output(self, ref, *, actor, before_send=False):
-        self._require_open()
+        self._require_open(reading=True)
         if self._slots >= 1024:
             raise CapacityError()
         self._slots += 1
@@ -389,11 +389,11 @@ class RuntimeClient:
                     await self.inputs.read(ref, actor)
             else:
                 await self.inputs.read(ref, actor)
-            self._require_open()
+            self._require_open(reading=True)
             subscription = await self.transport.subscribe(SubscriptionSpec(
                 self.namespace, ref.store_id, "output", "client", ref.session_id))
             await subscription.ready()
-            self._require_open()
+            self._require_open(reading=True)
             output = OutputSubscription(self, ref, actor, subscription)
             self._outputs.add(output)
             return output

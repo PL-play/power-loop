@@ -9,18 +9,18 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop import AgentLoopConfig, NoteMemory, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, NoteMemory, SessionStore
 
 from ._llm import make_llm
 from .judge import assert_passes
 
 
 @pytest.mark.asyncio
-async def test_recalled_note_reaches_and_is_used_by_live_model() -> None:
+async def test_recalled_note_reaches_and_is_used_by_live_model(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=256, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -34,12 +34,12 @@ async def test_recalled_note_reaches_and_is_used_by_live_model() -> None:
                 memory=NoteMemory(store),
             ),
         )
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         # Seed a distinctive fact the model could not otherwise know.
         await store.add_note(sid, "The user's project codename is 'Bluefin'.")
 
         q = "What is my project's codename?"
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
         assert r.final_text.strip()
         await assert_passes(
@@ -48,16 +48,17 @@ async def test_recalled_note_reaches_and_is_used_by_live_model() -> None:
             rubric="The answer states the project codename is 'Bluefin' (case-insensitive).",
         )
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_note_added_midsession_surfaces_on_next_send() -> None:
+async def test_note_added_midsession_surfaces_on_next_send(runtime_agent) -> None:
     """Recall is once-per-send: a note added after send 1 must surface on send 2."""
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=256, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -71,12 +72,12 @@ async def test_note_added_midsession_surfaces_on_next_send() -> None:
                 memory=NoteMemory(store),
             ),
         )
-        sid = await loop.new_session()
-        await loop.send("Hello.", session_id=sid)  # no note yet
+        sid = loop.target.session_id
+        await loop.send("Hello.")  # no note yet
         await store.add_note(sid, "The user's lucky number is 4127.")
 
         q = "What is my lucky number?"
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
         await assert_passes(
             question=q,
@@ -84,18 +85,19 @@ async def test_note_added_midsession_surfaces_on_next_send() -> None:
             rubric="The answer states the lucky number is 4127.",
         )
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_hook_events_audits_real_memory_injection() -> None:
+async def test_hook_events_audits_real_memory_injection(runtime_agent) -> None:
     """End-to-end against a LIVE provider: with record_hook_events="full", the ephemeral memory the
     MemoryRecallHook injects into the real LLM call is captured into pl_hook_events — and the model
     still actually used it. Validates the capture path on a real recall + real round, not a stub."""
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=256, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -110,11 +112,11 @@ async def test_hook_events_audits_real_memory_injection() -> None:
                 record_hook_events="full",
             ),
         )
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         await store.add_note(sid, "The user's project codename is 'Seahawk-9'.")
 
         q = "What is my project's codename?"
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
 
         # The audit captured the REAL recalled memory that was injected into the live call.
@@ -136,4 +138,5 @@ async def test_hook_events_audits_real_memory_injection() -> None:
             rubric="The answer states the project codename is 'Seahawk-9' (case-insensitive).",
         )
     finally:
+        await loop.aclose()
         await store.close()

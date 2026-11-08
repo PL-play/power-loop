@@ -98,3 +98,27 @@ def require_declared_control_writes(monkeypatch):
 
     monkeypatch.setattr(ControlTransaction, "execute", checked)
     monkeypatch.setattr(ControlTransaction, "execute_flag", checked_flag)
+
+
+@pytest.fixture
+async def runtime_agent(tmp_path):
+    """Compose and close a current Runtime for each test's explicit factory inputs."""
+    from power_loop import SessionStore
+    from tests.runtime_fixture import RunningAgent
+
+    agents = []
+    stores = []
+
+    async def create(*, model, store=None, registry=None, config=None, hooks=None, target=None, event_bus=None, task_runtime=None, command=None, allowed_models=None, capacity=1, runtime_env=None, process_control=None):
+        if store is None:
+            store = await SessionStore.open(str(tmp_path / f"runtime-{len(agents)}.db"))
+            stores.append(store)
+        agent = await RunningAgent(store, model, registry, config, hooks=hooks, event_bus=event_bus, task_runtime=task_runtime, command=command, allowed_models=allowed_models, capacity=capacity, runtime_env=runtime_env, process_control=process_control).start(target=target)
+        agents.append(agent)
+        return agent
+
+    yield create
+    for agent in reversed(agents):
+        await agent.aclose()
+    for store in reversed(stores):
+        await store.close()

@@ -21,7 +21,7 @@ TYPE = AgentEventType.TASK_SUPERVISION_CLOSED
 async def completed(case):
     _, manager, runtime, loop, model, sid, _ = case
     model.root_calls = 1  # This test needs a plain send, not delegation.
-    await loop.send("hello", sid)
+    await loop.send("hello")
     await runtime.flush_control_checkpoints()
     [job] = await jobs(case)
     return manager, runtime.actor(sid), job
@@ -91,15 +91,15 @@ async def test_authorization_generation_and_transaction_failure_never_emit(manag
         await observer.finalize_supervision(replace(actor, session_id="other"), job.job_id, generation=job.generation)
     with pytest.raises(JobError, match="generation_changed"):
         await observer.finalize_supervision(actor, job.job_id, generation=job.generation + 1)
-    original = observer._read
+    original = observer.joined_write
 
     @asynccontextmanager
     async def rollback():
         async with original() as tx:
             yield tx
-            raise OSError("original evidence read transaction failed")
+            raise OSError("original finalization transaction failed")
 
-    monkeypatch.setattr(observer, "_read", rollback)
+    monkeypatch.setattr(observer, "joined_write", rollback)
     with pytest.raises(OSError):
         await observer.finalize_supervision(actor, job.job_id, generation=job.generation)
     assert not events
@@ -110,7 +110,7 @@ async def test_running_child_cannot_be_closed_by_an_observer(managed):
     bus, events = AgentEventBus(), []
     bus.subscribe(TYPE, events.append)
     manager.event_bus = bus
-    await loop.send("delegate", sid)
+    await loop.send("delegate")
     child = next(job for job in await jobs(managed) if job.kind == "subagent")
     events.clear()
     with pytest.raises(JobError):

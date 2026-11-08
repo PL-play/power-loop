@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 import power_loop
-from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -91,7 +91,7 @@ def test_context_budget_is_independent_from_output_max_tokens():
 # ── ② 上下文检查点：按上一轮真实 prompt_tokens，轮边界优雅收尾 ────────────
 
 @pytest.mark.asyncio
-async def test_context_checkpoint_ends_send_when_real_prompt_reaches_threshold(tmp_path):
+async def test_context_checkpoint_ends_send_when_real_prompt_reaches_threshold(tmp_path, runtime_agent):
     llm = _Scripted(responses=[
         _tool_resp("c1", prompt=100),     # round 0：100 < 4000 → 继续
         _tool_resp("c2", prompt=5000),    # round 1：真实 prompt 5000 ≥ 4000 → 边界收尾
@@ -100,34 +100,26 @@ async def test_context_checkpoint_ends_send_when_real_prompt_reaches_threshold(t
     events: list = []
     bus = AgentEventBus(suppress_subscriber_errors=True)
     bus.subscribe(AgentEventType.STATUS_CHANGED, events.append)
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, context_checkpoint_tokens=4000),
-        tool_registry=_echo_registry("ok"), event_bus=bus,
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
-    assert res.status == "context_checkpoint"
-    assert res.rounds == 2
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, context_checkpoint_tokens=4000), registry=_echo_registry("ok"), event_bus=bus)
+    res = await loop.send("hi")
+    assert res.status == "interrupted" and res.error == "context_checkpoint"
+    assert (await loop.runtime.store.get_session_stats(loop.target.session_id)).rounds == 2
     assert llm._idx == 2, "第三个响应不该被消费：检查点在轮边界停"
     kinds = [(e.payload or {}).get("kind") for e in events]
     assert "context_checkpoint" in kinds
     ev = next(e for e in events if (e.payload or {}).get("kind") == "context_checkpoint")
     assert ev.payload["spent_tokens"] == 5000 and ev.payload["budget_tokens"] == 4000
     # 不留悬空 tool_calls：下一个 send 直接能跑（投影/续接靠宿主）
-    res2 = await loop.send("again", session_id=sid)
+    res2 = await loop.send("again")
     assert res2.status == "completed"
     await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_context_checkpoint_off_by_default(tmp_path):
+async def test_context_checkpoint_off_by_default(tmp_path, runtime_agent):
     llm = _Scripted(responses=[_tool_resp("c1", prompt=900000), _tool_resp("c2", prompt=900000), _resp("fin")])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=8),
-                             tool_registry=_echo_registry("ok"))
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8), registry=_echo_registry("ok"))
+    res = await loop.send("hi")
     assert res.status == "completed" and res.final_text == "fin"
     await loop.aclose()
 
@@ -135,7 +127,7 @@ async def test_context_checkpoint_off_by_default(tmp_path):
 # ── ③ send 内保险丝：最早 n 条工具结果 → 投影行（内存替换，逐轮递进）───────
 
 @pytest.mark.asyncio
-async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path):
+async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path, runtime_agent):
     big = "R" * 2000  # > 300 字符才算「值得蒸馏」
     llm = _Scripted(responses=[
         _tool_resp("c1", prompt=10),     # round 0 → prepare_round(1)：10 < 50，不动
@@ -147,14 +139,9 @@ async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path):
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
-        tool_registry=_echo_registry(big),
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+    res = await loop.send("hi")
     assert res.status == "completed"
     assert len(llm.seen) == 4
     # round 1 请求：c1 原文
@@ -168,33 +155,28 @@ async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path):
     assert [x.startswith("[distilled #1 seq=") for x in r3] == [True, True, False]
     assert len(r3[0]) < 2000
     # 存储里的原文不动（pl_messages 是真相；这里通过再次装配上一 send 的投影/原文侧面验证不抛错）
-    res2 = await loop.send("again", session_id=sid)
+    res2 = await loop.send("again")
     assert res2.status == "completed"
     await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_insend_distill_respects_hot_tail(tmp_path):
+async def test_insend_distill_respects_hot_tail(tmp_path, runtime_agent):
     big = "R" * 2000
     llm = _Scripted(responses=[_tool_resp("c1", prompt=100), _tool_resp("c2", prompt=100), _resp("done")])
     kwargs: dict[str, Any] = {}
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=10, insend_distill_hot_tail=2, **kwargs),
-        tool_registry=_echo_registry(big),
-    )
-    sid = await loop.new_session()
-    await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=10, insend_distill_hot_tail=2, **kwargs), registry=_echo_registry(big))
+    await loop.send("hi")
     # 只有两条工具结果且 hot_tail=2 → 一条都不许动
     assert _tool_rows(llm.seen[2]) == [big, big]
     await loop.aclose()
 
 @pytest.mark.asyncio
-async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatch):
+async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatch, runtime_agent):
     """反查 (name, args) 只解析本批选中的那几条，不是每轮把全历史重建一遍。
 
     旧写法每次触发都遍历全部 assistant 行、json.loads 每一个 tool_calls 的 arguments，
@@ -241,21 +223,16 @@ async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatc
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
-        tool_registry=_echo_registry(big),
-    )
-    sid = await loop.new_session()
-    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+    assert (await loop.send("hi")).status == "completed"
     await loop.aclose()
 
     args_parsed = [c for c in calls if c == '{"text": "x"}']
     # 3 次触发 × batch=1。旧写法这里是 1+2+3=6。
     assert len(args_parsed) == 3, f"解析了 {len(args_parsed)} 次，应当只解析选中的那 3 条"
 @pytest.mark.asyncio
-async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(tmp_path):
+async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(tmp_path, runtime_agent):
     """工具行少于 hot_tail 时一条都不许动（负数切片曾让它绕回去）。
 
     `tool_idx[len(tool_idx) - hot_tail:]`：条数不足时起点是负数，Python 当成「倒数第
@@ -277,15 +254,9 @@ async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        # 工具行最多 5 条 < hot_tail=8：旧写法在第 5 条时只保住最后 3 条
-        config=AgentLoopConfig(system_prompt="t", max_rounds=10, insend_distill_tokens=50,
-                               insend_distill_batch=10, insend_distill_hot_tail=8, **kwargs),
-        tool_registry=_echo_registry(big),
-    )
-    sid = await loop.new_session()
-    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=10, insend_distill_tokens=50,
+                               insend_distill_batch=10, insend_distill_hot_tail=8, **kwargs), registry=_echo_registry(big))
+    assert (await loop.send("hi")).status == "completed"
     for i, req in enumerate(llm.seen):
         rows = _tool_rows(req)
         assert all(r == big for r in rows), f"第 {i} 次请求里有被蒸馏的行：{rows}"
@@ -308,7 +279,7 @@ def _args_of(msgs: list[dict[str, Any]]) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
+async def test_insend_distill_also_slims_tool_call_arguments(tmp_path, runtime_agent):
     """保险丝也回收**调用参数**，不只是结果（6.25.0）。
 
     工具在上下文里占两块：结果在 tool 行、参数在 assistant 行的 tool_calls 里。参数此前
@@ -331,14 +302,9 @@ async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
-        tool_registry=_echo_registry("ok"),
-    )
-    sid = await loop.new_session()
-    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry("ok"))
+    assert (await loop.send("hi")).status == "completed"
 
     last = _args_of(llm.seen[-1])
     assert last, "最后一次请求里应当有工具调用"
@@ -355,7 +321,7 @@ async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_insend_distill_measures_total_context(tmp_path):
+async def test_insend_distill_measures_total_context(tmp_path, runtime_agent):
     """6.27.0：触发量 = 本 send 内的增长，不是整个上下文。
 
     真实事故（conv-237）：系统提示词 + 技能 + 工具目录一开局 3 万 token，trigger 配 30000，按整体判
@@ -373,33 +339,23 @@ async def test_insend_distill_measures_total_context(tmp_path):
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
-        tool_registry=_echo_registry(big),
-    )
-    sid = await loop.new_session()
-    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+    assert (await loop.send("hi")).status == "completed"
     for req in llm.seen[1:]:
         assert all(r.startswith("[distilled #") for r in _tool_rows(req)), "总上下文超过阈值即触发"
     # 同样的配置，send 内真涨了就该动（基线 100 → 100+60）
     llm2 = _Scripted(responses=[_tool_resp("c1", prompt=100), _tool_resp("c2", prompt=160), _resp("done")])
-    loop2 = StatefulAgentLoop(
-        llm=llm2, db_path=str(tmp_path / "s2.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
-        tool_registry=_echo_registry(big),
-    )
-    sid2 = await loop2.new_session()
-    assert (await loop2.send("hi", session_id=sid2)).status == "completed"
+    loop2 = await runtime_agent(model=llm2, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+    assert (await loop2.send("hi")).status == "completed"
     assert _tool_rows(llm2.seen[2])[0].startswith("[distilled #")
     await loop.aclose()
     await loop2.aclose()
 
 
 @pytest.mark.asyncio
-async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_path):
+async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_path, runtime_agent):
     """6.27.0：insend_distill_keep_tools 里的工具，调用参数永不瘦身（结果照旧）。
 
     send_message 的参数就是模型的发言；瘦成「_distilled N 字符…⟩」后，模型下一轮照着这个样子
@@ -432,15 +388,10 @@ async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_pat
     async def _say(**kw: Any) -> str:
         return "said"
     reg.register(ToolDefinition(name="say", description="speak", input_schema={"type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("test_fixture")), _say)
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
                                insend_distill_batch=5, insend_distill_hot_tail=0,
-                               insend_distill_keep_tools=("say",), **kwargs),
-        tool_registry=reg,
-    )
-    sid = await loop.new_session()
-    assert (await loop.send("hi", session_id=sid)).status == "completed"
+                               insend_distill_keep_tools=("say",), **kwargs), registry=reg)
+    assert (await loop.send("hi")).status == "completed"
     last = _args_of(llm.seen[-1])
     assert any(speech in a for a in last), "发言参数被瘦身了——模型会照着占位符再发一遍"
     assert any("_distilled" in a for a in last), "write_file 的正文仍该瘦身"
@@ -537,15 +488,11 @@ def test_context_profile_only_looks_at_this_send():
 
 
 @pytest.mark.asyncio
-async def test_fuse_never_stops_at_legacy_checkpoint_even_with_only_protected_calls(tmp_path):
+async def test_fuse_never_stops_at_legacy_checkpoint_even_with_only_protected_calls(tmp_path, runtime_agent):
     llm = _Scripted(responses=[_tool_resp("c1", prompt=100000), _resp("done")])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "exclusive.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4,
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4,
                                context_checkpoint_tokens=50000, insend_distill_tokens=80000,
-                               insend_distill_hot_tail=8, representation=power_loop.ProjectedRepresentation()),
-        tool_registry=_echo_registry("R" * 2000))
-    sid = await loop.new_session()
-    assert (await loop.send("hi", session_id=sid)).status == "completed"
+                               insend_distill_hot_tail=8, representation=power_loop.ProjectedRepresentation()), registry=_echo_registry("R" * 2000))
+    assert (await loop.send("hi")).status == "completed"
     assert _tool_rows(llm.seen[1]) == ["R" * 2000]
     await loop.aclose()

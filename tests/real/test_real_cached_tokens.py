@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig
 
 from ._llm import make_llm
 
@@ -21,24 +21,24 @@ _BIG_SP = "You are a terse assistant; reply with a single lowercase word.\n" + (
 
 
 @pytest.mark.asyncio
-async def test_real_cached_tokens_persisted(tmp_path) -> None:
-    db = str(tmp_path / "cached.db")
-    loop = StatefulAgentLoop(
+async def test_real_cached_tokens_persisted(tmp_path, runtime_agent) -> None:
+    str(tmp_path / "cached.db")
+    loop = await runtime_agent(
         # 256, not 16: a thinking model (deepseek-flash thinks by default) spends the first tokens
         # reasoning, so a 16-token budget truncates before any answer → hit_round_limit.
-        llm=make_llm(max_tokens=256, temperature=0),
-        db_path=db,
+        model=make_llm(max_tokens=256, temperature=0),
+
         config=AgentLoopConfig(system_prompt=_BIG_SP, max_rounds=1, max_tokens=256, temperature=0),
     )
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     expected_cached = 0
     try:
         for prompt in ("reply: one", "reply: two", "reply: three"):
-            r = await loop.send(prompt, session_id=sid)
+            r = await loop.send(prompt)
             assert r.status == "completed", r.status
             expected_cached += int(r.usage.get("cache_read_tokens") or 0)
 
-        stats = await loop.store.get_session_stats(sid)
+        stats = await loop.runtime.store.get_session_stats(sid)
         assert stats is not None
         # The feature: the store's cumulative cached_tokens == the sum the real provider reported.
         assert stats.cached_tokens == expected_cached

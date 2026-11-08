@@ -12,16 +12,11 @@
 | Provisional | 从 `power_loop` 顶层导出，但未来 minor 可能调整。 |
 | Internal | `power_loop.core.*` 等子模块导入，无兼容性承诺。 |
 
-## 核心
+## 当前运行时（11.0.0）
 
-| 符号 | 覆盖 | 更多 |
-|---|---|---|
-| `StatefulAgentLoop` | `new_session`、`send`、`send_sync`、`follow_up`、`follow_up_sync`、`resume`、`submit_input`、`abort_pending`、`close_session`、`get_messages`、`get_pending` | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/agent/stateful_loop.py) |
-| `StatefulResult` | `session_id`、`status`、`final_text`、`rounds`、`pending_tool_calls`、`pending_interactions` | [源码](../../../power_loop/agent/stateful_loop.py) |
-| `FollowUpQueued` | `session_id`、`queue_depth` — `follow_up()` 在运行中入队时返回，表示下一轮会注入指引 | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/agent/follow_up.py) |
-| `AgentLoopConfig` | loop 限制、temperature、压缩、重试、记忆 | [配置](../user-guide/configuration.md)、[源码](../../../power_loop/agent/types.py) |
-| `SessionStore` | 可插拔异步存储（SQLite / Postgres / MySQL）：会话、消息、压缩、usage、pending 状态、投影（`pl_project_messages`）、hook 注入审计（`pl_hook_events`，`list_hook_events`） | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/runtime/store/store.py) |
-| `HookEventRow` | 一条 `LLM_BEFORE` hook 临时注入的审计行（`pl_hook_events`）；见 `AgentLoopConfig.record_hook_events` / `SessionStore.list_hook_events` | [Hook 注入审计](../user-guide/hook-events-audit.md)、[源码](../../../power_loop/runtime/store/types.py) |
+见[运行时装配](../../runtime-11.md)和 `examples/design203_single_process.py`。
+`StatefulAgentLoop(runtime=...)` 委托 RuntimeClient；旧直接构造、同步执行和进程启动接口已退出。
+受理回执与持久结果分别查询。存储由 `SessionStore.open`（SQLite）或 `open_store`（DSN）装配。
 
 ## 工具与子代理
 
@@ -32,7 +27,7 @@
 | `create_default_tool_registry` | 已绑定或运行时解析的内置工具 registry | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/__init__.py) |
 | `DEFAULT_TOOL_HANDLERS` | 用于自定义 registry 组合的公开 handler 映射 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/default_tools.py) |
 | `AgentSpec` | 声明式子代理规格 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
-| `run_agent_spec` | 直接执行子代理 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
+| `run_agent_spec` | 可信宿主 command 受理子任务并等待持久结果 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
 | `register_spawn_agent` | `spawn_agent` meta-tool（4.0 起 `run_agent` 已并入） | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/tools/spawn_agent.py) |
 
 ## Hooks 与 Events
@@ -60,20 +55,11 @@
 | `ShellBackend`, `LocalShellBackend` | 持久 shell 启动方式与执行目标标识 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` 及子类 | 通用异常层级；每个子类带稳定的点分 `code`（类属性）—— 按 `exc.code` 分支，而非类身份 | [错误码](#错误码), [源码](../../../power_loop/contracts/errors.py) |
 
-> **3.0 重命名。** 3.0 之前的名字 `HistoryProjector` / `IdentityProjector` /
-> `DefaultDeterministicProjector`（投影）和 `Compactor` / `DefaultCompactor` /
-> `AgenticMemoryCompactor`（压缩）已**从 `power_loop.__all__` 移除**，取而代之的是
-> `Representation` × `FoldStrategy` 两轴模型。旧的 `compactor=` / `history_projector=`
-> 构造参数仍可用（映射到 `fold_strategy=` / `representation=`，带 `DeprecationWarning`）；
-> 旧类仅可通过深层 import 导入。见
-> [压缩](../user-guide/compaction.md) 与 [Send 上下文投影](../user-guide/send-context-projection.md)。
-
 ## LLM 契约
 
 provider 无关的 LLM 类型，从顶层 re-export（`from power_loop import …`），不必伸进 vendored
 transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResponse`、`LLMStreamChunk`、
-`LLMProviderConfig` 与 `create_llm_service_from_env`/`_config` 工厂已冻结,使 `StatefulAgentLoop`
-具备「构造闭包」(可仅用 STABLE 符号构造、使用、实现自定义 provider)。
+`LLMProviderConfig` 与 `create_llm_service_from_env`/`_config` 工厂供当前 worker 装配、持有模型连接。
 
 | 符号 | 覆盖 | 更多 |
 |---|---|---|
@@ -84,8 +70,7 @@ transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResp
 
 ## 错误码
 
-每个异常都继承 `PowerLoopError` 并带稳定、机器可读的 `code`（点分串）。按 `exc.code` 分支
-而非类身份 —— 重构友好。
+`RuntimeRequestError` 继承 ValueError，实例带 `code`，包括 capability_unavailable、resource_unavailable、definition_unavailable、forbidden 和 invalid_options。持久 Result.error_code 和宿主查询保留原码。下表列出其它 SDK 错误的 PowerLoopError 层级。
 
 | 异常 | `code` |
 |---|---|
@@ -98,3 +83,51 @@ transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResp
 | `ToolNotFound` | `tool.not_found` |
 | `ToolValidationError` | `tool.invalid_args` |
 | `SpecValidationError` | `spec.invalid` |
+
+## Timer, factory and resource ports (11.0.0)
+
+| Public port | Contract |
+|---|---|
+| `TimerBackend.create/list/cancel` | Receives trusted `TimerContext`, including original actor/tool identity |
+| `StoreTimerBackend` | Default SQLite/PostgreSQL/MySQL timer store |
+| `TimerDriver`, `TimerDriverStatus` | start/stop/status; mode, readiness, recent scan/error, bounded pending page |
+| `TimerRunner(store=..., client=..., hooks=..., event_bus=...)` | Bounded due scan and input acceptance; no model execution |
+| `RegistryRuntimeFactory.register_profile(name, preflight=...)` | Versioned capability and async deployment check before accepting |
+| `Runtime(required_profiles=..., timer_backend=..., timer_driver=..., timers_enabled=...)` | Explicit composition; external backend requires a ready driver |
+| `ExecutionEnvironment(runtime_env=..., workflow_file_io=..., process_control=..., resource_profile_ref=..., resource_scope=...)` | Current worker rebuilds tools/resources; shared workspace requires matching stable reference and shared scope |
+| `StoreBlackboard(store)` | Database-atomic post/update/remove, including concurrent first creation; `delete(board_id)` ends a host-owned scope |
+| `Runtime.status()` | Local accepting, ports, driver status, bounded pending/active counts and last error; no health SQL per request |
+| `Result.error_code` | Original machine-readable RuntimeRequestError code survives persistent result reads |
+
+`SqliteBlackboard` and `TimerDelivery` are removed without aliases. Default process
+coordination holds a native store lock; another independent process/domain is
+rejected, while pure clients and workers sharing one coordinator/transport remain
+supported. See [timers](../user-guide/timers.md), [blackboard](../user-guide/blackboard.md)
+and [runtime setup](../../runtime-11.md).
+
+## Runtime 宿主接口（11.0.0 / schema 15 / protocol 42 / descriptor 1）
+
+| 公开接口 | 合同 |
+|---|---|
+| `Runtime`、`RuntimeClient`、`RuntimeWorker` | 显式启停、输入受理、查询/等待/输出、取消与有界关闭 |
+| `StatefulAgentLoop(runtime=...)` | 客户端便利入口；send 显式传 target、message_id、可信 actor 和 deadline_ms，返回 Result |
+| `RuntimeFactory`、`RegistryRuntimeFactory` | 声明必需 profiles 和启动检查，当前节点重新取得执行资源 |
+| `ExecutionEnvironment` | 模型、工具、hooks、RuntimeEnv、workflow 文件接口、进程控制、稳定资源引用及作用范围 |
+| `TimerBackend`、`TimerContext`、`timer_context()` | 一个定时工具，使用配置的 backend 及当前输入/原工具调用身份 |
+| `TimerDriver`、`TimerDriverStatus`、`TimerRunner` | Runtime 管理启停和状态；索引分批扫描，只等待 RuntimeClient 受理 |
+| `StoreTimerBackend` | 默认 SDK 定时表，无 Redis；宿主 backend 必须提供 driver |
+| `StoreBlackboard` | 数据库内原子建行、修改、删除与清理，可用于独立连接并发 |
+
+`RuntimeRequestError` 继承 ValueError，实例的 `code` 保留 capability_unavailable、resource_unavailable、definition_unavailable、forbidden 等具体原因。持久 Result.error_code 与宿主查询不能丢弃该码，也不能把所有错误改成 definition_unavailable。
+
+`Runtime.status()` 读取内存中的 worker 和 driver 状态，不为每个请求新增健康查询。纯 Client 不启动定时驱动、不拿默认进程锁。默认内存协调的 worker 使用数据库或文件原生锁；共享模式必须配置共享适配器。
+
+### 子任务定时等待
+
+公开 `WaitPolicy(deadline_at_ms, max_wait_ms=1800000)` 和
+`register_wait_handoff_tool(registry, policy=...)`。在原主 Agent 和子任务的工厂
+工具集合中注册；可信截止时间由工厂提供，模型不能设置或延长。子任务请求定时复核，
+释放执行容量；主 Agent 读取原续办内容，再明确继续、延后或取消原 JobRef。
+继续使用 RuntimeClient.answer，取消使用 RuntimeClient.cancel，提醒使用已配置的
+TimerBackend/driver。未知定时创建不在重开时重放；错误保存在 schedule_error，
+后续新决定可继续或取消原任务。详细装配见 [运行时合同](../../runtime-11.md#finite-child-review)。

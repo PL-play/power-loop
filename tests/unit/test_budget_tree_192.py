@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage
+from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime import budget_scopes, delegation
+from power_loop.runtime import budget_scopes
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
@@ -421,7 +422,7 @@ def leaf(name):
     ],
     indirect=True,
 )
-async def test_original_workflow_owner_cap_stops_second_node_before_any_provider_call(tree_case):
+async def test_original_workflow_owner_cap_stops_second_node_before_any_provider_call(tree_case, runtime_agent):
     c = tree_case
     spec = {"name": "tree-budget", "root": {"type": "sequence", "steps": [leaf("BUILD"), leaf("REVIEW")]}}
     model, accepted = TreeModel(spec), []
@@ -432,20 +433,20 @@ async def test_original_workflow_owner_cap_stops_second_node_before_any_provider
         accepted.append(admission)
 
     register_workflow_tool(registry, ports=WorkflowToolPorts(on_accepted=on_accepted))
-    loop = StatefulAgentLoop(
-        llm=model,
+    loop = await runtime_agent(
+        model=model,
         store=c.store,
         task_runtime=c.runtime,
-        tool_registry=registry,
+        registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3, max_tokens=20),
     )
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     model.root = sid
     try:
-        first = await asyncio.wait_for(loop.send("Create the workflow", sid), 20)
+        first = await asyncio.wait_for(loop.send("Create the workflow"), 20)
         assert first.status == "completed" and len(accepted) == 1
         handle = accepted[0].handle
-        await asyncio.wait_for(handle.task, 20)
+        await asyncio.wait_for(handle.wait(deadline_ms=now_ms()+20000), 20)
         workflow = await c.manager.get_job(c.runtime.actor(sid), handle.job_id)
         assert workflow.outcome == "failed" and model.calls["BUILD"] == 1 and model.calls["REVIEW"] == 0
         assert c.host.reserve_calls == sum(model.calls.values()) == 3
@@ -457,11 +458,12 @@ async def test_original_workflow_owner_cap_stops_second_node_before_any_provider
     finally:
         model.release.set()
         if accepted:
-            await asyncio.wait_for(asyncio.gather(*(a.handle.task for a in accepted), return_exceptions=True), 20)
+            await asyncio.wait_for(asyncio.gather(*(a.handle.wait(deadline_ms=now_ms()+20000) for a in accepted), return_exceptions=True), 20)
+        await loop.aclose()
 
 
 @pytest.fixture
-async def tree_workflow(tree_case):
+async def tree_workflow(tree_case, runtime_agent):
     c = tree_case
     c.spec = {"name": "tree-budget", "root": {"type": "sequence", "steps": [leaf("BUILD"), leaf("REVIEW")]}}
     c.model, c.accepted = TreeModel(c.spec), []
@@ -473,23 +475,24 @@ async def tree_workflow(tree_case):
         c.accepted.append(admission)
 
     register_workflow_tool(registry, ports=WorkflowToolPorts(on_accepted=on_accepted))
-    c.loop = StatefulAgentLoop(
-        llm=c.model,
+    c.loop = await runtime_agent(
+        capacity=2,
+        model=c.model,
         store=c.store,
         task_runtime=c.runtime,
-        tool_registry=registry,
+        registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3, max_tokens=20),
     )
-    c.sid = await c.loop.new_session()
+    c.sid = c.loop.target.session_id
     c.model.root = c.sid
-    before = set(delegation._TASKS)
     try:
         yield c
     finally:
         c.model.release.set()
-        tasks = [a.handle.task for a in c.accepted] + list(set(delegation._TASKS) - before)
+        tasks = [a.handle.wait(deadline_ms=now_ms()+20000) for a in c.accepted]
         if tasks:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 20)
+        await c.loop.aclose()
 
 
 @pytest.mark.parametrize(
@@ -516,7 +519,7 @@ async def test_parallel_nodes_compete_for_one_workflow_call_before_the_first_res
         "on_error": "continue",
     }
     c.model.block = True
-    first = await asyncio.wait_for(c.loop.send("Create parallel workflow", c.sid), 20)
+    first = await asyncio.wait_for(c.loop.send("Create parallel workflow"), 20)
     assert first.status == "completed" and len(c.accepted) == 1
     await asyncio.wait_for(c.model.entered.wait(), 20)
     for _ in range(500):
@@ -535,7 +538,7 @@ async def test_parallel_nodes_compete_for_one_workflow_call_before_the_first_res
     assert c.model.calls["BUILD"] + c.model.calls["REVIEW"] == 1
     assert c.host.reserve_calls == 3
     c.model.release.set()
-    await asyncio.wait_for(c.accepted[0].handle.task, 20)
+    await asyncio.wait_for(c.accepted[0].handle.wait(deadline_ms=now_ms()+20000), 20)
     [counter] = [counter for _, limits, counter in await rows(c) if limits["key"] == "workflow"]
     assert counter["held_calls"] == 0 and counter["used_calls"] == 1
     assert sum(c.model.calls.values()) == 3
@@ -570,20 +573,29 @@ async def test_subagent_charges_its_original_node_and_workflow_without_double_bi
         return await prepare(context, logical_request, service=service)
 
     c.host.prepare = wait_for_original_child
-    first = await asyncio.wait_for(c.loop.send("Create workflow with one audit", c.sid), 20)
+    first = await asyncio.wait_for(c.loop.send("Create workflow with one audit"), 20)
     assert first.status == "completed" and len(c.accepted) == 1
-    await asyncio.wait_for(c.accepted[0].handle.task, 20)
-    await asyncio.wait_for(asyncio.gather(*list(delegation._TASKS), return_exceptions=True), 20)
-    assert c.model.calls == {"MAIN": 2, "BUILD": 1, "AUDIT": 1}
+    await asyncio.wait_for(c.accepted[0].handle.wait(deadline_ms=now_ms()+20000), 20)
+    await c.loop.drain()
+    # The main receives the finished workflow in a separate input; that real
+    # third main call is charged to its new root, not to the original node.
+    assert c.model.calls == {"MAIN": 3, "BUILD": 1, "AUDIT": 1}
     counters_by_template = {
         name: [counter for _, limits, counter in await rows(c) if limits["key"] == name]
         for name in ("authority", "root", "workflow", "node", "agent")
     }
-    assert counters_by_template["authority"][0]["used_calls"] == counters_by_template["root"][0]["used_calls"] == 4
+    assert counters_by_template["authority"][0]["used_calls"] == 5
+    assert sorted(counter["used_calls"] for counter in counters_by_template["root"]) == [1, 4]
     assert counters_by_template["workflow"][0]["used_calls"] == 2
     assert sum(c["used_calls"] for c in counters_by_template["node"]) == 2
     assert counters_by_template["agent"][0]["used_calls"] == 1
-    assert c.host.reserve_calls == 4 and len(c.host.applied) == 4
+    assert c.host.reserve_calls == 5 and len(c.host.applied) == 5
+    node = await c.manager.db.fetchone(f"SELECT session_id,generation FROM {c.manager.jobs} WHERE kind='workflow_node' AND title='BUILD'")
+    assert node['generation'] == 1
+    late = await c.manager.db.fetchall(f"SELECT status,delivered_seq FROM {c.store.t.follow_up_queue} WHERE session_id=? AND kind='task_done'", (node['session_id'],))
+    assert late and all(row['status'] == 'delivered' and row['delivered_seq'] is not None for row in late)
+    child = await c.manager.db.fetchone(f"SELECT result_status FROM {c.manager.jobs} WHERE kind='subagent'")
+    assert child['result_status'] == 'available'  # History retention is not model consumption.
     assert all(counter["held_calls"] == 0 for _, _, counter in await rows(c))
 
 
@@ -602,64 +614,33 @@ async def test_subagent_charges_its_original_node_and_workflow_without_double_bi
     indirect=True,
 )
 async def test_original_node_resume_does_not_get_a_fresh_owner_allowance_or_move_to_the_new_main_root(tree_workflow):
-    from power_loop.workflow import runner
-
     c = tree_workflow
-    c.spec["root"] = {
-        "type": "sequence",
-        "steps": [
-            {"type": "parallel", "branches": [leaf("BUILD"), leaf("AUDIT")], "max_concurrency": 2},
-            leaf("REVIEW"),
-        ],
-    }
-    c.model.hold = {"AUDIT"}
-    await asyncio.wait_for(c.loop.send("Create workflow", c.sid), 20)
-    await asyncio.wait_for(c.model.audit_entered.wait(), 20)
+    c.spec['root'] = leaf('BUILD')
+    await c.loop.send('Create workflow')
     [accepted] = c.accepted
-    engine = runner._ENGINES[accepted.handle.run_id]
-    build = None
-    for _ in range(500):
-        [row] = await c.manager.db.fetchall(
-            f"SELECT job_id FROM {c.manager.jobs} WHERE kind='workflow_node' AND title='BUILD'"
-        )
-        build = await c.manager.get_job(c.runtime.actor(c.sid), row["job_id"])
-        if build.outcome == "succeeded" and any(
-            not f["active"] and f["result"] and f["result"].node_id == "BUILD" for f in engine._frames.values()
-        ):
-            break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("Original BUILD did not settle")
+    assert (await accepted.handle.wait(deadline_ms=now_ms()+20000)).status == 'completed'
+    await c.loop.drain()
+    [row] = await c.manager.db.fetchall(f"SELECT job_id,session_id FROM {c.manager.jobs} WHERE kind='workflow_node'")
+    build = await c.manager.get_job(c.runtime.actor(c.sid), row['job_id'])
     previous = build.result
-    from power_loop.runtime.task_sessions import list_sessions
-
-    saved = await list_sessions(c.manager, c.runtime.actor(c.sid), build.job_id)
-    [physical] = saved["bindings"]
-    original_sid = physical["session_id"]
-    assert physical["generation"] == 1 and original_sid == previous["session_id"]
-    c.model.next_main.append(
-        {
-            "action": "nudge",
-            "run_id": accepted.handle.run_id,
-            "node": "BUILD",
-            "sid": original_sid,
-            "message": "Check the original result again",
-        }
-    )
-    control = await asyncio.wait_for(c.loop.send("Correct BUILD", c.sid), 20)
-    assert control.status == "completed"
-    messages = await c.store.load_all_messages(c.sid)
-    responses = [json.loads(m.content) for m in messages if m.role == "tool" and m.name == "workflow"]
-    assert responses[-1].get("generation") == 2 and responses[-1].get("session_id") == original_sid, responses
-    c.model.release.set()
-    await asyncio.wait_for(accepted.handle.task, 20)
+    assert build.generation == 1 and build.outcome == 'succeeded'
+    assert previous['input_ref']['session_id'] == row['session_id']
+    original_root = build.root_job_id
+    await c.loop.send('A separate main input without creating another workflow')
+    before = {limits['subject_job_id']:counter['used_calls'] for _,limits,counter in await rows(c)
+              if limits['key'] == 'root'}
+    resumed = await accepted.handle.resume(generation=1, node_id='BUILD',
+        message='Check original result', message_id='explicit-node-resume')
+    result = await resumed.wait(deadline_ms=now_ms()+20000)
+    assert result.status == 'failed' and 'budget_' in str(result)
+    await c.loop.drain()
     final = await c.manager.get_job(c.runtime.actor(c.sid), build.job_id)
-    assert final.generation == 2 and final.outcome == "failed" and c.model.calls["BUILD"] == 1
-    assert (await c.manager.get_result_revision(c.runtime.actor(c.sid), build.job_id, 1))["payload"][
-        "result"
-    ] == previous
-    [node_counter] = [counter for _, limits, counter in await rows(c) if limits.get("subject_job_id") == build.job_id]
-    assert node_counter["used_calls"] == 1 and node_counter["held_calls"] == 0
-    assert c.model.calls["REVIEW"] == 0 and c.host.reserve_calls == sum(c.model.calls.values())
-    roots = [counter for _, limits, counter in await rows(c) if limits["key"] == "root"]
-    assert sorted(counter["used_calls"] for counter in roots) == [2, 4]
+    assert final.generation == 2 and final.outcome == 'failed' and c.model.calls['BUILD'] == 1
+    assert final.session_id == build.session_id and final.root_job_id == original_root
+    assert (await c.manager.get_result_revision(c.runtime.actor(c.sid), build.job_id, 1))['payload']['result'] == previous
+    [node_counter] = [counter for _,limits,counter in await rows(c) if limits.get('subject_job_id') == build.job_id]
+    assert node_counter['used_calls'] == 1 and node_counter['held_calls'] == 0
+    after = {limits['subject_job_id']:counter['used_calls'] for _,limits,counter in await rows(c)
+             if limits['key'] == 'root'}
+    assert after[original_root] == before[original_root]
+    assert c.host.reserve_calls == sum(c.model.calls.values())

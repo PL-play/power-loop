@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -87,13 +87,10 @@ def _registry(tmp_path) -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_images_are_retired_after_retention_rounds(tmp_path):
+async def test_images_are_retired_after_retention_rounds(tmp_path, runtime_agent):
     llm = _Scripted(responses=[_tool("c1"), _tool("c2"), _tool("c3"), _resp("done")])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=8),
-                             tool_registry=_registry(tmp_path))
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8), registry=_registry(tmp_path))
+    res = await loop.send("hi")
     assert res.status == "completed"
     # 第 1 次 look 在 round 0 入图 → round 1 请求里是原图；round 2 请求里已换成占位
     r1 = _attachment_rows(llm.seen[1])
@@ -108,13 +105,10 @@ async def test_images_are_retired_after_retention_rounds(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_retention_off_keeps_images(tmp_path):
+async def test_retention_off_keeps_images(tmp_path, runtime_agent):
     llm = _Scripted(responses=[_tool("c1"), _tool("c2"), _resp("done")])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=8, image_retention_rounds=0),
-                             tool_registry=_registry(tmp_path))
-    sid = await loop.new_session()
-    await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, image_retention_rounds=0), registry=_registry(tmp_path))
+    await loop.send("hi")
     rows = _attachment_rows(llm.seen[2])
     assert rows and all(any(k == "attachment" for k in row) for row in rows)
     await loop.aclose()
@@ -122,7 +116,7 @@ async def test_retention_off_keeps_images(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("projected", [True, False])
-async def test_cross_send_image_representation(tmp_path, projected):
+async def test_cross_send_image_representation(tmp_path, projected, runtime_agent):
     """Projected history is text; verbatim history currently restores untracked attachments."""
     from power_loop.runtime.representation import ProjectedRepresentation, VerbatimRepresentation
 
@@ -133,14 +127,12 @@ async def test_cross_send_image_representation(tmp_path, projected):
         representation=ProjectedRepresentation() if projected else VerbatimRepresentation(),
     )
     assert config.image_retention_rounds == 1
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=config, tool_registry=_registry(tmp_path))
-    sid = await loop.new_session()
+    loop = await runtime_agent(model=llm, config=config, registry=_registry(tmp_path))
     try:
-        await loop.send("look", session_id=sid)
+        await loop.send("look")
         # The first image has already retired before this send finishes.
         assert "image retired" in str(llm.seen[2])
-        await loop.send("continue", session_id=sid)
+        await loop.send("continue")
         first = _attachment_rows(llm.seen[3])
         second = _attachment_rows(llm.seen[4])
         if projected:

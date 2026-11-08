@@ -256,6 +256,14 @@ def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
         "cursor": {"type": "string"},
         "max_chars": {"type": "integer", "minimum": 1024, "maximum": 32000},
         "detail": {"type": "boolean"},
+        "source": {"type": "string", "enum": ["messages", "projection"]},
+        "message_id": {"type": "string"},
+        "message_ids": {"type": "array", "items": {"type": "string"}},
+        "seq": {"type": "string"},
+        "id": {"type": "string"},
+        "send_index": {"type": "integer", "minimum": 1},
+        "char_offset": {"type": "integer", "minimum": 0},
+        "output_file": {"type": "string"},
     }
     if allow_inline_spec:
         properties["spec"] = {"type": "object"}
@@ -342,7 +350,11 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                 selected = await select_native_target(loop.task_runtime, sid, job, options)
                 node = await manager.get_job(actor, selected, include_result=False)
                 if action == "logs":
-                    value = await task_history.read_history(manager, actor, selected, limit=options.get("limit", 20))
+                    value = await task_history.read_history(manager, actor, selected, **{
+                        key: options[key] for key in ("source", "message_id", "message_ids", "seq", "id",
+                            "send_index", "limit", "cursor", "char_offset", "max_chars", "output_file")
+                        if key in options
+                    })
                 else:
                     _, trusted = await tool_actor(loop)
                     client = loop._runtime_worker.runtime.client

@@ -8,11 +8,9 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop
 from power_loop.runtime import executor_registry as registry
-from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.store.factory import open_store
-from power_loop.runtime.task_runtime import TaskRuntime
 
 
 async def main():
@@ -20,37 +18,10 @@ async def main():
     if '://' in dsn:
         address = urlparse(dsn)
         assert address.hostname == '127.0.0.1' and address.path.endswith('_test')
-    store = await open_store(dsn, table_prefix=prefix, schema='compatible')
+    store = await open_store(dsn, table_prefix=prefix, schema="verify")
     manager = JobManager(store, now_ms=lambda: int(clock))
     identity = registry.ExecutorIdentity(tenant, principal, executor, boot)
     try:
-        if mode == 'new-send':
-            class Model(LLMService):
-                calls = 0
-                async def complete(self, request, **kwargs):
-                    self.calls += 1
-                    return LLMResponse(raw_text='must not enter the model')
-                def stream(self, request):
-                    raise AssertionError('nonstream fixture')
-                async def close(self):
-                    pass
-            model = Model()
-            # This boot was registered by the parent host. Task admission must
-            # respect its durable state without replaying host bootstrap here.
-            runtime = TaskRuntime(manager, tenant_id=tenant, principal_id=principal,
-                                  executor_id=executor, boot_id=boot)
-            loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-                config=AgentLoopConfig(delegation_policy='single_level', max_rounds=2, compactor=None))
-            try:
-                try:
-                    result = await loop.send('new send during drain', sid)
-                    packet = {'status': result.status, 'result': str(result), 'calls': model.calls}
-                except JobError as exc:
-                    packet = {'error': exc.code, 'calls': model.calls}
-                Path(output).write_text(json.dumps(packet))
-            finally:
-                await loop.aclose(drain_timeout_s=.1)
-            return
         if mode in ('opposite-forward', 'opposite-reverse'):
             request = {'action': 'drain', 'reason': 'shutdown'}
             operation = registry._operation_key(manager, identity, 'drain', 'process-stop')

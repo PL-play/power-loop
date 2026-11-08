@@ -11,37 +11,35 @@ import pytest
 from power_loop import (
     AgentLoopConfig,
     SessionStore,
-    SqliteBlackboard,
-    StatefulAgentLoop,
+        StoreBlackboard,
     register_blackboard_tools,
 )
-from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.runtime.env import RuntimeEnv
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
 
 
 @pytest.mark.asyncio
-async def test_real_agent_posts_to_shared_board() -> None:
+async def test_real_agent_posts_to_shared_board(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         reg = ToolRegistry()
         register_blackboard_tools(reg)
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0), store=store, tool_registry=reg,
+        bb = StoreBlackboard(store)
+        loop = await runtime_agent(runtime_env=RuntimeEnv(blackboard=bb, blackboard_id="conv-real"),
+            model=make_llm(max_tokens=512, temperature=0), store=store, registry=reg,
             config=AgentLoopConfig(
                 system_prompt=("You coordinate with a teammate through a shared board. To record "
                                "anything, you MUST call the board tool with action='post' — that "
                                "is the only way to write to the board."),
                 max_rounds=4, max_tokens=512, temperature=0, compactor=None),
         )
-        bb = SqliteBlackboard(store)
-        sid = await loop.new_session(metadata={"spec_name": "alice"})
+        sid = loop.target.session_id
+        await store.merge_session_metadata(sid, {"spec_name":"alice"})
 
-        with runtime_env_context(RuntimeEnv(blackboard=bb, blackboard_id="conv-real")):
-            r = await loop.send(
+        r = await loop.send(
                 "Post a task to the shared board with the text: draft the introduction.",
-                session_id=sid,
             )
         assert r.status == "completed"
 
@@ -50,4 +48,5 @@ async def test_real_agent_posts_to_shared_board() -> None:
         assert any("introduction" in e.text.lower() or "intro" in e.text.lower() for e in entries)
         assert entries[0].author == "alice"  # author resolved from session metadata (spec_name)
     finally:
+        await loop.aclose()
         await store.close()

@@ -1,110 +1,38 @@
-"""05 · 悬挂态恢复 / Pending recovery: what if the process crashes mid-tool-call
-
-What you learn / 你将学到
---------------------------
-- 一轮工具调用的协议要求：assistant(tool_calls=[A,B]) 之后必须有 tool 消息对应每个 id
-  / protocol requires: assistant(tool_calls=[A,B]) must be followed by a tool
-  message for each id
-- 下次 send 自动为遗留调用补“执行中断，结果未知”并继续。
-  / The next send records interrupted/unknown results and continues.
-- 两条恢复路径 / Two recovery paths:
-  - ``await loop.resume(sid)`` —— 把剩余的 tool_calls 跑完，继续循环
-    / finish executing remaining tool_calls, then continue the loop
-  - ``loop.abort_pending(sid, reason=...)`` —— 给每个悬挂的 tool_call 写
-    ``<aborted>`` 消息，恢复协议合法性，再 ``send`` 即可
-    / write ``<aborted>`` messages for each pending tool_call, restoring protocol
-    validity, then ``send`` normally
-
-我们在这里直接往 store 里写一条 assistant(tool_calls) + ``set_pending`` 来模拟崩溃。
-/ We simulate a crash by directly writing an assistant(tool_calls) + ``set_pending`` to the store.
-
-Run / 运行
-----------
-    python examples/05_pending_recovery.py
-"""
-
-from __future__ import annotations
-
+"""05 · Align an interrupted tool response as unknown; never repeat the action."""
 import asyncio
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import (
-    AgentLoopConfig,
-    SessionStore,
-    StatefulAgentLoop,
-    ToolDefinition,
-    ToolRegistry,
-)
+from power_loop import LLMResponse, LLMService, ToolDefinition, ToolRegistry
 from power_loop.runtime.pricing import Free
 
 
-def _build_registry() -> ToolRegistry:
-    reg = ToolRegistry()
-    reg.register(
-        ToolDefinition(
-            pricing=Free("local example tool"),
-            name="echo",
-            description="Echo input.",
-            input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
-            required_params=(),
-        ),
-        lambda **kw: kw.get("text", ""),
-    )
-    return reg
+class ContinueModel(LLMService):
+    async def complete(self, request, **kwargs):
+        assert '结果未知' in str(request.messages)
+        return LLMResponse(raw_text='The previous result is unknown. New input can proceed.')
+
+    async def close(self):
+        pass
 
 
-async def _simulate_crash_pending(store: SessionStore, sid: str) -> int:
-    """直接往 store 里塞一条 assistant(tool_calls) + 把 pending 标上，
-    等价于「LLM 已返回，但 tool 调用还没跑完进程就挂了」。
-    / Write an assistant(tool_calls) to the store + mark pending — equivalent to
-    "LLM returned but process crashed before tool calls finished"."""
-    asst_seq = await store.append_message(
-        sid, role="assistant",
-        tool_calls=[{
-            "id": "tc-stuck",
-            "function": {"name": "echo", "arguments": '{"text":"x"}'},
-        }],
-        round_index=0,
-    )
-    await store.set_pending(sid, {
-        "assistant_seq": asst_seq, "round_index": 0,
-        "tool_call_ids": ["tc-stuck"],
-        "tool_calls": [{
-            "id": "tc-stuck",
-            "function": {"name": "echo", "arguments": '{"text":"x"}'},
-        }],
-    })
-    return asst_seq
+async def main():
+    registry = ToolRegistry()
+    def action():
+        raise AssertionError('An unknown action must not be repeated')
+    registry.register(ToolDefinition('external_action','External action', pricing=Free('demo')), action)
+    async with demo_runtime(ContinueModel(), registry) as (runtime, loop, target, actor):
+        calls = [{'id':'original','type':'function','function':{'name':'external_action','arguments':'{}'}}]
+        seq = await runtime.store.append_message(target.session_id, role='assistant', tool_calls=calls)
+        await runtime.store.set_pending(target.session_id,
+            {'assistant_seq':seq,'round_index':0,'tool_call_ids':['original'],'tool_calls':calls})
+        result = await loop.send(target, 'Continue with the unknown outcome', message_id='new-input', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        print(result.final_text)
+        return result.final_text
 
 
-async def main() -> str:
-    store = await SessionStore.open(":memory:")
-    try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(),
-            store=store,
-            tool_registry=_build_registry(),
-            config=AgentLoopConfig(
-                system_prompt="If a turn was aborted, acknowledge briefly and answer the new question.",
-                max_rounds=2,
-                compactor=None,
-            ),
-        )
-
-        # 1. 准备一个被「半成品」打断的 session
-        #    Prepare a session interrupted by a half-finished tool call
-        sid = await store.create_session(system_prompt="S")
-        await store.append_message(sid, role="user", content="initial prompt")
-        await _simulate_crash_pending(store, sid)
-
-        # 2. send 自动修复并继续 / send repairs pending calls and continues
-        r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid)
-        print(f"[send]  status={r.status}, reply={r.final_text}")
-        return r.final_text
-    finally:
-        await store.close()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

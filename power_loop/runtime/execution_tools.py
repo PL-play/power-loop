@@ -37,6 +37,8 @@ async def prepare(pipeline, attempt):
     if binding is None or binding.actor.session_id != pipeline.session_id:
         return
     control, job = current(binding), source(binding)
+    if control.closed:
+        raise JobError("execution_control_closed")
     if not binding.resource_evidence["_control_tool_plan_required"]:
         return
     seq = getattr(pipeline.sink, "persisted_assistant_seq", None)
@@ -130,11 +132,13 @@ async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None
     seq, call_id = current_invocation(binding.actor.session_id)
     owned, selected = entry(binding, seq, call_id)
     control, manager, job = current(binding), binding.runtime.manager, source(binding)
+    if control.closed:
+        raise JobError("execution_control_closed")
     declared = policy(registered, arguments, runtime=binding.runtime)
     if not declared.control_only:
         control.require_admission()
     if (owned["registrations"][call_id] is not registered or selected["tool_name"] != name
-            or selected["arguments_hash"] != _hash(arguments)
+            or (selected["recovery"] is not None and selected["arguments_hash"] != _hash(arguments))
             or selected["registration"] != registration_value(registered)):
         raise JobError("tool_call_plan_binding_changed")
     plan, ref = owned["plan"], owned["ref"]
@@ -169,8 +173,11 @@ async def prepare_attempt(binding, ref, call_id, registered, arguments):
         raise JobError("tool_attempt_original_required")
     control, job = current(binding), source(binding)
     owned, selected = entry(binding, ref.seq, call_id)
+    # TOOL_BEFORE may rewrite ordinary call arguments. Keep the original
+    # assistant identity, but price and dispatch the actual hook output.
+    # Managed effects still use their separately frozen request contract.
     if (ref != owned["ref"] or owned["registrations"][call_id] is not registered
-            or selected["arguments_hash"] != _hash(arguments)):
+            or (selected["recovery"] is not None and selected["arguments_hash"] != _hash(arguments))):
         raise JobError("tool_call_plan_binding_changed")
     pricing = validate_pricing(registered)
     control_only = policy(registered, arguments, runtime=binding.runtime).control_only

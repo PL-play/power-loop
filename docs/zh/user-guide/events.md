@@ -1,90 +1,27 @@
-# Events
+# 事件与输出
 
-[English](../../en/user-guide/events.md) | [用户手册](../index.md)
+SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
 
-Event 是**只读观测**通道。订阅者可以看到所有事情——但不能改变控制流（控制流用 [Hooks](hooks.md)）。
+[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
 
-## 快速示例
+通过 ExecutionEnvironment.event_bus 提供 EventBus。执行前订阅，使用会话与执行身份关联模型、工具、子任务、用量和生命周期事件。共享 bus 按目标会话过滤。执行结束时 Runtime 删除自己的流式订阅，并限时排空异步订阅回调；宿主拥有自己的订阅和 bus。
 
-```python
-from power_loop import AgentEventBus, AgentEventType
+事件用于观察，hooks 可以改变决策。它们都不是第二套计费账本；费用以持久任务结果和计费接口为准。流式增量是实时通知，重连后查询原输入结果，不能假设丢失增量能重放。
 
-bus = AgentEventBus()
+输出订阅的缓冲有界。慢消费者处理缺口并读取持久状态。不要在每个 token 回调中执行阻塞网络或数据库操作。事件可能包含用户和工具内容，访问权限与保留期由宿主决定。
 
-# 流式打字机
-def on_delta(event):
-    print(event.data.text, end="", flush=True)
+## 可执行示例
 
-bus.subscribe(AgentEventType.STREAM_DELTA, on_delta)
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
 
-# 订阅所有事件
-def audit(event):
-    log.write(f"[{event.type.value}] sid={event.session_id}\n")
+| 示例 | 行为 |
+|---|---|
+| [08_streaming.py](../../../examples/08_streaming.py) | 实时输出 |
+| [09_audit_log.py](../../../examples/09_audit_log.py) | 事件观察 |
+| [25_token_usage.py](../../../examples/25_token_usage.py) | 用量 |
+| [36_observability.py](../../../examples/36_observability.py) | 指标 |
+| [44_hook_events_audit.py](../../../examples/44_hook_events_audit.py) | Hooks 与事件 |
 
-bus.subscribe(None, audit)  # None = 所有事件
-
-loop = StatefulAgentLoop(llm=llm, event_bus=bus, config=config)
+```bash
+.venv/bin/python examples/08_streaming.py
 ```
-
-## 事件类型分类
-
-| 类别 | 事件数 | 关键事件 |
-|---|---|---|
-| 会话 | 2 | `session_started`, `session_ended` |
-| 轮次 | 3 | `round_started`, `round_completed`, `round_tools_present` |
-| 流式 | 4 | `stream_started`, `stream_delta`, `stream_think_delta`, `stream_completed` |
-| 工具 | 3 | `tool_call_started`, `tool_call_completed`, `tool_call_failed` |
-| 状态/用量 | 3 | `status_changed`（4 种子类型）, `usage_updated`, `timer_fired` |
-| 子代理 | 4 | `subagent_task_start`, `subagent_text`, `subagent_limit`, `subagent_completed` |
-| 每次LLM调用 | 2 | `llm_call_started`, `llm_call_completed`（按 `call_id` 配对，含本次调用延迟/用量；0.14.0） |
-| 重试/取消 | 3 | `llm_retry_attempted`, `llm_degraded`, `loop_cancelled` |
-| 记忆 | 2 | `memory_recalled`, `memory_failed` |
-| 其他 | 4 | `todo_updated`, `user_notification`, `agent_error`（异常逃逸 `run()` 时真实发射，随后补发 `session_ended(reason="error")`）, `system_log` |
-
-**共 30 种事件**，每种带类型化 payload。
-
-## 常见模式
-
-### 流式打字机（CLI/UI）
-
-```python
-def typewriter(event):
-    if event.data.is_think:
-        return
-    print(event.data.text, end="", flush=True)
-
-bus.subscribe(AgentEventType.STREAM_DELTA, typewriter)
-```
-
-### 成本追踪
-
-```python
-def track_cost(event):
-    if event.type == AgentEventType.STATUS_CHANGED:
-        d = event.data
-        if hasattr(d, "prompt_tokens"):
-            statsd.gauge("agent.tokens", d.prompt_tokens + (d.completion_tokens or 0))
-```
-
-### 审计日志
-
-```python
-import json
-
-def write_audit(event):
-    log.write(json.dumps({
-        "ts": time.time(),
-        "type": event.type.value,
-        "session_id": event.session_id,
-        "payload": event.payload,
-    }) + "\n")
-
-bus.subscribe(None, write_audit)  # 所有事件
-```
-
-## 下一步
-
-- [Hooks](hooks.md) — 改变控制流
-- [完整 Event 参考](../../events.md) — 每个 payload 字段
-
-异步任务监管收尾、策略 hook 与可靠回执的边界，参见[异步任务扩展](task-extensions.md)。

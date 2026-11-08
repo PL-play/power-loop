@@ -1,36 +1,22 @@
-"""23 · Per-call overrides / 每次调用覆盖: restrict tools & system prompt per send
+"""23 · RequestOptions limits visible tools and overrides this input's prompt.
 
-What you learn / 你将学到
---------------------------
-- 一个 loop 构造一次（含全部工具 + 基础 system prompt），但**每次 send 可覆盖**
-  / build the loop once (all tools + base prompt), then override **per send**
-- ``send(..., tools=[...])`` 只允许一个工具子集——模型**根本看不到**其它工具
-  / restrict this run to a tool subset — the model never even *sees* the rest
-- ``send(..., system_prompt=...)`` 仅对这次运行覆盖系统提示
-  / override the system prompt for this run only
-- 适合多租户：一个缓存 loop 服务多个调用方，各自不同的工具白名单/提示
-  / great for multi-tenant: one cached loop, per-caller allowlists & prompts
-
-``tools`` 接受工具名序列（从 loop 注册表里取子集）或一个 ``ToolRegistry``。
-/ ``tools`` accepts a sequence of tool names (subset of the loop registry) or a ``ToolRegistry``.
-
-Run / 运行
-----------
-    python examples/23_per_send_overrides.py
+An unbound registry resolves workspace from the current factory environment.
 """
 
 from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 from pathlib import Path
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
-    AgentLoopConfig,
+    LLMResponse,
+    LLMService,
+    RequestOptions,
     RuntimeEnv,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
     create_default_tool_registry,
@@ -74,32 +60,26 @@ def _build_registry() -> ToolRegistry:
     return r
 
 
+class VisibleModel(LLMService):
+    async def complete(self, request, **kwargs):
+        names = [t['function']['name'] for t in request.tools if t['function']['name'] != 'pass_turn']
+        assert len(names) == 1
+        if names == ['get_stock']:
+            assert 'Terse finance bot' in request.system_prompt
+        return LLMResponse(raw_text=','.join(names))
+
+    async def close(self):
+        pass
+
+
 async def main() -> None:
-    loop = StatefulAgentLoop(
-        llm=make_llm(),
-        db_path=":memory:",
-        tool_registry=_build_registry(),  # registered with BOTH tools
-        config=AgentLoopConfig(system_prompt="You are a helpful assistant.", max_rounds=4),
-    )
-
-    # Run A: only expose get_weather — the model cannot call get_stock at all.
-    sid_a = await loop.new_session()
-    res_a = await loop.send(
-        "What's the weather in Tokyo, and the price of AAPL?",
-        session_id=sid_a,
-        tools=["get_weather"],
-    )
-    print("A (weather only):", res_a.final_text)
-
-    # Run B: only expose get_stock + a per-run system prompt override.
-    sid_b = await loop.new_session()
-    res_b = await loop.send(
-        "What's the weather in Tokyo, and the price of AAPL?",
-        session_id=sid_b,
-        tools=["get_stock"],
-        system_prompt="You are a terse finance bot. Answer in one short line.",
-    )
-    print("B (stock only, terse):", res_b.final_text)
+    async with demo_runtime(VisibleModel(), _build_registry()) as (runtime, loop, target, actor):
+        for name in ['get_weather', 'get_stock']:
+            result = await loop.send(target, 'Show available tools', message_id=name, actor=actor,
+                options=RequestOptions(tools=[name], system_prompt='Terse finance bot' if name == 'get_stock' else None),
+                deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed' and result.final_text == name
+            print(name, result.final_text)
 
     # One unbound default registry can safely resolve a different workspace
     # for each invocation. The host owns the RuntimeEnv boundary.

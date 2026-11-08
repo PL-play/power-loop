@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -92,35 +92,25 @@ def test_unknown_shape_asserts_nothing() -> None:
 
 # ── 截断不重试，而是改变输入 ────────────────────────────────────────────────
 
-async def test_truncated_round_nudges_instead_of_blind_retry(tmp_path) -> None:
+async def test_truncated_round_nudges_instead_of_blind_retry(tmp_path, runtime_agent) -> None:
     llm = _ScriptedLLM(script=[_truncated()])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "t.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, max_tokens=20000),
-        tool_registry=ToolRegistry(),
-    )
-    sid = await loop.new_session()
-    result = await loop.send("写个大文件", sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, max_tokens=20000), registry=ToolRegistry())
+    result = await loop.send("写个大文件")
     assert result.final_text == "写小一点之后写完了"
     # 关键：下一轮的输入里必须多了那句实话——否则就是原样重试，必然再被截断。
     assert any("被从中间截断" in p for p in llm.seen_prompts[1:]), (
         "截断之后没有告诉模型，等于原样重试")
 
 
-async def test_completion_tokens_hitting_the_cap_counts_as_truncation(tmp_path) -> None:
+async def test_completion_tokens_hitting_the_cap_counts_as_truncation(tmp_path, runtime_agent) -> None:
     """有的供应商不给 finish_reason——输出打满 max_tokens 本身就是够硬的信号。"""
     from power_loop._vendor.llm_client.interface import LLMTokenUsage
 
     r = LLMResponse(raw_text="", tool_calls=[])
     r.token_usage = LLMTokenUsage(prompt_tokens=1000, completion_tokens=20000)
     llm = _ScriptedLLM(script=[r])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "c.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=8, max_tokens=20000),
-        tool_registry=ToolRegistry(),
-    )
-    sid = await loop.new_session()
-    await loop.send("写个大文件", sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, max_tokens=20000), registry=ToolRegistry())
+    await loop.send("写个大文件")
     assert any("被从中间截断" in p for p in llm.seen_prompts[1:])
 
 

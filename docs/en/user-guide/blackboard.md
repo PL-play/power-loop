@@ -1,91 +1,28 @@
-# Shared Blackboard
+# Shared blackboard
 
-[中文](../../zh/user-guide/blackboard.md) | [User Guide](../index.md)
+`StoreBlackboard(store)` is the default database-backed implementation of the `Blackboard` protocol. It supports SQLite, PostgreSQL and MySQL. Hosts choose a `board_id` and its lifetime; a board is independent of message sessions.
 
-A **scoped shared blackboard** is a small, structured, mutable space that several agents read and write to coordinate — distinct from each agent's private message history. A planner leaves tasks; a worker claims and completes them; each sees the other's updates — *without* dumping one agent's whole transcript into the other's context.
-
-It's the same abstraction whether the scope is a chat conversation or a workflow run; only the `blackboard_id` and lifetime differ. DeepTalk uses it (scope = `conversation_id`) for its in-room agent coordination board.
-
-## The pieces
-
-| Piece | Role |
-|---|---|
-| `Blackboard` (Protocol) | async `read` / `post` / `update` / `remove` — per-entry merge, never whole-doc overwrite |
-| `SqliteBlackboard` | the default impl, persisted in the `SessionStore` sqlite (a board is *not* tied to a session) |
-| `register_blackboard_tools(registry)` | adds the single agent-facing `board` tool (`action=post|read|update|remove`; merged from the four `board_*` tools in 5.0) |
-| `RuntimeEnv(blackboard=, blackboard_id=)` | injects the live board + this agent's board id per run |
-| `render_entries(entries, header=)` | format a board snapshot for prompt injection |
-
-Agents with the **same** `blackboard_id` share a board; different ids are isolated. A board-less agent simply doesn't register the tools (default = isolated).
-
-## Setup
+Each `post`, `update` and `remove` runs as an atomic read/modify/write in one database transaction, including creation of the first row. Independent instances and processes can update the same board without losing entries or allocating duplicate IDs. SQLite uses its write transaction; PostgreSQL and MySQL create the unique owner/key row without overwriting it, then lock it for the update. The entry and text limits still apply. Missing entries and invalid operations raise `BlackboardError`.
 
 ```python
-from power_loop import (
-    SqliteBlackboard, ToolRegistry, register_blackboard_tools,
-    RuntimeEnv, runtime_env_context, render_entries,
-)
+from power_loop import StoreBlackboard
 
-registry = ToolRegistry()
-# The kind/status vocabularies are YOUR policy (they shape the tool schemas).
-register_blackboard_tools(registry, kinds=("note", "task"), statuses=("open", "doing", "done"))
-
-board = SqliteBlackboard(loop.store)
-BOARD_ID = "project-x"
+board = StoreBlackboard(store)
+entry = await board.post("project-37", text="Review the plan", kind="task", status="open")
+await board.update("project-37", entry.id, status="done")
+entries = await board.read("project-37")
+await board.remove("project-37", entry.id)
+await board.delete("project-37")  # The host ends this board's scope.
 ```
 
-## Running an agent against the board
+For model tools, call `register_blackboard_tools(registry)` and have the current worker factory return an `ExecutionEnvironment` with `runtime_env=RuntimeEnv(blackboard=board, blackboard_id="project-37")`. This exposes the single `board` tool with `read/post/update/remove` actions. The model cannot select another board ID. Share a board only among authorized agents; the host supplies the scope and performs its final cleanup.
 
-Inject the board per send (the same seam as `shell_backend`). The **author is stamped from session metadata** (`spec_name`), not supplied by the model — so attribution can't be spoofed. The host typically *projects* the current board into each turn's prompt (the "pull" side):
+The factory must reconstruct the same board backend and scope when execution moves. A submitter's context variable is not a cross-process resource. DeepTalk uses `DeeptalkBlackboard`, whose writes go through its API and business tables; it does not write the SDK board table.
 
-```python
-sid = loop.new_session(metadata={"spec_name": "planner"})
-snapshot = render_entries(await board.read(BOARD_ID), header="Shared board:", empty="(empty)")
+Run the credential-free example:
 
-with runtime_env_context(RuntimeEnv(blackboard=board, blackboard_id=BOARD_ID)):
-    await loop.send(f"{snapshot}\n\nPost two tasks for your teammate.", session_id=sid)
+```bash
+python examples/29_shared_blackboard.py
 ```
 
-Now a second agent with the *same* `BOARD_ID` sees those entries and can act on them:
-
-```python
-sid2 = loop.new_session(metadata={"spec_name": "worker"})
-with runtime_env_context(RuntimeEnv(blackboard=board, blackboard_id=BOARD_ID)):
-    await loop.send("Mark the first task done and leave a note.", session_id=sid2)
-
-for e in await board.read(BOARD_ID):
-    print(f"#{e.id} [{e.kind}·{e.status}] ({e.author}) {e.text}")
-```
-
-See [example 29](../../../examples/29_shared_blackboard.py) for the full planner/worker run.
-
-## Tools the agent sees
-
-| Tool | Action |
-|---|---|
-| `board(action="read")` | snapshot the board (usually auto-shown at turn start; call to re-check) |
-| `board(action="post", text=..., kind?, status?)` | add an entry |
-| `board(action="update", entry_id=..., text?, status?)` | edit an entry by `entry_id` |
-| `board(action="remove", entry_id=...)` | delete an entry by `entry_id` |
-
-Entries are append-only with monotonic integer ids. Writes are per-entry (post / update one row), not whole-document last-write-wins — so concurrent authors don't clobber each other. `SqliteBlackboard` enforces `max_entries` and `max_text_len` caps and raises `BlackboardError` on violations.
-
-## Direct API (no agent)
-
-The board is a plain async object you can drive yourself — useful for seeding, tests, or a host-side audit view:
-
-```python
-e = await board.post(BOARD_ID, text="claim the plan", kind="task", status="open", author="alice")
-await board.update(BOARD_ID, e.id, status="done")
-await board.remove(BOARD_ID, e.id)
-```
-
-## Custom implementations
-
-`Blackboard` is a `Protocol`, so a host can back it with anything (an HTTP API, a shared DB) as long as it keeps the per-entry merge semantics. DeepTalk's `DeeptalkBlackboard` routes every write through its REST API (honoring its single-writer invariant) while reusing power-loop's tools and projector unchanged.
-
-## See also
-
-- [Tools](tools.md) — registering and presetting tools
-- [Configuration](configuration.md) — `RuntimeEnv` and per-send injection
-- [Workflows](workflows.md) — orchestrating the agents that share a board
+`SqliteBlackboard` is removed; no compatibility alias is provided. See [Runtime 11](../../runtime-11.md) for composition and lifecycle.

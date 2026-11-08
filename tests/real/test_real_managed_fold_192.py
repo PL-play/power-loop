@@ -10,7 +10,7 @@ from collections import Counter
 
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig
 from power_loop.runtime.budget_contracts import (
     BudgetAck,
     BudgetConfig,
@@ -39,7 +39,7 @@ class RecordingHost:
         self.prepared, self.grants, self.applied = [], {}, Counter()
 
     async def prepare(self, context, logical_request, *, service, purpose=None):
-        self.prepared.append((context["attempt_id"], service, purpose))
+        self.prepared.append((context["attempt_id"], getattr(service, "provider", service), purpose))
         return BudgetPlan(200000, {"attempt_id": context["attempt_id"], "origin": context})
 
     async def reserve(self, plan):
@@ -64,7 +64,7 @@ class RecordingHost:
 
 
 @pytest.mark.parametrize("variant", ["llm_summary", "summary_model", "agentic"])
-async def test_real_task_send_fold_is_booked_once_as_fold(tmp_path, variant):
+async def test_real_task_send_fold_is_booked_once_as_fold(tmp_path, variant, runtime_agent):
     store = await open_store(str(tmp_path / "fold.db"), table_prefix="real_fold_", schema="tasks")
     host = RecordingHost()
     runtime = TaskRuntime(JobManager(store), tenant_id="real-fold", principal_id="host", executor_id="executor",
@@ -75,14 +75,14 @@ async def test_real_task_send_fold_is_booked_once_as_fold(tmp_path, variant):
     summary = make_llm(max_tokens=2048, temperature=0.0) if variant == "summary_model" else None
     fold = (AgenticFold(keep_last_sends=1, summary_max_tokens=1024, max_rounds=3) if variant == "agentic"
             else LLMSummaryFold(keep_last_sends=1, summary_max_tokens=1024, summary_llm=summary))
-    loop = StatefulAgentLoop(llm=main, store=store, task_runtime=runtime, config=AgentLoopConfig(
+    loop = await runtime_agent(model=main, store=store, task_runtime=runtime, config=AgentLoopConfig(
         delegation_policy="single_level", system_prompt="You are terse. Reply with one short sentence.",
         max_rounds=3, max_tokens=2048, context_budget_tokens=40, model=main._cfg.model,
         representation=ProjectedRepresentation(), fold_strategy=fold))
     try:
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         for i in range(1, 5):
-            result = await loop.send(f"Note the word apple{i} and reply OK.", session_id=sid)
+            result = await loop.send(f"Note the word apple{i} and reply OK.")
             assert result.status == "completed", result.status
         compact = await store.latest_project_compact(sid)
         assert compact is not None and (compact.content or {}).get("summary", "").strip()
@@ -98,6 +98,9 @@ async def test_real_task_send_fold_is_booked_once_as_fold(tmp_path, variant):
         assert {booked[a][0] for a in folds} == {summary or main}
         assert set(host.applied) == set(booked) and set(host.applied.values()) == {1}
     finally:
+        await loop.aclose()
+        if summary is not None:
+            await summary.close()
         await store.close()
 
 

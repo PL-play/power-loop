@@ -31,9 +31,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
-from power_loop.agent.follow_up import (
-    FollowUpQueued,
-)
 from power_loop.agent.sink import (
     CONTENT_ENCODING_JSON,
     CONTENT_ENCODING_META_KEY,
@@ -49,7 +46,6 @@ from power_loop.contracts.errors import (
     CancellationRequested,
     SessionNotFoundError,
 )
-from power_loop.contracts.protocols import ChildRunGuard
 from power_loop.core.agent_context import (
     get_ctx,
     reset_current_loop,
@@ -360,10 +356,6 @@ class _ExecutionLoop:
         # and must NOT survive a restart: a crashed process's lease has to look foreign to its
         # replacement so the replacement can take it over once it expires.
         self._owner_id = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
-        # Host-registered guards entered around every inline child run
-        # (run_agent_spec) — see register_child_run_guard. (name, factory) pairs
-        # in registration order.
-        self._child_run_guards: list[tuple[str | None, ChildRunGuard]] = []
         # ── per-session active-window cache (rebuildable accelerator; see _SessionCache) ──
         self._session_cache_size = int(session_cache_size)
         self._session_cache: OrderedDict[str, _SessionCache] = OrderedDict()
@@ -398,45 +390,12 @@ class _ExecutionLoop:
                     HookPoint.LLM_BEFORE, hook, order=100, name=MemoryRecallHook.NAME,
                 )
 
-    def register_child_run_guard(
-        self, guard: ChildRunGuard, *, name: str | None = None
-    ) -> None:
-        """Register a context-manager factory entered around every INLINE child
-        run spawned under this loop (``run_agent_spec``: spawn_agent / run_agent
-        delegations and in-process workflow leaves).
-
-        An inline child shares the parent's hooks object and runs in the same
-        task (same contextvars), so per-send hook state kept by the host —
-        reminder counters, turn flags, same-send finalize claims — would
-        otherwise tick during the child's rounds and pollute the parent (or,
-        worse, fire parent finalization INTO the child session). A guard's
-        typical body: snapshot/suspend that state on ``__enter__``, restore on
-        ``__exit__``.
-
-        Guards are entered in registration order and exited in reverse, around
-        the child's whole run (exceptions included). They must be RE-ENTRANT:
-        a grandchild run enters the same guards again, nested. Out-of-process
-        leaves (``SubprocessExecutor``) never enter guards — nothing is shared.
-
-        ``name`` enables targeted removal via :meth:`remove_child_run_guard`.
-        PROVISIONAL (3.14).
-        """
-        self._child_run_guards.append((name, guard))
-
-    def remove_child_run_guard(self, name: str) -> bool:
-        """Remove the guard registered under ``name``. Returns True if found."""
-        for i, (n, _g) in enumerate(self._child_run_guards):
-            if n == name:
-                del self._child_run_guards[i]
-                return True
-        return False
-
     async def ensure_store(self) -> SessionStore:
         """Public accessor: return this loop's store, opening an owned one on first use.
 
         Construction is sync but the store opens lazily on first async use, so ``loop.store``
         is ``None`` until then. Host integrations that need the store up front — e.g. building
-        a :class:`~power_loop.runtime.blackboard.SqliteBlackboard` to share with the loop —
+        a :class:`~power_loop.runtime.blackboard.StoreBlackboard` to share with the loop —
         must ``await loop.ensure_store()`` rather than reading ``loop.store`` directly (which
         would capture ``None``).
         """
@@ -861,58 +820,6 @@ class _ExecutionLoop:
     @property
     def event_bus(self):
         return self._runner.event_bus
-
-    async def schedule_timer(
-        self,
-        session_id: str,
-        *,
-        delay_s: float | None = None,
-        due_at_ms: int | None = None,
-        note: str,
-        interval_s: int | None = None,
-        operation_id: str | None = None,
-    ):
-        """Create a durable wake-up for this session (external/orchestrator
-        path; agents use the ``schedule_wakeup`` tool). Provide exactly one of
-        ``delay_s`` / ``due_at_ms``. ``interval_s`` makes it recurring: after
-        each delivery it re-arms at fire-time + interval (fixed-delay) until
-        cancelled. Fires only while a ``TimerRunner`` (or an external
-        scheduler polling ``store.due_timers()``) is running."""
-        from power_loop.runtime.execution_roles import require_timer_creation
-        from power_loop.runtime.timer_backend import backend_for
-        from power_loop.runtime.timer_backend import operation_id as timer_operation_id
-
-        await require_timer_creation(self, sid=session_id)
-
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        if (delay_s is None) == (due_at_ms is None):
-            raise ValueError("provide exactly one of delay_s / due_at_ms")
-        if not (note or "").strip():
-            raise ValueError("note is required — the agent needs to know why it woke up")
-        if interval_s is not None and int(interval_s) < 1:
-            raise ValueError("interval_s must be >= 1 second")
-        return await backend_for(self, store).create(
-            session_id, delay_s=delay_s, due_at_ms=due_at_ms, note=note.strip(), interval_s=interval_s,
-            operation_id=timer_operation_id(self, session_id, operation_id),
-        )
-
-    async def cancel_timer(self, session_id: str, timer_id: int, *, operation_id: str | None = None) -> bool:
-        """Cancel an armed timer. Returns False when it already fired /
-        was cancelled / never existed."""
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        from power_loop.runtime.timer_backend import backend_for
-        from power_loop.runtime.timer_backend import operation_id as timer_operation_id
-        return await backend_for(self, store).cancel(session_id, int(timer_id),
-            operation_id=timer_operation_id(self, session_id, operation_id))
-
-    async def list_timers(self, session_id: str, *, statuses: tuple[str, ...] = ("armed", "firing")):
-        """Live (armed/firing) timers for this session, soonest first."""
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        from power_loop.runtime.timer_backend import backend_for
-        return await backend_for(self, store).list(session_id, statuses=statuses)
 
     # ── work in flight: list + stop by id (design/124 §8.1 / §8.4) ────────────────────────
 
@@ -1927,6 +1834,7 @@ class _ExecutionLoop:
         summary = getattr(self.config.fold_strategy, "summary_llm", None) or self.llm
         return FoldContext(session_id=sid, round_index=0, representation=projector,
                            llm=calls.wrap(self.llm), summary_llm=calls.wrap(summary),
+                           memory=self.config.memory, tool_registry=self.tool_registry,
                            max_tokens=self.config.max_tokens)
 
     async def _run_fold_with_timeout(self, fold_strategy: Any, rows: Any, ctx: Any) -> Any | None:
@@ -2082,4 +1990,4 @@ class StatefulAgentLoop:
         await self.aclose()
 
 
-__all__ = ["StatefulAgentLoop", "StatefulResult", "MessageState", "FollowUpQueued"]
+__all__ = ["StatefulAgentLoop", "StatefulResult", "MessageState"]

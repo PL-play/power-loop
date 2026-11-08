@@ -23,15 +23,18 @@ Run / 运行
 from __future__ import annotations
 
 import asyncio
+import inspect
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentEvent,
     AgentEventBus,
     AgentEventType,
     AgentLoopConfig,
-    StatefulAgentLoop,
+    LLMResponse,
+    LLMService,
     StreamDeltaPayload,
 )
 
@@ -62,30 +65,31 @@ def make_typewriter(bus: AgentEventBus) -> None:
     bus.subscribe(AgentEventType.STREAM_COMPLETED, on_done)
 
 
-async def main() -> str:
-    bus = AgentEventBus(suppress_subscriber_errors=True)
+class StreamingModel(LLMService):
+    async def complete(self, request, *, on_chunk_delta_text=None, **kwargs):
+        pieces = ['Streamed ', 'through ', 'the Runtime.']
+        for piece in pieces:
+            if on_chunk_delta_text:
+                value = on_chunk_delta_text(piece)
+                if inspect.isawaitable(value):
+                    await value
+        return LLMResponse(raw_text=''.join(pieces))
+
+    async def close(self):
+        pass
+
+
+async def main():
+    bus = AgentEventBus()
     make_typewriter(bus)
-
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=512, temperature=0.3),
-        db_path=":memory:",
-        event_bus=bus,
-        config=AgentLoopConfig(
-            system_prompt="You are a helpful assistant. Reply in English.",
-            max_rounds=1,
-            compactor=None,
-        ),
-    )
-    sid = await loop.new_session()
-    r = await loop.send(
-        "Explain in 3 short sentences why HTTPS is more secure than HTTP.",
-        session_id=sid,
-    )
-    # final_text 与流式拼出的内容应该一致
-    # final_text should match what was streamed
-    print(f"\n[result] status={r.status}, final_text len={len(r.final_text)}")
-    return r.final_text
+    async with demo_runtime(StreamingModel(), event_bus=bus,
+            config=AgentLoopConfig(max_rounds=1, compactor=None)) as (runtime, loop, target, actor):
+        result = await loop.send(target, 'stream', message_id='stream', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and result.final_text == 'Streamed through the Runtime.'
+        print('result:', result.final_text)
+        return result.final_text
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

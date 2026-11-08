@@ -45,4 +45,6 @@ async def consume_completed_result(loop, session_id, *, max_rounds=None, result_
         )
     if max_rounds is not None:
         options["max_rounds"] = max_rounds
-    return await loop.flush_follow_ups(session_id, **options)
+    from power_loop import RequestOptions
+    await loop.drain()
+    return await loop.send("Report the saved workflow result.", options=RequestOptions(**options))

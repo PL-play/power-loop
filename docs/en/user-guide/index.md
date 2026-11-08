@@ -40,7 +40,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 |---|---|
 | [Async orchestration](async-orchestration.md) | **Start here for anything async.** The host-driven model (no daemon), the `send`/`resume`/`submit_input`/`follow_up` wake API, how each async result re-enters, persistence & crash recovery, projection/compaction interaction, building a custom async-wake tool, troubleshooting |
 | [Dynamic Workflows](workflows.md) | `WorkflowSpec` DSL, deterministic engine, detached runs, cross-restart resume |
-| [Shared Blackboard](blackboard.md) | `SqliteBlackboard`, `board_*` tools, multi-agent coordination |
+| [Shared Blackboard](blackboard.md) | `StoreBlackboard`, `board_*` tools, multi-agent coordination |
 | [Sandboxing & Isolation](sandboxing.md) | `ShellBackend` (sandbox bash), `WorkerLauncher` (sandbox a leaf process) |
 
 ## Performance & scale

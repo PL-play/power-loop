@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from power_loop.agent.types import LoopMessage
@@ -47,22 +47,6 @@ class InboxItem:
     def __post_init__(self) -> None:
         if self.mode not in INBOX_MODES:
             raise ValueError(f"InboxItem.mode must be one of {INBOX_MODES}, got {self.mode!r}")
-
-
-@dataclass(frozen=True)
-class FollowUpQueued:
-    """Returned when :meth:`StatefulAgentLoop.deliver` / ``follow_up`` parked input in the inbox
-    instead of running it (a run is in flight, another process holds the session, or every item
-    was a duplicate).
-
-    ``queue_depth`` — undelivered items now waiting; ``accepted`` — how many of THIS call's items
-    were new; ``duplicates`` — how many were already known (same ``item_id``) and dropped."""
-
-    session_id: str
-    queue_depth: int
-    accepted: int = 1
-    duplicates: int = 0
-    accepted_ids: tuple[str, ...] = field(default_factory=tuple)
 
 
 def inbox_row(item: InboxItem) -> dict[str, Any]:
@@ -254,7 +238,6 @@ __all__ = [
     "INBOX_KIND_RELAY",
     "INBOX_KIND_TASK_DONE",
     "INBOX_KIND_USER",
-    "FollowUpQueued",
     "InboxItem",
     "inbox_row",
     "render_inbox_rows",

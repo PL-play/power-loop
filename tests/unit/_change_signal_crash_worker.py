@@ -19,7 +19,7 @@ async def write(store, sid, kind):
 
 
 async def main(dsn, prefix, sid, kind, stage):
-    store = await open_store(dsn, table_prefix=prefix, schema="compatible")
+    store = await open_store(dsn, table_prefix=prefix, schema="verify")
     if stage == "after_signal":
         signal = store.signal_changes
         async def stop(*args):

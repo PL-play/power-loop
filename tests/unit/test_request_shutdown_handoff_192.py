@@ -1,109 +1,91 @@
-"""Transferring a timed-out request must not double-signal ordinary shutdown."""
-from __future__ import annotations
-
+"""Runtime shutdown/cancel stop original requests; cancelling a waiter does not."""
 import asyncio
 
 import pytest
 
-from power_loop import AgentLoopConfig, CancellationToken, StatefulAgentLoop
+from power_loop import LLMResponse, LLMService
+from power_loop.agent.runtime_store import now_ms
+from tests.runtime_fixture import RunningAgent
 
-from .test_executor_lifecycle_192 import host
 from .test_job_registry_192 import registry_store
-from .test_task_runtime_192 import AdapterModel
 
-__all__ = ["host", "registry_store"]
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-async def test_ordinary_shutdown_keeps_one_request_cancellation_and_usage_cleanup(host, monkeypatch):
-    store, manager, runtime = host
-    model = AdapterModel()
-    started, release, cleaned = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    signals = []
-
-    async def inflight(request, **kwargs):
-        started.set()
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            signals.append("request-cancelled")
+@pytest.mark.parametrize('stop_kind', ['shutdown', 'cancel'])
+async def test_request_cancellation_runs_provider_cleanup_once(registry_store, stop_kind):
+    store, _ = registry_store
+    entered, cleaned, signals = asyncio.Event(), asyncio.Event(), []
+    class Model(LLMService):
+        async def complete(self, request, **kwargs):
+            entered.set()
             try:
-                await asyncio.sleep(.02)  # original provider cancellation cleanup
-                cleaned.set()
+                await asyncio.Event().wait()
             except asyncio.CancelledError:
-                signals.append("cleanup-cancelled-again")
+                signals.append('request-cancelled')
+                try:
+                    await asyncio.sleep(.02)
+                    cleaned.set()
+                except asyncio.CancelledError:
+                    signals.append('cleanup-cancelled-again')
+                    raise
                 raise
-            raise
-        raise AssertionError("must not turn shutdown into a completed answer")
-
-    monkeypatch.setattr(model, "complete", inflight)
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-        config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2))
-    sid = await loop.new_session()
-    sending = asyncio.create_task(loop.send("Compute original answer", sid))
+        async def close(self):
+            pass
+    agent = await RunningAgent(store, Model()).start()
     try:
-        await asyncio.wait_for(started.wait(), 3)
-        stopped = await runtime.shutdown(timeout_s=2, grace_s=.3)
-        result = await sending
-        assert result.status == "cancelled"
-        assert signals == ["request-cancelled"] and cleaned.is_set()
-        assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
-        assert not runtime._adapter_tasks
-        [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-        assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
-    finally:
-        release.set()
-        await asyncio.gather(sending, return_exceptions=True)
-
-
-@pytest.mark.parametrize("stop_kind", ["shutdown", "token", "caller"])
-async def test_original_request_stays_reachable_after_controller_exits(host, monkeypatch, stop_kind):
-    store, manager, runtime = host
-    runtime.lease_ms = 30000
-    model = AdapterModel()
-    model.release.set()
-    original = model.complete
-    started, signalled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    handles = set()
-    async def uncooperative(request, **kwargs):
-        handles.add(asyncio.current_task())
-        started.set()
-        try:
-            await release.wait()
-        except asyncio.CancelledError:
-            signalled.set()
-            await release.wait()
-        return await original(request, **kwargs)
-    monkeypatch.setattr(model, "complete", uncooperative)
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-        config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2))
-    sid = await loop.new_session()
-    token = CancellationToken()
-    sending = asyncio.create_task(loop.send("original request", sid, stop_event=token if stop_kind == "token" else None))
-    try:
-        await asyncio.wait_for(started.wait(), 3)
-        if stop_kind == "shutdown":
-            stopped = await runtime.shutdown(timeout_s=.2, grace_s=.05)
-            assert stopped["pending_handles"] and not stopped["store_safe_to_close"], {"snapshot": stopped, "requests": [repr(t) for t in handles], "adapters": [repr(t) for t in runtime._adapter_tasks]}
-        elif stop_kind == "token":
-            token.cancel("original explicit stop")
+        receipt = await agent.runtime.client.send(agent.target, 'original request', message_id='original', actor=agent.actor)
+        await asyncio.wait_for(entered.wait(), 5)
+        if stop_kind == 'shutdown':
+            await agent.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
         else:
-            sending.cancel("original caller stop")
-        await asyncio.wait_for(signalled.wait(), 1)
-        done, pending = await asyncio.wait({sending}, timeout=6)
-        assert done and not pending, "controller cleanup did not finish its original bounded wait"
-        [request_task] = handles
-        assert not request_task.done()
-        current = await runtime.executor_status()
-        assert current["pending_handles"] > 0 and not current["store_safe_to_close"], current
-        assert request_task in runtime._adapter_tasks
-        [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-        original_result = job["result_json"]
+            await agent.runtime.client.cancel(receipt.input_ref, actor=agent.actor, reason='user stop')
+        result = await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
+        assert result.status == 'cancelled'
+        assert signals == ['request-cancelled'] and cleaned.is_set()
+        assert (await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)) == result
+        assert signals == ['request-cancelled']
+    finally:
+        await agent.aclose()
+
+
+async def test_cancelled_waiter_does_not_cancel_or_replace_original_model(registry_store):
+    store, _ = registry_store
+    entered, release = asyncio.Event(), asyncio.Event()
+    class Model(LLMService):
+        calls = 0
+        cancelled = False
+        async def complete(self, request, **kwargs):
+            self.calls += 1
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return LLMResponse(raw_text='original answer')
+        async def close(self):
+            pass
+    model = Model()
+    agent = await RunningAgent(store, model).start()
+    try:
+        receipt = await agent.runtime.client.send(agent.target, 'original request', message_id='original', actor=agent.actor)
+        await asyncio.wait_for(entered.wait(), 5)
+        waiter = asyncio.create_task(agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not model.cancelled and model.calls == 1
+        release.set()
+        result = await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
+        assert result.status == 'completed' and result.final_text == 'original answer'
+        assert model.calls == 1 and not model.cancelled
+        duplicate = await agent.runtime.client.send(agent.target, 'original request', message_id='original', actor=agent.actor)
+        assert not duplicate.newly_accepted
+        assert (await agent.runtime.client.wait(duplicate.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)) == result
+        assert model.calls == 1
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(sending, *handles, return_exceptions=True), 3)
-
-    assert not runtime._adapter_tasks and all(t.done() for t in handles)
-    [after] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-    assert after["result_json"] == original_result
-    assert model.child_calls == 1
+        await agent.aclose()

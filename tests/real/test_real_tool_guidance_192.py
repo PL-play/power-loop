@@ -4,19 +4,19 @@ import asyncio
 
 import pytest
 
-from power_loop import AgentEventType, AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentEventType, AgentLoopConfig, HookPoint, SessionStore, ToolDefinition
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize('name,declared', [('write_plan', True), ('todo', False)])
-async def test_real_progress_and_prompt_follow_actual_declared_tool(tmp_path, record_property, name, declared):
+async def test_real_progress_and_prompt_follow_actual_declared_tool(tmp_path, record_property, name, declared, runtime_agent):
     provider, store = BoundedProvider(limit=2), await SessionStore.open(str(tmp_path / 'guidance.db'))
     calls, events, registry = [], [], ToolRegistry()
 
@@ -29,9 +29,11 @@ async def test_real_progress_and_prompt_follow_actual_declared_tool(tmp_path, re
         capabilities=('task.progress.v1',))) if declared else handler
     registry.register(ToolDefinition(name, 'Record the requested plan once. No arguments.',
         usage_hint='IMPLEMENTATION_PLAN_GUIDANCE: call this tool once with an empty object.', pricing=Free("test_fixture")), implementation)
-    loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
+    from power_loop import AgentEventBus
+    bus = AgentEventBus()
+    loop = await runtime_agent(event_bus=bus,model=provider, store=store, registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048, retry_policy=LLMRetryPolicy(max_attempts=1)))
-    loop.event_bus.subscribe(None, events.append)
+    bus.subscribe(None, events.append)
 
     async def schema(ctx):
         assert 'IMPLEMENTATION_PLAN_GUIDANCE' in ctx.system_prompt
@@ -41,9 +43,8 @@ async def test_real_progress_and_prompt_follow_actual_declared_tool(tmp_path, re
     loop.hooks.register(HookPoint.LLM_BEFORE, schema, name='test.actual-guidance')
     try:
         async with asyncio.timeout(150):
-            sid = await loop.new_session()
             result = await loop.send(f'Call {name} exactly once with an empty object. '
-                'After PLAN_RECORDED reply exactly DONE. Do not call other tools.', sid)
+                'After PLAN_RECORDED reply exactly DONE. Do not call other tools.')
             assert result.status == 'completed' and result.final_text.strip() == 'DONE'
             assert calls == [{}] and provider.calls == 2
             rounds = [e for e in events if e.type == AgentEventType.ROUND_COMPLETED and e.payload.get('has_tools')]
@@ -52,7 +53,7 @@ async def test_real_progress_and_prompt_follow_actual_declared_tool(tmp_path, re
         provider.report(record_property)
         record_property('actual_plan_writes', len(calls))
         try:
-            await loop.aclose(drain_timeout_s=0.1)
+            await loop.aclose()
         finally:
             await provider.close()
             await store.close()

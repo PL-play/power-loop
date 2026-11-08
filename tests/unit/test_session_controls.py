@@ -35,6 +35,6 @@ async def test_notice_recipient_version_changes_only_with_its_transaction(regist
             await route_notice()
     else:
         await route_notice()
-    observer = JobManager(await connect(schema="compatible"))
+    observer = JobManager(await connect(schema="verify"))
     after = await session_controls.version(observer, observer.db, recipient)
     assert after == (before[0] + (0 if rollback else 1), before[1])

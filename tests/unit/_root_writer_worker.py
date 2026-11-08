@@ -18,7 +18,7 @@ async def main():
         address = urlparse(dsn)
         assert address.hostname == '127.0.0.1' and address.path.endswith('_test')
     config = json.loads(raw)
-    store = await open_store(dsn, table_prefix=prefix, schema='compatible')
+    store = await open_store(dsn, table_prefix=prefix, schema="verify")
     manager = JobManager(store, now_ms=lambda: config['now'])
     try:
         async with manager._write() as tx:

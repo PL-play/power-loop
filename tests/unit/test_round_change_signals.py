@@ -9,15 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop, ToolDefinition
+from power_loop import LLMResponse, LLMService, ToolDefinition
+from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.sink import SQLiteSink
-from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.runtime_state import BackgroundRuntimeProjector
-from power_loop.runtime.store import store as store_module
 from power_loop.runtime.store.change_signals import COLUMNS
-from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 from ._change_signal_crash_worker import write
 from .test_job_registry_192 import registry_store
@@ -57,7 +55,7 @@ async def test_process_death_rolls_back_signal_and_payload_together(registry_sto
             process.kill()
             await process.wait()
     assert process.returncode == (91 if stage == "after_signal" else 92), output.decode()
-    cold = await connect(schema="compatible")
+    cold = await connect(schema="verify")
     assert await versions(cold, sid) == (0, 0, 0)
     assert not await payload(cold, sid, kind)
     await write(cold, sid, kind)
@@ -85,7 +83,7 @@ async def test_signal_and_payload_share_failed_or_unknown_commit(registry_store,
         patch.setattr(store._db, "transaction", fail)
         with pytest.raises(OSError, match="before_commit|committed_ack_lost"):
             await write(store, sid, kind)
-    cold = await connect(schema="compatible")
+    cold = await connect(schema="verify")
     expected = tuple(int(fault == "ack_loss" and column == kind + "_version") for column in COLUMNS)
     assert await versions(cold, sid) == expected
     assert bool(await payload(cold, sid, kind)) == (fault == "ack_loss")
@@ -118,55 +116,39 @@ class Model(LLMService):
         pass
 
 
-def fixture_loop(store, model, registry=None, projectors=None):
-    runtime = TaskRuntime(JobManager(store), tenant_id="change-test", principal_id="host",
-                          executor_id="executor", boot_id="boot", boot_contract_hash="c" * 64)
-    config = {"runtime_projectors": projectors} if projectors is not None else {}
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry or ToolRegistry(),
-        config=AgentLoopConfig(max_rounds=4, compactor=None, delegation_policy="single_level", **config))
-    return runtime, loop
-
-
-@pytest.mark.parametrize("kind", ["inbox", "background", "background_unacked"])
 @pytest.mark.parametrize("stage", ["during_model", "after_final_append"])
-async def test_update_during_last_model_round_is_consumed_before_completion(registry_store, monkeypatch, kind, stage):
-    store, connect = registry_store
+async def test_update_during_last_model_round_is_consumed_before_completion(registry_store, monkeypatch, stage):
+    store, _ = registry_store
     model = Model()
-    projectors = (BackgroundRuntimeProjector(mark_seen=False),) if kind == "background_unacked" else None
-    runtime, loop = fixture_loop(store, model, projectors=projectors)
-    sid = await loop.new_session()
-    other = await connect(schema="compatible")
-    written = False
+    runner = await RunningAgent(store, model).start()
     original = SQLiteSink.on_message_appended
+    appended = False
+    async def inject():
+        nonlocal appended
+        if not appended:
+            appended = True
+            return await runner.runtime.client.append(runner.target, "once", actor=runner.actor, message_id="late")
     async def append(self, message, **kwargs):
-        nonlocal written
         await original(self, message, **kwargs)
-        if (stage == "after_final_append" and not written and self.session_id == sid
-                and message.get("role") == "assistant" and not message.get("tool_calls")):
-            written = True
-            await write(other, sid, "background" if kind.startswith("background") else kind)
+        if stage == "after_final_append" and message.get("role") == "assistant" and not message.get("tool_calls"):
+            await inject()
     monkeypatch.setattr(SQLiteSink, "on_message_appended", append)
-    sending = asyncio.create_task(loop.send("start", sid))
+    sending = asyncio.create_task(runner.send("start"))
     try:
-        await asyncio.wait_for(model.entered.wait(), 5)
+        await asyncio.wait_for(model.entered.wait(), 10)
         if stage == "during_model":
-            await write(other, sid, "background" if kind.startswith("background") else kind)
+            await inject()
         model.release.set()
-        result = await asyncio.wait_for(sending, 10)
+        result = await asyncio.wait_for(sending, 20)
         assert result.status == "completed" and result.final_text == "updated"
         assert len(model.calls) == 2 and "once" in model.calls[1]
-        if kind == "inbox":
-            [item] = await store.inbox_items(sid)
-            assert item["status"] == "delivered"
-        elif kind == "background":
-            assert not await store.list_unseen_background_updates(sid)
+        late = await runner.runtime.client.wait(
+            __import__('power_loop').InputRef(store.store_id, runner.target.session_id, 'late'),
+            actor=runner.actor, deadline_ms=now_ms()+5000)
+        assert late.job_ref == result.job_ref
     finally:
         model.release.set()
-        if not sending.done():
-            sending.cancel()
-            await asyncio.gather(sending, return_exceptions=True)
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
+        await runner.aclose()
 
 
 async def test_todo_change_replaces_cached_state_in_next_round(registry_store):
@@ -174,78 +156,54 @@ async def test_todo_change_replaces_cached_state_in_next_round(registry_store):
     model = Model()
     model.tool = True
     model.release.set()
-    sid = await store.create_session()
-    await store.set_runtime_state(sid, "todo", {"rendered": "before-change"})
-    other = await connect(schema="compatible")
     registry = ToolRegistry()
+    other = await connect(schema="verify")
     async def change():
-        await other.set_runtime_state(sid, "todo", {"rendered": "after-change"})
+        await other.set_runtime_state(runner.target.session_id, "todo", {"rendered": "after-change"})
         return "changed"
-    registry.register(ToolDefinition("change", "Change todo", input_schema={"type": "object"}, pricing=Free("fixture")), change)
-    runtime, loop = fixture_loop(store, model, registry)
+    registry.register(ToolDefinition("change", "Change todo", input_schema={"type":"object"}, pricing=Free("fixture")), change)
+    runner = await RunningAgent(store, model, registry).start()
+    await store.set_runtime_state(runner.target.session_id, "todo", {"rendered": "before-change"})
     try:
-        result = await loop.send("start", sid)
+        result = await runner.send("start")
         assert result.status == "completed" and len(model.calls) == 2
         assert "before-change" in model.calls[0]
         assert "after-change" in model.calls[1] and "before-change" not in model.calls[1]
     finally:
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
+        await runner.aclose()
 
 
-@pytest.mark.parametrize("kind", ["inbox", "background"])
-async def test_pass_turn_checks_after_last_append_without_restarting_the_model(registry_store, monkeypatch, kind):
-    store, connect = registry_store
+async def test_pass_turn_accepts_late_append_without_losing_it(registry_store, monkeypatch):
+    from power_loop import create_default_tool_registry
+    store, _ = registry_store
     model = Model()
     model.pass_turn = True
     model.release.set()
-    runtime, loop = fixture_loop(store, model)
-    sid = await loop.new_session()
-    other = await connect(schema="compatible")
+    runner = await RunningAgent(store, model, create_default_tool_registry(bind=False)).start()
     original = SQLiteSink.on_message_appended
+    receipt = None
     async def append(self, message, **kwargs):
+        nonlocal receipt
         await original(self, message, **kwargs)
-        if self.session_id == sid and message.get("role") == "tool" and message.get("tool_call_id") == "pass":
-            await write(other, sid, kind)
+        if message.get("role") == "tool" and message.get("tool_call_id") == "pass":
+            receipt = await runner.runtime.client.append(runner.target, "once", message_id="after-pass", actor=runner.actor)
     monkeypatch.setattr(SQLiteSink, "on_message_appended", append)
     try:
-        result = await loop.send("pass after this round", sid)
-        assert result.passed and result.new_input_after_pass and len(model.calls) == 1
-        if kind == "inbox":
-            [row] = await store.inbox_items(sid)
-            assert row["status"] == "delivered"
-        else:
-            assert len(await store.list_unseen_background_updates(sid)) == 1
+        result = await runner.send("pass after this round")
+        assert result.status == "completed" and receipt is not None
+        late = await runner.runtime.client.wait(receipt.input_ref, actor=runner.actor, deadline_ms=now_ms()+10000)
+        await runner.drain()
+        assert late.status == "completed"
+        rows = await store.load_all_messages(runner.target.session_id)
+        assert sum(row.role == "user" and "once" in str(row.content) for row in rows) == 1
     finally:
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
-
-
-async def test_unchanged_counter_still_reclaims_a_crashed_claim_at_its_deadline(registry_store, monkeypatch):
-    store, _ = registry_store
-    sid = await store.create_session()
-    now = [100000]
-    monkeypatch.setattr(store_module, "_now_ms", lambda: now[0])
-    await write(store, sid, "inbox")
-    changes, token = store.begin_polling(sid)
-    try:
-        await changes.refresh()
-        [first] = await store.inbox_claim(sid)
-        await changes.refresh()
-        assert await store.inbox_claim(sid) == []
-        assert not changes.inbox_due(now[0])
-        now[0] += 60001
-        assert changes.inbox_due(now[0])
-        [second] = await store.inbox_claim(sid)
-        assert second["id"] == first["id"] and second["claim_token"] != first["claim_token"]
-    finally:
-        store.end_polling(token)
+        await runner.aclose()
 
 
 async def test_concurrent_writers_advance_counter_without_losing_input(registry_store):
     store, connect = registry_store
     sid = await store.create_session()
-    other = await connect(schema="compatible")
+    other = await connect(schema="verify")
     await asyncio.wait_for(asyncio.gather(*(
         (store if number % 2 else other).inbox_put(sid, [{"item_id": str(number), "content": str(number)}])
         for number in range(8))), 10)

@@ -1,6 +1,6 @@
 """Regression tests for Tier-2/3 runtime fixes:
 
-- C24: SqliteBlackboard._locks is weak-valued, so per-board_id locks don't accumulate
+- C24: StoreBlackboard._locks is weak-valued, so per-board_id locks don't accumulate
   forever in a long-lived process driving many distinct board ids.
 - C16: LLMRetryPolicy.total_timeout bounds an IN-FLIGHT call, not just the gap between
   attempts — a hung call can't blow past the wall-clock budget.
@@ -18,7 +18,7 @@ import pytest
 
 from power_loop import CancellationToken, LLMRetryPolicy, SessionStore
 from power_loop.contracts.errors import LLMTimeout
-from power_loop.runtime.blackboard import SqliteBlackboard
+from power_loop.runtime.blackboard import StoreBlackboard
 from power_loop.runtime.retry import with_retry
 
 pytestmark = pytest.mark.unit
@@ -28,7 +28,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_blackboard_locks_do_not_accumulate() -> None:
-    bb = SqliteBlackboard(store=None)  # _lock() does not touch the store
+    bb = StoreBlackboard(store=None)  # _lock() does not touch the store
 
     # same id returns the same lock while it is referenced (mutual exclusion holds)
     held = bb._lock("x")

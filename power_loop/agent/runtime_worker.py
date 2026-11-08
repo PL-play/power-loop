@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 
 from power_loop.agent.follow_up import render_inbox_rows
 from power_loop.agent.sink import _encode_content, _meta_with_content_encoding
-from power_loop.contracts.events import AgentEventType
+from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.events import AgentEventBus
 from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.jobs import JobError, JobManager
@@ -69,12 +69,14 @@ class _SessionExecution:
     root_job_id: str | None = None
     resources: object = None
     descriptor: object = None
+    expires_at_ms: int | None = None
 
     def snapshot(self):
         from power_loop.core.execution_context import ExecutionContext
         return ExecutionContext(self.store_id, self.session_id, self.node_id, self.boot_id,
             self.input_ref, self.job_ref, self.parent_job_id, self.root_job_id,
-            self.epoch, self.lease.token if self.lease else None, self.actor, self.options, self.resources, self.stop)
+            self.epoch, self.lease.token if self.lease else None, self.actor, self.options, self.resources, self.stop,
+            self.descriptor.host_context if self.descriptor else {})
 
 
 class _InputStart:
@@ -178,8 +180,13 @@ class _InputStart:
     def completed(self, result):
         response_format = self.context.options.response_format
         if result.status == "completed" and "child_spec" in self.context.descriptor.config and not result.final_text.strip():
-            result.status = "failed"
-            self.output_error = "subagent_output_missing"
+            # Keep the child's actual answer from this input when its last
+            # model turn is blank. No history read or supplier call is needed.
+            result.final_text = next((item["text"].strip() for item in reversed(result.texts)
+                                      if item["text"].strip()), "")
+            if not result.final_text:
+                result.status = "failed"
+                self.output_error = "subagent_output_missing"
         if result.status != "completed" or not response_format or response_format.get("type") not in {"json_object", "json_schema"}:
             return
         from power_loop.runtime.structured import StructuredOutputError, parse_structured
@@ -209,11 +216,15 @@ class _InputStart:
             error = status
             status = "interrupted"
         return Result(ctx.job_ref, ctx.input_ref, status, result.get("final_text", ""),
-                       result.get("usage", evidence.get("usage", {})), self.structured_output, error)
+                       result.get("usage", evidence.get("usage", {})), self.structured_output, error,
+                       evidence.get("error_code"))
 
     async def finish(self, tx, binding, evidence):
         ctx = self.context
         value = self.public_result(evidence)
+        deadline = self.worker._wait_deadlines.pop(ctx.job_ref, None)
+        if deadline is not None:
+            deadline.cancel()
         status = value.status
         if self.owner:
             manager = binding.runtime.manager
@@ -260,21 +271,36 @@ class RuntimeWorker:
         self._active = {}
         self._tasks = set()
         self._waiting = set()
+        self._wait_deadlines = {}
         self._capacity = asyncio.Semaphore(runtime.capacity)
         self._wake = asyncio.Event()
         self._started, self._closing, self._closed = False, False, False
+        self._lifecycle_lock = asyncio.Lock()
         self._recovery_cursor = None
         self._job_recovery_cursor = ""
         self._overflow = False
+        self._guard_monitor = None
+        self.last_error = None
         self.shutdown_result = ShutdownResult(True)
 
     async def start(self):
+        async with self._lifecycle_lock:
+            await self._start()
+
+    async def _start(self):
         if self._closed:
             raise RuntimeRequestError("session_closed")
         if self._started:
             return
         r = self.runtime
         try:
+            preflight = getattr(r.factory, "preflight", None)
+            if preflight is not None:
+                await preflight(r.required_profiles)
+            elif r.required_profiles:
+                raise RuntimeRequestError("capability_unavailable", "factory preflight is required")
+            if r.process_guard is not None:
+                await r.process_guard.acquire()
             for channel in ("activation", "work", "control"):
                 binding = SubscriptionSpec(r.namespace, r.store.store_id, channel, r.node_id + "/" + r.boot_id)
                 sub = await r.transport.subscribe(binding)
@@ -283,11 +309,19 @@ class RuntimeWorker:
                 await sub.ready()
             # Ready precedes recovery; dispatch begins only after the bounded initial page.
             await self.recover()
+            if r.timer_driver is not None:
+                await r.timer_driver.start()
+                if not r.timer_driver.status().ready:
+                    raise RuntimeRequestError("capability_unavailable", "timer driver is not ready")
         except BaseException:
+            if r.timer_driver is not None:
+                await r.timer_driver.stop()
             for sub in self._subscriptions:
                 await sub.aclose()
             self._subscriptions.clear()
             self._bindings.clear()
+            if r.process_guard is not None:
+                await r.process_guard.release()
             raise
         self._started = True
         self._listeners = [asyncio.create_task(self._listen(s), context=contextvars.Context()) for s in self._subscriptions]
@@ -295,6 +329,18 @@ class RuntimeWorker:
         self._recovery = (asyncio.create_task(self._recover_periodically(), context=contextvars.Context())
                           if r.recovery_interval_s is not None else None)
         r.client._accepting = True
+        if r.process_guard is not None:
+            self._guard_monitor = asyncio.create_task(self._watch_guard(), context=contextvars.Context())
+
+    async def _watch_guard(self):
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await self.runtime.process_guard.check()
+            except Exception as exc:
+                self.last_error = "store_lock_lost: " + str(exc)[:500]
+                await self.shutdown(timeout_s=0)
+                return
 
     def _activate(self, sid):
         if self._closing or sid in self._active:
@@ -302,7 +348,7 @@ class RuntimeWorker:
         if len(self._pending) >= 1024 and sid not in self._pending:
             self._overflow = True
             return
-        self._pending[sid] = None
+        self._pending.setdefault(sid, now_ms())
         self._wake.set()
 
     async def recover(self):
@@ -312,13 +358,17 @@ class RuntimeWorker:
             self._overflow = False
         for ref in page.items:
             self._activate(ref.session_id)
-        jobs = await self.inputs.db.fetchall(f"SELECT job_id,session_id FROM {self.inputs.jobs} "
+        jobs = await self.inputs.db.fetchall(f"SELECT job_id,session_id,status FROM {self.inputs.jobs} "
             "WHERE kind IN ('subagent','background_tool','background_command','workflow','workflow_node') AND session_id IS NOT NULL "
-            "AND status='running' AND outcome IS NULL AND job_id>? ORDER BY job_id LIMIT ?",
+            "AND status IN ('running','waiting') AND outcome IS NULL AND job_id>? ORDER BY job_id LIMIT ?",
             (self._job_recovery_cursor, self.runtime.claim_limit))
         self._job_recovery_cursor = jobs[-1]["job_id"] if len(jobs) == self.runtime.claim_limit else ""
         for job in jobs:
-            self._activate(job["session_id"])
+            if job['status'] == 'waiting':
+                from power_loop.runtime.wait_review import arm
+                await arm(self, job['session_id'], recover=True)
+            else:
+                self._activate(job["session_id"])
 
     async def _recover_periodically(self):
         while True:
@@ -333,6 +383,11 @@ class RuntimeWorker:
                 async for delivery in subscription:
                     packet = delivery.packet
                     ctx = self._active.get(packet.target.session_id)
+                    if packet.channel == "control" and (packet.payload or {}).get("cancelled"):
+                        deadline = self._wait_deadlines.pop(JobRef(packet.target.store_id,
+                            packet.target.job_id, packet.payload["generation"]), None)
+                        if deadline is not None:
+                            deadline.cancel()
                     if packet.channel == "control" and ctx is not None:
                         await self._control(ctx, packet)
                     elif packet.channel == "work" and ctx is not None and not ctx.closing:
@@ -474,13 +529,14 @@ class RuntimeWorker:
         leases = AsyncExitStack()
         busy = False
         r, env, ctx, deadline_task, output_task = self.runtime, None, None, None, None
+        bus, on_delta = None, None
         try:
-            row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata FROM {self.inputs.q} q "
+            row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata,s.parent_session_id AS event_parent,s.spawn_depth AS event_depth FROM {self.inputs.q} q "
                 f"JOIN {r.store.t.sessions} s ON s.session_id=q.session_id "
                 "WHERE q.session_id=? AND q.status='pending' ORDER BY q.id LIMIT 1", (sid,))
             recovery_only = row is None
             if recovery_only:
-                row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata FROM {self.inputs.jobs} j "
+                row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata,s.parent_session_id AS event_parent,s.spawn_depth AS event_depth FROM {self.inputs.jobs} j "
                     f"JOIN {self.inputs.q} q ON q.delivered_job_id=j.job_id "
                     f"JOIN {r.store.t.sessions} s ON s.session_id=j.session_id WHERE j.session_id=? "
                     "AND j.kind IN ('subagent','background_tool','background_command','workflow','workflow_node') "
@@ -501,6 +557,9 @@ class RuntimeWorker:
                 record = self.inputs.record(row)
                 recovery_only = True
             ctx = _SessionExecution(r.store.store_id, sid, r.node_id, r.boot_id, record.ref)
+            # An idle worker may start after several append notifications were accepted.
+            # Discover that bounded backlog at the normal round checkpoint.
+            ctx.append_overflow = record.meta["operation"] in {"append", "nudge", "steer", "result_ready"}
             ctx.options = RequestOptions(**record.meta["options"])
             scopes.enter_context(_bind_execution_context(ctx.snapshot, r.host_context_fields))
             ctx.task = asyncio.current_task()
@@ -515,6 +574,7 @@ class RuntimeWorker:
                     return
             from .runtime_types import TrustedActor
             ctx.actor = TrustedActor(identity["tenant_id"], identity["principal_id"], sid)
+            ctx.expires_at_ms = row["expires_at"]
             holder = SimpleNamespace(store=r.store, session_coordinator=r.coordinator,
                 config=SimpleNamespace(session_lease_ttl_s=r.session_lease_ttl_s),
                 _owner_id=r.node_id + "/" + r.boot_id,
@@ -531,19 +591,51 @@ class RuntimeWorker:
                     tenant_id=identity["tenant_id"], principal_id=identity["principal_id"]))
                 await recover_acquired_session(recovered, sid, cache_valid=False)
                 return
+            if record.meta["operation"] == "result_ready" and not driver and identity.get("execution_role", "main") != "main":
+                # An idle child/node has finished its execution. Keep a late
+                # descendant result in its history for explicit resume, without
+                # inventing a main send or claiming model consumption.
+                await self._retain_late_result(ctx, record)
+                return
             await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
             descriptor = ctx.descriptor = RuntimeDescriptor(**record.meta["descriptor"])
             try:
                 env = await r.factory.build(descriptor, ctx.snapshot())
                 ctx.resources = env.resources
+                if env.runtime_env is not None:
+                    from power_loop.runtime.env import runtime_env_context
+                    scopes.enter_context(runtime_env_context(replace(env.runtime_env,
+                        process_control=env.process_control or env.runtime_env.process_control)))
+                    if r.shared_execution and env.runtime_env.workspace_dir is not None:
+                        if env.resource_scope != "shared" or env.resource_profile_ref != descriptor.resource_profile_ref:
+                            raise RuntimeRequestError("resource_unavailable", "shared workspace requires its stable resource profile")
                 available = set(env.tool_registry.names() if env.tool_registry else ()) | {"pass_turn"}
                 missing = set(ctx.options.tools or ()) - available
                 if missing:
-                    raise RuntimeRequestError("definition_unavailable", "missing tools: " + ", ".join(sorted(missing)))
+                    raise RuntimeRequestError("capability_unavailable", "missing tools: " + ", ".join(sorted(missing)))
+                task_runtime = env.task_runtime or TaskRuntime(JobManager(r.store), tenant_id=identity["tenant_id"],
+                    principal_id=identity["principal_id"], executor_id=r.node_id, boot_id=r.boot_id)
+                model = env.llm
+                if "child_spec" in descriptor.config:
+                    from power_loop.runtime.spec import AgentSpec, _model_service
+                    model = _model_service(SimpleNamespace(llm=model, task_runtime=task_runtime),
+                                           AgentSpec.from_dict(plain(descriptor.config["child_spec"])))
             except (SessionLeaseLost, SessionBusy, CancellationRequested):
                 raise
             except Exception as exc:
-                parent_ref = await self.inputs.fail_start(record.ref, "definition_unavailable: " + str(exc), ctx)
+                code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
+                self.last_error = {"code": code, "message": str(exc)[:500],
+                    "definition_ref": descriptor.definition_ref, "resource_profile_ref": descriptor.resource_profile_ref}
+                if code in {"capability_unavailable", "resource_unavailable"}:
+                    # This homogeneous node cannot satisfy its declared ports.
+                    # Finish this visible failure, drain active work, and require
+                    # a corrected node composition before taking more inputs.
+                    r.client._accepting = False
+                    self._closing = True
+                    self._wake.set()
+                    if r.timer_driver is not None:
+                        await r.timer_driver.stop()
+                parent_ref = await self.inputs.fail_start(record.ref, str(exc), ctx, error_code=code)
                 if parent_ref:
                     await r.client._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
                                            parent_ref.message_id, parent_ref, ["work", "activation"])
@@ -561,13 +653,6 @@ class RuntimeWorker:
                     setattr(config, field_name, options[field_name])
             if record.row["expires_at"] is not None:
                 deadline_task = asyncio.create_task(self._expire(ctx, record.row["expires_at"], identity))
-            task_runtime = env.task_runtime or TaskRuntime(JobManager(r.store), tenant_id=identity["tenant_id"],
-                principal_id=identity["principal_id"], executor_id=r.node_id, boot_id=r.boot_id)
-            model = env.llm
-            if "child_spec" in descriptor.config:
-                from power_loop.runtime.spec import _model_service
-                model = _model_service(SimpleNamespace(llm=model, task_runtime=task_runtime),
-                                       AgentSpec.from_dict(plain(descriptor.config["child_spec"])))
             if descriptor.kind == "workflow_driver":
                 from power_loop.workflow.runner import run
                 await run(self, ctx, record, env, task_runtime, recovery=recovery_only)
@@ -576,8 +661,10 @@ class RuntimeWorker:
                 from power_loop.runtime.background_execution import run
                 await run(self, ctx, record, env, task_runtime)
                 return
-            bus = AgentEventBus()
+            bus = env.event_bus if env.event_bus is not None else AgentEventBus()
             def on_delta(event):
+                if event.session_id != sid:
+                    return
                 if ctx.output.full():
                     while not ctx.output.empty():
                         ctx.output.get_nowait()
@@ -588,11 +675,20 @@ class RuntimeWorker:
             output_task = asyncio.create_task(self._pump_output(ctx))
             loop = _ExecutionLoop(llm=model, store=r.store, config=config, tool_registry=env.tool_registry,
                                      hooks=env.hooks, event_bus=bus, task_runtime=task_runtime, session_coordinator=r.coordinator,
-                                     session_cache_size=0)  # This worker builds a fresh loop for each input.
+                                     session_cache_size=0, timer_backend=r.timer_backend)  # This worker builds a fresh loop for each input.
             loop._runtime_worker_context = ctx
             loop._runtime_worker = self
             loop._owner_id = r.node_id + "/" + r.boot_id
             ctx.loop = loop
+            child_spec = descriptor.config.get("child_spec")
+            child_result = None
+            if child_spec is not None:
+                from power_loop.contracts.event_payloads import SubagentTaskStartPayload
+                body = json.loads(record.row["content"])
+                bus.publish(AgentEvent(type=AgentEventType.SUBAGENT_TASK_START,
+                    data=SubagentTaskStartPayload(task=body if isinstance(body, str) else str(body),
+                        preset=child_spec.get("preset", "core"), sub_session_id=sid, depth=row["event_depth"]),
+                    session_id=row["event_parent"], source="subagent"))
             try:
                 send_index = (record.meta["interaction"]["send_index"] if record.meta["operation"] == "answer"
                               else int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1)
@@ -602,23 +698,54 @@ class RuntimeWorker:
                     from power_loop.runtime.host_commands import run
                     await run(loop, ctx, start, env.command, send_index)
                 else:
-                    await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
+                    child_result = await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
                         system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
                         response_format=options["response_format"], with_history=options["history"],
                         _initial_round_index=(record.meta["interaction"]["rounds"] if record.meta["operation"] == "answer" else 0),
                         _entry_send_index=send_index, _runtime_start=start)
+                    if child_result.status == 'waiting_for_input':
+                        from power_loop.runtime.wait_review import arm
+                        await arm(self, sid)
             finally:
+                if child_spec is not None:
+                    from power_loop.contracts.event_payloads import (
+                        SubagentCompletedPayload,
+                        SubagentLimitPayload,
+                        SubagentTextPayload,
+                    )
+                    status = child_result.status if child_result is not None else (
+                        "cancelled" if ctx.stop.is_cancelled() else "failed")
+                    fields = dict(sub_session_id=sid, status=status,
+                        rounds=child_result.rounds if child_result is not None else 0,
+                        final_text=child_result.final_text if child_result is not None else "")
+                    if status == "completed":
+                        bus.publish(AgentEvent(type=AgentEventType.SUBAGENT_TEXT,
+                            data=SubagentTextPayload(**fields), session_id=row["event_parent"], source="subagent"))
+                    elif status == "hit_round_limit":
+                        bus.publish(AgentEvent(type=AgentEventType.SUBAGENT_LIMIT,
+                            data=SubagentLimitPayload(sub_session_id=sid, max_rounds=config.max_rounds),
+                            session_id=row["event_parent"], source="subagent"))
+                    bus.publish(AgentEvent(type=AgentEventType.SUBAGENT_COMPLETED,
+                        data=SubagentCompletedPayload(**fields), session_id=row["event_parent"], source="subagent"))
                 ctx.closing = True
 
         except SessionBusy:
             busy = True
 
         except JobError as exc:
-            if exc.code != 'root_context_cancelled' or ctx.job_ref is not None:
+            if ctx.job_ref is not None:
                 raise
-            async with self.inputs.db.transaction() as tx:
-                await self.inputs.db.dialect.lock_state(tx, self.inputs.state, sid)
-                await self.inputs.void_unbound(tx, record.ref, reason=exc.code, status='cancelled')
+            if exc.code == 'root_context_cancelled':
+                async with self.inputs.db.transaction() as tx:
+                    await self.inputs.db.dialect.lock_state(tx, self.inputs.state, sid)
+                    await self.inputs.void_unbound(tx, record.ref, reason=exc.code, status='cancelled')
+            else:
+                # A normal admission refusal (for example a required budget
+                # provider) must complete the accepted input with its code.
+                parent_ref = await self.inputs.fail_start(record.ref, str(exc), ctx, error_code=exc.code)
+                if parent_ref:
+                    await r.client._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
+                                           parent_ref.message_id, parent_ref, ["work", "activation"])
 
         except RuntimeRequestError as exc:
             if exc.code == "input_not_startable" and ctx.job_ref is None:
@@ -658,6 +785,9 @@ class RuntimeWorker:
                     else:
                         await ctx.output.put(None)
                         await output_task
+                if bus is not None:
+                    bus.unsubscribe(on_delta)
+                    await bus.drain(timeout=r.hook_timeout_s)
                 if ctx:
                     ctx.closing = True
                     if ctx.loop:
@@ -666,6 +796,9 @@ class RuntimeWorker:
                             _release_session_sync(owned_sid, id(ctx.loop))
                         ctx.loop._sync_sids.clear()
                         ctx.loop._session_cache.clear()
+                        # A cancelled timer/callback may retain the execution
+                        # context until its deadline; release model/history now.
+                        ctx.loop = None
                         ctx.append_refs.clear()
                 if ctx and ctx.lease:
                     if ctx.lease.lost:
@@ -710,6 +843,19 @@ class RuntimeWorker:
                     ctx.input_ref.message_id, TargetRef(ctx.store_id, ctx.session_id), "output", ctx.input_ref, payload))
             except Exception:
                 log.warning("output notification lost for %s", ctx.input_ref.message_id, exc_info=True)
+
+    async def _retain_late_result(self, ctx, rendered):
+        manager = JobManager(self.runtime.store)
+        async with manager.joined_write() as tx:
+            records = await self.inputs.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id),
+                                                    ctx, 1, [rendered.ref])
+            if not records or await self.inputs.discard_cancelled_result(tx, records[0]):
+                return
+            record = records[0]
+        await self.runtime.store.append_message(ctx.session_id, role="user", name="follow_up",
+            content=json.loads(rendered.row["content"]),
+            meta={"inbox": {"item_ids": [record.ref.message_id], "kinds": [record.row["kind"]]}},
+            inbox={"claim_token": record.row["claim_token"], "ids": [record.row["id"]]})
 
     async def drain_append(self, ctx, *, only=None):
         if only is None and ctx.append_overflow and len(ctx.append_refs) < self.runtime.claim_limit:
@@ -776,11 +922,22 @@ class RuntimeWorker:
         return messages
 
     async def shutdown(self, *, timeout_s=30.0, cancel_running=False):
+        async with self._lifecycle_lock:
+            return await self._shutdown(timeout_s=timeout_s, cancel_running=cancel_running)
+
+    async def _shutdown(self, *, timeout_s, cancel_running):
         if self._closed:
             return self.shutdown_result
         self._closing = True
         self.runtime.client._accepting = False
         self._pending.clear()
+        deadlines = tuple(self._wait_deadlines.values())
+        for task in deadlines:
+            task.cancel()
+        await asyncio.gather(*deadlines, return_exceptions=True)
+        self._wait_deadlines.clear()
+        if self.runtime.timer_driver is not None:
+            await self.runtime.timer_driver.stop()
         if self._started:
             self._dispatcher.cancel()
             if self._recovery:
@@ -817,5 +974,10 @@ class RuntimeWorker:
             await asyncio.gather(self._dispatcher, *self._listeners,
                                  *([self._recovery] if self._recovery else []), return_exceptions=True)
             self.shutdown_result = ShutdownResult(not pending, interrupted)
+        if self._guard_monitor is not None and self._guard_monitor is not asyncio.current_task():
+            self._guard_monitor.cancel()
+            await asyncio.gather(self._guard_monitor, return_exceptions=True)
+        if self.runtime.process_guard is not None:
+            await self.runtime.process_guard.release()
         self._closed = True
         return self.shutdown_result

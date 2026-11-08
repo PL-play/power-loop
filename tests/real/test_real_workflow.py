@@ -10,12 +10,9 @@ Skipped automatically when no POWER_LOOP_* / OPENAI_COMPAT_* provider env is set
 
 from __future__ import annotations
 
-import tempfile
-
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop, create_llm_service_from_env
-from power_loop.workflow import create_workflow
+from ._workflow_runtime import run_workflow
 
 pytestmark = pytest.mark.real_llm
 
@@ -55,13 +52,9 @@ SPEC = {
 }
 
 
-async def test_real_workflow_sequence_foreach_structured():
-    loop = StatefulAgentLoop(
-        llm=create_llm_service_from_env(),
-        db_path=tempfile.mktemp(suffix=".db"),
-        config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=4),
-    )
-    result = await create_workflow(SPEC, parent_loop=loop).run()
+async def test_real_workflow_sequence_foreach_structured(runtime_agent):
+
+    result = await run_workflow(runtime_agent, SPEC)
 
     assert result.status == "completed", f"errors: {result.errors}"
     # output_schema was enforced at the provider → structured subtopics parsed
@@ -75,29 +68,21 @@ async def test_real_workflow_sequence_foreach_structured():
     assert result.usage.get("total_tokens", 0) > 0
 
 
-async def test_real_detached_on_complete_seam():
-    """3.21 host wake seam, end-to-end against a real provider: a detached run fires
-    ``on_complete`` with a ``completed`` WorkflowCompletion and arms NO durable timer."""
-    from power_loop.workflow import WorkflowCompletion
-
-    loop = StatefulAgentLoop(
-        llm=create_llm_service_from_env(),
-        db_path=tempfile.mktemp(suffix=".db"),
-        config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3),
-    )
-    psid = await loop.new_session()
-    seen: list[WorkflowCompletion] = []
-
-    async def on_complete(c: WorkflowCompletion) -> None:
-        seen.append(c)
-
-    spec = {"name": "one", "root": {"type": "agent", "id": "a",
-            "spec": {"name": "a", "system_prompt": "Reply with the single word: ok."}}}
-    wf = create_workflow(spec, parent_loop=loop, parent_session_id=psid)
-    handle = await wf.start(detached=True, on_complete=on_complete)
-    await handle.task
-
-    assert len(seen) == 1
-    assert seen[0].status == "completed"
-    assert seen[0].run_id == handle.run_id
-    assert not await loop.list_timers(psid)   # in-process wake, no durable timer
+async def test_real_detached_workflow_has_durable_result_without_timer(runtime_agent):
+    from power_loop import RuntimeClient, create_llm_service_from_env
+    from power_loop.agent.runtime_store import now_ms
+    agent = await runtime_agent(model=create_llm_service_from_env())
+    spec = {'name':'one','root':{'type':'agent','id':'a',
+        'spec':{'name':'a','system_prompt':'Reply with the single word: ok.'}}}
+    handle = await agent.runtime.client.workflow(agent.target, spec, message_id='detached', actor=agent.actor)
+    reader = RuntimeClient(store=agent.runtime.store, transport=agent.runtime.transport,
+                           namespace=agent.runtime.namespace)
+    try:
+        result = await handle.wait(deadline_ms=now_ms()+120000)
+        assert result.status == 'completed'
+        persisted = await reader.wait(handle.input_ref, actor=agent.actor, deadline_ms=now_ms()+1000)
+        assert persisted.status == 'completed' and persisted.structured_output['run_id'] == handle.run_id
+        assert not await agent.runtime.store.list_timers(agent.target.session_id)
+    finally:
+        await reader.aclose()
+   # in-process wake, no durable timer

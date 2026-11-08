@@ -1,111 +1,45 @@
-"""Coverage: TimerRunner recurring re-arm / due boundary / one-shot normalization + retry classification & backoff (probed clean)."""
-
-from __future__ import annotations
+"""Due boundary and fixed-delay rearm through the current default timer driver."""
+import time
 
 import pytest
 
+from .test_job_registry_192 import registry_store
+from .test_timers import timers
+
+__all__ = ["registry_store"]
 pytestmark = pytest.mark.unit
 
+async def test_recurring_rearm_collapses_missed_periods(registry_store):
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        interval = 100
+        row = await runtime.timer_backend.create(source, due_at_ms=int(time.time()*1000)-36000000,
+                                                  note="hb", interval_s=interval)
+        assert await runtime.timer_driver.scan_once() == 1
+        row = await store.get_timer(target.session_id, row.timer_id)
+        now = int(time.time()*1000)
+        assert row.status == "armed" and row.due_at > now
+        assert abs(row.due_at-(now+interval*1000)) < 5000
+        assert await runtime.timer_driver.scan_once() == 0
 
-@pytest.mark.asyncio
-async def test_recurring_rearm_collapses_missed_periods(tmp_path):
-    import time
-    from dataclasses import dataclass, field
+async def test_timer_due_at_boundary_is_inclusive(registry_store):
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        now = int(time.time()*1000)
+        await runtime.timer_backend.create(source, due_at_ms=now, note="exact")
+        assert len(await store.due_timers(now=now)) == 1
+        assert len(await store.due_timers(now=now-1)) == 0
 
-    from power_loop import AgentLoopConfig, StatefulAgentLoop, TimerRunner
-    from power_loop._vendor.llm_client.interface import LLMResponse, LLMService, LLMStreamChunk
-
-    @dataclass
-    class _Scripted(LLMService):
-        responses: list = field(default_factory=list)
-        _idx: int = 0
-        async def complete(self, request, *, on_chunk_delta_text=None, on_chunk_think=None, on_stream_end=None):
-            if self._idx >= len(self.responses):
-                return LLMResponse(raw_text="done", content_text="done")
-            r = self.responses[self._idx]
-            self._idx += 1
-            return r
-        def stream(self, request):
-            async def _e():
-                if False:
-                    yield LLMStreamChunk()
-            return _e()
-        async def close(self):
-            return None
-
-    loop = StatefulAgentLoop(
-        llm=_Scripted(responses=[LLMResponse(raw_text="x", content_text="x")]),
-        db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-    )
-    sid = await loop.new_session()
-    interval = 100
-    way_past = int(time.time() * 1000) - 10 * 3600 * 1000  # overdue by 10h
-    await loop.schedule_timer(sid, due_at_ms=way_past, note="hb", interval_s=interval)
-    runner = TimerRunner(loop)
-    assert await runner.scan_once() == 1
-    row = await loop.store.get_timer(sid, 1)
-    now = int(time.time() * 1000)
-    assert row.status == "armed"
-    assert row.due_at > now, "recurring re-arm landed in the past (catch-up storm)"
-    assert abs(row.due_at - (now + interval * 1000)) < 5000
-    assert await runner.scan_once() == 0  # not due again -> no storm
-    await loop.aclose()
-
-async def test_timer_due_at_boundary_is_inclusive(tmp_path):
-    import time
-
-    from power_loop import AgentLoopConfig, StatefulAgentLoop
-    from power_loop._vendor.llm_client.interface import LLMResponse, LLMService, LLMStreamChunk
-
-    class _NoLLM(LLMService):
-        async def complete(self, request, **k):
-            return LLMResponse(raw_text="x", content_text="x")
-        def stream(self, request):
-            async def _e():
-                if False:
-                    yield LLMStreamChunk()
-            return _e()
-        async def close(self):
-            return None
-
-    loop = StatefulAgentLoop(
-        llm=_NoLLM(), db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=1),
-    )
-    sid = await loop.new_session()
-    now = int(time.time() * 1000)
-    await loop.schedule_timer(sid, due_at_ms=now, note="exact")
-    assert len(await loop.store.due_timers(now=now)) == 1
-    assert len(await loop.store.due_timers(now=now - 1)) == 0  # 1ms early -> not due
-    await loop.aclose()
-
-async def test_interval_zero_normalizes_to_one_shot(tmp_path):
-    import time
-
-    from power_loop import AgentLoopConfig, StatefulAgentLoop
-    from power_loop._vendor.llm_client.interface import LLMResponse, LLMService, LLMStreamChunk
-
-    class _NoLLM(LLMService):
-        async def complete(self, request, **k):
-            return LLMResponse(raw_text="x", content_text="x")
-        def stream(self, request):
-            async def _e():
-                if False:
-                    yield LLMStreamChunk()
-            return _e()
-        async def close(self):
-            return None
-
-    loop = StatefulAgentLoop(
-        llm=_NoLLM(), db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=1),
-    )
-    sid = await loop.new_session()
-    row = await loop.store.create_timer(sid, due_at=int(time.time() * 1000), note="z", interval_s=0)
-    assert row.interval_s is None
-    assert (await loop.store.get_timer(sid, row.timer_id)).interval_s is None
-    await loop.aclose()
+async def test_single_timer_and_invalid_period_have_explicit_contract(registry_store):
+    from power_loop import RuntimeRequestError
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        for interval in (0, -1):
+            with pytest.raises(RuntimeRequestError, match="invalid_options"):
+                await runtime.timer_backend.create(source, delay_s=3600, note="bad", interval_s=interval)
+        row = await runtime.timer_backend.create(source, delay_s=3600, note="single", interval_s=None)
+        assert row.interval_s is None
+        assert (await store.get_timer(target.session_id, row.timer_id)).interval_s is None
 
 @pytest.mark.asyncio
 async def test_non_retryable_error_not_retried_and_not_wrapped():

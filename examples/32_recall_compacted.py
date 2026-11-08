@@ -1,149 +1,50 @@
-"""32 · 取回被压缩的细节 / Recall compacted detail with the recall_compacted tool
+"""32 · Retrieve original detail after folding with recall_send.
 
-What you learn / 你将学到
---------------------------
-- 压缩把旧消息折叠成 ``compact_note`` 并标 ``compacted_out`` —— 原文**没删**,
-  只是不再每轮发给模型。``recall_compacted`` 工具让 agent**按需**把原文捞回来。
-  / compaction folds old messages into a ``compact_note`` and marks them
-  ``compacted_out`` — the originals are NOT deleted, just not sent each turn. The
-  ``recall_compacted`` tool lets the agent pull them back on demand.
-- 一个具体编码埋在被折叠的早期消息里;摘要未必逐字保留。模型可以用
-  ``recall_compacted(query=...)`` 精确取回。
-  / a specific code is buried in folded early turns; the summary may not keep it
-  verbatim. The model can retrieve it exactly via ``recall_compacted(query=...)``.
-
-Run / 运行
-----------
-    python examples/32_recall_compacted.py
+Projected history folds by send index. Original messages remain available through
+recall_send; no manual execution context or old loop constructor is needed.
 """
-
-from __future__ import annotations
-
 import asyncio
-import os
-import re
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
-    AgentEventType,
     AgentLoopConfig,
-    MessageState,
-    SessionStore,
-    StatefulAgentLoop,
+    LLMResponse,
+    LLMService,
+    LLMSummaryFold,
+    ProjectedRepresentation,
+    create_default_tool_registry,
 )
-from power_loop.runtime.compact import DefaultCompactor
-from power_loop.tools import create_default_tool_registry
 
-# Alphanumeric (no separators) so a model can't render it with a fancy hyphen/space
-# and break an exact match; we still compare via a normalized form to be safe.
-ACCESS_CODE = "ZX7741QORN"
+ACCESS_CODE = 'ZX7741QORN'
 
+class RecallModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any('Retrieve rack serial now' in str(m.get('content')) for m in request.messages):
+            outputs = [m['content'] for m in request.messages if m.get('tool_call_id') == 'recall']
+            if outputs:
+                assert ACCESS_CODE in outputs[-1]
+                return LLMResponse(raw_text=ACCESS_CODE)
+            return LLMResponse(raw_text='', tool_calls=[{'id':'recall','type':'function','function':{
+                'name':'recall_send','arguments':'{"send_index":1}'}}])
+        return LLMResponse(raw_text='Work progressed; exact rack details remain in the original record.')
+    async def close(self):
+        pass
 
-def _norm(s: str | None) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+async def main():
+    config = AgentLoopConfig(max_tokens=100, context_budget_tokens=40,
+        representation=ProjectedRepresentation(), fold_strategy=LLMSummaryFold(keep_last_sends=1))
+    async with demo_runtime(RecallModel(), create_default_tool_registry(include=['recall_send']), config=config) as (runtime, loop, target, actor):
+        for index, text in enumerate([f'Rack serial {ACCESS_CODE}. '+ 'context '*80, 'more context '*80, 'continue '*80]):
+            result = await loop.send(target, text, message_id=f'seed-{index}', actor=actor, deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed'
+        compact = await runtime.store.latest_project_compact(target.session_id)
+        assert compact and compact.compact_to_send >= 1 and ACCESS_CODE not in str(compact.content)
+        result = await loop.send(target, 'Retrieve rack serial now', message_id='recall', actor=actor, deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and ACCESS_CODE in result.final_text, result
+        print(result.final_text)
+        return result.final_text
 
-
-async def _seed_with_buried_code(store: SessionStore, sid: str) -> None:
-    """Bury the code as an INCIDENTAL detail mid-filler (not flagged "remember
-    this"), then a lot of fat filler so it lands well inside the folded-out range.
-    Incidental specifics are exactly what a summary tends to drop — making the
-    tool the reliable way to get it back."""
-    await store.append_message(
-        sid, role="user",
-        content=(
-            "Here's the full context of the migration: " + ("blah " * 60)
-            + f" the old box was decommissioned (its rack serial happened to be {ACCESS_CODE}) "
-            + ("and then " * 60) + " — anyway, continue setting things up."
-        ),
-        round_index=0,
-    )
-    await store.append_message(sid, role="assistant", content="Understood, continuing the setup. " + ("ok " * 60), round_index=0)
-    for i in range(1, 6):
-        await store.append_message(sid, role="user", content="(unrelated step) " + ("filler " * 140), round_index=i)
-        await store.append_message(sid, role="assistant", content="done " + ("ok " * 140), round_index=i)
-
-
-async def main() -> dict:
-    os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"  # force the early turns to fold
-
-    store = await SessionStore.open(":memory:")
-    try:
-        sid = await store.create_session(system_prompt="S")
-        await _seed_with_buried_code(store, sid)
-
-        tools_called: list[str] = []
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=300),
-            store=store,
-            tool_registry=create_default_tool_registry(include=["recall_compacted"]),
-            config=AgentLoopConfig(
-                system_prompt=(
-                    "Older turns may have been summarized into a compact_note and may omit "
-                    "exact values. If you need a precise detail the summary doesn't contain, "
-                    "call recall_compacted (optionally with a query) to look it up before "
-                    "answering. Answer concisely."
-                ),
-                max_rounds=4,
-                # The summary keeps decisions/facts, so an incidental serial usually does not
-                # survive the fold — getting it back exactly is what the tool is for. (The budget
-                # is an output CEILING, not a way to force that: a reasoning model thinks before
-                # its first word, and a 40-token cap left an empty summary → no fold at all.)
-                compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1, summary_max_tokens=2048),
-            ),
-        )
-        loop.event_bus.subscribe(
-            AgentEventType.TOOL_CALL_STARTED, lambda e: tools_called.append(e.data.name)
-        )
-
-        r = await loop.send(
-            "Earlier I mentioned the rack serial of the decommissioned box. What was its exact value?",
-            session_id=sid,
-        )
-        print(f"status   : {r.status}")
-        print(f"reply    : {r.final_text}")
-        print(f"tools    : {tools_called}")
-
-        # the code is recoverable from the folded rows (the tool's data source)
-        folded = [m for m in await store.load_all_messages(sid)
-                  if m.state is MessageState.COMPACTED_OUT and ACCESS_CODE in (m.content or "")]
-        code_in_folded = bool(folded)
-        answer_has_code = _norm(ACCESS_CODE) in _norm(r.final_text)  # robust to bold/hyphen/spacing
-        print(f"code buried in folded rows : {code_in_folded}")
-        print(f"recall_compacted called    : {'recall_compacted' in tools_called}")
-        print(f"answer contains the code   : {answer_has_code}")
-
-        # Deterministic end-to-end check: invoke the tool directly on the REAL
-        # compacted session and confirm it recovers the buried code. (Whether the
-        # MODEL chose to call it autonomously above is non-deterministic — a soft
-        # demo — but the retrieval path itself must always work.)
-        from power_loop.core.agent_context import (
-            reset_current_loop,
-            reset_session_id,
-            set_current_loop,
-            set_session_id,
-        )
-        from power_loop.tools.default_tools import run_recall_compacted
-
-        t_loop, t_sid = set_current_loop(loop), set_session_id(sid)
-        try:
-            tool_out = await run_recall_compacted(query="rack serial")
-        finally:
-            reset_session_id(t_sid)
-            reset_current_loop(t_loop)
-        code_retrievable = _norm(ACCESS_CODE) in _norm(tool_out)
-        print(f"recall_compacted recovers it : {code_retrievable}")
-
-        return {
-            "final_text": r.final_text,
-            "code_in_folded": code_in_folded,
-            "code_retrievable": code_retrievable,
-            "answer_has_code": answer_has_code,
-            "recall_called": "recall_compacted" in tools_called,
-        }
-    finally:
-        await store.close()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

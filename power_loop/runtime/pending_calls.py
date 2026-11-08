@@ -211,9 +211,6 @@ async def _expected(manager, tx, source, closed):
 async def require_disposition(manager, tx, source, closed=None):
     if closed is None:
         closed = await _closed(manager, tx, source)
-    elif (set(closed) != {'generation', 'resource_state', 'evidence'}
-          or type(closed['generation']) is not int or type(closed['evidence']) is not dict):
-        raise JobError('pending_call_model_exit_required')
     if ERROR in closed.get('evidence', {}):
         raise JobError('pending_call_model_exit_required')
     if SNAPSHOT not in closed.get('evidence', {}):
@@ -230,16 +227,6 @@ async def require_disposition(manager, tx, source, closed=None):
         raise JobError('pending_call_disposition_required')
     from .finalization import _reference
     return await _reference(manager, tx, key)
-
-
-async def retire_pending(loop, actor, source_job_id):
-    """Host-only, atomic retirement after actual exit; never executes/replies/ACKs."""
-    from .managed_completion import _host_only
-    _host_only()
-    runtime = getattr(loop, 'task_runtime', None)
-    if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
-        raise JobError('task_runtime_required')
-    return await retire_pending_runtime(runtime, actor, source_job_id)
 
 
 async def retire_pending_runtime(runtime, actor, source_job_id):

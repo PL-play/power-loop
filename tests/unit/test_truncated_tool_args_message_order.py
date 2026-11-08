@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, ToolDefinition
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -105,15 +105,10 @@ def _assert_tool_calls_answered(messages: list[dict[str, Any]]) -> None:
         )
 
 
-async def test_truncated_args_notice_does_not_break_the_tool_call_sequence(tmp_path) -> None:
+async def test_truncated_args_notice_does_not_break_the_tool_call_sequence(tmp_path, runtime_agent) -> None:
     llm = _ScriptedLLM(script=[_cut_call()])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "a.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=_registry(),
-    )
-    sid = await loop.new_session()
-    await loop.send("画个卡片", sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry())
+    await loop.send("画个卡片")
 
     # 关键断言：发给供应商的每一次请求，序列都必须合法
     assert llm.seen_requests, "没有发出任何请求"
@@ -121,16 +116,11 @@ async def test_truncated_args_notice_does_not_break_the_tool_call_sequence(tmp_p
         _assert_tool_calls_answered(req)
 
 
-async def test_truncation_notice_is_still_delivered(tmp_path) -> None:
+async def test_truncation_notice_is_still_delivered(tmp_path, runtime_agent) -> None:
     """位置挪了，提示本身不能丢——没有它，模型会以为自己忘填参数，原样重写再被截断。"""
     llm = _ScriptedLLM(script=[_cut_call()])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "b.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=_registry(),
-    )
-    sid = await loop.new_session()
-    await loop.send("画个卡片", sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry())
+    await loop.send("画个卡片")
 
     later = llm.seen_requests[-1]
     notice = [m for m in later
@@ -142,19 +132,14 @@ async def test_truncation_notice_is_still_delivered(tmp_path) -> None:
     assert idx_notice > idx_tool, "提示又插到 tool 结果前面去了"
 
 
-async def test_normal_tool_call_has_no_notice(tmp_path) -> None:
+async def test_normal_tool_call_has_no_notice(tmp_path, runtime_agent) -> None:
     """参数完整的正常调用不该收到截断提示——那会平白教模型「拆小」。"""
     llm = _ScriptedLLM(script=[LLMResponse(
         raw_text="", tool_calls=[{"id": "c1", "type": "function",
                                   "function": {"name": "echo",
                                                "arguments": json.dumps({"text": "hi"})}}])])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "c.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=_registry(),
-    )
-    sid = await loop.new_session()
-    await loop.send("说 hi", sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry())
+    await loop.send("说 hi")
     for req in llm.seen_requests:
         _assert_tool_calls_answered(req)
         assert not [m for m in req if "被从中间截断" in str(m.get("content") or "")]

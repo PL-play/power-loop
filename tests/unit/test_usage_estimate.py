@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, SessionStore
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -102,51 +102,49 @@ class _Script(LLMService):
         return None
 
 
-async def _run(plan: list[Any], *, attempts: int = 1) -> tuple[Any, list[dict]]:
+async def _run(runtime_agent, plan: list[Any], *, attempts: int = 1) -> tuple[Any, list[dict]]:
     store = await SessionStore.open(":memory:")
     bus = AgentEventBus()
     events: list[dict] = []
     bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, lambda e: events.append(dict(e.payload or {})))
-    loop = StatefulAgentLoop(llm=_Script(plan), store=store, event_bus=bus, config=AgentLoopConfig(
+    loop = await runtime_agent(model=_Script(plan), store=store, event_bus=bus, config=AgentLoopConfig(
         system_prompt="S" * 100, max_rounds=1, compactor=None,
         retry_policy=LLMRetryPolicy(max_attempts=attempts, backoff_initial=0, total_timeout=None)))
-    sid = await loop.new_session()
     try:
-        res = await loop.send("用户的问题" * 20, sid)
+        res = await loop.send("用户的问题" * 20)
     finally:
+        await loop.aclose()
         await store.close()
     return res, events
 
 
 @pytest.mark.asyncio
-async def test_failed_attempt_is_estimated_and_counted_in_run_totals() -> None:
-    real = LLMTokenUsage(prompt_tokens=500, completion_tokens=20, total_tokens=520)
-    res, events = await _run([("stream_then_fail", "写到一半" * 30), ("ok", real)], attempts=2)
-    assert res.status == "completed"
-    failed, ok = events
+async def test_failed_attempt_is_estimated_and_counted_in_run_totals(runtime_agent) -> None:
+    res, events = await _run(runtime_agent, [("stream_then_fail", "写到一半" * 30)], attempts=2)
+    assert res.status == "failed"
+    assert len(events) == 1  # unknown external action is not automatically replayed
+    failed = events[0]
     assert failed["success"] is False and failed["estimated"] is True
     assert failed["outcome"] == "error"
-    assert failed["prompt_tokens"] > 50, "the prompt was processed — it was billed"
+    assert failed["prompt_tokens"] > 50
     assert failed["completion_tokens"] == estimate_text_tokens("写到一半" * 30)
-    assert ok["estimated"] is False and ok["prompt_tokens"] == 500
     totals = res.usage
-    assert totals["calls"] == 2 and totals["failed_calls"] == 1
-    assert totals["prompt_tokens"] == 500 + failed["prompt_tokens"]
-    assert totals["estimated_calls"] == 1
-    assert totals["estimated_tokens"] == failed["total_tokens"]
+    assert totals["calls"] == 1 and totals["failed_calls"] == 1
+    assert totals["prompt_tokens"] == failed["prompt_tokens"]
+    assert totals["estimated_calls"] == 1 and totals["estimated_tokens"] == failed["total_tokens"]
 
 
 @pytest.mark.asyncio
-async def test_rejected_request_costs_no_prompt() -> None:
-    res, events = await _run([("reject", 402)])
-    assert res.status == "degraded"
+async def test_rejected_request_costs_no_prompt(runtime_agent) -> None:
+    res, events = await _run(runtime_agent, [("reject", 402)])
+    assert res.status == "failed"
     assert events[0]["prompt_tokens"] == 0 and events[0]["completion_tokens"] == 0
     assert events[0]["estimated"] is True
 
 
 @pytest.mark.asyncio
-async def test_completed_call_without_usage_is_estimated_not_borrowed() -> None:
-    res, events = await _run([("ok", None)])
+async def test_completed_call_without_usage_is_estimated_not_borrowed(runtime_agent) -> None:
+    res, events = await _run(runtime_agent, [("ok", None)])
     assert res.status == "completed"
     assert events[0]["estimated"] is True and events[0]["success"] is True
     assert events[0]["prompt_tokens"] > 0
@@ -155,22 +153,24 @@ async def test_completed_call_without_usage_is_estimated_not_borrowed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_aborted_attempt_outcome_and_partial_output() -> None:
+async def test_aborted_attempt_outcome_and_partial_output(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     bus = AgentEventBus()
     events: list[dict] = []
     streaming = asyncio.Event()
     bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, lambda e: events.append(dict(e.payload or {})))
     bus.subscribe(AgentEventType.STREAM_DELTA, lambda e: streaming.set())
-    loop = StatefulAgentLoop(llm=_Script(["hang"]), store=store, event_bus=bus,
+    loop = await runtime_agent(model=_Script(["hang"]), store=store, event_bus=bus,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=1,
                                                     compactor=None, retry_policy=None))
-    sid = await loop.new_session()
-    task = asyncio.create_task(loop.send("hi", sid))
+    from power_loop.agent.runtime_store import now_ms
+    receipt = await loop.runtime.client.send(loop.target, "hi", message_id="hang", actor=loop.actor)
     await asyncio.wait_for(streaming.wait(), timeout=5)
-    task.cancel()  # what a steer / stop abort does to the call's task
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    await loop.runtime.client.cancel(receipt.input_ref, actor=loop.actor)
+    result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+5000)
+    assert result.status == "cancelled"
+    await loop.drain()
+    await loop.aclose()
     await store.close()
     assert events and events[0]["outcome"] == "aborted"
     assert events[0]["estimated"] is True
@@ -182,7 +182,7 @@ async def test_aborted_attempt_outcome_and_partial_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transport_never_reports_a_previous_calls_usage() -> None:
+async def test_transport_never_reports_a_previous_calls_usage(runtime_agent) -> None:
     svc = OpenAICompatibleChatLLMService(OpenAICompatibleChatConfig(
         base_url="http://unused", api_key="k", model="m"))
     svc._last_usage = {"prompt_tokens": 99999, "completion_tokens": 1, "total_tokens": 100000}
@@ -197,7 +197,7 @@ async def test_transport_never_reports_a_previous_calls_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_events_name_the_services_model_when_loop_sets_none() -> None:
+async def test_call_events_name_the_services_model_when_loop_sets_none(runtime_agent) -> None:
     from power_loop._vendor.llm_client.capabilities import ModelCapabilities
 
     class _Named(_Script):
@@ -208,11 +208,11 @@ async def test_call_events_name_the_services_model_when_loop_sets_none() -> None
     events: list[dict] = []
     bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, lambda e: events.append(dict(e.payload or {})))
     real = LLMTokenUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6)
-    loop = StatefulAgentLoop(llm=_Named([("ok", real)]), store=store, event_bus=bus,
+    loop = await runtime_agent(model=_Named([("ok", real)]), store=store, event_bus=bus,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    sid = await loop.new_session()
     try:
-        await loop.send("hi", sid)
+        await loop.send("hi")
     finally:
+        await loop.aclose()
         await store.close()
     assert events[0]["model"] == "deepseek-flash"

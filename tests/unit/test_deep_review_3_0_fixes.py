@@ -10,7 +10,6 @@ from __future__ import annotations
 import pytest
 
 from power_loop._vendor.llm_client.interface import LLMResponse
-from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.runtime.history_projector import DefaultDeterministicProjector, IdentityProjector
 from power_loop.runtime.representation import ProjectedRepresentation
@@ -84,21 +83,23 @@ def test_b9_projected_render_tags_sends_with_index() -> None:
 # ── B3 + B5: resume() self-heals a crash-left ids-only pending ─────────────────
 
 
-async def test_resume_self_heals_ids_only_pending() -> None:
+async def test_new_input_aligns_unknown_pending_without_replay(runtime_agent) -> None:
     async with await SessionStore.open(":memory:") as store:
-        loop = StatefulAgentLoop(
-            llm=_Scripted([LLMResponse(raw_text="resumed-final")]), store=store,
-            tool_registry=_echo_registry(),
+        loop = await runtime_agent(
+            model=_Scripted([LLMResponse(raw_text="resumed-final")]), store=store,
+            registry=_echo_registry(),
             config=AgentLoopConfig(system_prompt="S", max_rounds=3),
         )
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         # A crash mid-abort can persist a pending carrying only tool_call_ids (tool_calls dropped).
         await store.set_pending(
             sid, {"round_index": 0, "assistant_seq": None, "tool_call_ids": ["b"], "tool_calls": []}
         )
-        await loop.resume(sid)
-        assert await loop.get_pending(sid) is None  # pending cleared, NOT stranded
+        result = await loop.send("continue")
+        assert result.status == "completed"
+        assert (await store.get_state(sid)).pending is None  # pending cleared, NOT stranded
         rows = await store.load_active_messages(sid)
+        await loop.aclose()
         assert any(r.role == "tool" and r.tool_call_id == "b" for r in rows)  # protocol resolved
 
 
@@ -111,16 +112,17 @@ async def test_resume_self_heals_ids_only_pending() -> None:
 # the token gate actually gates. A regression that ignored the threshold (always-fold) would slip past.
 
 
-async def test_fold_gate_does_not_fold_below_token_budget() -> None:
+async def test_fold_gate_does_not_fold_below_token_budget(runtime_agent) -> None:
     async with await SessionStore.open(":memory:") as store:
         # keep_last_sends=2 with 4 short sends → a foldable span [1,2] EXISTS, but the rendered prefix
         # is far below max_tokens(8000) × trigger_ratio → nothing should fold.
-        proj = _projector_loop(
-            store, _Scripted([LLMResponse(raw_text=f"d{i}") for i in range(1, 5)]),
+        proj = await _projector_loop(
+            runtime_agent, store, _Scripted([LLMResponse(raw_text=f"d{i}") for i in range(1, 5)]),
             DefaultDeterministicProjector(keep_last_sends=2), max_tokens=8000,
         )
-        sid = await proj.new_session()
+        sid = proj.target.session_id
         for i in range(1, 5):
-            assert (await proj.send(f"m{i}", session_id=sid)).status == "completed"
+            assert (await proj.send(f"m{i}")).status == "completed"
         compacts = [r for r in await store.load_project_messages(sid) if r.kind == "compact"]
+        await proj.aclose()
         assert compacts == [], "fold fired below the token budget (the trigger gate is broken)"

@@ -452,7 +452,7 @@ class BashSession:
             argv = self._backend.launch_argv(self._cwd)
             cwd = self._backend.launch_cwd(self._cwd)
             self._control_target = bind_shell_control(self._backend, self._cwd,
-                argv=argv, cwd=cwd, env=env)
+                argv=argv, cwd=cwd, env=env, factory=get_runtime_env().process_control)
 
             self._proc = subprocess.Popen(
                 argv,
@@ -1397,7 +1397,7 @@ async def run_schedule_wakeup(
 async def _schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
     from power_loop.core.agent_context import get_current_loop
     from power_loop.runtime.execution_roles import require_timer_creation
-    from power_loop.runtime.timer_backend import backend_for, operation_id
+    from power_loop.runtime.timer_backend import backend_for, timer_context
 
     await require_timer_creation(get_current_loop())
 
@@ -1415,14 +1415,8 @@ async def _schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | N
     if not (note or "").strip():
         raise ValueError("note is required — write what future-you should do")
     backend = backend_for(get_current_loop(), store)
-    live = await backend.list(sid, statuses=("armed",))
-    if len(live) >= WAKEUP_MAX_LIVE:
-        return (
-            f"Budget exceeded: {len(live)} wake-ups already scheduled. "
-            "Cancel or merge some first (schedule_wakeup action=list / action=cancel)."
-        )
-    timer = await backend.create(sid, delay_s=delay, due_at_ms=None, note=note.strip(),
-        interval_s=interval, operation_id=operation_id(get_current_loop(), sid))
+    timer = await backend.create(await timer_context(), delay_s=delay, due_at_ms=None, note=note.strip(),
+        interval_s=interval)
     if interval:
         return (
             f"Recurring wake-up #{timer.timer_id} scheduled: first in {delay}s, "
@@ -1436,8 +1430,8 @@ async def _list_wakeups() -> str:
 
     store, sid = _timers_store_and_session()
     from power_loop.core.agent_context import get_current_loop
-    from power_loop.runtime.timer_backend import backend_for
-    timers = await backend_for(get_current_loop(), store).list(sid, statuses=("armed", "firing"))
+    from power_loop.runtime.timer_backend import backend_for, timer_context
+    timers = await backend_for(get_current_loop(), store).list(await timer_context(), statuses=("armed", "firing"))
     if not timers:
         return "No wake-ups scheduled."
     now = _time.time() * 1000
@@ -1453,9 +1447,9 @@ async def _list_wakeups() -> str:
 async def _cancel_wakeup(timer_id: int) -> str:
     store, sid = _timers_store_and_session()
     from power_loop.core.agent_context import get_current_loop
-    from power_loop.runtime.timer_backend import backend_for, operation_id
+    from power_loop.runtime.timer_backend import backend_for, timer_context
     loop = get_current_loop()
-    if await backend_for(loop, store).cancel(sid, int(timer_id), operation_id=operation_id(loop, sid)):
+    if await backend_for(loop, store).cancel(await timer_context(), int(timer_id)):
         return f"Wake-up #{timer_id} cancelled."
     return f"Wake-up #{timer_id} not found or already fired."
 

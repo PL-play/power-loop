@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, SessionStore, ToolDefinition
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import task_query
 from power_loop.runtime.jobs import JobManager
@@ -14,23 +14,22 @@ from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
+from ._bounded import BoundedProvider
 from ._required_response import require_visible_response
-from .test_real_async_boundaries_192 import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_output(tmp_path, record_property):
+async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_output(tmp_path, record_property, runtime_agent):
     path = str(tmp_path / "task-directory.db")
     store = await SessionStore.open(path, schema="tasks")
     manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id="task-directory", principal_id="host", executor_id="executor", boot_id="boot")
     provider = BoundedProvider(limit=5)
     registry = ToolRegistry()
-    loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry, task_runtime=runtime,
-        config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4, max_tokens=2048,
+    loop = await runtime_agent(model=provider, store=store, registry=registry, task_runtime=runtime, config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4, max_tokens=2048,
             system_prompt="Use the directory tools in the requested order. Read saved outputs; do not start replacement work or guess output."))
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     require_visible_response(registry, store, sid)
     actor = runtime.actor(sid)
     root = await manager.register_job(actor, kind="send", session_id=sid, system_key="original-send")
@@ -40,7 +39,7 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
     child_lease = await manager.claim_job(actor, saved.job.job_id, executor_id="old-executor", boot_id="old-boot", expected_version=1)
     await manager.record_execution_result(actor, child_lease, outcome="succeeded", result={"final_text": "Inventory contains 47 books."}, resource_state="stopped")
     await manager.close_model_execution(actor, root_lease)
-    reopened = await SessionStore.open(path, schema="compatible")
+    reopened = await SessionStore.open(path, schema="verify")
     reader = JobManager(reopened)
     calls = []
     async def inspect_tasks(action="list", job_id=None):
@@ -59,7 +58,7 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
         async with asyncio.timeout(120):
             before = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? ORDER BY event_id", (saved.job.job_id,))
             result = await loop.send("Call inspect_tasks action=list, then action=get with the listed completed inventory job_id. "
-                "Report the number of books and its canonical result event_id from that saved output. Do not launch work.", sid)
+                "Report the number of books and its canonical result event_id from that saved output. Do not launch work.")
             assert result.status == "completed" and "47" in result.final_text
             assert calls == [("list", None), ("get", saved.job.job_id)], calls
             assert "result_"+saved.job.job_id in result.final_text
@@ -80,4 +79,5 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
         provider.report(record_property)
         await provider.close()
         await reopened.close()
+        await loop.aclose()
         await store.close()

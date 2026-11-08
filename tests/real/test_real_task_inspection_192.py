@@ -1,68 +1,68 @@
-"""A real main model reads an alert and inspects the original unknown task."""
-import asyncio
-
+"""A real main model reads a persisted alert and queries the original unknown job."""
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
-from power_loop.core.agent_context import get_session_id
+from power_loop import (
+    AgentHooks,
+    AgentLoopConfig,
+    ExecutionEnvironment,
+    HookPoint,
+    InputRef,
+    RegistryRuntimeFactory,
+    Runtime,
+    ToolRegistry,
+    TrustedActor,
+)
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_inspection import CONSTRAINTS, inspect_tasks
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.jobs import register_jobs_tools
-from power_loop.tools.registry import ToolRegistry
-from tests.unit.test_job_registry_192 import registry_store, runtime
-from tests.unit.test_task_inspection_192 import POLICY, troubled
+from tests.unit.test_task_inspection_192 import POLICY, registry_runtime, registry_store, runtime, troubled
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
+from ._live_fixture import BorrowedProvider
 
-__all__ = ['registry_store', 'runtime']
-pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
+__all__=['registry_store','registry_runtime','runtime']
+pytestmark=[pytest.mark.real_llm,pytest.mark.asyncio]
 
 
-async def test_real_main_reads_original_alert_and_queries_without_replaying_unknown_task(runtime, record_property):
-    store, manager, actor, root, lease, connect, now = runtime
-    target = await troubled(runtime)
-    # A fresh connection reconstructs the alert from persisted task state.
-    reader = JobManager(await connect(), now_ms=manager.now)
-    [key] = (await inspect_tasks(reader, actor, root.job.job_id, policy=POLICY))['notification_ids']
-    before = await manager.get_job(actor, target.job_id)
-    provider = BoundedProvider(limit=5)
-    registry = ToolRegistry()
+async def test_real_main_reads_original_alert_without_replaying_unknown_job(runtime,record_property):
+    store,manager,actor,root,lease,connect,now=runtime
+    target=await troubled(runtime)
+    reader=JobManager(await connect(),now_ms=manager.now)
+    [key]=(await inspect_tasks(reader,actor,root.job.job_id,policy=POLICY))['notification_ids']
+    before=await manager.get_job(actor,target.job_id)
+    provider,registry=BoundedProvider(limit=5),ToolRegistry()
     register_jobs_tools(registry)
-    execution = TaskRuntime(manager, tenant_id=actor.tenant_id, principal_id=actor.principal_id,
-        executor_id='alert-main', boot_id='original-budget', lease_ms=300000, boot_contract_hash='e'*64)
-    loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=execution, tool_registry=registry,
-        config=AgentLoopConfig(max_rounds=4, max_tokens=2048, delegation_policy='single_level', compactor=None, system_prompt=(
-            'You supervise original tasks. When a task alert arrives, call the offered jobs function '
-            'with action=get and job_id equal to the affected job_id, exactly once using native function calling. '
-            'Then explain its unknown state briefly. Never start, stop, or replace work.')))
-    from power_loop.runtime.retry import LLMRetryPolicy
-    loop.config.retry_policy = LLMRetryPolicy(max_attempts=1)
-    seen = []
-    from power_loop import HookPoint
-
-    async def actual_request(ctx):
-        assert get_session_id() == actor.session_id
-        seen.extend(m.get('content', '') for m in ctx.messages if isinstance(m.get('content'), str))
-        if any(m.get('role') == 'tool' and target.job_id in m.get('content', '') for m in ctx.messages):
-            # Two actual phases: inspect once, then summarize without more tools.
-            ctx.tools = []
-            ctx.system_prompt += '\nThe original task inspection has returned. Give a short final text response now.'
-
-    loop.hooks.register(HookPoint.LLM_BEFORE, actual_request, name='test.actual-alert-request')
+    managed=TaskRuntime(manager,tenant_id=actor.tenant_id,principal_id=actor.principal_id,executor_id='alert-main',boot_id='boot')
+    seen=[]
+    hooks=AgentHooks()
+    async def shape(ctx):
+        seen.extend(m.get('content','') for m in ctx.messages if isinstance(m.get('content'),str))
+        if any(m.get('role')=='tool' and target.job_id in m.get('content','') for m in ctx.messages):
+            ctx.tools=[]
+            ctx.system_prompt+=' The original task inspection returned. Reply with a short explanation now.'
+    hooks.register(HookPoint.LLM_BEFORE,shape,name='test.actual-alert')
+    factory=RegistryRuntimeFactory()
+    async def build(descriptor,context):
+        return ExecutionEnvironment(BorrowedProvider(provider),registry,AgentLoopConfig(compactor=None,max_rounds=4,max_tokens=2048,
+            system_prompt='When a task alert arrives call jobs action=get with its affected job_id exactly once. Then explain the unknown state. Never create, stop or replace work.'),hooks=hooks,task_runtime=managed)
+    factory.register('inspection@1',build)
+    factory.register('inspection@2',build)
+    worker=Runtime(store=store,factory=factory,node_id='inspector',timers_enabled=False,recovery_interval_s=None)
+    trusted=TrustedActor(actor.tenant_id,actor.principal_id,None)
     try:
-        async with asyncio.timeout(150):
-            result = await loop.send('Handle the queued task alert by inspecting its original task.', actor.session_id, tools=['jobs'])
-            assert result.status == 'completed' and result.final_text
-            assert provider.calls >= 2
-            rows = await store._db.fetchall(f"SELECT content,tool_call_id FROM {store.t.messages} WHERE session_id=? AND role='tool'", (actor.session_id,))
-            assert len(rows) == 1 and target.job_id in rows[0]['content']
-            assert any(CONSTRAINTS in text and target.job_id in text for text in seen)
-            assert await manager.get_job(actor, target.job_id) == before
-            event = await store._db.fetchone(f'SELECT event_type FROM {manager.events} WHERE event_id=?', (key,))
-            assert event['event_type'] == 'task_alert'
+        await worker.worker.start()
+        result=await worker.client.wait(InputRef(store.store_id,actor.session_id,key),actor=trusted,deadline_ms=now_ms()+120000)
+        assert result.status=='completed' and result.final_text and provider.calls>=2
+        rows=await store.load_all_messages(actor.session_id)
+        tools=[r for r in rows if r.role=='tool' and r.name=='jobs']
+        assert len(tools)==1 and target.job_id in tools[0].content
+        assert any(CONSTRAINTS in text and target.job_id in text for text in seen)
+        assert await manager.get_job(actor,target.job_id)==before
     finally:
+        await worker.worker.shutdown(timeout_s=3,cancel_running=True)
+        await worker.client.aclose()
+        await worker.transport.aclose()
         provider.report(record_property)
-        await execution.shutdown(timeout_s=3)
-        await loop.aclose(drain_timeout_s=.1)
         await provider.close()

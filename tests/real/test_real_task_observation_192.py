@@ -5,43 +5,42 @@ import asyncio
 
 import pytest
 
-from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, SessionStore
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-async def test_real_output_and_usage_survive_failed_closure_observer(tmp_path, record_property):
+async def test_real_output_and_usage_survive_failed_closure_observer(tmp_path, record_property, runtime_agent):
     store = await SessionStore.open(str(tmp_path / "events.db"), schema="tasks")
     llm, bus, events = BoundedProvider(limit=1), AgentEventBus(suppress_subscriber_errors=True), []
 
     def broken(event):
         raise RuntimeError("test observer unavailable")
 
-    bus.subscribe(AgentEventType.TASK_SUPERVISION_CLOSED, broken)
-    bus.subscribe(AgentEventType.TASK_SUPERVISION_CLOSED, events.append)
+    bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, broken)
+    bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, events.append)
     manager = JobManager(store, event_bus=bus)
     runtime = TaskRuntime(manager, tenant_id="test", principal_id="host", executor_id="exec", boot_id="boot")
-    loop = StatefulAgentLoop(llm=llm, store=store, task_runtime=runtime,
+    loop = await runtime_agent(model=llm, store=store, task_runtime=runtime, event_bus=bus,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=1, max_tokens=1024))
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     try:
         async with asyncio.timeout(90):
-            result = await loop.send("Reply with the number 42 only.", sid)
-            await runtime.flush_control_checkpoints()
+            result = await loop.send("Reply with the number 42 only.")
             assert result.status == "completed" and "42" in result.final_text and llm.calls == 1
-            [row] = await manager.db.fetchall(f"SELECT job_id,generation FROM {manager.jobs}")
-            ref = await manager.finalize_supervision(runtime.actor(sid), row["job_id"], generation=row["generation"])
-            assert events and events[-1].data.event_id == ref["event_id"]
-            assert (await manager.get_job(runtime.actor(sid), row["job_id"])).supervision_status == "closed"
+            from power_loop.agent.runtime_store import now_ms
+            queried = await loop.runtime.client.wait(result.input_ref, actor=loop.actor, deadline_ms=now_ms()+5000)
+            assert queried == result and result.usage['total_tokens'] > 0
+            assert len(events) == 1 and events[0].data.model_attempt_job_id == result.job_ref.job_id
             [message] = [m for m in await store.load_all_messages(sid) if m.role == "assistant"]
             assert message.content == result.final_text and llm.calls == 1
             assert llm.responses[0].token_usage.total_tokens > 0
     finally:
         llm.report(record_property)
-        await runtime.flush_control_checkpoints()
+        await loop.aclose()
         await llm.close()
         await store.close()

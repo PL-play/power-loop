@@ -740,13 +740,6 @@ class JobManager:
             owner = (await self._row(tx, parent_row["control_owner_job_id"])
                      if parent_row["kind"] == "send" and parent_row["control_owner_job_id"] else parent_row)
         now = self.now()
-        wait_binding = None
-        if kind == "timer" and "managed_wait" in request_data:
-            from .timer_waits import prepare_binding
-
-            wait_binding = await prepare_binding(self, tx, actor, parent_row, request_data,
-                caller=parent, session_id=session_id, independent=independent, call_ref=call_ref,
-                tool_call_id=tool_call_id)
         if parent is not None:
             from .execution_membership import note_child
             note_child(self, parent.job_id)
@@ -789,8 +782,6 @@ class JobManager:
             # Recovery must not reread a potentially edited YAML/file or
             # reconstruct a full execution contract from a request hash.
             payload["request"] = request_data
-        if wait_binding is not None:
-            payload["wait_binding"] = wait_binding
         from .invocation import capture_host_contexts
         host_contexts = capture_host_contexts()
         if host_contexts:
@@ -815,13 +806,6 @@ class JobManager:
             await self._supervision_barriers(tx, row)
             if row["status"] != "queued" or row["version"] != expected_version:
                 raise JobError("job_claim_conflict")
-            if row["kind"] == "timer":
-                creation = await tx.fetchone(f"SELECT payload_json FROM {self.events} WHERE job_id=? AND event_type='operation' AND action='create'", (job_id,))
-                data = json.loads(creation["payload_json"]) if creation else {}
-                if "wait_binding" in data or "managed_wait" in data.get("request", {}):
-                    from .timer_waits import _read
-                    await _read(self, tx, actor, job_id)
-                    raise JobError("managed_wait_has_no_executor")
             await self._control_owners(tx, row)
             from .tool_call_abort import require_claim
             await require_claim(self, tx, row)
@@ -968,21 +952,6 @@ class JobManager:
 
     async def _record_result(self, actor, lease, *, outcome, result, resource_state, evidence_only=False, require_children_stopped=False):
         result = _result_value(outcome, result, resource_state)
-        if outcome == "succeeded":
-            from . import wait_decisions, wait_effects
-            from .finalization_plan import PlanChanged
-
-            while True:
-                with wait_decisions.prepared_sources() as proofs:
-                    await wait_effects._prepare_owner_sources(self, actor, lease, check_result=True)
-                    proofs.publishing = True
-                    try:
-                        async with self._write() as tx:
-                            return await self._record_result_tx(tx, actor, lease, outcome=outcome, result=result,
-                                resource_state=resource_state, evidence_only=evidence_only,
-                                require_children_stopped=require_children_stopped)
-                    except PlanChanged:
-                        continue
         async with self._write() as tx:
             return await self._record_result_tx(tx, actor, lease, outcome=outcome, result=result,
                 resource_state=resource_state, evidence_only=evidence_only,
@@ -1036,16 +1005,8 @@ class JobManager:
         if effective_outcome == "succeeded" and row["executor_key"] is not None and publication_proof is None:
             from .executor_registry import check_execution
             await check_execution(self, tx, row)
-        if effective_outcome == "succeeded":
-            from .owner_waits import references
-            from .timer_waits import has_required_wait
-
-            await references(self, tx, actor, row, success=True)
-
-            if require_children_stopped or await has_required_wait(self, tx, actor, row):
-                from .wait_effects import settle_owner_tx
-                await settle_owner_tx(self, tx, actor, row)
-                await self._require_scope_ready(tx, row)
+        if effective_outcome == "succeeded" and require_children_stopped:
+            await self._require_scope_ready(tx, row)
         from .result_payloads import canonical
         payload = canonical(payload, effective_outcome, effective_result)
         await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status=?,outcome=?,result_json=?,"

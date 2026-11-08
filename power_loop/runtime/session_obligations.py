@@ -10,8 +10,8 @@ from .result_revisions import result_id
 EVENTS = frozenset({
     "tool_call_abort", "source_abort_delivery", "pending_call_disposition",
     "controller_review_handoff", "pending_owner_transfer", "managed_effect_delivery",
-    "controller_stopped", "wait_notification", "result", "supervision_reopened",
-    "input_disposition", "node_result_consumed", "wait_decision",
+    "controller_stopped", "result", "supervision_reopened",
+    "node_result_consumed",
     "managed_effect_tool_receipt",
 })
 COLUMNS = ("session_id", "kind", "source_id", "job_id", "opened_version")
@@ -19,10 +19,7 @@ _INPUT_MODES = frozenset({"steer", "continue", "restore_input"})
 
 
 def _queued_input(event, data):
-    # Current wait continuations carry the original decision/effect handoff,
-    # rather than the user-nudge mode. Generic caller operations are not input.
-    return data.get("mode") in _INPUT_MODES or (
-        event.get("call_ref_json") is None and "handoff" in data.get("request", {}))
+    return data.get("mode") in _INPUT_MODES
 
 
 def note(recorder, event):
@@ -42,7 +39,7 @@ async def _desired(manager, tx, row, *, verify=False):
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND "
         "(event_type IN ('tool_call_abort','source_abort_delivery','pending_call_disposition',"
         "'controller_review_handoff','pending_owner_transfer','managed_effect_delivery',"
-        f"'controller_stopped','wait_notification','result','task_control_request') OR (event_type='operation' AND {operation_filter}))",
+        f"'controller_stopped','result','task_control_request') OR (event_type='operation' AND {operation_filter}))",
         (row["job_id"],))
     if verify:
         from .store.operation_migration import verify_operation_records
@@ -114,21 +111,11 @@ async def _desired(manager, tx, row, *, verify=False):
                 await notice(manager, tx, row)
             if not _handled(current):
                 add(recipient, "controller", event)
-        elif kind == "wait_notification" and event["delivery_status"] != "handled":
-            if verify:
-                from .wait_notifications import notification
-                actor = JobActor(row["tenant_id"], row["principal_id"], recipient)
-                await notification(manager, tx, actor, json.loads(event["payload_json"])["due_event_id"])
-            add(recipient, "wait", event)
         elif (kind == "operation" and event["delivery_status"] == "pending_delivery"
               and row["kind"] in ("subagent", "workflow_node")):
             data = json.loads(event["payload_json"])
             if _handled(event):
                 continue
-            if verify:
-                from .wait_effects import validate_input
-                actor = JobActor(row["tenant_id"], row["principal_id"], data["request"]["session_id"])
-                await validate_input(manager, tx, actor, event)
             add(data["request"]["session_id"], "input", event)
     return entries
 

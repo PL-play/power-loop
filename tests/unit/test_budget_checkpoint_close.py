@@ -40,7 +40,7 @@ async def test_process_crash_preserves_grant_and_usage_until_atomic_close(regist
             await process.wait()
     assert process.returncode == {"open": 81, "during_close": 82, "closed": 83}[stage], output.decode()
     saved = json.loads(evidence.read_text())
-    reader = await connect(schema="compatible")
+    reader = await connect(schema="verify")
     host = FileHost(str(evidence) + ".charges")
     runtime = TaskRuntime(JobManager(reader), tenant_id="budget-tenant", principal_id="host",
         executor_id="reconciler", boot_id="new-boot", boot_contract_hash="a" * 64, budget_config=config(host))

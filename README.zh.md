@@ -8,6 +8,7 @@
 
 - [当前 API 与启动方式](docs/runtime-11.md)
 - [可运行的单进程示例](examples/design203_single_process.py)
+- [可运行的默认定时器](examples/26_timers.py)
 - [版本变更](CHANGELOG.md)
 - [公共稳定导出](power_loop/__init__.py)
 
@@ -18,3 +19,5 @@
 `StatefulAgentLoop` 仅接受 `runtime=`；旧的直接 LLM/DSN 构造方式不再可用。
 受理回执不代表执行完成，调用方必须按原 `InputRef` 等待结果。
 正常权限、费用、上下文与清理继续保证；基础设施故障允许 interrupted/unknown，不自动重放未知外部动作。
+
+子任务定时等待通过 `WaitPolicy` 与 `register_wait_handoff_tool` 装配。等待释放执行容量；原主 Agent 可以继续、取消或延后，始终受原截止时间与预算约束。详见 [运行时合同](docs/runtime-11.md#finite-child-review)。

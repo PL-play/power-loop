@@ -1,3 +1,7 @@
+# SDK 11 boundary
+
+SDK 11 requires a fresh current store and the Runtime factory/client entry. There is no runtime compatibility with the historical APIs below. Use [Runtime 11](../runtime-11.md) and [Getting started](getting-started.md) for current code. The following notes are a historical record, not executable migration instructions for version 11.
+
 # Migration Guide
 
 [中文](../zh/migration.md) | [Back to docs](../README.md)

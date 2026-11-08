@@ -10,8 +10,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from power_loop.runtime.jobs import JobActor, JobLease, JobManager
+from power_loop.runtime.managed_effects import _ref
 from power_loop.runtime.store.factory import open_store
-from power_loop.runtime.timer_waits import _ref
 
 
 async def main():
@@ -20,7 +20,7 @@ async def main():
         address = urlparse(dsn)
         assert address.hostname=='127.0.0.1' and address.path.endswith('_test')
     config = json.loads(raw)
-    store = await open_store(dsn,table_prefix=prefix,schema='compatible')
+    store = await open_store(dsn,table_prefix=prefix,schema="verify")
     manager = JobManager(store,now_ms=lambda:config['now'])
     actor,caller = JobActor(**config['actor']),JobLease(**config['caller'])
     receipt = _ref(config['receipt'])

@@ -1,7 +1,7 @@
 """Exercise the context admission gate independently of the old global mutex.
 
 The worker uses the actual SDK admission read in a native transaction. Public
-whole-send/process races remain in test_root_cancel_trees and run after D3 too.
+whole-send/process races use test_shared_session_roots and test_runtime_messaging_203.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from power_loop.runtime import root_context, root_control
-from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.jobs import JobError
 from power_loop.runtime.session_controls import ControlTransaction
 from power_loop.runtime.store.factory import _make_database
 
@@ -101,8 +101,8 @@ async def test_context_admission_and_stop_serialize_without_the_global_store_loc
         await observer.close()
 
 
-@pytest.mark.parametrize('stage', ['first', 'same-context', 'new-context', 'derived-missing-open', 'derived-missing-closed'])
-async def test_context_admission_has_one_warm_statement_and_repairs_only_missing_derived_gate(root_case, stage):
+@pytest.mark.parametrize('stage', ['first', 'same-context', 'new-context'])
+async def test_context_admission_reads_current_control_state_without_rewriting_jobs(root_case, stage):
     c = root_case
     manager, payload = c.manager, PAYLOAD
     receipt = None
@@ -110,14 +110,7 @@ async def test_context_admission_has_one_warm_statement_and_repairs_only_missing
         await send(c)
     if stage == 'new-context':
         payload = {'origin_run_id': 202}
-    if stage == 'derived-missing-closed':
-        receipt = await stop(c)
-    if stage.startswith('derived-missing'):
-        await c.loop.aclose(drain_timeout_s=.1)
-        await manager.db.execute(f'DELETE FROM {manager.prefix}session_controls WHERE session_id=?', (c.sid,))
-        manager = JobManager(await c.connect())
-    else:
-        assert await manager.db.fetchone(f'SELECT version FROM {manager.prefix}session_controls WHERE session_id=?', (c.sid,)) is not None
+    assert await manager.db.fetchone(f'SELECT version FROM {manager.prefix}session_controls WHERE session_id=?', (c.sid,)) is not None
     before = await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_context_events ORDER BY event_id')
     jobs = await manager.db.fetchall(f'SELECT * FROM {manager.jobs} ORDER BY job_id')
     original = manager.db
@@ -125,15 +118,13 @@ async def test_context_admission_has_one_warm_statement_and_repairs_only_missing
     manager.db = manager.store._db = profiled
     try:
         async with manager._write() as tx:
-            if stage == 'derived-missing-closed':
-                with pytest.raises(JobError, match='root_context_cancelled'):
-                    await root_control._admit(manager, tx, c.actor, root_context._document(NAMESPACE, payload))
-            else:
-                await root_control._admit(manager, tx, c.actor, root_context._document(NAMESPACE, payload))
+            await root_control._admit(manager, tx, c.actor, root_context._document(NAMESPACE, payload))
     finally:
         manager.db = manager.store._db = original
     queries = [record for record in profiled.records if any(site.startswith('runtime.root_control:') for site in record['chain'])]
-    assert len(queries) == (3 if stage.startswith('derived-missing') else 1)
+    # Current ControlTransaction checks the session control row, then reads its
+    # context admission state. Both calls already exist at the P7A source start.
+    assert len(queries) == 2
     assert _counts(profiled.records, profiled.tx_sites)['control_tx'] == 1
     assert await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_context_events ORDER BY event_id') == before
     assert await manager.db.fetchall(f'SELECT * FROM {manager.jobs} ORDER BY job_id') == jobs

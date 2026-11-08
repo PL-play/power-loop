@@ -1,15 +1,23 @@
 """A workflow node or sub-agent session that reaches a second send folds under its own booking."""
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
+from power_loop import (
+    AgentEventBus,
+    AgentEventType,
+    AgentLoopConfig,
+    JobRef,
+    LLMResponse,
+    LLMService,
+    LLMTokenUsage,
+    RuntimeRequestError,
+    TargetRef,
+)
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime import delegation
 from power_loop.runtime.fold import LLMSummaryFold
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.representation import ProjectedRepresentation
@@ -44,14 +52,6 @@ def folding(config, summarizer):
                                fold_strategy=LLMSummaryFold(keep_last_sends=1, summary_llm=summarizer))
 
 
-async def fold_attempts(manager):
-    rows = await manager.db.fetchall(
-        f"SELECT payload_json FROM {manager.events} WHERE event_type='model_attempt_prepared'")
-    return [p for p in (json.loads(r["payload_json"]) for r in rows) if p.get("purpose") == "fold"]
-
-
-
-
 class SpawnModel(LLMService):
     def __init__(self):
         self.root, self.calls = None, {"MAIN": 0, "CHILD": 0}
@@ -62,7 +62,7 @@ class SpawnModel(LLMService):
         text, calls = "done", None
         if role == "MAIN" and self.calls[role] == 1:
             text, calls = "", [{"id": "spawn-1", "type": "function", "function": {"name": "spawn_agent", "arguments": json.dumps({
-                "task": "answer", "system_prompt": "child", "tools": [], "max_rounds": 2,
+                "task": "answer", "system_prompt": "child", "lifecycle": "linked", "tools": [], "max_rounds": 2,
                 "output_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}})}}]
         elif role == "CHILD":
             text = "not json at all" if self.calls[role] == 1 else '{"ok": true}'
@@ -76,31 +76,39 @@ class SpawnModel(LLMService):
         pass
 
 
-async def test_subagent_schema_repair_send_folds_under_the_child_session(registry_store):
+async def test_subagent_schema_repair_send_folds_under_the_child_session(registry_store, runtime_agent):
     store, _ = registry_store
-    manager = JobManager(store)
-    runtime = TaskRuntime(manager, tenant_id="fold-positions", principal_id="host",
+    runtime = TaskRuntime(JobManager(store), tenant_id="fold-positions", principal_id="host",
                           executor_id="executor", boot_id="boot", lease_ms=2000)
-    model, summarizer = SpawnModel(), Summarizer()
+    model, summarizer, bus, events = SpawnModel(), Summarizer(), AgentEventBus(), []
+    bus.subscribe(AgentEventType.LLM_CALL_STARTED, events.append)
     registry = ToolRegistry()
     register_spawn_agent(registry)
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
-                             config=folding(AgentLoopConfig(delegation_policy="single_level", max_rounds=4), summarizer))
-    sid = await loop.new_session()
-    model.root = sid
-    before = set(delegation._TASKS)
-    try:
-        assert (await loop.send("delegate", sid)).status == "completed"
-        tasks = list(set(delegation._TASKS) - before)
-        if tasks:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 8)
-        assert model.calls["CHILD"] == 2
-        attempts = await fold_attempts(manager)
-        assert len(attempts) == summarizer.calls
-        children = {a["session_id"] for a in attempts} - {sid}
-        assert len(children) == 1
-        assert (await store.latest_project_compact(children.pop())) is not None
-    finally:
-        tasks = list(set(delegation._TASKS) - before)
-        if tasks:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 8)
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, registry=registry, event_bus=bus,
+        config=folding(AgentLoopConfig(delegation_policy="single_level", max_rounds=4), summarizer))
+    sid = model.root = loop.target.session_id
+    assert (await loop.send("delegate")).status == "completed"
+    await loop.drain()
+    assert model.calls["CHILD"] == 2
+    child_sessions = {event.session_id for event in events} - {sid}
+    assert len(child_sessions) == 1
+    child = child_sessions.pop()
+    from power_loop.agent.runtime_store import now_ms
+    with pytest.raises(RuntimeRequestError) as rejected:
+        await loop.runtime.client.send(TargetRef(store.store_id, child), "wrong child entry",
+            message_id="invalid-child-input", actor=loop.actor)
+    assert rejected.value.code == "invalid_options"
+    rows = await store.load_all_messages(sid)
+    spawn = json.loads(next(row.content for row in rows if row.tool_call_id == "spawn-1"))
+    original = await loop.runtime.client.wait(JobRef(**spawn["job_ref"]), actor=loop.actor, deadline_ms=now_ms()+15000)
+    receipt = await loop.runtime.client.resume(original.job_ref, body="next input",
+        message_id="child-second-input", actor=loop.actor)
+    result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+15000)
+    assert result.status == "completed", result
+    await loop.drain()
+    assert model.calls["CHILD"] == 3
+    attempts = [event for event in events if event.data.purpose == "fold"]
+    assert len(attempts) == summarizer.calls
+    children = {event.session_id for event in attempts} - {sid}
+    assert len(children) == 1
+    assert (await store.latest_project_compact(children.pop())) is not None

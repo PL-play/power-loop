@@ -1,133 +1,43 @@
-"""22 · Follow-up steering / 运行中追加指引
-
-This example uses a real LLM. It starts a multi-round ``send()`` (tool call +
-final answer), injects ``follow_up()`` while the session lock is still held,
-and shows how steering text appears in the next LLM round as a wrapped
-``<follow_up>`` user message.
-
-Run:
-
-    python examples/22_follow_up_steering.py
-"""
-
-from __future__ import annotations
-
+"""22 · Append guidance to a running input; duplicate message IDs are recalled."""
 import asyncio
-import json
-import tempfile
-from dataclasses import asdict, is_dataclass
-from typing import Any
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import (
-    AgentLoopConfig,
-    FollowUpQueued,
-    SessionStore,
-    StatefulAgentLoop,
-    ToolDefinition,
-    ToolRegistry,
-)
-from power_loop.runtime.pricing import Free
-
-DEFAULT_STEERING = (
-    "Before you finish, your final answer MUST include the exact word STEERED "
-    "in uppercase."
-)
-
-SYSTEM_PROMPT = """You are demonstrating in-flight steering with follow_up.
-
-Rules:
-- For each user request, call the echo tool exactly once with a short phrase
-  related to the topic.
-- After the tool result arrives, write one concise final sentence.
-- Obey any <follow_up> guidance that appears before your final answer.
-"""
-
-ECHO_TOOL = ToolDefinition(
-    pricing=Free("local example tool"),
-    name="echo",
-    description="Repeat the given text verbatim.",
-    input_schema={
-        "type": "object",
-        "properties": {"text": {"type": "string"}},
-        "required": ["text"],
-    },
-    required_params=("text",),
-)
+from power_loop import LLMResponse, LLMService
 
 
-def _echo_handler(**kwargs: Any) -> str:
-    return str(kwargs.get("text") or "")
+class SteeringModel(LLMService):
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
 
+    async def complete(self, request, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            await self.release.wait()
+            return LLMResponse(raw_text='Considering the first input.')
+        text = '\n'.join(str(m.get('content', '')) for m in request.messages)
+        assert 'STEERED' in text
+        return LLMResponse(raw_text='STEERED: patience helps.')
 
-async def main(steering: str | None = None) -> dict[str, Any]:
-    llm = make_llm(max_tokens=700, temperature=0.0)
-    registry = ToolRegistry()
-    registry.register(ECHO_TOOL, _echo_handler)
-    steering_text = steering or DEFAULT_STEERING
+    async def close(self):
+        pass
 
-    with tempfile.TemporaryDirectory(prefix="power-loop-follow-up-") as tmp:
-        store = await SessionStore.open(f"{tmp}/sessions.sqlite3")
-        loop = StatefulAgentLoop(
-            llm=llm,
-            store=store,
-            tool_registry=registry,
-            config=AgentLoopConfig(system_prompt=SYSTEM_PROMPT, max_rounds=4, compactor=None),
-        )
+async def main():
+    model = SteeringModel()
+    async with demo_runtime(model) as (runtime, loop, target, actor):
+        receipt = await runtime.client.send(target, 'Discuss patience', message_id='first', actor=actor)
+        await asyncio.wait_for(model.entered.wait(), 10)
+        added = await runtime.client.append(target, 'Include STEERED in your answer', message_id='guidance', actor=actor)
+        duplicate = await runtime.client.append(target, 'Include STEERED in your answer', message_id='guidance', actor=actor)
+        assert added.input_ref == duplicate.input_ref
+        model.release.set()
+        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and 'STEERED' in result.final_text
+        print(result.final_text)
 
-        try:
-            sid = await loop.new_session(metadata={"demo": "follow_up"})
-            send_task = asyncio.create_task(
-                loop.send(
-                    "Write one sentence about patience while waiting for good news.",
-                    session_id=sid,
-                )
-            )
-
-            for _ in range(200):
-                if loop._lock_for(sid).locked():
-                    break
-                await asyncio.sleep(0.005)
-            else:
-                raise RuntimeError("expected session lock while send() is running")
-
-            queued = await loop.follow_up(steering_text, sid)
-            if not isinstance(queued, FollowUpQueued):
-                raise RuntimeError(f"expected FollowUpQueued while running, got {queued!r}")
-
-            result = await send_task
-            messages = await loop.get_messages(sid)
-            follow_rows = [
-                m
-                for m in messages
-                if m.get("name") == "follow_up"
-                or "<follow_up>" in str(m.get("content") or "")
-            ]
-
-            payload = {
-                "session_id": sid,
-                "status": result.status,
-                "final_text": result.final_text,
-                "queue_depth": queued.queue_depth,
-                "follow_up_message_count": len(follow_rows),
-                "steering": steering_text,
-            }
-            print(_json(payload))
-            return payload
-        finally:
-            await llm.close()
-            await store.close()
-
-
-def _json(value: Any) -> str:
-    def default(obj: Any) -> Any:
-        if is_dataclass(obj):
-            return asdict(obj)
-        return repr(obj)
-
-    return json.dumps(value, ensure_ascii=False, indent=2, default=default)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

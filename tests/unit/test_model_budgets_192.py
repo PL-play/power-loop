@@ -12,7 +12,6 @@ import pytest
 from power_loop import LLMRequest
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
-from power_loop.runtime.control_runtime import current
 from power_loop.runtime.budget_contracts import (
     BudgetAck,
     BudgetConfig,
@@ -21,6 +20,7 @@ from power_loop.runtime.budget_contracts import (
     BudgetSubmission,
     LocalBudgetScope,
 )
+from power_loop.runtime.control_runtime import current
 from power_loop.runtime.jobs import JobError, JobManager, _hash
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.schema import StoreSchemaError

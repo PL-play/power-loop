@@ -1,5 +1,5 @@
 """Real-LLM end-to-end check that tool calling round-trips through the
-StatefulAgentLoop / sink / store pipeline.
+RequestOptions / sink / store pipeline.
 
 The model is given a single ``lookup`` tool whose canned data is the only
 way to answer the question correctly. If the loop fails to route through
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
@@ -48,12 +48,12 @@ def _build_registry(call_log: list[str]) -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
+async def test_tool_round_routes_through_registry_and_judges_answer(runtime_agent) -> None:
     call_log: list[str] = []
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=512, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -64,22 +64,21 @@ async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
                 max_rounds=4, max_tokens=512, temperature=0,
                 compactor=None,
             ),
-            tool_registry=_build_registry(call_log),
+            registry=_build_registry(call_log),
         )
         q = "What is Lima's signature dish? Be brief."
-        sid = await loop.new_session()
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
         assert "lima" in call_log, (
             f"the model did not invoke the lookup tool; call_log={call_log}"
         )
 
         # Verify pending is cleared after every tool resolves.
-        assert await loop.get_pending(r.session_id) is None
+        assert (await store.get_state(r.input_ref.session_id)).pending is None
 
         # Verify persistence: the store records the assistant(tool_calls)
         # and the matching tool message.
-        msgs = await loop.get_messages(r.session_id)
+        msgs = [dict(role=row.role, content=row.content) for row in await store.load_active_messages(r.input_ref.session_id)]
         roles = [m["role"] for m in msgs]
         assert "tool" in roles, f"no tool message persisted; roles={roles}"
 
@@ -92,4 +91,5 @@ async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
             ),
         )
     finally:
+        await loop.aclose()
         await store.close()

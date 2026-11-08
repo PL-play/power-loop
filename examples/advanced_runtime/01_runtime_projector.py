@@ -1,33 +1,21 @@
 """Advanced runtime 01: project incident state into the next LLM round.
-
-Scenario
---------
-An incident commander dashboard keeps authoritative state in SQLite. The LLM
-should see the latest incident state every round, but that projection should
-not be persisted as chat history.
-
-Note
-----
-This example calls your configured real LLM. Make sure `.env` is configured
-and be mindful of provider usage/cost.
-
-Run:
-    python examples/advanced_runtime/01_runtime_projector.py
+Uses an offline model and the current Runtime factory; no real deployment occurs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
-from _helpers import make_llm
+from _helpers import demo_runtime
 
-from power_loop import AgentLoopConfig, RuntimeProjector, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, RuntimeProjector
 
 
 class IncidentProjector(RuntimeProjector):
-    def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
-        incident = store.get_runtime_state(session_id, "incident", default={}) or {}
+    async def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
+        incident = await store.get_runtime_state(session_id, "incident", default={}) or {}
         if not incident:
             return []
         return [
@@ -44,33 +32,24 @@ class IncidentProjector(RuntimeProjector):
         ]
 
 
-async def main() -> str:
-    store = SessionStore.open(":memory:")
-    sid = store.create_session()
-    store.set_runtime_state(
-        sid,
-        "incident",
-        {"severity": "SEV2", "summary": "checkout latency above threshold"},
-    )
+class IncidentModel(LLMService):
+    async def complete(self, request, **kwargs):
+        assert 'SEV2' in str(request.messages)
+        return LLMResponse(raw_text='SEV2: checkout latency above threshold')
+    async def close(self):
+        pass
 
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=256, temperature=0.0),
-        store=store,
-        config=AgentLoopConfig(
-            system_prompt=(
-                "You assist an incident commander. Use the runtime-projected "
-                "incident state when answering. Keep the answer to one sentence."
-            ),
-            max_rounds=1,
-            compactor=None,
-            runtime_projectors=(IncidentProjector(),),
-        ),
-    )
+async def main():
+    config = AgentLoopConfig(compactor=None, runtime_projectors=(IncidentProjector(),))
+    async with demo_runtime(IncidentModel(), config=config) as (runtime, loop, target, actor):
+        await runtime.store.set_runtime_state(target.session_id, 'incident',
+            {'severity':'SEV2','summary':'checkout latency above threshold'})
+        result = await loop.send(target, 'Latest incident?', message_id='incident', actor=actor,
+            deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        assert not any('<incident_state>' in row.content for row in await runtime.store.load_all_messages(target.session_id))
+        print(result.final_text)
+        return result.final_text
 
-    result = await loop.send("What is the latest incident state?", session_id=sid)
-    print(result.final_text)
-    return result.final_text
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

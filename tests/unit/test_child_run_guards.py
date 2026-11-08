@@ -1,186 +1,105 @@
-"""S1 (3.14): child-run guards — host per-send state suspended around inline
-child runs (``StatefulAgentLoop.register_child_run_guard``)."""
+"""The factory gives each parent/child fresh hooks and releases its resources.
 
-from __future__ import annotations
-
-import contextlib
-from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass, field
-from typing import Any
+Inline child guards were retired with inline execution. Their normal purpose,
+host state isolation and cleanup on failure, belongs to ExecutionEnvironment.
+"""
+import json
+from contextvars import ContextVar
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop
-from power_loop._vendor.llm_client.interface import (
-    LLMRequest,
+from power_loop import (
+    AgentHooks,
+    AgentLoopConfig,
+    AgentSpec,
+    ExecutionEnvironment,
+    HookPoint,
     LLMResponse,
     LLMService,
-    LLMStreamChunk,
+    RegistryRuntimeFactory,
+    Runtime,
+    RuntimeDescriptor,
+    ToolDefinition,
+    TrustedActor,
 )
-from power_loop.contracts.tools import ToolDefinition
+from power_loop.agent.runtime_store import now_ms
+from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
+from power_loop.tools.registry import ToolRegistry
+
+from .test_job_registry_192 import registry_store
+
+__all__ = ['registry_store']
+pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@dataclass
-class _Scripted(LLMService):
-    responses: list[LLMResponse] = field(default_factory=list)
-    _idx: int = 0
+@pytest.mark.parametrize('failed', [False, True])
+async def test_factory_isolates_child_hook_state_and_closes_original_resources(registry_store, failed):
+    store, _ = registry_store
+    host_state = ContextVar('host_state', default=None)
+    states, closed, observed = {}, [], []
+    factory = RegistryRuntimeFactory()
+    registry = ToolRegistry()
 
-    async def complete(
-        self,
-        request: LLMRequest,
-        *,
-        on_chunk_delta_text: Callable[[str], Any] | None = None,
-        on_chunk_think: Callable[[str], Any] | None = None,
-        on_stream_end: Callable[[LLMResponse], Any] | None = None,
-    ) -> LLMResponse:
-        if self._idx >= len(self.responses):
-            return LLMResponse(raw_text="done")
-        r = self.responses[self._idx]
-        self._idx += 1
-        return r
+    async def delegate():
+        parent = host_state.get()
+        child = await run_agent_spec(AgentSpec(name='child', system_prompt='child'),
+                                     'work', parent_loop=get_current_loop())
+        assert host_state.get() is parent
+        assert parent['calls'] == 0
+        return child
 
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
+    registry.register(ToolDefinition('delegate', 'Run child', {'type': 'object', 'properties': {}},
+                                    pricing=Free('fixture')), delegate)
 
-        return _empty()
+    class Model(LLMService):
+        async def complete(self, request, **kwargs):
+            state = host_state.get()
+            assert state['calls'] == 1
+            observed.append(state['session'])
+            if failed:
+                raise OSError('supplier unavailable')
+            return LLMResponse(raw_text='child answer')
+        async def close(self):
+            pass
 
-    async def close(self) -> None:
-        return None
+    async def build(descriptor, context):
+        state = {'session': context.input_ref.session_id, 'calls': 0}
+        states[context.input_ref] = state
+        host_state.set(state)
+        hooks = AgentHooks()
+        async def before(ctx):
+            assert host_state.get() is state
+            state['calls'] += 1
+        hooks.register(HookPoint.LLM_BEFORE, before)
+        class Resources:
+            async def aclose(self):
+                closed.append(context.input_ref)
+        return ExecutionEnvironment(Model(), registry, AgentLoopConfig(compactor=None), hooks=hooks,
+            resources=Resources(), command=None if 'child_spec' in descriptor.config else ('delegate', {}))
 
-
-@pytest.fixture
-async def store() -> AsyncIterator[SessionStore]:
-    s = await SessionStore.open(":memory:")
-    yield s
-    await s.close()
-
-
-def _loop(store: SessionStore, llm: LLMService) -> StatefulAgentLoop:
-    return StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-
-
-def test_register_and_remove_by_name(store: SessionStore) -> None:
-    llm = _Scripted()
-    loop = _loop(store, llm)
-
-    @contextlib.contextmanager
-    def g() -> Iterator[None]:
-        yield
-
-    loop.register_child_run_guard(g, name="one")
-    loop.register_child_run_guard(g)  # anonymous
-    assert loop.remove_child_run_guard("one") is True
-    assert loop.remove_child_run_guard("one") is False
-    assert loop.remove_child_run_guard("missing") is False
-    assert len(loop._child_run_guards) == 1
-
-
-@pytest.mark.asyncio
-async def test_guards_wrap_child_run_in_order(store: SessionStore) -> None:
-    events: list[str] = []
-
-    def make_guard(tag: str):
-        @contextlib.contextmanager
-        def g() -> Iterator[None]:
-            events.append(f"enter:{tag}")
-            try:
-                yield
-            finally:
-                events.append(f"exit:{tag}")
-
-        return g
-
-    llm = _Scripted(responses=[LLMResponse(raw_text="child out")])
-    loop = _loop(store, llm)
-    loop.register_child_run_guard(make_guard("a"), name="a")
-    loop.register_child_run_guard(make_guard("b"), name="b")
-
-    res = await run_agent_spec(
-        AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-    )
-    assert res["status"] == "completed"
-    # Entered in registration order, exited in reverse, around the whole run.
-    assert events == ["enter:a", "enter:b", "exit:b", "exit:a"]
-
-
-@pytest.mark.asyncio
-async def test_guards_restore_on_child_failure(store: SessionStore) -> None:
-    """A raising child run still exits the guards (state restored)."""
-    state = {"suspended": False}
-
-    @contextlib.contextmanager
-    def g() -> Iterator[None]:
-        state["suspended"] = True
-        try:
-            yield
-        finally:
-            state["suspended"] = False
-
-    class _Boom(_Scripted):
-        async def complete(self, request: LLMRequest, **_kw: Any) -> LLMResponse:
-            raise RuntimeError("provider down")
-
-    loop = _loop(store, _Boom())
-    loop.register_child_run_guard(g)
-    with pytest.raises(RuntimeError, match="provider down"):
-        await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-        )
-    assert state["suspended"] is False
-
-
-@pytest.mark.asyncio
-async def test_guards_reenter_for_grandchild(store: SessionStore) -> None:
-    """Nested child runs enter the same guards again (re-entrancy contract)."""
-    depth = {"cur": 0, "max": 0}
-
-    @contextlib.contextmanager
-    def g() -> Iterator[None]:
-        depth["cur"] += 1
-        depth["max"] = max(depth["max"], depth["cur"])
-        try:
-            yield
-        finally:
-            depth["cur"] -= 1
-
-    async def spawnling(**_kw: Any) -> str:
-        from power_loop.core.agent_context import get_current_loop
-
-        res = await run_agent_spec(
-            AgentSpec(name="grandkid", system_prompt="p"),
-            "task", parent_loop=get_current_loop(),
-        )
-        return str(res["status"])
-
-    llm = _Scripted(responses=[
-        LLMResponse(raw_text="", tool_calls=[{
-            "id": "t1", "type": "function",
-            "function": {"name": "spawnling", "arguments": "{}"},
-        }]),                                  # child round 1 → spawn grandchild
-        LLMResponse(raw_text="grandchild"),   # grandchild run
-        LLMResponse(raw_text="child done"),   # child round 2
-    ])
-    from power_loop.tools.registry import ToolRegistry
-
-    reg = ToolRegistry()
-    reg.register(
-        ToolDefinition(
-            name="spawnling", description="spawn",
-            input_schema={"type": "object", "properties": {}},
-        pricing=Free("test_fixture")),
-        spawnling,
-    )
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(max_rounds=3),
-    )
-    loop.register_child_run_guard(g)
-    res = await run_agent_spec(
-        AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-    )
-    assert res["status"] == "completed"
-    assert depth["max"] == 2  # child + nested grandchild
-    assert depth["cur"] == 0
+    factory.register('guard-replacement@1', build)
+    runtime = Runtime(store=store, factory=factory, node_id='factory-isolation', capacity=1,
+                      timers_enabled=False, recovery_interval_s=None)
+    actor = TrustedActor('guards', 'host', None)
+    descriptor = RuntimeDescriptor(1, 'agent', 'guard-replacement@1', None,
+        'builtin.empty@1', 'builtin.none@1', 'builtin.none@1', {}, {})
+    try:
+        await runtime.worker.start()
+        target = await runtime.open_session(descriptor, actor=actor)
+        receipt = await runtime.client.send(target, 'delegate', actor=actor, message_id='first')
+        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=now_ms()+15000)
+        assert result.status == 'completed', result
+        child = json.loads(result.final_text)
+        assert child['status'] == ('failed' if failed else 'completed'), child
+        if not failed:
+            assert child['final_text'] == 'child answer'
+        assert observed == [child['session_id']]
+        assert host_state.get() is None
+    finally:
+        await runtime.worker.shutdown(timeout_s=2)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+    assert set(closed) == set(states) and len(closed) == len(states)
+    assert {state['session'] for state in states.values()} >= {target.session_id, child['session_id']}

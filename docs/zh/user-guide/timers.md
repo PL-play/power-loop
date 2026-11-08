@@ -1,84 +1,40 @@
-# 持久化定时器
+# Runtime 11 定时器
 
-[English](../../en/user-guide/timers.md) | [用户手册](../index.md)
+一个部署使用一个 `schedule_wakeup` 工具和一个权威 `TimerBackend`。
+默认 `Runtime` 装配 `StoreTimerBackend`，随 worker 启停 `TimerRunner`，不需要 Redis。
+纯 `RuntimeClient` 不启动扫描器；不需要定时器时传 `timers_enabled=False`。
+显式宿主 backend 必须同时配置具有 start/stop/status 的 driver；未就绪时拒绝启动，不回退本地表。
 
-定时器让 Agent（或你的宿主程序）可以表达*"在时刻 T 用这条备注唤醒该会话"*。它们是**持久化**的——一行 `timers` 表记录，而非内存中的任务——因此能在进程重启后存活。触发本身就是一次普通的轮次：备注通过 `follow_up` 投递进会话（空闲时为一次普通 `send`，运行中则为一次排队注入）。
+模型调用 `schedule_wakeup(action="schedule", delay_seconds=60, note="检查进展")`，
+或 `action="list"`、`action="cancel", timer_id=...`。`every_seconds` 指定周期。
+只有 main 角色能创建；查询和取消也校验身份。SDK 向后端传入可信 `TimerContext`：
+store/session、actor、原 job/tool-call、稳定 operation_id 和宿主上下文；身份不来自模型参数。
 
-## 创建定时器
-
-两种方式，写入的是同一批记录。
-
-**Agent 自行安排唤醒**，通过默认工具 `schedule_wakeup`（单工具，用 `action` 区分 schedule / list / cancel）：
-
-```python
-from power_loop import create_default_tool_registry, get_tool_definitions
-from power_loop.tools import DEFAULT_TOOL_HANDLERS
-
-registry = create_default_tool_registry(preset="core", workspace_dir=ws)
-for d in get_tool_definitions(include=["schedule_wakeup"]):   # 可加 "current_time"
-    registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
-# 现在模型可以调用：
-#   schedule_wakeup(action="schedule", delay_seconds=3600, note="check the build")
-#   schedule_wakeup(action="schedule", delay_seconds=60, note="heartbeat", every_seconds=300)
-#   schedule_wakeup(action="list")
-#   schedule_wakeup(action="cancel", timer_id=1)
-```
-
-**宿主程序从外部安排**，通过 loop API：
+宿主也可使用相同 backend：
 
 ```python
-t = loop.schedule_timer(sid, delay_s=3600, note="check the report")   # or due_at_ms=…
-loop.list_timers(sid)
-loop.cancel_timer(sid, t.timer_id)
+from power_loop import TimerContext
+source = TimerContext(store.store_id, target.session_id, authenticated_actor)
+timer = await runtime.timer_backend.create(source, delay_s=60, note="检查进展")
+items = await runtime.timer_backend.list(source, statuses=("armed", "firing"))
+await runtime.timer_backend.cancel(source, timer.timer_id)
 ```
 
-## 触发它们：TimerRunner
+到期驱动按索引取有限批次，带条件领取，再用稳定 message_id 调 `RuntimeClient.append`。
+只等待受理，不等待模型执行。忙时在轮边界追加，空闲时启动调用。
+周期任务从此次投递时间加 interval 计算，不补跑全部错过的周期。
+取消阻止未来触发，也阻止已领取周期任务重新 armed；已经受理的输入须用正常任务控制取消。
 
-定时器只在 `TimerRunner` 运行时触发——它扫描 store 中到期的记录并投递。（如果你从自己的调度器轮询 `loop.store.due_timers()`，则不需要它。）
+把 `AgentHooks` 显式传给 Runtime/driver，保留 `TIMER_FIRE`：CONTINUE 投递、SKIP 跳过本次、
+BREAK 取消、正数 postpone_s 延后，也可修改 ctx.message。
+自定义 driver 可通过 `TimerRunner(event_bus=...)` 发送结果事件。
+status() 提供就绪、最近扫描/错误和最近一批到期待办，查询状态不扫描数据库。
 
-```python
-from power_loop import TimerRunner
+基础设施异常允许丢失、重复或 unknown。陈旧领取会结束该次未知触发，不自动重放；后续周期可继续。
+终态记录沿用七天保留期。
+DeepTalk 使用 API backend 和 dispatcher；API 负责业务授权、限额以及每次新 run/预算，不写 SDK 定时表。
+参见[可运行的编号例子 26](../../../examples/26_timers.py)和[当前 Runtime 合同](../../runtime-11.md)。
 
-runner = TimerRunner(loop)
-await runner.start()    # re-arms stale rows, then scans every scan_interval
-# ...
-await runner.stop()
-```
-
-参见 [示例 26](../../../examples/26_timers.py)。
-
-## 一次性 vs 周期性
-
-是否周期在创建时声明。无 `interval` → 一次性（`firing → fired`）。设置 `every_seconds`（工具）/ `interval_s`（API）→ 定时器在触发时刻 + interval 处重新装载（固定延迟），直到被取消。**取消是周期性定时器结束的唯一途径。**
-
-```python
-loop.schedule_timer(sid, delay_s=60, note="heartbeat", interval_s=300)   # every 5 min
-```
-
-## TIMER_FIRE 钩子——编排层的否决点
-
-每次投递前，runner 会以一个 `TimerFireCtx` 运行 `HookPoint.TIMER_FIRE`。由该钩子决定接下来发生什么：
-
-```python
-from power_loop import HookDirective, HookPoint
-
-def gate(ctx):                 # ctx: TimerFireCtx(session_id, timer_id, note, due_at, message)
-    if system_is_busy():
-        ctx.postpone_s = 300   # re-arm 5 min later
-    # ctx.directive = HookDirective.SKIP    # drop THIS firing (recurring still re-arms)
-    # ctx.directive = HookDirective.BREAK   # cancel the timer entirely
-
-hooks.register(HookPoint.TIMER_FIRE, gate)
-```
-
-未注册钩子 → 投递。这里也是你在**重复触发后去重**的地方（见下文）。
-
-## 投递语义
-
-定时器是**至少一次**的。认领是一次比较并设置（`armed → firing`）；某行因进程在触发途中死亡而卡在 `firing`，会被恢复扫描重新装载，可能投递两次。一次*活跃*的慢投递**不会**被重新认领——runner 在 `follow_up` 运行期间对 `firing` 行发送心跳（节奏 = `stale_firing_s` 的四分之一，可通过 `TimerRunner(heartbeat_interval_s=…)` 覆盖）。若某个副作用要求恰好一次，请在 `TIMER_FIRE` 钩子中去重。
-
-## 参见
-
-- [钩子](hooks.md) —— 完整的 `TIMER_FIRE` 契约
-- [会话](sessions.md) —— `follow_up` 与持久化 store
-- [工作流](workflows.md) —— 分离运行（detached run）用一个定时器唤醒父会话
+有限子任务可显式注册 `register_wait_handoff_tool(registry, policy=WaitPolicy(deadline_at_ms=...))`。
+期限由宿主工厂冻结；子任务请求等待，原主 Agent 可继续、取消或延后。延后不能越过原期限。
+等待复用原任务交互及当前 TimerBackend，不另建调度账本；未知创建只查询原结果，不自动重放。

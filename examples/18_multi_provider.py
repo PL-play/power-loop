@@ -38,7 +38,6 @@ from dotenv import load_dotenv
 from power_loop import (
     AgentLoopConfig,
     LLMProviderConfig,
-    StatefulAgentLoop,
     create_llm_service_from_config,
 )
 
@@ -55,23 +54,17 @@ def _cfg_from_env(prefix: str) -> LLMProviderConfig | None:
 
 
 async def run_with_provider(label: str, config: LLMProviderConfig, question: str) -> str:
-    """Run one question against a specific provider configuration."""
-    llm = create_llm_service_from_config(config)
-    loop = StatefulAgentLoop(
-        llm=llm,
-        config=AgentLoopConfig(
-            system_prompt="You are a concise assistant. Reply in English.",
-            max_rounds=1, compactor=None,
-        ),
-    )
-    try:
-        sid = await loop.new_session()
-        r = await loop.send(question, session_id=sid)
-        print(f"[{label}] model={config.model}")
-        print(f"[{label}] reply: {r.final_text[:120]}")
-        return r.final_text
-    finally:
-        await loop.aclose()
+    import time
+
+    from _runtime import demo_runtime
+    service = create_llm_service_from_config(config)
+    async with demo_runtime(service, config=AgentLoopConfig(max_tokens=300, max_rounds=1, compactor=None)) as (runtime, loop, target, actor):
+        result = await loop.send(target, question, message_id=label, actor=actor,
+                                 deadline_ms=int(time.time()*1000)+120000)
+        if result.status != 'completed':
+            raise RuntimeError(result.error)
+        print(label, result.final_text)
+        return result.final_text
 
 
 async def main() -> None:

@@ -43,17 +43,20 @@ Run / 运行
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import time
 from collections.abc import Awaitable, Callable
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentHooks,
     AgentLoopConfig,
     HookDirective,
     HookPoint,
-    StatefulAgentLoop,
+    LLMResponse,
+    LLMService,
     ToolDefinition,
     ToolRegistry,
 )
@@ -136,32 +139,30 @@ def build_hook(confirm_fn: ConfirmFn) -> AgentHooks:
 # ── 3. 主程序 / Main program ──────────────────────────────────────────────
 
 
+class ApprovalModel(LLMService):
+    async def complete(self, request, **kwargs):
+        outputs = [m['content'] for m in request.messages if m['role'] == 'tool']
+        if outputs:
+            return LLMResponse(raw_text='; '.join(outputs))
+        return LLMResponse(raw_text='', tool_calls=[{'id':f'command-{i}','type':'function',
+            'function':{'name':'bash','arguments':json.dumps({'command':command})}}
+            for i, command in enumerate(['ls', 'rm README.md'])])
+
+    async def close(self):
+        pass
+
+
 async def run_with_policy(confirm_fn: ConfirmFn, prompt: str) -> str:
     registry = ToolRegistry()
     registry.register(BASH_TOOL, fake_bash)
-
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=512, temperature=0),
-        db_path=":memory:",
-        tool_registry=registry,
-        hooks=build_hook(confirm_fn),
-        config=AgentLoopConfig(
-            system_prompt=(
-                "You have a `bash` tool that takes a `command` string. "
-                "Call it for every shell action. If a tool call is denied, "
-                "do NOT retry the same command — explain to the user that "
-                "it was denied and stop."
-            ),
-            max_rounds=5,
-            compactor=None,
-        ),
-    )
-    sid = await loop.new_session()
-    r = await loop.send(prompt, session_id=sid)
-    print(f"\n[reply] status={r.status}, rounds={r.rounds}")
-    print(f"[reply] {r.final_text}")
-    print(f"[stats] commands actually executed: {EXECUTED}")
-    return r.final_text
+    async with demo_runtime(ApprovalModel(), registry, hooks=build_hook(confirm_fn),
+            config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+        result = await loop.send(target, prompt, message_id='approval', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        print(result.final_text)
+        print('executed:', EXECUTED)
+        return result.final_text
 
 
 async def main() -> str:
@@ -172,10 +173,12 @@ async def main() -> str:
         return False
 
     EXECUTED.clear()
-    return await run_with_policy(
+    result = await run_with_policy(
         always_deny,
         "Please list the files in the project, then delete README.md.",
     )
+    assert EXECUTED == ["ls"] and "denied" in result
+    return result
 
 
 if __name__ == "__main__":

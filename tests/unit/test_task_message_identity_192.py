@@ -42,7 +42,7 @@ async def test_partial_control_owner_schema_is_rejected_on_open(tmp_path):
     await s._db.execute("ALTER TABLE pl_jobs DROP COLUMN control_owner_boot_id")
     await s.close()
     with pytest.raises(StoreSchemaError, match="control owner schema incomplete"):
-        await SessionStore.open(path, schema="compatible")
+        await SessionStore.open(path, schema="verify")
 
 
 async def test_message_ids_are_store_wide_while_seq_remains_session_local(task_store):
@@ -100,7 +100,7 @@ async def test_legacy_mode_degrades_and_never_automatically_migrates(tmp_path):
     await s.close()
     with pytest.raises(StoreSchemaError, match="maintenance migration"):
         await SessionStore.open(path, schema="tasks")
-    s = await SessionStore.open(path, schema="compatible")
+    s = await SessionStore.open(path, schema="verify")
     assert s.schema_version == CURRENT_SCHEMA_VERSION and (await s.load_all_messages(sid))[0].content == "legacy"
     await s.close()
 

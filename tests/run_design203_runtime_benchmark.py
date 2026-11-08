@@ -12,8 +12,9 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
 
-from power_loop import AgentLoopConfig, RequestOptions, ToolDefinition, record_billing_receipt
+from power_loop import AgentLoopConfig, LLMService, RequestOptions, ToolDefinition, record_billing_receipt
 from power_loop.agent.runtime_store import now_ms
+from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import BillingReceipt, Free, Money
@@ -32,7 +33,7 @@ SCENARIOS = ('send', 'paid', 'append', 'cancel', 'stateless', 'same_session')
 
 
 @asynccontextmanager
-async def composition(store, lane, scenario):
+async def composition(store, lane, scenario, *, coordinator=None, transport=None, models=None):
     paid = scenario == 'paid'
     model, registry, host = Model(4 if paid else 1), ToolRegistry(), Host()
     async def capture(packet):
@@ -43,7 +44,13 @@ async def composition(store, lane, scenario):
         if paid:
             await record_billing_receipt(BillingReceipt(provider_amount=Money(Decimal('1'), 'CNY')))
         return text
-    host.service, host.capture_response, host.prepare_tool = model, capture, tool_plan
+    class RoutedModel(LLMService):
+        async def complete(self, request, **kwargs):
+            return await models[get_session_id()].complete(request, **kwargs)
+        async def close(self):
+            pass
+    service = RoutedModel() if models is not None else model
+    host.service, host.capture_response, host.prepare_tool = service, capture, tool_plan
     registry.register(ToolDefinition('echo', 'Return input', input_schema={
         'type': 'object', 'properties': {'text': {'type': 'string'}}},
         async_capable=True, pricing=Paid() if paid else Free('fixture')), echo)
@@ -52,9 +59,11 @@ async def composition(store, lane, scenario):
     accounting = TaskRuntime(JobManager(store), tenant_id='profile-'+scenario, principal_id='host',
         executor_id=f'bench-{lane}-'+os.urandom(4).hex(), boot_id=os.urandom(8).hex(),
         lease_ms=300000, boot_contract_hash='a'*64, budget_config=config)
-    agent = await RunningAgent(store, model, registry,
+    agent = await RunningAgent(store, service, registry,
         AgentLoopConfig(max_rounds=5, max_tokens=20, compactor=None, delegation_policy='single_level'),
-        task_runtime=accounting).start()
+        task_runtime=accounting, coordinator=coordinator, transport=transport).start()
+    if models is not None:
+        models[agent.target.session_id] = model
     serial = 0
     try:
         async def operation():
@@ -91,7 +100,7 @@ async def composition(store, lane, scenario):
         await agent.aclose()
         await accounting.shutdown(timeout_s=1)
         assert not agent.runtime.worker._tasks and not agent.runtime.worker._active
-        assert not agent.runtime.transport._subscriptions
+        assert all(sub.closed for sub in agent.runtime.worker._subscriptions)
 
 
 async def run_case(dsn, scenario, concurrency, output):
@@ -107,13 +116,19 @@ async def run_case(dsn, scenario, concurrency, output):
     try:
         for repeat in range(3):
             async with AsyncExitStack() as stack:
-                operations = [await stack.enter_async_context(composition(store, lane, scenario))
+                from power_loop import MemoryMessageTransport
+                from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
+                coordinator, transport = MemorySessionOwnershipCoordinator(), MemoryMessageTransport()
+                models = {}
+                operations = [await stack.enter_async_context(composition(store, lane, scenario, coordinator=coordinator, transport=transport, models=models))
                               for lane in range(1 if scenario == 'same_session' else concurrency)]
                 if scenario == 'same_session':
                     operations *= concurrency
                 await batch(operations, 10)
                 result = await batch(operations, 34)
                 report['pairs'].append({'pair': repeat, 'arm': 'N', **result})
+            assert not transport._subscriptions
+            await transport.aclose()
             gc.collect()
             report['pairs'][-1]['rss_after_close_gc'] = rss()
         output.write_text(json.dumps(report, indent=2)+'\n')

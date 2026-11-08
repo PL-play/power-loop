@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, StructuredOutputError, parse_structured
+from power_loop import AgentLoopConfig, SessionStore, StructuredOutputError, parse_structured
+from tests.runtime_fixture import RunningAgent
 
+from ._live_fixture import BorrowedProvider
 from ._llm import make_llm
 
 _JUDGE_SYSTEM = """You are a strict test judge. You will be given:
@@ -54,9 +56,8 @@ async def judge_async(
     llm = make_llm(max_tokens=256, temperature=0, model=model)
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=llm,
-            store=store,
+        loop = await RunningAgent(
+            store, BorrowedProvider(llm),
             config=AgentLoopConfig(
                 system_prompt=_JUDGE_SYSTEM,
                 max_rounds=1,
@@ -64,16 +65,17 @@ async def judge_async(
                 max_tokens=256,
                 compactor=None,
             ),
-        )
+        ).start()
         user_msg = (
             f"QUESTION:\n{question}\n\n"
             f"ANSWER:\n{answer}\n\n"
             f"RUBRIC (all must hold):\n{rubric}"
         )
-        sid = await loop.new_session()
-        result = await loop.send(user_msg, session_id=sid)
+        result = await loop.send(user_msg)
         return _parse_verdict(result.final_text)
     finally:
+        await loop.aclose()
+        await llm.close()
         await store.close()
 
 

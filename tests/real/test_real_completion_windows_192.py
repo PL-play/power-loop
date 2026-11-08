@@ -7,23 +7,22 @@ from dataclasses import asdict
 
 import pytest
 
-from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, HookPoint, SessionStore, ToolDefinition
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import completion_windows as windows
-from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _OWNER, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize("expire", [False, True])
-async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reopen_and_closes_tree(tmp_path, record_property, expire):
+async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reopen_and_closes_tree(tmp_path, record_property, expire, runtime_agent):
     path = str(tmp_path / "original-window.db")
     store = await SessionStore.open(path, schema="tasks")
     manager = JobManager(store)
@@ -44,11 +43,11 @@ async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reope
 
     registry.register(ToolDefinition(name="deadline_probe", description="Read the original child deadline exactly once.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False}, pricing=Free("test_fixture")), probe)
-    loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
+    loop = await runtime_agent(model=provider, store=store, task_runtime=runtime, registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4, max_tokens=2048,
             system_prompt="Initially create exactly one requested child with spawn_agent, then reply WAITING as text without pass_turn. "
                 "Do not create replacement tasks. Later consume the original child's result."))
-    parent = await loop.new_session()
+    parent = loop.target.session_id
 
     async def hold_child(ctx):
         nonlocal child_requests
@@ -62,12 +61,11 @@ async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reope
             child_requests += 1
 
     loop.hooks.register(HookPoint.LLM_BEFORE, hold_child, name="test.original-window-observation")
-    before = set(delegation._TASKS)
     try:
         async with asyncio.timeout(120):
             await loop.send("Use spawn_agent create once with tools=['deadline_probe'], max_rounds=3, task='Compute 7+8', "
                 "system_prompt='Call deadline_probe exactly once, then answer 15 as final text with no more tools or pass_turn.'. "
-                "Then reply WAITING.", parent)
+                "Then reply WAITING.")
             await asyncio.wait_for(ready.wait(), 30)
             [original] = captured
             assert original["deadline_at_ms"] == original["admitted_at_ms"] + windows.DEFAULT_TIMEOUT_MS
@@ -82,21 +80,15 @@ async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reope
                 # Trusted fault injection advances only the runtime clock and
                 # preserves short execution leases to isolate the UTC gate.
                 manager.now = lambda: original["deadline_at_ms"]
-                await manager.db.execute(f"UPDATE {manager.jobs} SET lease_until_ms=? WHERE resource_state='running'",
-                    (manager.now() + 30000,))
             release.set()
-            tasks = set(delegation._TASKS) - before
-            if tasks:
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 30)
+            await loop.drain()
             owner = await manager.get_job(runtime.actor(parent), original["origin"]["job_id"])
             assert owner.outcome == ("failed" if expire else "succeeded") and owner.resource_state == "stopped", owner
             if expire:
-                attempts = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='model_attempt_dispatched' AND job_id IN "
-                    f"(SELECT job_id FROM {manager.jobs} WHERE control_owner_job_id=?)", (owner.job_id,))
-                assert len(attempts) == 1  # The probe's original actual request only.
+                assert child_requests == 2  # The hook fires; the expired dispatch never calls the provider.
                 assert owner.result["usage"]["total_tokens"] > 0
             consuming = True
-            await loop.flush_follow_ups(parent)
+            await loop.drain()
             rows = await manager.db.fetchall(f"SELECT kind,generation,supervision_status FROM {manager.jobs}")
             assert all(r["supervision_status"] == "closed" for r in rows), rows
             assert await windows.read(manager, runtime.actor(parent), owner.job_id) == original
@@ -108,9 +100,7 @@ async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reope
             record_property("supervision_tree", json.dumps(rows))
     finally:
         release.set()
-        tasks = set(delegation._TASKS) - before
-        if tasks:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 20)
+        await loop.aclose()
         for session in [parent, *(s.session_id for s in await store.list_children(parent))]:
             record_property("messages_" + session, json.dumps([asdict(m) for m in await store.load_all_messages(session)]))
         provider.report(record_property)

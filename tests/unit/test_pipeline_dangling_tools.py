@@ -16,8 +16,6 @@ import pytest
 
 from power_loop import (
     AgentLoopConfig,
-    SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
     create_default_tool_registry,
 )
@@ -76,7 +74,7 @@ def _assert_no_dangling(messages: list[dict]) -> None:
     assert requested <= responded, f"dangling tool_calls: {requested - responded}"
 
 
-async def test_tool_after_break_resolves_remaining_tool_calls() -> None:
+async def test_tool_after_break_resolves_remaining_tool_calls(runtime_agent) -> None:
     hooks = AgentHooks()
     hooks.register(HookPoint.TOOL_AFTER, lambda ctx: HookDirective.BREAK)  # break after 1st tool
     reg = ToolRegistry()
@@ -85,20 +83,20 @@ async def test_tool_after_break_resolves_remaining_tool_calls() -> None:
         _multi_tool(("c1", "echo", "{}"), ("c2", "echo", "{}")),
         LLMResponse(raw_text="done", content_text="done"),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, store=await SessionStore.open(":memory:"), tool_registry=reg, hooks=hooks,
+    loop = await runtime_agent(
+        model=llm, registry=reg, hooks=hooks,
         config=AgentLoopConfig(system_prompt="o", max_rounds=4, compactor=None),
     )
-    sid = await loop.new_session()
-    result = await loop.send("go", session_id=sid)
+    sid = loop.target.session_id
+    result = await loop.send("go")
     assert result.status == "completed"
-    _assert_no_dangling(await loop.get_messages(sid))  # c2 must have a (skipped) response
+    _assert_no_dangling([dict(role=r.role, content=r.content, tool_calls=r.tool_calls, tool_call_id=r.tool_call_id) for r in await loop.runtime.store.load_active_messages(sid)])  # c2 must have a (skipped) response
     # the session must NOT be left pending → a second send works (no unresolved calls)
-    r2 = await loop.send("again", session_id=sid)
+    r2 = await loop.send("again")
     assert r2.status in ("completed", "hit_round_limit")
 
 
-async def test_request_user_input_batched_resolves_later_tool_calls() -> None:
+async def test_request_user_input_batched_resolves_later_tool_calls(runtime_agent) -> None:
     reg = create_default_tool_registry(include=["request_user_input"])
     reg.register(_echo_def(), lambda **k: "echoed")
     llm = _Scripted(responses=[
@@ -110,18 +108,24 @@ async def test_request_user_input_batched_resolves_later_tool_calls() -> None:
         ),
         LLMResponse(raw_text="resumed done", content_text="resumed done"),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, store=await SessionStore.open(":memory:"), tool_registry=reg,
+    loop = await runtime_agent(
+        model=llm, registry=reg,
         config=AgentLoopConfig(system_prompt="o", max_rounds=4, compactor=None),
     )
-    sid = await loop.new_session()
-    result = await loop.send("go", session_id=sid)
-    assert result.status == "waiting_for_input"
+    sid = loop.target.session_id
+    from power_loop.agent.runtime_store import now_ms
+    from tests.unit.test_history_projection_loop import question
+    receipt, pending = await question(loop, "go")
     # c1 executed, c3 resolved as skipped (not dangling); c2 is the interaction.
-    responded = {m.get("tool_call_id") for m in await loop.get_messages(sid) if m.get("role") == "tool"}
+    responded = {m.get("tool_call_id") for m in [dict(role=r.role, content=r.content, tool_calls=r.tool_calls, tool_call_id=r.tool_call_id) for r in await loop.runtime.store.load_active_messages(sid)] if m.get("role") == "tool"}
     assert "c1" in responded and "c3" in responded
 
-    interaction_id = result.pending_interactions[0]["interaction_id"]
-    resumed = await loop.submit_input(sid, interaction_id, {"choice": "yes"})
+    status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
+    answer = await loop.runtime.client.answer(status.job_ref,
+        interaction_id=pending['pending_interactions'][0]['interaction_id'],
+        wait_round=pending['round_index'], value={'choice':'yes'}, message_id='answer', actor=loop.actor)
+    resumed = await loop.runtime.client.wait(answer.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
     assert resumed.status == "completed"
-    _assert_no_dangling(await loop.get_messages(sid))  # full valid sequence after resume
+    await loop.drain()
+    _assert_no_dangling([dict(role=r.role, tool_calls=r.tool_calls, tool_call_id=r.tool_call_id)
+                        for r in await loop.runtime.store.load_active_messages(sid)])

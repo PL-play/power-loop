@@ -25,13 +25,20 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
 from pathlib import Path
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import AgentLoopConfig, MessageState, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, MessageState, SessionStore
 from power_loop.runtime.compact import DefaultCompactor
 
+
+class PlanetModel(LLMService):
+    async def complete(self, request, **kwargs):
+        return LLMResponse(raw_text='Jupiter')
+    async def close(self):
+        pass
 
 async def main() -> str:
     # Demo: a tiny compaction threshold so the seeded turns fold (real apps tune this
@@ -51,20 +58,21 @@ async def main() -> str:
     )
 
     pruned = 0
-    async with StatefulAgentLoop(llm=make_llm(max_tokens=200), store=store, config=cfg) as loop:
-        sid = await loop.new_session()
+    async with demo_runtime(PlanetModel(), store=store, config=cfg) as (runtime, loop, target, actor):
+        sid = target.session_id
         # Seed several fat earlier turns the compactor must fold on the next send
         # (big enough that reclaiming them visibly shrinks the file).
         for i in range(12):
             await store.append_message(sid, role="user", content="context " + "u" * 3000, round_index=i)
             await store.append_message(sid, role="assistant", content="noted " + "a" * 3000, round_index=i)
 
-        result = await loop.send("Name the largest planet in our solar system.", session_id=sid)
+        result = await loop.send(target, "Name the largest planet in our solar system.", message_id="planet", actor=actor, deadline_ms=int(time.time()*1000)+10000)
         assert result.status == "completed"
 
         compactions = await store.list_compactions(sid)
         active_before = [(m.role, m.name) for m in await store.load_active_messages(sid)]
 
+        assert compactions, "configured verbatim compactor must fold seeded history"
         # OPS-4: ARCHIVE the full session first (incl. the folded-out originals) — so the
         # export is complete; then reclaim locally. This is the "archive then prune" order.
         blob = await store.export_session(sid)
@@ -93,6 +101,7 @@ async def main() -> str:
     finally:
         await other.close()
 
+    assert pruned > 0 and restored_compacted == pruned
     summary = (
         f"answer={result.final_text!r} | compactions={len(compactions)} | "
         f"pruned_originals={pruned} | file {size_before}->{size_after} bytes | "

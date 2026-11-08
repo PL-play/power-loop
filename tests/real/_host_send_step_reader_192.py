@@ -12,7 +12,7 @@ from power_loop.runtime.send_receipt import read
 async def main():
     path, actor_json, step_json, source_json = sys.argv[1:]
     actor, step, source = JobActor(**json.loads(actor_json)), json.loads(step_json), json.loads(source_json)
-    store = await SessionStore.open(path, schema="compatible")
+    store = await SessionStore.open(path, schema="verify")
     try:
         manager = JobManager(store)
         binding = await lookup(manager, actor, **step, expected_host_context=source)

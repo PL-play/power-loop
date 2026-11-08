@@ -28,8 +28,6 @@ from power_loop import (
     LLMRetryExhausted,
     LLMRetryPolicy,
     LLMTimeout,
-    SessionStore,
-    StatefulAgentLoop,
 )
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.errors import CancellationRequested
@@ -60,16 +58,6 @@ class _ScriptedLLM:
 
     async def close(self):
         pass
-
-
-def _new_loop(*, llm, store, bus, retry=None, max_rounds=1) -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=llm, store=store, event_bus=bus,
-        config=AgentLoopConfig(
-            system_prompt="x", max_rounds=max_rounds, compactor=None,
-            retry_policy=retry,
-        ),
-    )
 
 
 # ── with_retry direct tests ──────────────────────────────────────────────
@@ -175,85 +163,46 @@ def test_callable_raising_treated_as_not_cancelled() -> None:
     assert tok.is_cancelled() is False
 
 
-# ── End-to-end through the pipeline (fake LLM) ──────────────────────────
+# Runtime does not replay an unknown model request. The standalone retry
+# utility above remains available for host actions known to be retryable.
+@pytest.mark.asyncio
+async def test_pipeline_unknown_failure_is_visible_and_new_input_can_continue(runtime_agent):
+    llm = _ScriptedLLM(script=[RuntimeError("unconfirmed call"), LLMResponse(raw_text="new input succeeded")])
+    events = []
+    bus = AgentEventBus()
+    bus.subscribe(None, events.append)
+    loop = await runtime_agent(model=llm, event_bus=bus, config=AgentLoopConfig(compactor=None,
+        retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0)))
+    result = await loop.send("first input")
+    assert result.status == "failed" and "unconfirmed call" in result.error
+    assert llm.calls == 1
+    assert not any(e.type == AgentEventType.LLM_RETRY_ATTEMPTED for e in events)
+    assert (await loop.send("new input")).final_text == "new input succeeded"
+    assert llm.calls == 2
 
 
 @pytest.mark.asyncio
-async def test_pipeline_retry_then_succeed_emits_retry_event() -> None:
-    store = await SessionStore.open(":memory:")
-    try:
-        events: list = []
-        bus = AgentEventBus()
-        bus.subscribe(None, lambda e: events.append(e))
-        llm = _ScriptedLLM(script=[
-            RuntimeError("first"),
-            RuntimeError("second"),
-            LLMResponse(raw_text="hello"),
-        ])
-        loop = _new_loop(
-            llm=llm, store=store, bus=bus,
-            retry=LLMRetryPolicy(max_attempts=3, backoff_initial=0.001, backoff_max=0.001),
-        )
-        sid = await loop.new_session()
-        r = await loop.send("hi", session_id=sid)
-        assert r.status == "completed"
-        assert r.final_text == "hello"
-        assert llm.calls == 3
-        retry_events = [e for e in events if e.type == AgentEventType.LLM_RETRY_ATTEMPTED]
-        assert len(retry_events) == 2
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_pipeline_retry_exhausted_degrades() -> None:
-    store = await SessionStore.open(":memory:")
-    try:
-        events: list = []
-        bus = AgentEventBus()
-        bus.subscribe(None, lambda e: events.append(e))
-        llm = _ScriptedLLM(script=[RuntimeError("a"), RuntimeError("b")])
-        loop = _new_loop(
-            llm=llm, store=store, bus=bus, max_rounds=2,
-            retry=LLMRetryPolicy(max_attempts=2, backoff_initial=0.001, backoff_max=0.001),
-        )
-        sid = await loop.new_session()
-        r = await loop.send("hi", session_id=sid)
-        assert r.status == "degraded"
-        assert "degraded" in r.final_text
-        assert any(e.type == AgentEventType.LLM_DEGRADED for e in events)
-    finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_pipeline_cancel_status_and_event() -> None:
-    store = await SessionStore.open(":memory:")
-    try:
-        events: list = []
-        bus = AgentEventBus()
-        bus.subscribe(None, lambda e: events.append(e))
-        token = CancellationToken()
-        llm = _ScriptedLLM(script=[RuntimeError("boom")])
-        loop = _new_loop(
-            llm=llm, store=store, bus=bus,
-            retry=LLMRetryPolicy(
-                max_attempts=5, backoff_initial=0.2, backoff_max=0.2, total_timeout=10,
-            ),
-        )
-
-        async def cancel_soon() -> None:
-            await asyncio.sleep(0.05)
-            token.cancel("external_stop")
-
-        sid = await loop.new_session()
-        send_task = asyncio.create_task(loop.send("hi", session_id=sid, stop_event=token))
-        await cancel_soon()
-        result = await send_task
-        assert result.status == "cancelled"
-        assert any(e.type == AgentEventType.LOOP_CANCELLED for e in events)
-    finally:
-        await store.close()
+async def test_pipeline_cancel_status_and_event(runtime_agent):
+    from power_loop.agent.runtime_store import now_ms
+    entered = asyncio.Event()
+    class Blocking(_ScriptedLLM):
+        async def complete(self, request, **kwargs):
+            self.calls += 1
+            entered.set()
+            await asyncio.Event().wait()
+    events = []
+    bus = AgentEventBus()
+    bus.subscribe(None, events.append)
+    llm = Blocking()
+    loop = await runtime_agent(model=llm, event_bus=bus)
+    receipt = await loop.runtime.client.send(loop.target, "hi", message_id="cancel", actor=loop.actor)
+    await asyncio.wait_for(entered.wait(), 5)
+    status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
+    await loop.runtime.client.cancel(status.job_ref, actor=loop.actor)
+    result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
+    await loop.finish(receipt.input_ref, failed=True)
+    assert result.status == "cancelled" and llm.calls == 1
+    assert any(e.type == AgentEventType.LOOP_CANCELLED for e in events)
 
 
 @pytest.mark.asyncio

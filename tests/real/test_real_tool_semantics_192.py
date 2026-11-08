@@ -4,20 +4,21 @@ from dataclasses import replace
 
 import pytest
 
-from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, HookPoint, SessionStore
 from power_loop.core import pass_turn
+from power_loop.runtime.env import RuntimeEnv
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.skills import LOAD_SKILL_DEFINITION, SkillLoader
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.skill_contract import SkillTool
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-async def test_real_model_reads_skill_using_actual_registered_alias(tmp_path, record_property):
+async def test_real_model_reads_skill_using_actual_registered_alias(tmp_path, record_property, runtime_agent):
     skills = tmp_path / 'skills'
     example = skills / 'example'
     example.mkdir(parents=True)
@@ -32,7 +33,8 @@ async def test_real_model_reads_skill_using_actual_registered_alias(tmp_path, re
     registry.register(replace(LOAD_SKILL_DEFINITION, name='read_handbook'), SkillTool(read))
     provider = BoundedProvider(limit=2)
     store = await SessionStore.open(str(tmp_path / 'skill.db'))
-    loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
+    loop = await runtime_agent(model=provider, store=store, registry=registry,
+        runtime_env=RuntimeEnv(workspace_dir=tmp_path, skills_dir=skills),
         config=AgentLoopConfig(skills_dir=str(skills), max_tokens=2048, max_rounds=3, compactor=None,
                                retry_policy=LLMRetryPolicy(max_attempts=1)))
 
@@ -45,21 +47,20 @@ async def test_real_model_reads_skill_using_actual_registered_alias(tmp_path, re
     loop.hooks.register(HookPoint.LLM_BEFORE, prompt, name='test.skill-alias-guide')
     try:
         async with asyncio.timeout(150):
-            sid = await loop.new_session()
-            result = await loop.send('Read the example skill exactly once with its available reader, then extract only the value to the right of the equals sign in SECRET_SKILL_VALUE. Reply with that value alone as plain text; do not include the key, equals sign, labels, quotes or formatting.', sid)
+            result = await loop.send('Read the example skill exactly once with its available reader, then extract only the value to the right of the equals sign in SECRET_SKILL_VALUE. Reply with that value alone as plain text; do not include the key, equals sign, labels, quotes or formatting.')
             assert result.status == 'completed' and result.final_text.strip() == 'S42'
             assert calls == ['example'] and provider.calls == 2
     finally:
         provider.report(record_property)
         try:
-            await loop.aclose(drain_timeout_s=.1)
+            await loop.aclose()
         finally:
             await provider.close()
             await store.close()
 
 
 @pytest.mark.parametrize('implemented', [True, False])
-async def test_real_yield_requires_actual_effect_and_statistics_capability(tmp_path, implemented, record_property):
+async def test_real_yield_requires_actual_effect_and_statistics_capability(tmp_path, implemented, record_property, runtime_agent):
     registry = ToolRegistry()
     original = pass_turn.ensure_pass_turn(ToolRegistry()).get('pass_turn')
     name = 'finish_stage' if implemented else 'pass_turn'
@@ -72,7 +73,7 @@ async def test_real_yield_requires_actual_effect_and_statistics_capability(tmp_p
     registry.register(replace(original.definition, name=name),
         FunctionRuntimeTool(handler, ToolRuntimeContract('example.yield', capabilities=('task.yield.v1',))) if implemented else handler)
     provider, store = BoundedProvider(limit=1 if implemented else 2), await SessionStore.open(str(tmp_path / 'yield.db'))
-    loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
+    loop = await runtime_agent(model=provider, store=store, registry=registry,
         config=AgentLoopConfig(max_tokens=2048, max_rounds=3, compactor=None, retry_policy=LLMRetryPolicy(max_attempts=1)))
 
     async def schema(ctx):
@@ -81,10 +82,10 @@ async def test_real_yield_requires_actual_effect_and_statistics_capability(tmp_p
     loop.hooks.register(HookPoint.LLM_BEFORE, schema, name='test.yield-contract')
     try:
         async with asyncio.timeout(150):
-            sid = await loop.new_session()
             result = await loop.send(f'Call {name} exactly once with reason="done", with no assistant text before the call. '
-                                     'If it returns CONTINUE, reply only DONE without any more tools.', sid)
-            assert result.status == 'completed' and result.passed == implemented
+                                     'If it returns CONTINUE, reply only DONE without any more tools.')
+            assert result.status == 'completed'
+            assert bool(result.final_text.strip()) is (not implemented)
             assert len(seen) == 1 and seen[0]['work_tools'] == (0 if implemented else 1)
             assert provider.calls == (1 if implemented else 2)
             if not implemented:
@@ -92,7 +93,7 @@ async def test_real_yield_requires_actual_effect_and_statistics_capability(tmp_p
     finally:
         provider.report(record_property)
         try:
-            await loop.aclose(drain_timeout_s=.1)
+            await loop.aclose()
         finally:
             await provider.close()
             await store.close()

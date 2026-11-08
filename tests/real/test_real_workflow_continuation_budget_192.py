@@ -1,73 +1,45 @@
-"""Actual round-limit continuation reports every provider request exactly once."""
-
-from __future__ import annotations
-
-import asyncio
-
+"""Workflow continuations count every real node request in the current budget."""
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, ToolDefinition, ToolRegistry
+from power_loop.agent.runtime_store import now_ms
+from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.pricing import Free
-from power_loop.tools.registry import ToolRegistry
-from power_loop.workflow import SharedBudget, create_workflow
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
-pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
+pytestmark=[pytest.mark.real_llm,pytest.mark.asyncio]
 
 
-async def test_real_continuation_budget_equals_actual_reported_requests(tmp_path, record_property):
-    store = await SessionStore.open(str(tmp_path / "continued.db"))
-    provider = BoundedProvider(limit=6)
-    tools = ToolRegistry()
-    touched = []
-
+async def test_real_continuation_budget_equals_actual_reported_requests(runtime_agent,record_property):
+    node_responses=[]
+    class Provider(BoundedProvider):
+        async def complete(self,request,**kwargs):
+            response=await super().complete(request,**kwargs)
+            if get_session_id()!=self.root_sid:
+                node_responses.append(response)
+            return response
+    provider,registry=Provider(limit=8),ToolRegistry()
+    touched=[]
     async def touch():
         touched.append(True)
-        return "done; the result code is 42"
-
-    tools.register(
-        ToolDefinition(
-            name="touch", description="Read the result code once.", input_schema={"type": "object", "properties": {}}
-        , pricing=Free("test_fixture")),
-        touch,
-    )
-    loop = StatefulAgentLoop(
-        llm=provider, store=store, tool_registry=tools, config=AgentLoopConfig(max_tokens=2048, max_rounds=2)
-    )
-    pool = SharedBudget(50000)
-    pool.commit({"total_tokens": 13})
-    spec = {
-        "name": "real-continuation-budget",
-        "root": {
-            "type": "agent",
-            "id": "calculate",
-            "input": "Read the result code once with touch, then report it.",
-            "spec": {
-                "name": "calculate",
-                "tools": ["touch"],
-                "max_rounds": 1,
-                "system_prompt": "On the first task turn call touch exactly once with empty arguments. "
-                "When touch has a recorded result anywhere in the conversation, do not call it again; "
-                "return exactly 42 in assistant text. If asked to continue or finalize, return 42 without tools.",
-            },
-            "continuation": {"max_continuations": 1, "extra_rounds": 2, "gate": "always"},
-        },
-    }
+        return 'done; the result code is 42'
+    registry.register(ToolDefinition('touch','Read the result code once.',input_schema={'type':'object','properties':{}},pricing=Free('fixture')),touch)
+    agent=await runtime_agent(model=provider,registry=registry,config=AgentLoopConfig(compactor=None,max_tokens=2048))
+    provider.root_sid=agent.target.session_id
+    spec={'name':'real-continuation-budget','budget':{'max_tokens':50000},'root':{
+        'type':'agent','id':'calculate','input':'Read the result code with touch and report it.',
+        'spec':{'name':'calculate','tools':['touch'],'max_rounds':1,'system_prompt':
+            'First call touch exactly once. After its recorded result, return exactly 42 without tools. If asked to finalize, return 42.'},
+        'continuation':{'max_continuations':1,'extra_rounds':2,'gate':'always'}}}
     try:
-        async with asyncio.timeout(150):
-            result = await create_workflow(spec, parent_loop=loop, allowed_tools=["touch"], budget=pool).run()
-            actual = sum(int(getattr(response.token_usage, "total_tokens", 0) or 0) for response in provider.responses)
-            record_property("actual_reported_tokens", actual)
-            record_property("shared_pool_spent", pool.spent)
-            record_property("aggregate_usage", result.usage.get("total_tokens", 0))
-            assert result.status == "completed" and result.final is not None and "42" in result.final.text, result
-            assert len(touched) == 1
-            assert 3 <= provider.calls <= 6
-            assert pool.spent == 13 + actual, (pool.spent, actual, result.usage)
-            assert result.usage["total_tokens"] == actual
-            assert result.final.usage["total_tokens"] == actual
+        handle=await agent.runtime.client.workflow(agent.target,spec,message_id='original',actor=agent.actor)
+        result=await handle.wait(deadline_ms=now_ms()+120000)
+        assert result.status=='completed' and '42' in result.results['calculate'].text
+        actual=sum(r.token_usage.total_tokens for r in node_responses)
+        assert len(touched)==1 and len(node_responses)>=2
+        assert result.usage['total_tokens']==result.results['calculate'].usage['total_tokens']==actual>0
+        record_property('actual_node_tokens',actual)
+        assert (await agent.runtime.store._db.fetchone(f"SELECT COUNT(*) AS n FROM {agent.runtime.store.table_prefix}jobs WHERE kind='workflow_node'"))['n']==1
     finally:
         provider.report(record_property)
-        await provider.close()
-        await store.close()

@@ -171,7 +171,7 @@ async def _inbox(manager, tx, source, delivery):
     row = await tx.fetchone(f'SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?',
                             (delivery[1].get('main_session_id', source['session_id']), delivery[0]['event_id']))
     if (row is None or row['kind'] != 'original_call_outcome' or row['mode'] != 'queue'
-            or row['status'] not in ('pending', 'claimed', 'delivered', 'transferred') or row['content'] != render(delivery[1]['public'])):
+            or row['status'] not in ('pending', 'claimed', 'delivered', 'transferred') or row['content'] != _json(render(delivery[1]['public']))):
         raise JobError('abort_outcome_inbox_mismatch')
     if row['status'] == 'transferred':
         from .controller_handoff import identity
@@ -239,12 +239,12 @@ async def uses_batch_route(manager, tx, source, closed):
     return True
 
 
-async def reconcile(loop,actor,source_job_id):
-    return await _reconcile(loop,actor,source_job_id,permit=None)
+async def reconcile(runtime,actor,source_job_id):
+    return await _reconcile(runtime,actor,source_job_id,permit=None)
 
 
 @_verify_stored
-async def _reconcile(loop, actor, source_job_id, *, permit):
+async def _reconcile(runtime, actor, source_job_id, *, permit):
     """One original main batch: atomic negative result, notice and disposition."""
     from .execution_membership import proof
     from .managed_completion import _host_only
@@ -253,8 +253,8 @@ async def _reconcile(loop, actor, source_job_id, *, permit):
     from .tool_call_plans import _event
     if permit is None:
         _host_only()
-    runtime = getattr(loop, 'task_runtime', None)
-    if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
+    from .task_runtime import TaskRuntime
+    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
         raise JobError('task_runtime_required')
     manager = runtime.manager
     async with manager._write() as tx:
@@ -282,10 +282,8 @@ async def _reconcile(loop, actor, source_job_id, *, permit):
             result = await result_event(manager, tx, source)
             data = await _notice_value(manager, tx, source, result)
             key = notice_id(manager, source)
-            columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
-            await manager.store.signal_changes(tx, actor.session_id, "inbox")
-            await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
-                (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(data['public']), manager.now()))
+            from .result_notices import accept
+            await accept(manager, tx, actor, source['root_job_id'], key, 'original_call_outcome', render(data['public']))
             await _event(manager, tx, key, source, 'source_abort_delivery', data)
             await tx.set_event_recipient(key, actor.session_id)
             expected = await expected_disposition(manager, tx, source, closed)
@@ -298,18 +296,12 @@ async def _reconcile(loop, actor, source_job_id, *, permit):
         disposition = await require_disposition(manager, tx, source, await model(manager, tx, source))
         result = await result_event(manager, tx, source)
         delivery = await notice(manager, tx, source, result)
-        inbox = await _inbox(manager, tx, source, delivery)
+        await _inbox(manager, tx, source, delivery)
         route = ({'main_session_id':actor.session_id} if 'review_owner' not in delivery[1]
                  else {'review_session_id':actor.session_id,'review_owner':delivery[1]['review_owner']})
         response = {'source_job_id': source_job_id, 'mode': MODE, 'disposition': disposition,
                     'notices': [{'notification_id': delivery[0]['event_id'], **route}],
                     'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}
-    if inbox['status'] == 'pending':
-        try:
-            loop._note_committed_inbox(actor.session_id)
-        except Exception:
-            import logging
-            logging.getLogger(__name__).exception('Original batch outcome queued; local hint failed: %s', delivery[0]['event_id'])
     return response
 
 

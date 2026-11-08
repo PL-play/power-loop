@@ -662,6 +662,8 @@ class TaskRuntime:
                     await save_wait(input_start, tx, binding, evidence)
                     finalized = True
                 else:
+                    if binding.resource_evidence.get("_runtime_error_code") is not None:
+                        evidence["error_code"] = binding.resource_evidence["_runtime_error_code"]
                     public = input_start.public_result(evidence)
                     from dataclasses import replace
 

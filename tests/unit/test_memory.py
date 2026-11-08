@@ -28,7 +28,6 @@ from power_loop import (
     HookPoint,
     MemorySnapshot,
     SessionStore,
-    StatefulAgentLoop,
 )
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.hook_contexts import MemoryRecalledCtx
@@ -77,9 +76,12 @@ class _FakeMemory:
         self.remembered.append(snapshot)
 
 
-def _new_loop(*, llm, store, bus, memory=None, hooks=None) -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=llm, store=store, event_bus=bus, hooks=hooks,
+async def _new_loop(runtime_agent, *, llm, store, bus, memory=None, hooks=None):
+    hooks = hooks or AgentHooks()
+    llm.before_sanitize = []
+    hooks.register(HookPoint.LLM_BEFORE, lambda ctx: llm.before_sanitize.append([dict(m) for m in ctx.messages]), order=200)
+    return await runtime_agent(
+        model=llm, store=store, event_bus=bus, hooks=hooks,
         config=AgentLoopConfig(
             system_prompt="sp", max_rounds=1, compactor=None, memory=memory,
         ),
@@ -90,7 +92,7 @@ def _new_loop(*, llm, store, bus, memory=None, hooks=None) -> StatefulAgentLoop:
 
 
 @pytest.mark.asyncio
-async def test_recalled_messages_injected_at_tail_and_tagged() -> None:
+async def test_recalled_messages_injected_at_tail_and_tagged(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecordingLLM()
@@ -101,22 +103,23 @@ async def test_recalled_messages_injected_at_tail_and_tagged() -> None:
             {"content": "user prefers Chinese replies"},
             {"role": "user", "name": "leftover", "content": "user lives in Shanghai"},
         ])
-        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
+        loop = await _new_loop(runtime_agent, llm=llm, store=store, bus=bus, memory=mem)
 
-        sid = await loop.new_session()
-        await loop.send("hi", session_id=sid)
+        sid = loop.target.session_id
+        await loop.send("hi")
 
         assert mem.recall_calls == 1
-        sent = llm.seen[0]
+        sent = llm.before_sanitize[0]
         # Find the memory_* messages
         mem_msgs = [m for m in sent if str(m.get("name") or "").startswith("memory_")]
         assert len(mem_msgs) == 2
         assert all(m["role"] == "system" for m in mem_msgs)
         assert "Chinese" in mem_msgs[0]["content"]
+        assert "user prefers Chinese replies" in str(llm.seen[0]) and "user lives in Shanghai" in str(llm.seen[0])
         # Default position is TAIL: memory comes AFTER the user message so the
         # prior-history prefix stays byte-stable / prefix-cacheable.
         first_user_idx = next(i for i, m in enumerate(sent) if m.get("role") == "user")
-        first_mem_idx = min(i for i, m in enumerate(sent) if str(m.get("name") or "").startswith("memory_"))
+        first_mem_idx = min(i for i, m in enumerate(sent) if m in mem_msgs)
         assert first_user_idx < first_mem_idx
         # Memory must NOT leak into persisted history (ephemeral injection).
         rows = await store.load_active_messages(sid)
@@ -127,6 +130,7 @@ async def test_recalled_messages_injected_at_tail_and_tagged() -> None:
         assert recall_events[0].payload["returned"] == 2
         assert recall_events[0].payload["injected"] == 2
     finally:
+        await loop.aclose()
         await store.close()
 
 
@@ -134,7 +138,7 @@ async def test_recalled_messages_injected_at_tail_and_tagged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recall_failure_is_soft_and_emits_event() -> None:
+async def test_recall_failure_is_soft_and_emits_event(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecordingLLM()
@@ -142,19 +146,19 @@ async def test_recall_failure_is_soft_and_emits_event() -> None:
         events: list = []
         bus.subscribe(None, lambda e: events.append(e))
         mem = _FakeMemory(recall_raises=RuntimeError("backend down"))
-        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
+        loop = await _new_loop(runtime_agent, llm=llm, store=store, bus=bus, memory=mem)
 
-        sid = await loop.new_session()
-        r = await loop.send("hi", session_id=sid)
+        r = await loop.send("hi")
         assert r.status == "completed"
 
         # No memory_* messages reached the LLM.
-        assert not any(str(m.get("name") or "").startswith("memory_") for m in llm.seen[0])
+        assert not any("secret to redact" in str(m.get("content", "")) for m in llm.seen[0])
         failed = [e for e in events if e.type == AgentEventType.MEMORY_FAILED
                   and e.payload.get("phase") == "recall"]
         assert len(failed) == 1
         assert failed[0].payload["error_type"] == "RuntimeError"
     finally:
+        await loop.aclose()
         await store.close()
 
 
@@ -162,7 +166,7 @@ async def test_recall_failure_is_soft_and_emits_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_remember_failure_does_not_affect_result() -> None:
+async def test_remember_failure_does_not_affect_result(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecordingLLM()
@@ -170,10 +174,9 @@ async def test_remember_failure_does_not_affect_result() -> None:
         events: list = []
         bus.subscribe(None, lambda e: events.append(e))
         mem = _FakeMemory(remember_raises=RuntimeError("disk full"))
-        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
+        loop = await _new_loop(runtime_agent, llm=llm, store=store, bus=bus, memory=mem)
 
-        sid = await loop.new_session()
-        r = await loop.send("hi", session_id=sid)
+        r = await loop.send("hi")
         assert r.status == "completed"
         assert r.final_text == "ok"
 
@@ -181,20 +184,20 @@ async def test_remember_failure_does_not_affect_result() -> None:
                   and e.payload.get("phase") == "remember"]
         assert len(failed) == 1
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_remember_receives_snapshot_with_history_and_status() -> None:
+async def test_remember_receives_snapshot_with_history_and_status(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecordingLLM(response_text="done")
         bus = AgentEventBus()
         mem = _FakeMemory()
-        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
+        loop = await _new_loop(runtime_agent, llm=llm, store=store, bus=bus, memory=mem)
 
-        sid = await loop.new_session()
-        await loop.send("hi", session_id=sid)
+        await loop.send("hi")
         assert len(mem.remembered) == 1
         snap = mem.remembered[0]
         assert snap.status == "completed"
@@ -202,6 +205,7 @@ async def test_remember_receives_snapshot_with_history_and_status() -> None:
         assert any(m.get("role") == "user" and m.get("content") == "hi" for m in snap.messages)
         assert snap.rounds >= 1
     finally:
+        await loop.aclose()
         await store.close()
 
 
@@ -209,7 +213,7 @@ async def test_remember_receives_snapshot_with_history_and_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_memory_recalled_hook_skip_drops_injection() -> None:
+async def test_memory_recalled_hook_skip_drops_injection(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecordingLLM()
@@ -224,15 +228,15 @@ async def test_memory_recalled_hook_skip_drops_injection() -> None:
         hooks.register(HookPoint.MEMORY_RECALLED, skip_all)
 
         mem = _FakeMemory(to_recall=[{"content": "secret to redact"}])
-        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem, hooks=hooks)
+        loop = await _new_loop(runtime_agent, llm=llm, store=store, bus=bus, memory=mem, hooks=hooks)
 
-        sid = await loop.new_session()
-        await loop.send("hi", session_id=sid)
-        assert not any(str(m.get("name") or "").startswith("memory_") for m in llm.seen[0])
+        await loop.send("hi")
+        assert not any("secret to redact" in str(m.get("content", "")) for m in llm.seen[0])
         recall_events = [e for e in events if e.type == AgentEventType.MEMORY_RECALLED]
         assert recall_events[0].payload["returned"] == 1
         assert recall_events[0].payload["injected"] == 0
     finally:
+        await loop.aclose()
         await store.close()
 
 
@@ -240,7 +244,7 @@ async def test_memory_recalled_hook_skip_drops_injection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_memory_recalled_hook_filter_subset_injects_remainder() -> None:
+async def test_memory_recalled_hook_filter_subset_injects_remainder(runtime_agent) -> None:
     """A MEMORY_RECALLED handler that MUTATES ctx.recalled to a subset (drops some
     entries) without SKIP → only the remaining entries are injected, and the
     'injected' telemetry reflects the filtered count."""
@@ -261,19 +265,20 @@ async def test_memory_recalled_hook_filter_subset_injects_remainder() -> None:
             {"content": "keep this one"},
             {"content": "redact this one"},
         ])
-        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem, hooks=hooks)
-        sid = await loop.new_session()
-        await loop.send("hi", session_id=sid)
+        loop = await _new_loop(runtime_agent, llm=llm, store=store, bus=bus, memory=mem, hooks=hooks)
+        await loop.send("hi")
 
-        mem_msgs = [m for m in llm.seen[0] if str(m.get("name") or "").startswith("memory_")]
+        mem_msgs = [m for m in llm.before_sanitize[0] if str(m.get("name") or "").startswith("memory_")]
         assert len(mem_msgs) == 1
         assert "keep this one" in mem_msgs[0]["content"]
+        assert "keep this one" in str(llm.seen[0])
         assert all("redact this one" not in (m.get("content") or "") for m in llm.seen[0])
 
         recall_events = [e for e in events if e.type == AgentEventType.MEMORY_RECALLED]
         assert recall_events[0].payload["returned"] == 2
         assert recall_events[0].payload["injected"] == 1  # filtered down to 1
     finally:
+        await loop.aclose()
         await store.close()
 
 

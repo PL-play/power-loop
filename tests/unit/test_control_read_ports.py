@@ -34,7 +34,7 @@ async def originals(manager):
 async def test_membership_usage_and_call_lookup_have_no_control_writer(registry_runtime, monkeypatch):
     store, manager, actor, root, parent, _, _ = registry_runtime
     origin = await call(store, actor)
-    child = await manager.register_job(actor, kind="subagent", parent=parent, call_ref=origin,
+    child = await manager.register_job(actor, kind="subagent", session_id=await store.create_session(parent_session_id=actor.session_id), parent=parent, call_ref=origin,
         tool_call_id="call-1", independent=True)
     before = await originals(manager)
     database = manager.db
@@ -64,8 +64,7 @@ async def test_membership_usage_and_call_lookup_have_no_control_writer(registry_
 
 async def test_root_provenance_and_owned_transcript_bindings_have_no_control_writer(root_case, monkeypatch):
     c = root_case
-    with c.runtime.root_context(c.sid, namespace="test.read", payload={"request_id": "read-only"}):
-        assert (await c.loop.send("one actual root", c.sid)).status == "completed"
+    assert (await c.send("one actual root", source={"namespace":"test.read", "payload":{"request_id":"read-only"}})).status == "completed"
     [root] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE parent_job_id IS NULL")
     before, calls = await originals(c.manager), list(c.model.calls)
     with monkeypatch.context() as patch:
@@ -111,7 +110,7 @@ async def test_paused_execution_inspection_allows_a_stop_to_commit(registry_runt
 
 
 async def test_read_inside_an_explicit_joined_write_uses_its_existing_connection(registry_runtime, monkeypatch):
-    _, manager, actor, root, parent, _, _ = registry_runtime
+    store, manager, actor, root, parent, _, _ = registry_runtime
     before = await originals(manager)
 
     @asynccontextmanager
@@ -119,9 +118,11 @@ async def test_read_inside_an_explicit_joined_write_uses_its_existing_connection
         raise AssertionError("joined read must reuse its existing transaction")
         yield
 
+    child_sid = await store.create_session(parent_session_id=actor.session_id)
+    before = await originals(manager)
     with pytest.raises(OSError, match="caller transaction rolled back"):
         async with manager.joined_write():
-            child = await manager.register_job(actor, kind="subagent", parent=parent, system_key="uncommitted-child")
+            child = await manager.register_job(actor, kind="subagent", session_id=child_sid, parent=parent, system_key="uncommitted-child")
             lease = await manager.claim_job(actor, child.job.job_id, executor_id="joined-child", boot_id="boot", expected_version=1)
             with monkeypatch.context() as patch:
                 patch.setattr(manager.db, "read_snapshot", forbidden_snapshot)

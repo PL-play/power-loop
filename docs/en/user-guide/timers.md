@@ -1,84 +1,52 @@
-# Durable Timers
+# Timers in runtime 11
 
-[中文](../../zh/user-guide/timers.md) | [User Guide](../index.md)
+A deployment uses one `schedule_wakeup` tool and one authoritative `TimerBackend`.
+The default `Runtime` binds `StoreTimerBackend` and starts/stops `TimerRunner` with
+its worker. No Redis is required. A standalone `RuntimeClient` starts no driver.
+Set `timers_enabled=False` to disable timers. An explicit host backend requires
+an explicit driver implementing `start`, `stop`, and `status`; startup refuses an
+unready driver rather than falling back to local storage.
 
-Timers let an agent (or your host) say *"wake this session at time T with this note."* They are **durable** — a row in the `timers` table, not an in-memory task — so they survive process restarts. Firing is just a normal turn: the note is delivered into the session via `follow_up` (a plain `send` when idle, a queued injection when mid-run).
+The model calls `schedule_wakeup(action="schedule", delay_seconds=60, note="check")`,
+`action="list"`, or `action="cancel", timer_id=...`. Add `every_seconds` for a
+recurring timer. Only main agents may create timers; query and cancel also check
+identity. The SDK supplies the backend with a trusted `TimerContext`: store,
+session, actor, original job/tool call, stable operation ID, and host context.
+These fields never come from model arguments.
 
-## Creating timers
-
-Two ways, both writing the same rows.
-
-**The agent schedules its own wake-ups** via the default tool `schedule_wakeup` (a single tool whose `action` selects schedule / list / cancel):
-
-```python
-from power_loop import create_default_tool_registry, get_tool_definitions
-from power_loop.tools import DEFAULT_TOOL_HANDLERS
-
-registry = create_default_tool_registry(preset="core", workspace_dir=ws)
-for d in get_tool_definitions(include=["schedule_wakeup"]):   # optionally add "current_time"
-    registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
-# Now the model can call:
-#   schedule_wakeup(action="schedule", delay_seconds=3600, note="check the build")
-#   schedule_wakeup(action="schedule", delay_seconds=60, note="heartbeat", every_seconds=300)
-#   schedule_wakeup(action="list")
-#   schedule_wakeup(action="cancel", timer_id=1)
-```
-
-**The host schedules externally** via the loop API:
+Hosts can use the same backend:
 
 ```python
-t = loop.schedule_timer(sid, delay_s=3600, note="check the report")   # or due_at_ms=…
-loop.list_timers(sid)
-loop.cancel_timer(sid, t.timer_id)
+from power_loop import TimerContext
+source = TimerContext(store.store_id, target.session_id, authenticated_actor)
+timer = await runtime.timer_backend.create(source, delay_s=60, note="check")
+items = await runtime.timer_backend.list(source, statuses=("armed", "firing"))
+await runtime.timer_backend.cancel(source, timer.timer_id)
 ```
 
-## Firing them: TimerRunner
+The driver takes bounded indexed due batches, conditionally claims an occurrence,
+and calls `RuntimeClient.append` with a stable message ID. It waits for acceptance
+only. Busy sessions consume the note at a round boundary; idle sessions start a
+turn. A slow model never keeps the timer scan open. Periodic timers schedule the
+next occurrence from delivery time plus interval; missed intervals are not replayed.
+Cancellation prevents future occurrences, including rearming a claimed periodic
+timer. It does not cancel an input already accepted by the runtime.
 
-Timers only fire while a `TimerRunner` is running — it scans the store for due rows and delivers them. (If you poll `loop.store.due_timers()` from your own scheduler, you don't need it.)
+Pass `AgentHooks` explicitly to the runtime/driver for `TIMER_FIRE`:
+`CONTINUE` delivers, `SKIP` skips this occurrence, `BREAK` cancels, and positive
+`postpone_s` delays it. The hook may replace `ctx.message`. A custom driver can
+receive an `AgentEventBus` through `TimerRunner(event_bus=...)` for result events.
+Driver `status()` reports readiness, last scan/error and the latest bounded due page.
 
-```python
-from power_loop import TimerRunner
+On infrastructure failure an occurrence may be lost, duplicated or unknown.
+Stale claimed occurrences are ended without replay; periodic future occurrences
+can continue. Terminal rows retain the existing seven-day cleanup policy.
 
-runner = TimerRunner(loop)
-await runner.start()    # re-arms stale rows, then scans every scan_interval
-# ...
-await runner.stop()
-```
+DeepTalk uses `ApiTimerBackend` and dispatcher readiness. The API retains business
+authorization, limits, and a new run/budget for each wake; SDK timers are unused.
+See [runnable example 26](../../../examples/26_timers.py) and
+[the runtime contract](../../runtime-11.md).
 
-See [example 26](../../../examples/26_timers.py).
-
-## One-shot vs recurring
-
-Recurrence is declared at creation. No `interval` → one-shot (`firing → fired`). Set `every_seconds` (tool) / `interval_s` (API) → the timer re-arms at fire-time + interval (fixed-delay) until cancelled. **Cancelling is the only way a recurring timer ends.**
-
-```python
-loop.schedule_timer(sid, delay_s=60, note="heartbeat", interval_s=300)   # every 5 min
-```
-
-## The TIMER_FIRE hook — the orchestrator's veto point
-
-Before every delivery the runner runs `HookPoint.TIMER_FIRE` with a `TimerFireCtx`. The hook decides what happens:
-
-```python
-from power_loop import HookDirective, HookPoint
-
-def gate(ctx):                 # ctx: TimerFireCtx(session_id, timer_id, note, due_at, message)
-    if system_is_busy():
-        ctx.postpone_s = 300   # re-arm 5 min later
-    # ctx.directive = HookDirective.SKIP    # drop THIS firing (recurring still re-arms)
-    # ctx.directive = HookDirective.BREAK   # cancel the timer entirely
-
-hooks.register(HookPoint.TIMER_FIRE, gate)
-```
-
-No hook registered → deliver. This is also where you **dedupe after a re-fire** (see below).
-
-## Delivery semantics
-
-Timers are **at-least-once**. A claim is a compare-and-set (`armed → firing`); a row stuck in `firing` because a process died mid-fire is re-armed by the recovery sweep and may deliver twice. A *live* slow delivery is **not** reclaimed — the runner heartbeats the `firing` row while `follow_up` runs (cadence = a quarter of `stale_firing_s`, overridable via `TimerRunner(heartbeat_interval_s=…)`). If exactly-once matters for a side effect, dedupe in the `TIMER_FIRE` hook.
-
-## See also
-
-- [Hooks](hooks.md) — the full `TIMER_FIRE` contract
-- [Sessions](sessions.md) — `follow_up` and the durable store
-- [Workflows](workflows.md) — detached runs use a timer to wake the parent
+Register finite child review explicitly with `register_wait_handoff_tool(registry, policy=WaitPolicy(deadline_at_ms=...))`.
+The factory freezes the deadline. The original main can continue, cancel or defer the child, within its original deadline.
+Review reuses the persisted interaction and current TimerBackend; an unknown timer creation is never replayed automatically.

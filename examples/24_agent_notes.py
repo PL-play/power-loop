@@ -1,82 +1,49 @@
-"""24 · Agent 自主笔记 / Agent-authored notes: self-managed persistent memory
-
-What you learn / 你将学到
---------------------------
-- ``note(action=add|update|delete)`` 写入，``note(action=list)`` 读回：模型自己决定记什么
-  / write with ``note(action=add|update|delete)``, read back explicitly with ``note(action=list)``; the model decides what to remember
-- ``NoteMemory``：把笔记作为 system 消息在每次 send 注入
-  / a MemoryProvider that injects the session's notes every send
-- ``NotesPolicy``：容量上限、单条长度、注入预算；默认 **reject**（满了必须先删/合并），
-  可选 ``eviction="fifo"`` / capacity bounds; default **reject** when full, optional fifo
-- 笔记存在 session store 的 ``notes`` 表里，随 ``close_session`` 级联删除
-  / notes live in the session store and cascade-delete with the session
-
-和 MemoryProvider 的关系 / Relationship to MemoryProvider
----------------------------------------------------------
-``MemoryProvider`` 是被动记忆（边界自动 recall/remember）；笔记是**自主记忆**——
-模型在对话中途用工具增删改，``NoteMemory.recall()`` 只负责"让模型每轮都看到
-自己的笔记"，``remember()`` 是 no-op（写入早已实时发生）。
-
-Run / 运行
-----------
-    python examples/24_agent_notes.py        # 需要 .env 配置 POWER_LOOP_*
-"""
-
-from __future__ import annotations
-
+"""24 · Notes use the current execution's store; a later input recalls them."""
 import asyncio
-from tempfile import TemporaryDirectory
+import json
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentLoopConfig,
+    LLMResponse,
+    LLMService,
     NoteMemory,
     NotesPolicy,
-    StatefulAgentLoop,
+    SessionStore,
     create_default_tool_registry,
 )
-from power_loop.runtime.store.store import SessionStore
 
 
-async def main() -> None:
-    with TemporaryDirectory() as tmp:
-        store = await SessionStore.open(f"{tmp}/sessions.db")
-        policy = NotesPolicy(max_notes=20)  # eviction="reject" 是默认
+class NotesModel(LLMService):
+    def __init__(self):
+        self.calls = 0
 
-        loop = StatefulAgentLoop(
-            llm=make_llm(),
-            store=store,  # 关键：provider 和 loop 共享同一个 store
-            config=AgentLoopConfig(
-                system_prompt="You are a helpful assistant with persistent notes.",
-                memory=NoteMemory(store, policy=policy),
-                notes_policy=policy,
-            ),
-            tool_registry=create_default_tool_registry(
-                include=["note"],
-                workspace_dir=tmp,
-            ),
-        )
+    async def complete(self, request, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(raw_text='', tool_calls=[{'id':'note','type':'function','function':{
+                'name':'note','arguments':json.dumps({'action':'add','content':'BLUEBIRD deploys to ap-southeast-1'})}}])
+        assert 'BLUEBIRD' in str(request.messages)
+        return LLMResponse(raw_text='BLUEBIRD / ap-southeast-1')
 
-        sid = await loop.new_session()
+    async def close(self):
+        pass
 
-        # 第一轮：让模型记点东西 / round 1: ask the model to take a note
-        r1 = await loop.send(
-            "请记住：我的项目代号是 BLUEBIRD，部署目标是 ap-southeast-1。"
-            "用你的笔记工具记下来，然后简单确认。",
-            sid,
-        )
-        print("R1:", r1.final_text)
-        for n in await store.list_notes(sid):
-            print(f"  note #{n.note_id} pinned={n.pinned}: {n.content}")
+async def main():
+    store = await SessionStore.open(':memory:')
+    policy = NotesPolicy(max_notes=20)
+    config = AgentLoopConfig(compactor=None, memory=NoteMemory(store, policy=policy), notes_policy=policy)
+    async with demo_runtime(NotesModel(), create_default_tool_registry(include=['note']), store=store, config=config) as (runtime, loop, target, actor):
+        for index, text in enumerate(['Record my project', 'Recall my project']):
+            result = await loop.send(target, text, message_id=f'note-{index}', actor=actor, deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed'
+            print(result.final_text)
+        notes = await store.list_notes(target.session_id)
+        assert len(notes) == 1 and 'BLUEBIRD' in notes[0].content
+        await store.close_session(target.session_id)
+        assert not await store.list_notes(target.session_id)
 
-        # 第二轮：新的 send 自动注入笔记 / round 2: notes are injected automatically
-        r2 = await loop.send("我的项目代号和部署区域是什么？", sid)
-        print("R2:", r2.final_text)
-
-        await loop.close_session(sid)  # notes 级联删除 / notes cascade-delete
-        await loop.aclose()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

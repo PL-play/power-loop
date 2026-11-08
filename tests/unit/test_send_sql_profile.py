@@ -90,8 +90,12 @@ class Profiled:
         self.transactions += 1
         self.tx_sites.append(_sites())
         async with self.db.transaction() as tx:
-            async with self.meter.transaction(tx) if self.meter else nullcontext():
-                yield _Tx(self, tx)
+            measured = _Tx(self, tx)
+            yield measured
+            if measured.before is not None:
+                after = await self.meter.totals(tx)
+                self.meter.max_tx_rows = max(self.meter.max_tx_rows, after[0] - measured.before[0])
+                self.meter.max_tx_bytes = max(self.meter.max_tx_bytes, after[1] - measured.before[1])
 
     @asynccontextmanager
     async def read_snapshot(self):
@@ -119,24 +123,35 @@ class Profiled:
 class _Tx:
     def __init__(self, owner, tx):
         self.owner, self.tx = owner, tx
+        self.before = None
+
+    async def begin_meter(self, sql):
+        # A PostgreSQL snapshot must set isolation before its first query.
+        # Delay instrumentation until after transaction configuration.
+        if self.owner.meter and self.before is None and not sql.lstrip().upper().startswith("SET TRANSACTION"):
+            self.before = await self.owner.meter.totals(self.tx)
 
     def __getattr__(self, name):
         return getattr(self.tx, name)
 
     async def execute(self, sql, params=()):
+        await self.begin_meter(sql)
         self.owner.note(sql)
         return await self.tx.execute(sql, params)
 
     async def execute_flag(self, sql, params=()):
+        await self.begin_meter(sql)
         self.owner.note(sql)
         return await self.tx.execute_flag(sql, params)
 
     async def fetchone(self, sql, params=()):
+        await self.begin_meter(sql)
         result = await self.tx.fetchone(sql, params)
         self.owner.note(sql, 0 if result is None else 1)
         return result
 
     async def fetchall(self, sql, params=()):
+        await self.begin_meter(sql)
         result = await self.tx.fetchall(sql, params)
         self.owner.note(sql, len(result))
         return result
@@ -175,8 +190,12 @@ async def test_send_sql_independent_of_history(registry_store, budgeted):
     # The executor heartbeat follows elapsed wall time, not transcript length.
     # Keep it in all reported costs; compare foreground work for this invariant.
     def foreground(records, sites):
-        return _counts([r for r in records if not _executor_heartbeat(r['chain'])],
-                       [chain for chain in sites if not _executor_heartbeat(chain)])
+        def periodic(chain):
+            return _executor_heartbeat(chain) or any(site.startswith('runtime.timers:') for site in chain)
+        # Timer scans run by wall clock as well. Keep every scan in the raw
+        # whole-request report; compare only foreground history-dependent work.
+        return _counts([r for r in records if not periodic(r['chain'])],
+                       [chain for chain in sites if not periodic(chain)])
     short, long = foreground(short_records, short_tx), foreground(long_records, long_tx)
     for name in ("billing", "control", "control_tx"):
         assert long[name] == short[name], (name, short, long)

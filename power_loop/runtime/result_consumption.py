@@ -21,7 +21,6 @@ async def observe(binding, messages, *, round_index, send_index):
     from .session_controls import ControlReadView
     tx = ControlReadView(manager.db, manager)
     source = binding.resource_evidence["_control_source"]
-    waits = []
     for offset in range(0, len(ids), 100):
         part = ids[offset:offset+100]
         rows = await tx.fetchall(f"SELECT * FROM {manager.store.t.follow_up_queue} "
@@ -37,10 +36,6 @@ async def observe(binding, messages, *, round_index, send_index):
             binding.observed_inputs.add(inbox["item_id"])
             if event is None:
                 continue  # Ordinary append/steer input has no task result to consume.
-            if event["event_type"] == "wait_notification":
-                waits.append(event)
-                binding.observed_inputs.discard(inbox["item_id"])
-                continue
             if event["event_type"] in {"managed_effect_delivery", "source_abort_delivery", "controller_result_delivery"}:
                 target = await manager._authorize(tx, actor, event["job_id"])
                 if event["caller_session_id"] != actor.session_id:
@@ -50,9 +45,7 @@ async def observe(binding, messages, *, round_index, send_index):
                 event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (original_id,))
             if event["event_type"] == "operation" and event["action"] == "nudge":
                 from .node_inputs import input_target
-                from .wait_effects import validate_input
                 target = await input_target(manager, tx, actor, source, event)
-                await validate_input(manager, tx, actor, event)
                 request = json.loads(event["payload_json"])["request"]
                 if request["session_id"] != actor.session_id or source["control_owner_job_id"] != target["job_id"]:
                     raise JobError("input_binding_mismatch")
@@ -65,22 +58,11 @@ async def observe(binding, messages, *, round_index, send_index):
                     raise JobError("result_binding_mismatch")
             else:
                 continue
-            if event["delivery_status"] != "handled":
+            if event["delivery_status"] not in {"handled", "suppressed"}:
                 if len(binding.consumed_inputs) >= 1000 and event["event_id"] not in binding.consumed_inputs:
                     raise JobError("consumed_input_limit")
                 binding.consumed_inputs[event["event_id"]] = (target["job_id"], target["root_job_id"], generation,
                     event["event_type"])
-    if waits:
-        # These observations authorize the real wait decision tool. They are
-        # not consumption acknowledgements and have no handler-exit dependency.
-        from .wait_notifications import prepare_request_observations, record_request_observations
-        _, observations = await prepare_request_observations(manager, tx, actor, binding.lease,
-            source=source, round_index=round_index, send_index=send_index, messages=messages, notices=waits)
-        if observations:
-            async with manager._write() as writer:
-                current = await manager._fence(writer, actor, binding.lease)
-                await record_request_observations(manager, writer, actor, binding.lease,
-                    source=current, observations=observations)
 
 
 async def finish(binding):
@@ -98,7 +80,7 @@ async def finish(binding):
             for event_id, job_id, generation, kind in entries:
                 changed = await tx.update_event(job_id,
                     f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=? AND job_id=? "
-                    "AND delivery_status<>'handled'", (event_id, job_id), obligations=False)
+                    "AND delivery_status NOT IN ('handled','suppressed')", (event_id, job_id), obligations=False)
                 if changed:
                     if kind == "result":
                         await tx.write_job(job_id, f"UPDATE {manager.jobs} SET result_status='handled',version=version+1 "
@@ -154,8 +136,5 @@ async def require_event_handled(manager, tx, event, *, session_id, owner_job_id,
         request = json.loads(event["payload_json"])["request"]
         if request["session_id"] != session_id or request["target"]["job_id"] != owner_job_id:
             raise JobError("required_input_unhandled")
-        from .input_dispositions import read_tx
-        if event["delivery_status"] != "handled" and await read_tx(manager, tx, event) is not None:
-            return
     if event["delivery_status"] != "handled" and not (allow_suppressed and event["delivery_status"] == "suppressed"):
         raise JobError("required_result_unhandled")

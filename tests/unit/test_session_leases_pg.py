@@ -11,7 +11,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 @pytest.fixture
 async def stores(registry_store):
     store, connect = registry_store
-    yield [store] + [await connect(schema="compatible") for _ in range(7)]
+    yield [store] + [await connect(schema="verify") for _ in range(7)]
 
 @pytest.mark.asyncio
 async def test_concurrent_drains_deliver_each_item_exactly_once(stores) -> None:

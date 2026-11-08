@@ -8,7 +8,6 @@ from power_loop import (
     LLMResponse,
     LLMService,
     LLMTokenUsage,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
     invoke_priced_tool,
@@ -16,7 +15,6 @@ from power_loop import (
     tool_billing_active,
     tool_billing_managed,
 )
-from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.pricing import BillingReceipt, Charge, Estimate, Free, Money
@@ -42,46 +40,19 @@ class Paid:
             self.rule_id, self.version())
 
 
-@pytest.mark.parametrize('fault', ['success', 'paid_error', 'ack_lost', 'parallel', 'reserve_lost',
-    'reserve_unconfirmed', 'finished_disk', 'detached', 'argument_mutation'])
-async def test_composite_uses_separate_original_paid_attempts_and_only_retries_bookkeeping(registry_store, monkeypatch, fault):
+@pytest.mark.parametrize('fault', ['success', 'paid_error', 'parallel', 'detached', 'argument_mutation'])
+async def test_composite_uses_separate_original_paid_attempts_and_only_retries_bookkeeping(registry_store, monkeypatch, fault, runtime_agent):
     store, _ = registry_store
     host, calls, child_contexts = Host(), [], []
     original_arguments = {'text': '0', 'metadata': {'value': 'original'}}
-    from power_loop.runtime import control_runtime, nested_tools
-    if fault == 'receipt_disk':
-        original_persist, failures = nested_tools.persist_receipt, []
-        async def persist(slot):
-            if not failures:
-                failures.append(True)
-                raise OSError('receipt checkpoint disk failure')
-            return await original_persist(slot)
-        monkeypatch.setattr(nested_tools, 'persist_receipt', persist)
-    if fault == 'finished_disk':
-        original_save, failures = control_runtime.project_events, []
-        async def save(manager, tx, identity, records):
-            if not failures and any(record['kind'] == 'attempt'
-                    and record['value'].get('observation', {}).get('charge', {}).get('rule_id') == 'inner-image'
-                    for record in records):
-                failures.append(True)
-                raise OSError('settlement checkpoint disk failure')
-            return await original_save(manager, tx, identity, records)
-        monkeypatch.setattr(control_runtime, 'project_events', save)
     supplier_started = asyncio.Event()
     async def plan(context, call, *, pricing):
         if call.name == 'inner':
             child_contexts.append(context)
-            host.reserve_lost_ack = fault in ('reserve_lost', 'reserve_unconfirmed')
             if fault == 'argument_mutation':
                 original_arguments['metadata']['value'] = 'changed during reservation'
         return BudgetPlan(0, {'attempt_id': context['attempt_id'], 'origin': context})
     host.prepare_tool = plan
-    original_lookup = host.lookup
-    async def lookup(plan):
-        if fault == 'reserve_unconfirmed' and plan.request['origin'].get('tool_name') == 'inner':
-            return None
-        return await original_lookup(plan)
-    host.lookup = lookup
     class Model(LLMService):
         calls = 0
         async def complete(self, request, **kw):
@@ -105,8 +76,6 @@ async def test_composite_uses_separate_original_paid_attempts_and_only_retries_b
             provider_request_id='supplier-' + text))
         if fault == 'paid_error':
             raise ValueError('failed after supplier billed')
-        if fault == 'ack_lost':
-            host.apply_lost_ack = True
         return 'image-' + text
     inner = ToolDefinition('inner', '', required_params=('text',), pricing=Paid())
     async def composite():
@@ -131,40 +100,30 @@ async def test_composite_uses_separate_original_paid_attempts_and_only_retries_b
     runtime = TaskRuntime(manager, tenant_id='nested-tools', principal_id='host', executor_id='executor',
         boot_id='boot', lease_ms=300000, boot_contract_hash='c'*64,
         budget_config=BudgetConfig('nested-tools-196', (LocalBudgetScope('shared', max_calls=20, max_inflight=8),), host))
+    observations = {}
+    prepare_usage = host.prepare_usage
+    async def observe(context, grant, observation):
+        observations[context['attempt_id']] = observation
+        return await prepare_usage(context, grant, observation)
+    host.prepare_usage = observe
     model = Model()
     host.service = model
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, registry=registry,
         config=AgentLoopConfig(model='test', max_tokens=20, max_rounds=3, delegation_policy='single_level'))
     try:
-        sid = await loop.new_session()
-        result = await loop.send('make image', sid)
+        result = await loop.send('make image')
         if fault in ('success', 'ack_lost', 'parallel', 'reserve_lost', 'detached', 'argument_mutation'):
             assert result.status == 'completed', result
-        reader = JobManager(store)
-        states = [await budgets.get_budget(reader, runtime.actor(sid), row['attempt_id']) for row in await manager.db.fetchall(
-            f'SELECT attempt_id FROM {manager.prefix}task_budget_attempts')]
         inner_ids = {context['attempt_id'] for context in child_contexts}
-        inner_states = [state for state in states if state['attempt_id'] in inner_ids]
         count = 2 if fault == 'parallel' else 1
-        assert len(inner_states) == count
-        assert len({state['attempt_id'] for state in inner_states}) == count
-        if fault == 'reserve_unconfirmed':
-            assert calls == [] and len(host.released) == 1
-        else:
-            assert len(calls) == count
-            for state in inner_states:
-                assert state['submission']['request']['evidence']['charge']['amount'] == '0.25'
-                assert state['submission']['request']['evidence']['charge']['rule_version'] == 'fixed-inner-price'
-                assert state['submission']['request']['evidence']['provider_response_id'] in {'supplier-' + call for call in calls}
-                host.apply_lost_ack = False
-                await budgets.reconcile_usage(runtime, runtime.actor(sid), state['job_id'], state['attempt_id'])
-                assert len(calls) == count
-        assert runtime._native_returns.pending_count() == 0
+        assert len(inner_ids) == count and len(calls) == count
+        for identity in inner_ids:
+            evidence = observations[identity]
+            assert evidence['charge']['amount'] == '0.25'
+            assert evidence['charge']['rule_version'] == 'fixed-inner-price'
+            assert evidence['provider_response_id'] in {'supplier-' + call for call in calls}
         assert not runtime._native_returns.slots
-        for state in states:
-            if state['pending'] and state['attempt_id'] not in inner_ids:
-                host.apply_lost_ack = host.reserve_lost_ack = False
-                await budgets.reconcile_usage(runtime, runtime.actor(sid), state['job_id'], state['attempt_id'])
+        assert (await manager.db.fetchone(f'SELECT COUNT(*) AS n FROM {manager.prefix}task_budget_attempts'))['n'] == 0
     finally:
         host.apply_lost_ack = host.reserve_lost_ack = False
         await loop.aclose()

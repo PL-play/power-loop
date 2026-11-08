@@ -1477,14 +1477,15 @@ class AgentPipeline:
                     # the model. Settle it at zero so a corrected request can run.
                     repair_kind = request_repair_kind(exc)
                     repairable = repair_kind is not None and not any(produced)
+                    http_status = _status_of(exc)
                     rejected = not any(produced) and (repairable or (
-                        model_attempt is None and _status_of(exc) is not None))
+                        http_status is not None and 400 <= http_status < 500))
                     p_est = 0 if rejected or not provider_started else estimate_prompt_tokens(
                         messages=messages, system_prompt=system_prompt, tools=tools)
                     c_est = estimate_completion_tokens(text=produced[0], think=produced[1])
                     self.ctx.add_unreported_usage(p_est, c_est)
                     await observe(model_attempt, usage={"prompt_tokens": p_est, "completion_tokens": c_est,
-                        "total_tokens": p_est + c_est}, estimated=not repairable, error=exc, rejected=repairable)
+                        "total_tokens": p_est + c_est}, estimated=not repairable, error=exc, rejected=rejected)
                     self._emit(
                         AgentEventType.LLM_CALL_COMPLETED,
                         LlmCallCompletedPayload(
@@ -2159,6 +2160,10 @@ class AgentPipeline:
                         else "retry_exhausted"
                     )
                     inner = getattr(exc, "last_error", exc)
+                    from power_loop.runtime.task_runtime import _SEND
+                    binding = _SEND.get()
+                    if binding is not None and getattr(inner, "code", None) is not None:
+                        binding.resource_evidence["_runtime_error_code"] = inner.code
                     self._emit(
                         AgentEventType.LLM_DEGRADED,
                         LlmDegradedPayload(
@@ -2748,6 +2753,10 @@ class AgentPipeline:
         except (LLMRetryExhausted, LLMTimeout) as exc:
             reason = "timeout" if isinstance(exc, LLMTimeout) else "retry_exhausted"
             inner = getattr(exc, "last_error", exc)
+            from power_loop.runtime.task_runtime import _SEND
+            binding = _SEND.get()
+            if binding is not None and getattr(inner, "code", None) is not None:
+                binding.resource_evidence["_runtime_error_code"] = inner.code
             self._emit(AgentEventType.LLM_DEGRADED, LlmDegradedPayload(
                 reason=reason, attempts=getattr(exc, "attempts", 0),
                 error_type=type(inner).__name__, error_message=str(inner)[:500]),

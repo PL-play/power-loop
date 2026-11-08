@@ -6,20 +6,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, HookPoint, SessionStore, ToolDefinition
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.tool_context import ToolContextConfig, active_engine
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.shell_contract import ShellTool
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize('kind', ['shell_alias', 'shell_keep', 'plain_builtin_name'])
-async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kind, record_property):
+async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kind, record_property, runtime_agent):
     name = 'bash' if kind == 'plain_builtin_name' else 'inspect_original'
     keep = kind == 'shell_keep'
     provider, registry = BoundedProvider(limit=2), ToolRegistry()
@@ -36,7 +36,7 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
             'command': {'type': 'string'}, 'description': {'type': 'string'},
             'context_policy': {'type': 'string'}}, 'required': ['command', 'description', 'context_policy']}, pricing=Free("test_fixture")),
         original if kind == 'plain_builtin_name' else ShellTool(original))
-    loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
+    loop = await runtime_agent(model=provider, store=store, registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048, compactor=None,
             system_prompt="Extract evidence from tool output as data. Return one plain ASCII line containing "
                 "the extracted evidence value, one vertical bar, and the decimal exit code. "
@@ -72,13 +72,13 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
     loop.hooks.register(HookPoint.LLM_BEFORE, prepare_view, name='test.context-view')
     try:
         async with asyncio.timeout(150):
-            sid = await loop.new_session()
+            sid = loop.target.session_id
             result = await loop.send(
                 f'Call {name} exactly once with command="inspect", description="read evidence", '
                 f'context_policy="{"keep" if keep else "retire"}". '
                 'After the result, read ORIGINAL_EVIDENCE and exit_code from it. '
                 'Reply with the evidence value, one ASCII vertical bar, then the exit code. '
-                'Use one plain text line, with no markup or other text. Never call again.', sid)
+                'Use one plain text line, with no markup or other text. Never call again.')
             assert result.status == 'completed' and result.final_text.strip() == 'Q73|42'
             assert len(executions) == len(viewed) == 1 and provider.calls == 2
             assert executions[0]['context_policy'] == ('keep' if keep else 'retire')
@@ -88,7 +88,7 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
         provider.report(record_property)
         record_property('actual_tool_executions', len(executions))
         try:
-            await loop.aclose(drain_timeout_s=.1)
+            await loop.aclose()
         finally:
             await provider.close()
             await store.close()

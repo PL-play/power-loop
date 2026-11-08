@@ -18,7 +18,6 @@ from power_loop import (
     LLMNonRetryable,
     LLMRetryExhausted,
     SessionStore,
-    StatefulAgentLoop,
     is_permanent_llm_error,
 )
 from power_loop._vendor.llm_client.interface import (
@@ -162,21 +161,21 @@ class _Broke(LLMService):
 
 
 @pytest.mark.asyncio
-async def test_pipeline_degrades_once_with_reason_non_retryable() -> None:
+async def test_pipeline_rejects_once_with_original_error(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
         bus = AgentEventBus()
         degraded: list[dict] = []
         bus.subscribe(AgentEventType.LLM_DEGRADED, lambda e: degraded.append(dict(e.payload or {})))
         llm = _Broke()
-        loop = StatefulAgentLoop(llm=llm, store=store, event_bus=bus, config=AgentLoopConfig(
+        loop = await runtime_agent(model=llm, store=store, event_bus=bus, config=AgentLoopConfig(
             system_prompt="S", max_rounds=2, compactor=None,
             retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0, total_timeout=None)))
-        sid = await loop.new_session()
-        res = await loop.send("hi", sid)
-        assert res.status == "degraded"
+        res = await loop.send("hi")
+        assert res.status == "failed" and "Insufficient Balance" in res.error
         assert llm.calls == 1
-        assert degraded and degraded[0]["reason"] == "non_retryable"
+        assert len(degraded) == 1 and degraded[0]["reason"] == "non_retryable"
         assert degraded[0]["attempts"] == 1
     finally:
+        await loop.aclose()
         await store.close()

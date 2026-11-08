@@ -29,7 +29,7 @@ async def test_real_completed_send_receipt_survives_reopen_without_paid_replay(m
     assert receipt["result"]["usage"]["total_tokens"] > 0
     # Use the actual original SQLite path and table namespace, with no provision.
     reopened = await SessionStore.open(str(tmp_path / "model-attempts.db"),
-        table_prefix=store.table_prefix, schema="compatible")
+        table_prefix=store.table_prefix, schema="verify")
     try:
         assert await read(JobManager(reopened), runtime.actor(sid), job["job_id"], expected_host_context=source) == receipt
     finally:

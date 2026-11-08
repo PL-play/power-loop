@@ -10,11 +10,11 @@ from power_loop import (
     AgentLoopConfig,
     MessageState,
     SessionStore,
-    StatefulAgentLoop,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.compact import CompactionPlan, DefaultCompactor
+from tests.runtime_fixture import RunningAgent
 
 # ── Fake LLMs ───────────────────────────────────────────────────────────
 
@@ -299,15 +299,10 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 @pytest.mark.asyncio
-async def test_compaction_persists_to_store_and_marks_state(store: SessionStore, monkeypatch) -> None:
+async def test_compaction_persists_to_store_and_marks_state(store: SessionStore, monkeypatch, runtime_agent) -> None:
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     """Long history forces compaction during the next send; verify the store
     has compacted_out rows + a compact_note + a compactions audit row."""
-    sid = await store.create_session(system_prompt="S")
-    # Seed history: 5 user/assistant pairs of fat content + nothing pending.
-    for i in range(5):
-        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
-        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
 
     summary = "<summary>folded earlier turns</summary>"
     final_text = "after compact"
@@ -315,9 +310,14 @@ async def test_compaction_persists_to_store_and_marks_state(store: SessionStore,
 
     compactor = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
     cfg = AgentLoopConfig(system_prompt="S", max_rounds=2, max_tokens=4000, compactor=compactor)
-    loop = StatefulAgentLoop(llm=llm, store=store, config=cfg)
+    loop = await runtime_agent(model=llm, store=store, config=cfg)
+    sid = loop.target.session_id
+    # Seed history: 5 user/assistant pairs of fat content + nothing pending.
+    for i in range(5):
+        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
+        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
 
-    r = await loop.send("kick another round", session_id=sid)
+    r = await loop.send("kick another round")
     assert r.status == "completed"
     assert r.final_text == final_text
 
@@ -339,13 +339,12 @@ async def test_compaction_persists_to_store_and_marks_state(store: SessionStore,
 
 
 @pytest.mark.asyncio
-async def test_no_compactor_means_no_compaction(store: SessionStore) -> None:
+async def test_no_compactor_means_no_compaction(store: SessionStore, runtime_agent) -> None:
     cfg = AgentLoopConfig(max_rounds=1, max_tokens=10, compactor=None)
     llm = _Scripted(responses=[LLMResponse(raw_text="ok")])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=cfg)
-    sid = await loop.new_session()
-    r = await loop.send("hi" * 5000, session_id=sid)
-    assert await store.list_compactions(r.session_id) == []
+    loop = await runtime_agent(model=llm, store=store, config=cfg)
+    await loop.send("hi" * 5000)
+    assert await store.list_compactions(loop.target.session_id) == []
 
 
 @pytest.mark.asyncio
@@ -377,10 +376,6 @@ class _FakeMemory:
 async def _run_compaction(store: SessionStore, *, memory=None, hooks=None, compactor=None) -> tuple[str, list, set]:
     """Seed a fat 5-pair history, send one turn (forcing compaction), return
     (sid, all_rows, set-of-compacted_out-seqs)."""
-    sid = await store.create_session(system_prompt="S")
-    for i in range(5):
-        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
-        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
     llm = _Scripted(responses=[
         LLMResponse(raw_text="<summary>folded earlier turns</summary>"),
         LLMResponse(raw_text="done"),
@@ -390,8 +385,15 @@ async def _run_compaction(store: SessionStore, *, memory=None, hooks=None, compa
         compactor=compactor if compactor is not None else DefaultCompactor(keep_last_n=1),
         memory=memory,
     )
-    loop = StatefulAgentLoop(llm=llm, store=store, config=cfg, hooks=hooks)
-    await loop.send("kick another round", session_id=sid)
+    loop = await RunningAgent(store, llm, config=cfg, hooks=hooks).start()
+    sid = loop.target.session_id
+    for i in range(5):
+        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
+        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
+    try:
+        await loop.send("kick another round")
+    finally:
+        await loop.aclose()
     rows = await store.load_all_messages(sid)
     compacted = {r.seq for r in rows if r.state is MessageState.COMPACTED_OUT}
     return sid, rows, compacted

@@ -42,7 +42,7 @@ def _call_ref(action, request):
 
 def _origin(manager, actor, request, action):
     operation = (request['operation_action'] if action == 'record' else
-        'nudge' if action in ('resume', 'resume_node', 'restore') else 'wait_decision' if action=='decide' else action)
+        'nudge' if action in ('resume', 'resume_node', 'restore') else action)
     return manager._origin_key(actor, operation,
         _call_ref(action, request), request["tool_call_id"], None)
 
@@ -54,9 +54,6 @@ def _domain(action):
     if action == "nudge":
         from . import nudges
         return nudges
-    if action == 'decide':
-        from . import wait_decision_admission
-        return wait_decision_admission
     if action == 'record':
         from . import operation_records
         return operation_records

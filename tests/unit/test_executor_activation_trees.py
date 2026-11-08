@@ -16,7 +16,7 @@ from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.session_controls import ControlTransaction
 
-from .test_executor_drain_trees import spawn_worker, stop_worker, wait_ready
+from .test_executor_drain_trees import stop_worker
 from .test_executor_registry_192 import boot, root, start
 from .test_job_registry_192 import registry_store
 
@@ -257,41 +257,6 @@ async def test_boot_metadata_change_requires_a_fresh_original_proof_before_activ
     assert (await registry.get(c.manager, late))['state'] == 'draining'
 
 
-async def test_real_send_process_cannot_dispatch_old_boot_while_new_activation_proof_is_prepared(boot, tmp_path):
-    c = boot
-    identity, _ = await old_roots(c)
-    jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
-    if c.manager.db.dialect.name == 'sqlite':
-        dsn = next(row['file'] for row in await c.manager.db.fetchall('PRAGMA database_list') if row['name'] == 'main')
-    else:
-        dsn = os.environ['POWER_LOOP_TASK_PG_DSN' if c.manager.db.dialect.name == 'postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
-    marker = tmp_path/'activation-ready.json'
-    config = {'identity': asdict(identity), 'now': c.now[0]}
-    process = await asyncio.create_subprocess_exec(sys.executable, '-m', 'tests.unit._executor_activation_worker',
-        dsn, c.manager.prefix, json.dumps(config), 'hold-prepared', str(marker),
-        cwd=Path(__file__).resolve().parents[2], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    send_process = None
-    try:
-        await wait_ready(process, marker)
-        assert json.loads(marker.read_text()) == {'stage': 'hold-prepared', 'pid': process.pid}
-        assert (await registry.get(c.manager, c.identity))['state'] == 'draining'
-        assert (await registry.get(c.manager, identity))['state'] == 'starting'
-        send_process, _, release, output = await spawn_worker(c, tmp_path, 'new-send')
-        stdout, _ = await asyncio.wait_for(send_process.communicate(), 30)
-        assert send_process.returncode == 0, stdout.decode()
-        assert json.loads(output.read_text()) == {'error': 'executor_not_accepting', 'calls': 0}
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id') == jobs
-        marker.with_suffix('.release').touch()
-        stdout, _ = await asyncio.wait_for(process.communicate(), 30)
-        assert process.returncode == 0, stdout.decode()
-        receipt = json.loads(marker.with_suffix('.done').read_text())
-        assert receipt['executor']['state'] == 'accepting' and not receipt['replayed']
-        release.touch()
-    finally:
-        marker.with_suffix('.release').touch()
-        if send_process is not None:
-            await stop_worker(send_process)
-        await stop_worker(process)
 
 
 async def test_drain_during_activation_proof_cannot_be_revived(boot, monkeypatch):

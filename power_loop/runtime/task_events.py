@@ -99,12 +99,6 @@ async def _events(manager, tx, job, kind, upper=None):
 
 async def _public_header(manager, tx, job, event):
     public = _header(manager, job, event)
-    if event["event_type"] == "operation" and event["action"] == "nudge":
-        from .input_dispositions import identity, read_tx, summary
-        if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (identity(manager, event["event_id"]),)):
-            original = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event["event_id"],))
-            proof = await read_tx(manager, tx, original, required=True)
-            public["input_disposition"] = summary(proof)
     return public
 
 

@@ -15,13 +15,15 @@ from power_loop import (
     HookPoint,
     RuntimeProjector,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
     get_tool_runtime_context,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.runtime.pricing import Free
+from tests.unit.test_job_registry_192 import registry_store
+
+__all__ = ["registry_store"]
 
 
 @dataclass
@@ -97,18 +99,18 @@ def test_tool_runtime_context_outside_loop_is_explicit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_custom_tool_queries_session_and_projects_state(store: SessionStore) -> None:
+async def test_custom_tool_queries_session_and_projects_state(store: SessionStore, runtime_agent) -> None:
     reg = ToolRegistry()
 
     async def inspect_session(**_: Any) -> str:
         runtime = get_tool_runtime_context(required=True)
         session = await runtime.store.get_session(runtime.session_id)
-        messages = await runtime.loop.get_messages(runtime.session_id)
+        messages = await runtime.store.load_active_messages(runtime.session_id)
         await runtime.store.set_runtime_state(
             runtime.session_id,
             "inspect",
             {
-                "owner": session.metadata["owner"],
+                "owner": session.metadata["principal_id"],
                 "message_count": len(messages),
             },
         )
@@ -124,10 +126,10 @@ async def test_custom_tool_queries_session_and_projects_state(store: SessionStor
             LLMResponse(raw_text="saw inspect state"),
         ]
     )
-    loop = StatefulAgentLoop(
-        llm=llm,
+    loop = await runtime_agent(
+        model=llm,
         store=store,
-        tool_registry=reg,
+        registry=reg,
         config=AgentLoopConfig(
             system_prompt="S",
             max_rounds=3,
@@ -135,18 +137,18 @@ async def test_custom_tool_queries_session_and_projects_state(store: SessionStor
             runtime_projectors=(_InspectProjector(),),
         ),
     )
-    sid = await loop.new_session(metadata={"owner": "alice"})
+    sid = loop.target.session_id
 
-    await loop.send("inspect this session", session_id=sid)
+    await loop.send("inspect this session")
 
     state = await store.get_runtime_state(sid, "inspect")
-    assert state == {"owner": "alice", "message_count": 2}
-    assert any("alice" in str(msg.get("content", "")) for msg in llm.calls[1])
+    assert state == {"owner": "host", "message_count": 2}
+    assert any("host" in str(msg.get("content", "")) for msg in llm.calls[1])
     assert any("message_count" in str(msg.get("content", "")) for msg in llm.calls[1])
 
 
 @pytest.mark.asyncio
-async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: SessionStore) -> None:
+async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: SessionStore, runtime_agent) -> None:
     reg = ToolRegistry()
 
     async def save_value(value: str) -> str:
@@ -187,23 +189,25 @@ async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: Session
             LLMResponse(raw_text="done"),
         ]
     )
-    loop = StatefulAgentLoop(
-        llm=llm,
+    loop = await runtime_agent(
+        model=llm,
         store=store,
-        tool_registry=reg,
+        registry=reg,
         hooks=hooks,
         config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
     )
-    sid = await loop.new_session()
+    sid = loop.target.session_id
 
-    await loop.send("save a value", session_id=sid)
+    result = await loop.send("save a value")
+    assert result.status == "completed", result
+    assert await store.get_runtime_state(sid, "inspect") is not None, [(r.role,r.content) for r in await store.load_all_messages(sid)]
 
     assert await store.get_runtime_state(sid, "inspect") == {"value": "hooked-value"}
     assert await store.get_runtime_state(sid, "after_hook") == {"output": "saved hooked-value"}
 
 
 @pytest.mark.asyncio
-async def test_events_observe_custom_tool_lifecycle(store: SessionStore) -> None:
+async def test_events_observe_custom_tool_lifecycle(store: SessionStore, runtime_agent) -> None:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(name="ping_runtime", description="Ping runtime", pricing=Free("test_fixture")),
@@ -223,18 +227,72 @@ async def test_events_observe_custom_tool_lifecycle(store: SessionStore) -> None
             LLMResponse(raw_text="done"),
         ]
     )
-    loop = StatefulAgentLoop(
-        llm=llm,
+    loop = await runtime_agent(
+        model=llm,
         store=store,
-        tool_registry=reg,
+        registry=reg,
         event_bus=bus,
         config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
     )
-    sid = await loop.new_session()
 
-    await loop.send("ping", session_id=sid)
+    await loop.send("ping")
 
     assert seen == [
         (AgentEventType.TOOL_CALL_STARTED, "ping_runtime"),
         (AgentEventType.TOOL_CALL_COMPLETED, "ping_runtime"),
     ]
+
+
+async def test_hook_arguments_price_actual_call_and_retain_original_history(registry_store, runtime_agent):
+    from decimal import Decimal
+
+    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
+    from power_loop.runtime.jobs import JobManager
+    from power_loop.runtime.pricing import Charge, Estimate, Money
+    from power_loop.runtime.task_runtime import TaskRuntime
+    from tests.unit.test_model_budgets_192 import Host
+
+    store, _ = registry_store
+    plans, charges, executed = [], [], []
+    class PerCharacter:
+        rule_id = 'characters'
+        def version(self):
+            return '1'
+        def estimate(self, call):
+            return Estimate(Money(Decimal(len(call.arguments['value'])), 'CNY'), {})
+        def settle(self, call, receipt, error):
+            return Charge(Money(Decimal(len(call.arguments['value'])), 'CNY'), 'exact', {}, self.rule_id, self.version())
+    async def save(value):
+        executed.append(value)
+        return value
+    host = Host()
+    async def plan(context, call, *, pricing):
+        plans.append(dict(call.arguments))
+        assert pricing.estimate(call).maximum.amount == Decimal(5)
+        return BudgetPlan(0, {'attempt_id': context['attempt_id'], 'origin': context})
+    prepare_usage = host.prepare_usage
+    async def capture(context, grant, observation):
+        if context['kind'] == 'tool':
+            charges.append(observation['charge'])
+        return await prepare_usage(context, grant, observation)
+    host.prepare_tool, host.prepare_usage = plan, capture
+    model = _Scripted([_tool_resp('original', 'save', '{"value":"x"}'), LLMResponse(raw_text='done')])
+    host.service = model
+    task_runtime = TaskRuntime(JobManager(store), tenant_id='hook-price', principal_id='host', executor_id='hook',
+        boot_id='boot', boot_contract_hash='a'*64, budget_config=BudgetConfig('hook-price', (LocalBudgetScope('scope', max_calls=10, max_tokens=100000),), host))
+    registry = ToolRegistry()
+    registry.register(ToolDefinition('save', 'save', required_params=('value',), pricing=PerCharacter()), save)
+    hooks = AgentHooks()
+    def replace(ctx):
+        ctx.tool_args['value'] = 'hello'
+    hooks.register(HookPoint.TOOL_BEFORE, replace)
+    agent = await runtime_agent(model=model, store=store, registry=registry, hooks=hooks, task_runtime=task_runtime,
+        config=AgentLoopConfig(model="test", max_tokens=20, max_rounds=3, compactor=None))
+    result = await agent.send('save')
+    assert result.status == 'completed', result
+    assert plans == [{'value':'hello'}] and executed == ['hello']
+    assert len(charges) == 1 and charges[0]['amount'] == '5'
+    rows = await store.load_all_messages(agent.target.session_id)
+    call = next(row for row in rows if row.tool_calls)
+    assert call.tool_calls[0]['id'] == 'original' and call.tool_calls[0]['function']['arguments'] == '{"value":"x"}'
+    assert next(row.content for row in rows if row.tool_call_id == 'original') == 'hello'

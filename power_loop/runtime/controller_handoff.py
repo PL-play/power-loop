@@ -128,23 +128,6 @@ async def _quiescent(manager, tx, actor, owner, source, binding):
     return evidence
 
 
-async def transfer_review(loop, actor, source_job_id):
-    """Host mechanical port after actual exit; enqueue original-main review only."""
-    from .managed_completion import _host_only
-
-    _host_only()
-    runtime = getattr(loop, 'task_runtime', None)
-    if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
-        raise JobError('task_runtime_required')
-    response = await transfer_review_runtime(runtime, actor, source_job_id)
-    try:
-        loop._note_committed_inbox(actor.session_id)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning('Original review handoff persisted; local inbox hint failed')
-    return response
-
-
 async def transfer_review_runtime(runtime, actor, source_job_id):
     """Host-runtime form for mechanical recovery without constructing a model."""
     from .abort_outcomes import _inbox, notice, render, result_event
@@ -188,11 +171,8 @@ async def transfer_review_runtime(runtime, actor, source_job_id):
                 'resource_stop_confirmed': False, 'billing_settled': False}
             await _event(manager, tx, key, source, 'controller_review_handoff', data)
             await tx.set_event_recipient(key, actor.session_id)
-            columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
-            await manager.store.signal_changes(tx, actor.session_id, "inbox")
-            await manager.store.signal_changes(tx, source['session_id'], "inbox")
-            await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
-                (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(public), manager.now()))
+            from .result_notices import accept
+            await accept(manager, tx, actor, main['job_id'], key, 'original_call_outcome', render(public))
             await tx.execute(f"UPDATE {manager.store.t.follow_up_queue} SET status='transferred' WHERE session_id=? AND item_id=? AND status='pending'",
                              (source['session_id'], original[0]['event_id']))
         found = await read(manager, tx, source, result, optional=False)

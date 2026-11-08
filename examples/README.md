@@ -1,80 +1,57 @@
-# Examples
+# Examples (11.0.0)
 
-[Back to docs](../docs/README.md) | [Detailed Guide](../docs/en/tutorials/examples-guide.md) | [详细指南](../docs/zh/tutorials/examples-guide.md)
+Default examples use fixed model responses but execute the actual Runtime, tools and store. No model credentials are needed. Example 18 uses a real provider and requires model configuration/credentials. Example 28 requires a working Docker CLI/daemon. Example 38 requires MCP 2.x (`pip install 'power-loop[mcp]'`). Missing dependencies are errors, not successful validation.
 
-Each file in this directory is a standalone, runnable Python script that teaches **one concept**. They are ordered progressively — start at `00` and move forward.
+`_runtime.py` composes a local factory. The demo host owns and lends its model; deployment factories should resolve their own provider, tools and resources by stable profile. Runtime starts the default timer driver; pure clients do not.
 
-A representative subset is validated by `tests/real/test_examples.py` against a real LLM; every example is import/parse-clean and runnable as `python examples/NN_*.py` with your `.env` configured.
+Run from the SDK directory: `python examples/00_hello_world.py`. Runnable entries are checked by `tests/unit/test_examples_run_208.py`; real format/summary/structured cases are in `tests/real/test_delivery_203.py`.
 
-## List
+| Number | File | Behavior |
+|---|---|---|
+| 00 | [00_hello_world.py](00_hello_world.py) | One Runtime input and its durable result; no credentials or Redis. |
+| 01 | [01_multi_turn_chat.py](01_multi_turn_chat.py) | Reuse a TargetRef and unique message IDs; inspect persisted history. |
+| 02 | [02_tool_calling.py](02_tool_calling.py) | Custom free tool through the Runtime; the demo model is deterministic. |
+| 03 | [03_subagent_delegation.py](03_subagent_delegation.py) | Capacity-one parent accepts a child, finishes, and receives its result. |
+| 04 | [04_compaction.py](04_compaction.py) | Fold old projected sends; preserve the project code in the summary. |
+| 05 | [05_pending_recovery.py](05_pending_recovery.py) | Align an interrupted tool response as unknown; never repeat the action. |
+| 06 | [06_declarative_subagent.py](06_declarative_subagent.py) | A trusted factory command delegates with a frozen AgentSpec. |
+| 07 | [07_human_approval.py](07_human_approval.py) | 中断 / 用户确认 / Human approval: confirm before executing bash |
+| 08 | [08_streaming.py](08_streaming.py) | 流式渲染 / Streaming: subscribe to STREAM_DELTA for typewriter effect |
+| 09 | [09_audit_log.py](09_audit_log.py) | Current worker events to JSONL; close the subscriber and file explicitly. |
+| 10 | [10_concurrent_sessions.py](10_concurrent_sessions.py) | Three Runtime sessions and an independent asynchronous approval queue. |
+| 11 | [11_cross_process_resume.py](11_cross_process_resume.py) | Sequential processes reopen the same store and TargetRef. |
+| 12 | [12_retry_and_cancel.py](12_retry_and_cancel.py) | Unknown calls are not replayed; explicit new input and cancellation. |
+| 13 | [13_memory_sqlite.py](13_memory_sqlite.py) | User-scoped SQLite memory across two independent Runtime sessions. |
+| 14 | [14_structured_card.py](14_structured_card.py) | 结构化输出 / Structured output: LLM emits JSON cards directly |
+| 15 | [15_skills_from_markdown.py](15_skills_from_markdown.py) | Parse skill instructions and supply the resulting config in the factory. |
+| 16 | [16_custom_compactor.py](16_custom_compactor.py) | A custom FoldStrategy that deliberately discards old details. |
+| 17 | [17_custom_memory_provider.py](17_custom_memory_provider.py) | A host memory adapter over an explicitly supplied API client. |
+| 18 | [18_multi_provider.py](18_multi_provider.py) | 多 Provider / Multi-provider: use three LLM providers or switch on demand |
+| 19 | [19_full_chatbot.py](19_full_chatbot.py) | Tools, memory, hooks and persisted history on a rebuilt local Runtime. |
+| 20 | [20_default_tools.py](20_default_tools.py) | File, shell, skill and background tools with explicit workspace grants. |
+| 21 | [21_request_user_input.py](21_request_user_input.py) | A paused task is answered by JobRef, interaction ID and wait round. |
+| 22 | [22_follow_up_steering.py](22_follow_up_steering.py) | Append guidance to a running input; duplicate message IDs are recalled. |
+| 23 | [23_per_send_overrides.py](23_per_send_overrides.py) | RequestOptions limits visible tools and overrides this input's prompt. |
+| 24 | [24_agent_notes.py](24_agent_notes.py) | Notes use the current execution's store; a later input recalls them. |
+| 25 | [25_token_usage.py](25_token_usage.py) | Result usage is per input; stored session statistics accumulate. |
+| 26 | [26_timers.py](26_timers.py) | Default Runtime-owned timers; no Redis or model credentials required. |
+| 27 | [27_dynamic_workflow.py](27_dynamic_workflow.py) | Declarative workflow through the common runtime, with an offline example model. |
+| 28 | [28_docker_shell_backend.py](28_docker_shell_backend.py) | An explicit factory environment runs bash inside a dedicated Docker container. |
+| 29 | [29_shared_blackboard.py](29_shared_blackboard.py) | Two current-runtime sessions use one database-atomic board (no credentials). |
+| 31 | [31_memory_with_compaction.py](31_memory_with_compaction.py) | Recalled memory stays ephemeral while persisted sends are folded. |
+| 32 | [32_recall_compacted.py](32_recall_compacted.py) | Retrieve original detail after folding with recall_send. |
+| 33 | [33_coordinating_compactor.py](33_coordinating_compactor.py) | A FoldStrategy stores useful detail in a host memory provider before folding. |
+| 34 | [34_durability_lifecycle.py](34_durability_lifecycle.py) | 持久化生命周期 / Durability lifecycle (0.15.0 — OPS-2..5) |
+| 35 | [35_scaling_and_read_pool.py](35_scaling_and_read_pool.py) | Explicit worker capacity bounds concurrent model calls. |
+| 36 | [36_observability.py](36_observability.py) | 可观测性 / Observability (0.17.0 — OBS-1/2/4) |
+| 37 | [37_custom_retrieval_tool.py](37_custom_retrieval_tool.py) | 自定义检索工具 / Custom retrieval tool (ECO-6) |
+| 38 | [38_mcp_tools.py](38_mcp_tools.py) | MCP 工具 / MCP tools (ECO-1) |
+| 39 | [39_pluggable_backends_and_resume.py](39_pluggable_backends_and_resume.py) | Rebuild a Runtime from a store DSN, stable profiles and TargetRef. |
+| 40 | [40_send_context_projection.py](40_send_context_projection.py) | Projected history folds by input; recall_send reads the original detail. |
+| 41 | [41_custom_async_tool.py](41_custom_async_tool.py) | A host job schedules a read-only result check through the timer backend. |
+| 42 | [42_build_your_own_tools.py](42_build_your_own_tools.py) | Custom tools on the current Runtime ports. |
+| 43 | [43_memory_hook_override.py](43_memory_hook_override.py) | Factory-owned hooks: default memory, disabled memory, custom injection. |
+| 44 | [44_hook_events_audit.py](44_hook_events_audit.py) | Hook 注入审计 / Auditing ephemeral hook injection (record_hook_events) |
+| 45 | [45_custom_projection_render.py](45_custom_projection_render.py) | 自定义投影渲染 / Custom projection render (ProjectionRenderConfig + subclass) |
 
-| # | File | Concept | Key APIs |
-|---|---|---|---|
-| 00 | [`hello_world.py`](00_hello_world.py) | Explicit session + send | `StatefulAgentLoop`, `new_session()`, `send()` |
-| 01 | [`multi_turn_chat.py`](01_multi_turn_chat.py) | Multi-turn conversation | `session_id`, `get_messages()` |
-| 02 | [`tool_calling.py`](02_tool_calling.py) | Custom tool + JSON Schema | `ToolRegistry`, `ToolDefinition` |
-| 03 | [`subagent_delegation.py`](03_subagent_delegation.py) | Imperative sub-agent | `spawn_agent`, `EPHEMERAL` |
-| 04 | [`compaction.py`](04_compaction.py) | Auto context compaction | `DefaultCompactor`, `SessionStore` |
-| 05 | [`pending_recovery.py`](05_pending_recovery.py) | Crash recovery mid-tool | automatic `send()`, `resume()`, `abort_pending()` |
-| 06 | [`declarative_subagent.py`](06_declarative_subagent.py) | `spawn_agent` overrides + declarative spec | `spawn_agent(system_prompt=, tools=, max_rounds=)`, `AgentSpec`, `run_agent_spec()` |
-| 07 | [`human_approval.py`](07_human_approval.py) | User confirmation gate | `TOOL_BEFORE` hook, `HookDirective.SKIP` |
-| 08 | [`streaming.py`](08_streaming.py) | Real-time token streaming | `STREAM_DELTA` event |
-| 09 | [`audit_log.py`](09_audit_log.py) | Subscribe to all events | `bus.subscribe(None, …)` |
-| 10 | [`concurrent_sessions.py`](10_concurrent_sessions.py) | Multiple sessions in parallel | `asyncio.Lock`, `asyncio.Queue` |
-| 11 | [`cross_process_resume.py`](11_cross_process_resume.py) | Resume after process restart | `db_path`, `subprocess` |
-| 12 | [`retry_and_cancel.py`](12_retry_and_cancel.py) | Retry policy + cancel | `LLMRetryPolicy`, `CancellationToken` |
-| 13 | [`memory_sqlite.py`](13_memory_sqlite.py) | Cross-session SQLite memory | `MemoryProvider`, `recall()` / `remember()` |
-| 14 | [`structured_card.py`](14_structured_card.py) | Structured JSON extraction | `StructuredOutputSpec`, `parse_structured()` |
-| 15 | [`skills_from_markdown.py`](15_skills_from_markdown.py) | SKILL.md → system prompt | Frontmatter parsing, domain knowledge injection |
-| 16 | [`custom_compactor.py`](16_custom_compactor.py) | Custom Compactor protocol | `Compactor` Protocol, `CompactionPlan` |
-| 17 | [`custom_memory_provider.py`](17_custom_memory_provider.py) | HTTP-backed MemoryProvider | `MemoryProvider` Protocol, HTTP API mock |
-| 18 | [`multi_provider.py`](18_multi_provider.py) | Multiple LLM providers | `LLMProviderConfig`, `create_llm_service_from_config()` |
-| 19 | [`full_chatbot.py`](19_full_chatbot.py) | **Flagship**: all features on | session + tools + hooks + events + memory + compaction |
-| 20 | [`default_tools.py`](20_default_tools.py) | Built-in filesystem/search/bash tools | `create_default_tool_registry(preset="full")` |
-| 21 | [`request_user_input.py`](21_request_user_input.py) | Resumable human input | `request_user_input`, `submit_input()` |
-| 22 | [`follow_up_steering.py`](22_follow_up_steering.py) | In-flight steering | `follow_up()`, `FollowUpQueued`, `<follow_up>` |
-| 23 | [`23_per_send_overrides.py`](23_per_send_overrides.py) | Per-call tool/prompt overrides | `send(tools=, system_prompt=)`, `ToolRegistry.subset` |
-| 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note(action=...)`, `NoteMemory`, `NotesPolicy` |
-| 25 | [`25_token_usage.py`](25_token_usage.py) | Token usage accounting | `result.usage`, `get_session_stats`, `max_tokens_per_run`, `usage_updated` |
-| 26 | [`26_timers.py`](26_timers.py) | Durable timers / self wake-ups | `schedule_wakeup`, `TimerRunner`, `HookPoint.TIMER_FIRE` |
-| 27 | [`27_dynamic_workflow.py`](27_dynamic_workflow.py) | Declarative multi-agent workflow | `power_loop.workflow`, `WorkflowSpec`, `create_workflow`, `register_workflow_tools` |
-| 28 | [`28_docker_shell_backend.py`](28_docker_shell_backend.py) | **Sandbox**: model-authored bash inside Docker | `ShellBackend`, `RuntimeEnv(shell_backend=…)`, `runtime_env_context` |
-| 29 | [`29_shared_blackboard.py`](29_shared_blackboard.py) | **Coordination**: two agents share a scoped board | `SqliteBlackboard`, `register_blackboard_tools`, `RuntimeEnv(blackboard=…)` |
-| 31 | [`31_memory_with_compaction.py`](31_memory_with_compaction.py) | Cross-session memory recall alongside the default compactor | `MemoryProvider`, `DefaultCompactor` |
-| 32 | [`32_recall_compacted.py`](32_recall_compacted.py) | Pull back exact turns that compaction folded out | `recall_compacted` tool |
-| 33 | [`33_coordinating_compactor.py`](33_coordinating_compactor.py) | Custom compactor that remembers must-keep detail before folding | `CompactionContext`, `Compactor` |
-| 34 | [`34_durability_lifecycle.py`](34_durability_lifecycle.py) | **Durability**: prune folded originals, VACUUM, export/import, graceful `aclose()` | `prune_compacted_messages`, `vacuum`, `export_session`/`import_session`, `aclose` |
-| 35 | [`35_scaling_and_read_pool.py`](35_scaling_and_read_pool.py) | **Scale**: concurrent sessions on the async store; the `bench/` harness | `asyncio.gather` fan-out, `python -m bench` |
-| 36 | [`36_observability.py`](36_observability.py) | **Observability**: durable JSONL sink + `replay` + metrics | `attach_jsonl_sink`, `replay`, `attach_metrics_sink` |
-| 37 | [`37_custom_retrieval_tool.py`](37_custom_retrieval_tool.py) | **Extending**: register a custom (retrieval) tool — the no-bundled-connectors recipe | `ToolDefinition`, `ToolRegistry`, `tools=` allowlist |
-| 38 | [`38_mcp_tools.py`](38_mcp_tools.py) | **MCP**: wire a real MCP server's tools into the agent | `StdioMCPClient`, `register_mcp_tools` (`power-loop[mcp]`) |
-| 39 | [`39_pluggable_backends_and_resume.py`](39_pluggable_backends_and_resume.py) | **Storage**: pick a backend by DSN (SQLite/PG/MySQL), resume a session from a cold loop, schema policy | `dsn=`, `SchemaPolicy`, `StoreSchemaError`, `prewarm()`, `cache_stats` |
-| 40 | [`40_send_context_projection.py`](40_send_context_projection.py) | **Context axes (3.0)**: `ProjectedRepresentation` × `LLMSummaryFold` — feed finished sends as plain text (`pl_project_messages`) instead of verbatim history; fold + `recall_send` | `AgentLoopConfig(representation=, fold_strategy=)`, `ProjectedRepresentation`, `LLMSummaryFold`, `recall_send` |
-| 41 | [`41_custom_async_tool.py`](41_custom_async_tool.py) | **Custom async-wake tool**: start async work, return immediately, wake the agent when done — the extension recipe | `ToolDefinition`, `get_tool_runtime_context`, `loop.schedule_timer`, `TimerRunner`, `follow_up` |
-| 42 | [`42_build_your_own_tools.py`](42_build_your_own_tools.py) | **Build your own**: recreate the built-ins (background / sub-agent / timer / human-input / blackboard / memory / mini-workflow) from public primitives | `run_agent_spec`, `HumanInputRequired`, `RuntimeProjector`, `MemoryProvider`, `get/set_runtime_state`, `add_note` |
-| 43 | [`43_memory_hook_override.py`](43_memory_hook_override.py) | **Memory hook**: the auto-registered built-in `MemoryRecallHook` (ephemeral tail injection) — and how to disable or override it by name | `MemoryRecallHook`, `NoteMemory`, `hooks.remove`/`replace`/`has` |
-| 44 | [`44_hook_events_audit.py`](44_hook_events_audit.py) | **Hook-injection audit**: `record_hook_events="full"` records the ephemeral context `LLM_BEFORE` hooks inject (e.g. recalled memory) into `pl_hook_events` — observability only, never re-enters history/the request | `AgentLoopConfig(record_hook_events=)`, `store.list_hook_events`, `HookEventRow` |
-| 45 | [`45_custom_projection_render.py`](45_custom_projection_render.py) | **Custom projection render**: retune how stored projection rows render to LLM text — via `ProjectionRenderConfig` (JSON-friendly tags/separators/toggles) or by overriding one `render_*` method | `ProjectedRepresentation`, `ProjectionRenderConfig`, `render_project_row` |
-
-## Running
-
-```bash
-# Set up credentials (once)
-cp .env.example .env
-# edit .env with POWER_LOOP_BASE_URL / API_KEY / MODEL
-
-# Run any example
-python examples/00_hello_world.py
-```
-
-## Shared helper
-
-[`_helpers.py`](_helpers.py) provides `make_llm()` — loads `.env` and builds the configured LLM client. Each example imports it. If you copy an example into your own project, inline the two lines from `make_llm()` and drop the import.
-
-## Advanced runtime examples
-
-[`advanced_runtime/`](advanced_runtime/) contains focused examples for runtime-bound tools: custom `RuntimeProjector`s, `get_tool_runtime_context()`, hooks-based control flow, and event-bus observability. These examples call your configured real LLM, so make sure `.env` is set and watch provider usage/cost.
-
-## Next
-
-After `19`, explore the [User Guide](../docs/en/user-guide/index.md) for deep-dive reference docs, or the [Tutorials](../docs/en/tutorials/index.md) for step-by-step project builds.
+Advanced examples cover projectors, trusted tool context, argument hooks and event subscriptions through the same Runtime, using local simulated actions. [advanced_runtime](advanced_runtime/README.md).

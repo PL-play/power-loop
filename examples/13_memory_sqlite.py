@@ -1,54 +1,22 @@
-"""13 · MemoryProvider：跨 session 的 SQLite 事实记忆 / Cross-session SQLite fact memory
-
-What you learn / 你将学到
---------------------------
-- ``MemoryProvider`` Protocol 两个方法：``recall`` / ``remember``。
-  / ``MemoryProvider`` Protocol has two methods: ``recall`` / ``remember``
-- 怎么把召回的事实注入到 ``role=system, name=memory_*`` 区域，与
-  ``compact_note`` 一道躲过 ``DefaultCompactor`` 的折叠（system 区天然保留）。
-  / how recalled facts are injected into ``role=system, name=memory_*`` region,
-  surviving ``DefaultCompactor`` folds alongside ``compact_note`` (system region
-  is naturally preserved)
-- ``recall`` / ``remember`` 任一抛错都不会打断主循环 —— 框架只发
-  ``MEMORY_FAILED`` 事件，照常返回。
-  / errors in ``recall`` / ``remember`` never interrupt the main loop — framework
-  only emits ``MEMORY_FAILED`` event and continues normally
-- 跨 session：第一个 session 让 Agent 记住一个事实；第二个 session 用同一
-  ``MemoryProvider`` 但**新 session_id**，仍然能用上事实。
-  / cross-session: first session teaches a fact; second session uses the same
-  ``MemoryProvider`` with a **new session_id** and still has access to the fact
-
-本例的事实抽取很粗（让 LLM 在第一轮答案末尾贴一个 ``FACT: …`` 行，
-``remember`` 抓出来落库）；真实系统应当走更稳的 schema（M1.3 结构化
-输出）或独立 extract 步骤。**库内零实现**正是为了让这种业务策略留在
-应用层。
-/ This example uses coarse fact extraction (LLM appends ``FACT: …`` lines,
-``remember`` extracts them). Real systems should use more stable schemas
-(structured output) or separate extraction steps. **Zero in-library implementation**
-keeps business logic in the application layer.
-
-Run / 运行
-----------
-    python examples/13_memory_sqlite.py
-"""
-
+"""13 · User-scoped SQLite memory across two independent Runtime sessions."""
 from __future__ import annotations
 
 import asyncio
 import re
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentEventBus,
     AgentEventType,
     AgentLoopConfig,
+    LLMResponse,
+    LLMService,
     MemorySnapshot,
-    SessionStore,
-    StatefulAgentLoop,
 )
 
 # ── 1. 一个非常薄的 SQLite 事实库 / A minimal SQLite fact store ──────────
@@ -122,66 +90,30 @@ def _print_events(bus: AgentEventBus, label: str) -> list:
     return seen
 
 
-async def main() -> None:
-    with tempfile.TemporaryDirectory(prefix="power_loop_p13_") as tmp:
-        mem_path = str(Path(tmp) / "memory.db")
-        sess_path = str(Path(tmp) / "sessions.db")
-        memory = SqliteFactMemory(mem_path)
+class FactModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if 'Known facts about the user' in str(request.messages):
+            assert 'Alan' in str(request.messages) and '37' in str(request.messages)
+            return LLMResponse(raw_text='Alan / 37')
+        return LLMResponse(raw_text='FACT: name=Alan\nFACT: favorite_number=37')
 
-        # ── Session A：教 Agent 一个事实 / Teach the agent a fact ────────
-        print("\n── Session A: teach the agent a fact ──")
-        store = await SessionStore.open(sess_path)
-        try:
-            bus_a = AgentEventBus()
-            seen_a = _print_events(bus_a, "A")
-            loop = StatefulAgentLoop(
-                llm=make_llm(max_tokens=200), store=store, event_bus=bus_a,
-                config=AgentLoopConfig(
-                    system_prompt=SYSTEM, max_rounds=1, compactor=None,
-                    memory=memory,
-                ),
-            )
-            sid1 = await loop.new_session()
-            r1 = await loop.send(
-                "My name is Alan and my favorite number is 37. Reply in one sentence.",
-                session_id=sid1,
-            )
-            print(f"[A] reply={r1.final_text}")
-            print(f"[A] memory events: {[e.type.value for e in seen_a]}")
-        finally:
-            await store.close()
-
-        # 验：直接看 SQLite，事实已经入库
-        # Verify: check SQLite directly — facts are stored
-        with sqlite3.connect(mem_path) as c:
-            facts = list(c.execute("SELECT key, value FROM facts ORDER BY key"))
-        print(f"[memory.db] facts after session A: {facts}")
-
-        # ── Session B：完全新 session，靠 recall 把事实带回来 ──────────
-        #    Brand new session — facts come back via recall
-        print("\n── Session B: new session — does the agent remember? ──")
-        store = await SessionStore.open(sess_path)
-        try:
-            bus_b = AgentEventBus()
-            seen_b = _print_events(bus_b, "B")
-            loop = StatefulAgentLoop(
-                llm=make_llm(max_tokens=200), store=store, event_bus=bus_b,
-                config=AgentLoopConfig(
-                    system_prompt=SYSTEM, max_rounds=1, compactor=None,
-                    memory=memory,
-                ),
-            )
-            sid2 = await loop.new_session()
-            r2 = await loop.send(
-                "What is my name? What is my favorite number? One sentence.",
-                session_id=sid2,
-            )
-            print(f"[B] reply={r2.final_text}")
-            print(f"[B] memory events: {[e.type.value for e in seen_b]}")
-            assert r2.session_id != r1.session_id, "should be different sessions"
-        finally:
-            await store.close()
+    async def close(self):
+        pass
 
 
-if __name__ == "__main__":
+async def main():
+    with tempfile.TemporaryDirectory(prefix='power_loop_memory_test_') as directory:
+        memory = SqliteFactMemory(str(Path(directory)/'memory.db'))
+        targets = []
+        for index, question in enumerate(['Remember my name and number', 'What do you remember?']):
+            async with demo_runtime(FactModel(), config=AgentLoopConfig(memory=memory, compactor=None)) as (runtime, loop, target, actor):
+                targets.append(target)
+                result = await loop.send(target, question, message_id=f'memory-{index}', actor=actor,
+                                         deadline_ms=int(time.time()*1000)+10000)
+                assert result.status == 'completed'
+                print(result.final_text)
+        assert targets[0] != targets[1] and result.final_text == 'Alan / 37'
+
+
+if __name__ == '__main__':
     asyncio.run(main())

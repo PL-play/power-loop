@@ -84,15 +84,16 @@ async def test_duplicate_prepare_is_recall_but_dispatch_cannot_run_twice(attempt
         await prepare(c, model="changed-original-request")
 
 
-@pytest.mark.parametrize("fault", ["cancel", "expired", "old-generation"])
+@pytest.mark.parametrize("fault", ["cancel", "old-generation"])
 async def test_dispatch_is_fenced_after_prepare_and_cannot_claim_remote_start(attempt_case, fault):
     c = attempt_case
     attempt = await prepare(c)
     if fault == "cancel":
         await c.manager.request_cancel(c.actor, c.binding.lease.job_id, system_key="stop", reason="before dispatch")
     else:
-        column, value = ("lease_until_ms", 0) if fault == "expired" else ("generation", 2)
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET {column}=? WHERE job_id=?", (value, c.binding.lease.job_id))
+        # Expiry belongs to session ownership (test_session_ownership_tasks),
+        # while a replaced task generation must still reject this dispatch.
+        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?", (c.binding.lease.job_id,))
         # Cross-process revocation is observed at the next bounded checkpoint.
         from power_loop.runtime.control_runtime import current
         await current(c.binding).before_checkpoint()
@@ -102,19 +103,18 @@ async def test_dispatch_is_fenced_after_prepare_and_cannot_claim_remote_start(at
 
 
 @pytest.mark.parametrize("status", ["returned", "unknown"])
-async def test_actual_late_observation_survives_stop_and_expiry_without_dispatch_authority(attempt_case, status):
+async def test_actual_late_observation_survives_stop_without_dispatch_authority(attempt_case, status):
     c = attempt_case
     attempt = await prepare(c)
     await attempts.dispatch(attempt)
     await c.manager.request_cancel(c.actor, c.binding.lease.job_id, system_key="stop", reason="after dispatch")
-    await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET lease_until_ms=0 WHERE job_id=?", (c.binding.lease.job_id,))
     args = dict(status=status, usage={"total_tokens": 17}, estimated=status == "unknown", error_type="TimeoutError" if status == "unknown" else None)
     await attempts.finish(attempt, **args)
     await attempts.finish(attempt, **args)
     await flush_binding(c.binding)
     with pytest.raises(JobError, match="model_attempt_conflict"):
         await attempts.finish(attempt, **(args | {"usage": {"total_tokens": 18}}))
-    with pytest.raises(JobError, match="cancel_requested|lease_expired"):
+    with pytest.raises(JobError, match="cancel_requested"):
         await attempts.dispatch(attempt)
     data = current(c.binding).get("attempt", attempt.attempt_id)["observation"]
     assert data["status"] == status and data["usage"] == {"total_tokens": 17}
@@ -132,28 +132,28 @@ async def test_invalid_admission_is_rejected_without_any_dispatch(attempt_case, 
 
 @pytest.mark.parametrize("phase", ["prepared", "dispatched"])
 async def test_pre_request_storage_failure_never_calls_provider(managed, monkeypatch, phase):
-    _, manager, _, loop, model, sid, _ = managed
+    _, manager, runtime, loop, model, sid, _ = managed
     model.root_calls = 10
     fn = "prepare" if phase == "prepared" else "dispatch"
     async def fail(*args, **kwargs):
         raise RuntimeError("test: before physical request")
     monkeypatch.setattr(attempts, fn, fail)
-    result = await loop.send("do not dispatch without durable admission", sid)
-    assert result.status == "degraded" and model.root_calls == 10
+    result = await loop.send("do not dispatch without durable admission")
+    assert result.status == "failed" and model.root_calls == 10
     assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='model_attempt_finished'")
 
 
 async def test_return_observation_write_failure_preserves_actual_usage_and_pending_control(managed, monkeypatch):
-    _, manager, _, loop, model, sid, _ = managed
+    _, manager, runtime, loop, model, sid, _ = managed
     model.root_calls = 10
     async def fail(*args, **kwargs):
         raise RuntimeError("test: returned observation unavailable")
     monkeypatch.setattr(attempts, "finish", fail)
-    result = await loop.send("one known paid response", sid)
+    result = await loop.send("one known paid response")
     assert model.root_calls == 11 and result.usage["total_tokens"] == 10
     [row] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
     assert row["resource_state"] == "unknown" and row["supervision_status"] == "open"
-    assert (await manager.execution_usage(loop.task_runtime.actor(sid), row["job_id"]))["total_tokens"] == 10
+    assert (await manager.execution_usage(runtime.actor(sid), row["job_id"]))["total_tokens"] == 10
 
 
 async def test_request_contents_are_hashed_and_never_persisted(attempt_case):
@@ -203,15 +203,15 @@ async def test_terminal_nested_admission_error_is_not_retried():
 
 
 async def test_managed_provider_timeout_uses_one_actual_request_even_with_retry_policy(managed, monkeypatch):
-    _, manager, _, loop, model, sid, _ = managed
+    _, manager, runtime, loop, model, sid, _ = managed
     loop.config.retry_policy = LLMRetryPolicy(max_attempts=5, backoff_initial=0)
     calls = []
     async def timed_out(request, **kwargs):
         calls.append(True)
         raise TimeoutError("transport lost; supplier outcome unknown")
     monkeypatch.setattr(model, "complete", timed_out)
-    result = await loop.send("one request only", sid)
-    assert result.status == "degraded" and calls == [True]
+    result = await loop.send("one request only")
+    assert result.status == "failed" and calls == [True]
     [row] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
     assert row["resource_state"] == "unknown" and row["supervision_status"] == "open"
 
@@ -246,11 +246,11 @@ async def test_fresh_main_control_send_can_run_without_erasing_old_unknown_risk(
     async def unknown(request, **kwargs):
         raise TimeoutError("test: old supplier request has no receipt")
     monkeypatch.setattr(model, "complete", unknown)
-    assert (await loop.send("old request", sid)).status == "degraded"
+    assert (await loop.send("old request")).status == "failed"
     [old] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
     assert old["resource_state"] == "unknown"
     monkeypatch.setattr(model, "complete", original)
-    assert (await loop.send("new authorized control turn", sid)).status == "completed"
+    assert (await loop.send("new authorized control turn")).status == "completed"
     assert model.root_calls == 11
     current = await manager.get_job(runtime.actor(sid), old["job_id"])
     assert current.resource_state == "unknown" and current.supervision_status == "open"
@@ -260,7 +260,7 @@ async def test_late_original_observation_does_not_modify_superseding_generation(
     c = attempt_case
     attempt = await prepare(c)
     await attempts.dispatch(attempt)
-    await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=2,boot_id='new-boot' WHERE job_id=?", (c.binding.lease.job_id,))
+    await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?", (c.binding.lease.job_id,))
     before = await c.manager._row(c.manager.db, c.binding.lease.job_id)
     await attempts.finish(attempt, status="returned", usage={"total_tokens": 10}, estimated=False)
     await flush_binding(c.binding)

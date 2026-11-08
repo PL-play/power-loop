@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, ToolDefinition
 from power_loop.runtime import control_requests, operation_records, session_obligations
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.pricing import Free
@@ -21,6 +21,7 @@ from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 from .test_executor_activation_trees import observe
 from .test_executor_drain_trees import stop_worker
@@ -223,13 +224,6 @@ async def test_actual_model_tool_records_an_old_tree_and_binds_its_real_receipt_
     store, _ = registry_store
     manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id='record-loop', principal_id='host', executor_id='record-loop', boot_id='boot')
-    sid = await store.create_session()
-    actor = runtime.actor(sid)
-    old = await manager.register_job(actor, kind='send', session_id=sid, system_key='old-parent')
-    first = await manager.claim_job(actor, old.job.job_id, executor_id='old', boot_id='old', expected_version=1)
-    target = await manager.register_job(actor, kind='subagent', parent=first, independent=True, system_key='old-independent')
-    lease = await manager.claim_job(actor, target.job.job_id, executor_id='target', boot_id='target', expected_version=1)
-    await manager.close_model_execution(actor, first, evidence={'exit': 'completed'}, resource_state='stopped')
     calls = []
     tools = ToolRegistry()
 
@@ -257,10 +251,19 @@ async def test_actual_model_tool_records_an_old_tree_and_binds_its_real_receipt_
             pass
 
     model = Model()
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=tools,
-        config=AgentLoopConfig(delegation_policy='single_level', compactor=None, max_rounds=3))
+    loop = await RunningAgent(store, model, tools, task_runtime=runtime,
+        config=AgentLoopConfig(model='test', max_tokens=50, delegation_policy='single_level',
+                               compactor=None, max_rounds=3)).start()
+    sid = loop.target.session_id
+    actor = runtime.actor(sid)
+    old = await manager.register_job(actor, kind='send', session_id=sid, system_key='old-parent')
+    first = await manager.claim_job(actor, old.job.job_id, executor_id='old', boot_id='old', expected_version=1)
+    child_sid = await store.create_session(parent_session_id=sid, metadata={'execution_role': 'subagent'})
+    target = await manager.register_job(actor, kind='subagent', session_id=child_sid, parent=first, independent=True, system_key='old-independent')
+    lease = await manager.claim_job(actor, target.job.job_id, executor_id='target', boot_id='target', expected_version=1)
+    await manager.close_model_execution(actor, first, evidence={'exit': 'completed'}, resource_state='stopped')
     try:
-        result = await loop.send('record old work', sid)
+        result = await loop.send('record old work')
         assert result.status == 'completed' and result.final_text == 'done'
         assert model.calls == 2 and len(calls) == 1
         operation = await manager.get_operation(actor, calls[0].operation_id)
@@ -272,7 +275,7 @@ async def test_actual_model_tool_records_an_old_tree_and_binds_its_real_receipt_
         assert (await store.inbox_counts(sid))['pending'] == 0
         assert not await manager.db.fetchall(f"SELECT * FROM {manager.prefix}session_obligations WHERE kind='control_request'")
     finally:
-        await loop.aclose(drain_timeout_s=.1)
+        await loop.aclose()
 
 
 @pytest.mark.parametrize('action', ['steer', 'nudge'])

@@ -96,11 +96,12 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
             hashlib.sha256(('result:' + result_id(result.job_ref.job_id, result.job_ref.generation)).encode()).hexdigest()))
         await runner.drain(after_input=parent_input)
         elapsed = time.monotonic()-started
-        sql = {**_counts(profiled.records, profiled.tx_sites), 'total_sql':len(profiled.records), 'transactions':len(profiled.tx_sites)}
+        records, tx_sites = list(profiled.records), list(profiled.tx_sites)
+        sql = {**_counts(records, tx_sites), 'total_sql':len(records), 'transactions':len(tx_sites)}
         writes = await meter.report() if meter else None
         after = await _snapshot(original, store.table_prefix)
-        assert sql['total_sql'] == len(profiled.records)
-        assert sql['transactions'] == len(profiled.tx_sites)
+        assert sql['total_sql'] == len(records)
+        assert sql['transactions'] == len(tx_sites)
         delta = {t:[after[t][0]-before[t][0],after[t][1]-before[t][1]] for t in after if after[t] != before[t]}
         assert after.get('execution_batches', (0,0))[0] == 0
         for table in ('execution_checkpoints', 'execution_allocations', 'task_budget_attempts'):
@@ -108,7 +109,7 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
         if output := os.environ.get('P3_FLOW_OUT'):
             with Path(output).open('a') as file:
                 file.write(json.dumps({'db':original.dialect.name,'flow':flow,'sql':sql,'tables':delta,
-                    'writes':writes,'elapsed_s':elapsed,'records':profiled.records,'tx_sites':profiled.tx_sites,
+                    'writes':writes,'elapsed_s':elapsed,'records':records,'tx_sites':tx_sites,
                     'B':None,'comparison':'no equivalent fixed-B flow case; ordinary-send B comparison is reported separately'})+'\n')
     finally:
         gate.set()

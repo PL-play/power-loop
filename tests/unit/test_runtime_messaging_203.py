@@ -745,10 +745,15 @@ async def test_list_jobs_pages_and_subtree_cancel_use_stored_relations(registry_
     await client.aclose()
 
 
-async def test_failed_start_closes_subscriptions_and_reconnect_retries(registry_store):
-    store, _ = registry_store
+async def test_failed_start_closes_subscriptions_and_reconnect_retries(registry_store, tmp_path):
+    store, connect = registry_store
     async with running(store, 'memory') as (runtime, model, target, actor):
-        other = Runtime(store=store, factory=runtime.factory, node_id='other', boot_id='boot',
+        if store._db.dialect.name == 'sqlite':
+            from power_loop.runtime.store.factory import open_store
+            other_store = await open_store(str(tmp_path / 'startup.db'), schema='tasks')
+        else:
+            other_store = await connect(suffix='startup_')
+        other = Runtime(store=other_store, factory=runtime.factory, node_id='other', boot_id='boot',
                         transport=MemoryMessageTransport(), capacity=1, recovery_interval_s=None)
         subscribe = other.transport.subscribe
         async def fail_control(binding):
@@ -759,6 +764,8 @@ async def test_failed_start_closes_subscriptions_and_reconnect_retries(registry_
         with pytest.raises(ConnectionError):
             await other.worker.start()
         assert not other.transport._subscriptions and not other.client._accepting
+        if store._db.dialect.name == 'sqlite':
+            await other_store.close()
         await other.client.aclose()
         await other.transport.aclose()
         # The active worker must recover even if the first resubscribe fails.
@@ -794,7 +801,8 @@ async def parent_child_port_fixture(store):
     child_target = TargetRef(store.store_id, child_sid)
     child = await manager.register_job(parent_actor, kind='subagent', parent=lease, session_id=child_sid,
                                       system_key='child', independent=True)
-    receipt = await accept(port, command(child_target, 'child-start'), actor)
+    async with port.db.transaction() as tx:
+        receipt = await port.accept_input(tx, command(child_target, 'child-start'), actor, child_start=True)
     zero = JobRef(store.store_id, child.job.job_id, 0)
     await port.db.execute(f'UPDATE {port.q} SET delivered_job_id=?,delivered_job_generation=0 '
                          'WHERE session_id=? AND item_id=?', (zero.job_id, child_sid, receipt.input_ref.message_id))

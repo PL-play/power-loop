@@ -102,7 +102,7 @@ async def admit(loop, binding, actor, *, kind, title, descriptor, options, body,
         command = Command(input_ref.message_id, TargetRef(port.store.store_id, sid),
             "send", {"body": body}, "new_turn", options=plain(options))
         submitter = actor if system_key is None else TrustedActor(actor.tenant_id, actor.principal_id, None)
-        receipt = await port.accept_input(tx, command, submitter, descriptor=descriptor)
+        receipt = await port.accept_input(tx, command, submitter, descriptor=descriptor, child_start=True)
         if receipt.newly_accepted:
             await tx.execute(f"UPDATE {port.q} SET delivered_job_id=?,delivered_job_generation=0 "
                 "WHERE session_id=? AND item_id=?", (registration.job.job_id, sid, input_ref.message_id))

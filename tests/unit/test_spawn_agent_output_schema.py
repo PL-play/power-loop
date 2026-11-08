@@ -1,112 +1,27 @@
-"""design/126 §2: ``spawn_agent(output_schema=…)`` and the ``strict`` flag on
-``AgentSpec.output_schema`` (run_agent_spec + the isolated workflow worker)."""
-
-from __future__ import annotations
-
-import asyncio
+"""Structured child and workflow output through current client/worker execution."""
 import json
-import os
-import tempfile
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, AgentSpecError, SessionStore, StatefulAgentLoop
-from power_loop._vendor.llm_client.interface import (
-    LLMRequest,
-    LLMResponse,
-    LLMService,
-    LLMStreamChunk,
-)
-from power_loop.core.agent_context import (
-    reset_current_loop,
-    reset_session_id,
-    set_current_loop,
-    set_session_id,
-)
-from power_loop.runtime.spec import (
-    normalize_output_schema,
-    output_response_format,
-    run_agent_spec,
-)
-from power_loop.runtime.store.store import MAX_SPAWN_DEPTH
+from power_loop import AgentLoopConfig, AgentSpec, AgentSpecError, JobRef, LLMResponse
+from power_loop.agent.runtime_store import now_ms
+from power_loop.core.agent_context import get_session_id
+from power_loop.runtime.spec import normalize_output_schema, output_response_format
+from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import (
     _RAW_TEXT_CAP,
     SPAWN_AGENT_DEFINITION,
     _format_structured_result,
-    _handle_spawn_agent,
+    register_spawn_agent,
 )
-from power_loop.workflow import WorkerBootstrap, run_spec_isolated
+from tests.runtime_fixture import RunningAgent
 
-LABEL_SCHEMA = {
-    "type": "object",
-    "required": ["label"],
-    "properties": {"label": {"type": "string"}},
-}
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, _tool_resp
 
-
-@dataclass
-class _Capturing(LLMService):
-    responses: list[LLMResponse] = field(default_factory=list)
-    seen: list[LLMRequest] = field(default_factory=list)
-    _idx: int = 0
-
-    async def complete(
-        self,
-        request: LLMRequest,
-        *,
-        on_chunk_delta_text: Callable[[str], Any] | None = None,
-        on_chunk_think: Callable[[str], Any] | None = None,
-        on_stream_end: Callable[[LLMResponse], Any] | None = None,
-    ) -> LLMResponse:
-        self.seen.append(request)
-        if self._idx >= len(self.responses):
-            return LLMResponse(raw_text="done")
-        r = self.responses[self._idx]
-        self._idx += 1
-        return r
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-
-        return _empty()
-
-    async def close(self) -> None:
-        return None
-
-
-@pytest.fixture
-async def store() -> AsyncIterator[SessionStore]:
-    s = await SessionStore.open(":memory:")
-    yield s
-    await s.close()
-
-
-async def _call_tool(loop: StatefulAgentLoop, parent_sid: str, **kwargs: Any) -> str:
-    """Invoke the spawn_agent handler as if from inside ``loop``'s run on ``parent_sid``."""
-    tok_loop = set_current_loop(loop)
-    tok_sid = set_session_id(parent_sid)
-    try:
-        out = await _handle_spawn_agent(**kwargs)
-        if out.startswith("Error:"):
-            return out
-        receipt = json.loads(out)
-        from power_loop.runtime.delegation import _TASKS
-        while _TASKS:
-            await asyncio.gather(*list(_TASKS))
-        record = await (await loop.ensure_store()).get_runtime_state(parent_sid, "subagent:run:" + receipt["run_id"])
-        return json.dumps(record["result"], ensure_ascii=False)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-
-# ── tool schema ─────────────────────────────────────────────────────────
-
+__all__ = ['registry_store']
+LABEL_SCHEMA = {'type':'object','required':['label'],'properties':{'label':{'type':'string'}}}
 
 def test_tool_schema_exposes_optional_output_schema() -> None:
     props = SPAWN_AGENT_DEFINITION.input_schema["properties"]
@@ -114,10 +29,6 @@ def test_tool_schema_exposes_optional_output_schema() -> None:
     assert "JSON Schema" in props["output_schema"]["description"]
     assert "output_schema" not in SPAWN_AGENT_DEFINITION.input_schema["required"]
     assert SPAWN_AGENT_DEFINITION.required_params == ()
-
-
-# ── normalization ───────────────────────────────────────────────────────
-
 
 def test_normalize_wrapped_form_keeps_name_and_declared_strict() -> None:
     out = normalize_output_schema(
@@ -128,25 +39,21 @@ def test_normalize_wrapped_form_keeps_name_and_declared_strict() -> None:
     out = normalize_output_schema({"schema": LABEL_SCHEMA}, default_strict=False)
     assert out == {"name": "Output", "schema": LABEL_SCHEMA, "strict": False}
 
-
 def test_normalize_bare_schema() -> None:
     assert normalize_output_schema(LABEL_SCHEMA, default_strict=False) == {
         "name": "Output", "schema": LABEL_SCHEMA, "strict": False,
     }
     assert normalize_output_schema(LABEL_SCHEMA)["strict"] is True  # library default
 
-
 def test_normalize_json_string_of_either_form() -> None:
     assert normalize_output_schema(json.dumps(LABEL_SCHEMA))["schema"] == LABEL_SCHEMA
     wrapped = json.dumps({"name": "C", "schema": LABEL_SCHEMA, "strict": False})
     assert normalize_output_schema(wrapped) == {"name": "C", "schema": LABEL_SCHEMA, "strict": False}
 
-
 def test_normalize_sanitizes_name_for_native_providers() -> None:
     out = normalize_output_schema({"name": "用户 列表", "schema": LABEL_SCHEMA})
     assert out["name"] == "_____"
     assert len(normalize_output_schema({"name": "x" * 100, "schema": LABEL_SCHEMA})["name"]) == 64
-
 
 @pytest.mark.parametrize(
     ("value", "needle"),
@@ -164,77 +71,6 @@ def test_normalize_rejects_bad_shapes(value: Any, needle: str) -> None:
     with pytest.raises(AgentSpecError, match=needle):
         normalize_output_schema(value)
 
-
-# ── spawn_agent handler ─────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_invalid_schema_is_reported_without_spawning(store: SessionStore) -> None:
-    llm = _Capturing()
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    out = await _call_tool(loop, parent, task="classify", output_schema={"type": "array"})
-    assert out.startswith("Error: output_schema 无效，子 agent 没有启动")
-    assert "根必须是" in out
-    assert llm.seen == []
-    assert await store.list_children(parent) == []
-
-
-@pytest.mark.asyncio
-async def test_bad_spec_args_are_reported_not_raised(store: SessionStore) -> None:
-    llm = _Capturing()
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    out = await _call_tool(loop, parent, task="x", tools="bash")  # must be a list
-    assert out.startswith("Error: spawn_agent 参数有误")
-    assert llm.seen == []
-
-
-@pytest.mark.asyncio
-async def test_child_request_carries_non_strict_response_format(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text='{"label": "紧急"}')])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    out = await _call_tool(loop, parent, task="classify", output_schema=LABEL_SCHEMA)
-    rf = llm.seen[0].response_format
-    assert rf == {"type": "json_schema", "json_schema": {"name": "Output", "schema": LABEL_SCHEMA}}
-    assert "strict" not in rf["json_schema"]
-    assert json.loads(out)["payload"] == {"label": "紧急"}
-
-
-@pytest.mark.asyncio
-async def test_declared_strict_true_is_honoured(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text='{"label": "a"}')])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    await _call_tool(
-        loop, parent, task="classify",
-        output_schema=json.dumps({"name": "Label", "schema": LABEL_SCHEMA, "strict": True}),
-    )
-    js = llm.seen[0].response_format["json_schema"]
-    assert js["name"] == "Label" and js["strict"] is True
-
-
-@pytest.mark.asyncio
-async def test_structured_success_from_fenced_prose(store: SessionStore) -> None:
-    reply = '好的：\n```json\n{"label": "urgent", "score": 3,}\n```'
-    llm = _Capturing(responses=[LLMResponse(raw_text=reply)])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    out = await _call_tool(loop, parent, task="classify", output_schema=LABEL_SCHEMA)
-    assert json.loads(out)["payload"] == {"label": "urgent", "score": 3}
-
-
-@pytest.mark.asyncio
-async def test_structured_failure_returns_reason_and_text(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text="这张工单很紧急")])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    out = await _call_tool(loop, parent, task="classify", output_schema=LABEL_SCHEMA)
-    assert json.loads(out)["status"] == "failed"
-    assert "structured_output" in json.loads(out)["error"]
-
-
 def test_structured_failure_reasons_and_cap() -> None:
     out = _format_structured_result('{"other": 1}', LABEL_SCHEMA)
     assert out == '结构化结果解析失败（缺少必填字段 label），原文：{"other": 1}'
@@ -245,34 +81,6 @@ def test_structured_failure_reasons_and_cap() -> None:
     assert f"原文共 {len(long)} 字" in out
     assert len(out) < len(long)
 
-
-@pytest.mark.asyncio
-async def test_non_completed_status_keeps_plain_format(store: SessionStore) -> None:
-    sid = await store.create_session()
-    cur = sid
-    for _ in range(MAX_SPAWN_DEPTH):
-        cur = await store.create_session(parent_session_id=cur)
-    llm = _Capturing()
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=1))
-    out = await _call_tool(loop, cur, task="x", output_schema=LABEL_SCHEMA)
-    assert out.startswith("Error:") and "depth" in out
-    assert "结构化结果" not in out
-
-
-@pytest.mark.asyncio
-async def test_parent_inbox_receives_structured_completion(store):
-    llm = _Capturing(responses=[LLMResponse(raw_text='{"label":"urgent"}')])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=4))
-    sid = await loop.new_session()
-    result = json.loads(await _call_tool(loop, sid, task="classify", output_schema=LABEL_SCHEMA))
-    assert result["payload"] == {"label": "urgent"}
-    assert result["messages"] is not None
-    assert (await store.inbox_counts(sid))["pending"] == 1
-
-
-# ── strict flag in run_agent_spec / the isolated worker ─────────────────
-
-
 def test_output_response_format_strict_default_and_opt_out() -> None:
     rf = output_response_format({"name": "C", "schema": LABEL_SCHEMA})
     assert rf["json_schema"]["strict"] is True
@@ -281,57 +89,15 @@ def test_output_response_format_strict_default_and_opt_out() -> None:
     rf = output_response_format(LABEL_SCHEMA)  # bare schema
     assert rf["json_schema"] == {"name": "Output", "schema": LABEL_SCHEMA, "strict": True}
 
-
 def test_agent_spec_rejects_non_boolean_strict() -> None:
     with pytest.raises(AgentSpecError, match="strict must be a boolean"):
         AgentSpec(name="n", system_prompt="p",
                   output_schema={"name": "C", "schema": LABEL_SCHEMA, "strict": "no"})
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("declared", "expect_strict"), [({}, True), ({"strict": False}, False)])
-async def test_run_agent_spec_honours_strict(
-    store: SessionStore, declared: dict[str, Any], expect_strict: bool
-) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text='{"label": "a"}')])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    await run_agent_spec(
-        AgentSpec(name="kid", system_prompt="p",
-                  output_schema={"name": "C", "schema": LABEL_SCHEMA, **declared}),
-        "task", parent_loop=loop,
-    )
-    js = llm.seen[0].response_format["json_schema"]
-    assert js["name"] == "C" and js["schema"] == LABEL_SCHEMA
-    assert js.get("strict", False) is expect_strict
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("declared", "expect_strict"), [({}, True), ({"strict": False}, False)])
-async def test_isolated_worker_honours_strict(declared: dict[str, Any], expect_strict: bool) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text='{"label": "a"}')])
-    db = tempfile.mktemp(suffix=".db")
-    try:
-        result = await run_spec_isolated(
-            {"name": "leaf", "system_prompt": "p",
-             "output_schema": {"name": "C", "schema": LABEL_SCHEMA, **declared}},
-            "task", bootstrap=WorkerBootstrap(llm_factory=lambda: llm), db_path=db,
-        )
-    finally:
-        for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(db + suffix):
-                os.remove(db + suffix)
-    assert result["status"] == "completed"
-    assert llm.seen[0].response_format["json_schema"].get("strict", False) is expect_strict
-
-
-# ── workflow agent node: output_schema may carry strict ──────────────────────
-
-
 def _node_spec(output_schema: Any) -> dict[str, Any]:
     return {"name": "w", "root": {"type": "agent", "id": "leaf",
                                   "spec": {"name": "leaf", "system_prompt": "p"},
                                   "output_schema": output_schema}}
-
 
 def test_workflow_node_accepts_strict_and_round_trips_it() -> None:
     from power_loop.workflow import WorkflowSpec
@@ -341,7 +107,6 @@ def test_workflow_node_accepts_strict_and_round_trips_it() -> None:
     again = WorkflowSpec.from_json(parsed.to_dict())  # resume rebuilds nodes from the journal
     assert again.root.output_schema["strict"] is False
 
-
 @pytest.mark.parametrize("bad", [{"strict": "no"}, {"extra": 1}])
 def test_workflow_node_rejects_non_boolean_strict_and_unknown_keys(bad: dict[str, Any]) -> None:
     from power_loop.workflow import WorkflowSpec
@@ -349,18 +114,90 @@ def test_workflow_node_rejects_non_boolean_strict_and_unknown_keys(bad: dict[str
     with pytest.raises(Exception, match="output_schema"):
         WorkflowSpec.from_json(_node_spec({"name": "C", "schema": LABEL_SCHEMA, **bad}))
 
+@pytest.mark.parametrize('reply,expected', [('{"label":"urgent"}', {'label':'urgent'}),
+    ('好的：\n```json\n{"label":"urgent","score":3,}\n```', {'label':'urgent','score':3}),
+    ('plain text', None)])
+@pytest.mark.parametrize('strict',[False,True])
+async def test_child_format_and_persisted_parent_completion(registry_store, reply, expected, strict):
+    store,_=registry_store
+    class Model(_Scripted):
+        parent=None
+        sent=False
+        child_requests=[]
+        async def complete(self,request,**kwargs):
+            if get_session_id()!=self.parent:
+                self.child_requests.append(request)
+                return LLMResponse(raw_text=reply)
+            if not self.sent:
+                self.sent=True
+                return _tool_resp('spawn','spawn_agent',json.dumps({'task':'classify','tools':[],
+                    'output_schema':{'name':'Label','schema':LABEL_SCHEMA,'strict':strict}}))
+            return LLMResponse(raw_text='parent done')
+    model,registry=Model(),ToolRegistry()
+    model.child_requests=[]
+    register_spawn_agent(registry)
+    agent=await RunningAgent(store,model,registry,AgentLoopConfig(max_rounds=4,compactor=None)).start()
+    model.parent=agent.target.session_id
+    try:
+        await agent.send('classify')
+        rows=await store.load_all_messages(agent.target.session_id)
+        receipt=json.loads(next(r.content for r in rows if r.tool_call_id=='spawn'))
+        result=await agent.runtime.client.wait(JobRef(**receipt['job_ref']),actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert result.status==('completed' if expected is not None else 'failed')
+        assert result.structured_output==expected and result.final_text==reply
+        if expected is None:
+            assert 'structured_output' in result.error
+        response_format=model.child_requests[0].response_format['json_schema']
+        assert response_format['name']=='Label' and response_format['schema']==LABEL_SCHEMA
+        assert response_format.get('strict',False) is strict
+        await agent.drain()
+        rows=await store.load_all_messages(agent.target.session_id)
+        notifications=[r.content for r in rows if '[subagent_result]' in str(r.content)]
+        assert len(notifications)==1
+        payload=json.loads(notifications[0].split('\n',1)[1])
+        assert payload['structured_output']==expected and payload['status']==result.status
+    finally:
+        await agent.aclose()
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("declared", "expect_strict"), [({}, True), ({"strict": False}, False)])
-async def test_workflow_node_strict_reaches_the_request(
-    store: SessionStore, declared: dict[str, Any], expect_strict: bool
-) -> None:
-    from power_loop.workflow import WorkflowSpec, create_workflow
 
-    llm = _Capturing(responses=[LLMResponse(raw_text='{"label": "a"}')])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
-    psid = await loop.new_session()
-    spec = WorkflowSpec.from_json(_node_spec({"name": "C", "schema": LABEL_SCHEMA, **declared}))
-    res = await create_workflow(spec, parent_loop=loop, parent_session_id=psid).start(detached=False)
-    assert res.status == "completed"
-    assert llm.seen[0].response_format["json_schema"].get("strict", False) is expect_strict
+@pytest.mark.parametrize('arguments,reason', [({'task':'x','output_schema':{'type':'array'}},'output_schema'),
+    ({'task':'x','tools':'bash'},'参数有误')])
+async def test_invalid_child_contract_creates_no_child(registry_store,arguments,reason):
+    store,_=registry_store
+    registry=ToolRegistry()
+    register_spawn_agent(registry)
+    agent=await RunningAgent(store,_Scripted([_tool_resp('spawn','spawn_agent',json.dumps(arguments))]),registry).start()
+    try:
+        await agent.send('invalid')
+        rows=await store.load_all_messages(agent.target.session_id)
+        output=next(r.content for r in rows if r.tool_call_id=='spawn')
+        assert output.startswith('Error:') and reason in output
+        assert await store.list_children(agent.target.session_id)==[]
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.parametrize('strict',[False,True])
+async def test_workflow_worker_receives_schema_and_strict(registry_store,strict):
+    store,_=registry_store
+    class Model(_Scripted):
+        seen=[]
+        async def complete(self,request,**kwargs):
+            self.seen.append(request)
+            return LLMResponse(raw_text='{"label":"a"}')
+    model=Model()
+    model.seen=[]
+    agent=await RunningAgent(store,model,ToolRegistry()).start()
+    try:
+        spec=_node_spec({'name':'C','schema':LABEL_SCHEMA,'strict':strict})
+        handle=await agent.runtime.client.workflow(agent.target,spec,message_id='strict',actor=agent.actor)
+        result=await agent.runtime.client.wait(JobRef(store.store_id,handle.job_id,0),actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert result.status=='completed',result
+        leaf_request=next(r for r in model.seen if r.response_format and r.response_format.get('type')=='json_schema')
+        assert leaf_request.response_format['json_schema'].get('strict',False) is strict
+        nodes=await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='workflow_node'")
+        assert len(nodes)==1
+        child=await agent.runtime.client.wait(JobRef(store.store_id,nodes[0]['job_id'],0),actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert child.structured_output=={'label':'a'}
+    finally:
+        await agent.aclose()

@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, AgentSpec, RequestOptions, SessionStore
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -26,15 +26,11 @@ from power_loop._vendor.llm_client.interface import (
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import (
     get_effective_tools,
-    reset_effective_tools,
-    set_effective_tools,
 )
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
-from power_loop.workflow.engine import WorkflowEngine
-from power_loop.workflow.spec import WorkflowSpec
 
 
 @dataclass
@@ -110,7 +106,7 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 @pytest.mark.asyncio
-async def test_send_with_tools_publishes_effective_set(store: SessionStore) -> None:
+async def test_send_with_tools_publishes_effective_set(store: SessionStore, runtime_agent) -> None:
     seen: list[frozenset[str] | None] = []
 
     def probe(**_kw: Any) -> str:
@@ -123,11 +119,8 @@ async def test_send_with_tools_publishes_effective_set(store: SessionStore) -> N
         _tool_call("t1", "probe"),
         LLMResponse(raw_text="fin"),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(max_rounds=3),
-    )
-    sid = await loop.new_session()
-    r = await loop.send("go", session_id=sid, tools=["probe", "a"])
+    loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(max_rounds=3))
+    r = await loop.send("go", options=RequestOptions(tools=["probe", "a"]))
     assert r.status == "completed"
     assert seen == [frozenset({"probe", "a"})]
     # And it is reset once the run finishes.
@@ -135,7 +128,7 @@ async def test_send_with_tools_publishes_effective_set(store: SessionStore) -> N
 
 
 @pytest.mark.asyncio
-async def test_send_without_tools_publishes_none(store: SessionStore) -> None:
+async def test_send_without_tools_publishes_none(store: SessionStore, runtime_agent) -> None:
     seen: list[frozenset[str] | None] = []
 
     def probe(**_kw: Any) -> str:
@@ -148,169 +141,109 @@ async def test_send_without_tools_publishes_none(store: SessionStore) -> None:
         _tool_call("t1", "probe"),
         LLMResponse(raw_text="fin"),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(max_rounds=3),
-    )
-    sid = await loop.new_session()
-    await loop.send("go", session_id=sid)
+    loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(max_rounds=3))
+    await loop.send("go")
     assert seen == [None]
 
 
-# ── run_agent_spec inherits the filter ───────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_child_inherit_mode_clamped_by_send_filter(store: SessionStore) -> None:
-    """spec.tools=None (inherit all) under an active filter → child sees only
-    the filtered names."""
-    llm = _Capturing(responses=[LLMResponse(raw_text="child done")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry("a", "b", "c"),
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    token = set_effective_tools(frozenset({"a", "c"}))
-    try:
-        res = await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-        )
-    finally:
-        reset_effective_tools(token)
-    assert res["status"] == "completed"
-    assert llm.seen_tools == [["a", "c"]]
+@pytest.mark.parametrize('declared,grant,expected', [
+    (None, ['a', 'c'], ['a', 'c']),
+    (['b'], ['a', 'b'], ['b']),
+    (None, ['a', 'b', 'c'], ['a', 'b', 'c']),
+    (['b', 'c'], ['a', 'b'], None),
+])
+async def test_child_uses_frozen_grant_and_cannot_widen_it(store, runtime_agent, declared, grant, expected):
+    from power_loop.core.agent_context import get_current_loop
+    from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
+    reg = _registry('a', 'b', 'c')
+    async def delegate():
+        return await run_agent_spec(AgentSpec(name='kid', system_prompt='CHILD', tools=declared),
+                                    'task', parent_loop=get_current_loop())
+    reg.register(_tool_def('delegate'), FunctionRuntimeTool(delegate,
+        ToolRuntimeContract('test.delegate', allowed_roles=('main',))))
+    class Model(_Capturing):
+        submitted = False
+        async def complete(self, request, **kwargs):
+            if request.system_prompt.startswith('CHILD'):
+                return await super().complete(request, **kwargs)
+            if not self.submitted:
+                self.submitted = True
+                return _tool_call('delegation', 'delegate')
+            return LLMResponse(raw_text='parent done')
+    model = Model([LLMResponse(raw_text='child done')])
+    runner = await runtime_agent(model=model, store=store, registry=reg, config=AgentLoopConfig(compactor=None))
+    assert (await runner.send('go', options=RequestOptions(tools=['delegate', *grant]))).status == 'completed'
+    rows = await store.load_all_messages(runner.target.session_id)
+    receipt = next(r.content for r in rows if r.tool_call_id == 'delegation')
+    if expected is None:
+        assert 'forbidden' in receipt and 'grant' in receipt
+        assert not model.seen_tools and not await store.list_children(runner.target.session_id)
+    else:
+        assert model.seen_tools == [expected]
+        assert json.loads(receipt)['status'] == 'completed'
+    assert get_effective_tools() is None
+    await runner.drain()
 
 
-@pytest.mark.asyncio
-async def test_child_specify_mode_intersected(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text="child done")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry("a", "b", "c"),
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    token = set_effective_tools(frozenset({"a", "b"}))
-    try:
-        await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p", tools=["b", "c"]),
-            "task", parent_loop=loop,
-        )
-    finally:
-        reset_effective_tools(token)
-    assert llm.seen_tools == [["b"]]
+async def test_child_cannot_spawn_grandchild_and_filter_is_restored(store, runtime_agent):
+    from power_loop.core.agent_context import get_current_loop
+    from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
+    reg = _registry('a', 'b')
+    seen = []
+    async def spawnling():
+        seen.append(get_effective_tools())
+        return await run_agent_spec(AgentSpec(name='grandkid', system_prompt='GRANDCHILD'),
+                                    'task', parent_loop=get_current_loop())
+    reg.register(_tool_def('spawnling'), FunctionRuntimeTool(spawnling,
+        ToolRuntimeContract('test.nested', allowed_roles=('subagent',))))
+    async def delegate():
+        return await run_agent_spec(AgentSpec(name='kid', system_prompt='CHILD'),
+                                    'task', parent_loop=get_current_loop())
+    reg.register(_tool_def('delegate'), FunctionRuntimeTool(delegate,
+        ToolRuntimeContract('test.delegate', allowed_roles=('main',))))
+    class Model(_Capturing):
+        submitted = False
+        async def complete(self, request, **kwargs):
+            if request.system_prompt.startswith('CHILD'):
+                return await super().complete(request, **kwargs)
+            if not self.submitted:
+                self.submitted = True
+                return _tool_call('delegate', 'delegate')
+            return LLMResponse(raw_text='parent done')
+    model = Model([_tool_call('nested', 'spawnling'), LLMResponse(raw_text='child done')])
+    runner = await runtime_agent(model=model, store=store, registry=reg, config=AgentLoopConfig(compactor=None))
+    await runner.send('go', options=RequestOptions(tools=['delegate', 'spawnling', 'a']))
+    [child] = await store.list_children(runner.target.session_id)
+    assert not await store.list_children(child.session_id)
+    rows = await store.load_all_messages(child.session_id)
+    assert any(r.tool_call_id == 'nested' and 'role' in r.content for r in rows)
+    assert model.seen_tools == [['a', 'spawnling'], ['a', 'spawnling']]
+    assert seen == [frozenset({'a', 'spawnling'})]
+    assert get_effective_tools() is None
+    await runner.drain()
 
 
-@pytest.mark.asyncio
-async def test_inherit_send_filter_false_escape_hatch(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text="child done")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry("a", "b"),
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    token = set_effective_tools(frozenset({"a"}))
-    try:
-        await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-            inherit_send_filter=False,
-        )
-    finally:
-        reset_effective_tools(token)
-    assert llm.seen_tools == [["a", "b"]]
-
-
-@pytest.mark.asyncio
-async def test_nested_child_run_resets_filter(store: SessionStore) -> None:
-    """A child run WITHOUT tools= resets the innermost filter to None: a
-    grandchild is clamped only by the child's (already-clamped) registry, not
-    by re-application of the outer names."""
-    llm = _Capturing(responses=[
-        _tool_call("t1", "spawnling"),        # child round 1: call the spawning tool
-        LLMResponse(raw_text="grandchild"),   # grandchild run
-        LLMResponse(raw_text="child done"),   # child round 2
-    ])
-    inner_seen: list[frozenset[str] | None] = []
-
-    async def spawnling(**_kw: Any) -> str:
-        # Runs inside the CHILD's run → the innermost filter must be None.
-        inner_seen.append(get_effective_tools())
-        from power_loop.core.agent_context import get_current_loop
-
-        res = await run_agent_spec(
-            AgentSpec(name="grandkid", system_prompt="p"),
-            "task", parent_loop=get_current_loop(),
-        )
-        return str(res["status"])
-
-    reg = _registry("a", "b")
-    reg.register(_tool_def("spawnling"), spawnling)
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(max_rounds=3),
-    )
-    token = set_effective_tools(frozenset({"spawnling", "a"}))
-    try:
-        await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-        )
-    finally:
-        reset_effective_tools(token)
-    assert inner_seen == [None]
-    # Child advertised the clamped set; grandchild inherited the child's full
-    # (clamped) registry — not the raw parent registry.
-    assert llm.seen_tools[0] == ["a", "spawnling"]
-    assert llm.seen_tools[1] == ["a", "spawnling"]
-
-
-# ── workflow: capture at submission + leaf clamp + journal round-trip ────
-
-
-def _leaf_spec(tools: list[str] | None = None) -> dict[str, Any]:
-    node_spec: dict[str, Any] = {"name": "leaf", "system_prompt": "p"}
-    if tools is not None:
-        node_spec["tools"] = tools
-    return {
-        "name": "wf",
-        "root": {"type": "agent", "id": "n1", "spec": node_spec},
-    }
-
-
-@pytest.mark.asyncio
-async def test_workflow_captures_send_filter_at_submission(store: SessionStore) -> None:
-    llm = _Capturing(responses=[])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry("a", "b"),
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    token = set_effective_tools(frozenset({"a"}))
-    try:
-        wf = create_workflow(_leaf_spec(), parent_loop=loop)
-    finally:
-        reset_effective_tools(token)
-    assert wf._allowed_tools == frozenset({"a"})
-    # Explicit override beats capture; None = unrestricted.
-    wf2 = create_workflow(_leaf_spec(), parent_loop=loop, allowed_tools=["b"])
-    assert wf2._allowed_tools == frozenset({"b"})
-    wf3 = create_workflow(_leaf_spec(), parent_loop=loop, allowed_tools=None)
-    assert wf3._allowed_tools is None
-
-
-@pytest.mark.asyncio
-async def test_workflow_engine_clamps_leaf_tools(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text="leaf out")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry("a", "b", "c"),
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    engine = WorkflowEngine(loop, allowed_tools=frozenset({"a", "b"}))
-    result = await engine.run(WorkflowSpec.from_json(_leaf_spec()))
-    assert result.status == "completed"
-    assert llm.seen_tools == [["a", "b"]]  # inherit → clamp set becomes the whitelist
-
-
-@pytest.mark.asyncio
-async def test_workflow_engine_intersects_explicit_leaf_tools(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text="leaf out")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry("a", "b", "c"),
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    engine = WorkflowEngine(loop, allowed_tools=frozenset({"b", "c"}))
-    result = await engine.run(WorkflowSpec.from_json(_leaf_spec(tools=["a", "b"])))
-    assert result.status == "completed"
-    assert llm.seen_tools == [["b"]]
+@pytest.mark.parametrize('grant,declared,expected', [
+    (['a'], None, ['a']), (['b'], None, ['b']), (None, None, ['a', 'b', 'c']),
+    (['a', 'b'], None, ['a', 'b']), (['b', 'c'], ['a', 'b'], ['b']),
+])
+async def test_workflow_submission_freezes_grant_and_clamps_leaf(store, runtime_agent, grant, declared, expected):
+    from power_loop.agent.runtime_store import now_ms
+    model = _Capturing([LLMResponse(raw_text='leaf out')])
+    runner = await runtime_agent(model=model, store=store, registry=_registry('a', 'b', 'c'),
+                                 config=AgentLoopConfig(compactor=None))
+    node_spec = {'name': 'leaf', 'system_prompt': 'LEAF'}
+    if declared is not None:
+        node_spec['tools'] = declared
+    options = RequestOptions(tools=grant)
+    workflow = create_workflow({'name':'filtered','root':{'type':'agent','id':'n1','spec':node_spec}},
+        client=runner.runtime.client, target=runner.target, actor=runner.actor, message_id='workflow', options=options)
+    handle = await workflow.start()
+    if grant is not None:
+        grant.append('not-registered-after-submission')
+    result = await handle.wait(deadline_ms=now_ms()+10000)
+    assert result.status == 'completed'
+    assert model.seen_tools == [expected]
+    await runner.drain()

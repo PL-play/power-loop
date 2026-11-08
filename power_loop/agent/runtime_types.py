@@ -245,6 +245,7 @@ class Result:
     usage: dict | None = None
     structured_output: Any = None
     error: str | None = None
+    error_code: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "usage", freeze(self.usage or {}))

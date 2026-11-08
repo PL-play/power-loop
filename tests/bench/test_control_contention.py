@@ -12,22 +12,22 @@ import logging
 import os
 import platform
 import time
-from contextvars import ContextVar
 from pathlib import Path
 
 import pytest
 
 from bench.harness import percentile
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, MemoryMessageTransport
+from power_loop.core.execution_context import get_execution_context
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 from tests.unit.test_job_registry_192 import registry_store
 
 __all__ = ["registry_store"]
 pytestmark = [pytest.mark.bench, pytest.mark.asyncio]
-_MEASURED_SEND = ContextVar("control_benchmark_send", default=None)
-
 
 class Model(LLMService):
     def __init__(self):
@@ -52,7 +52,8 @@ class Timings(logging.Handler):
         self.transactions = []
 
     def emit(self, record):
-        send = _MEASURED_SEND.get()
+        context = get_execution_context(required=False)
+        send = context.input_ref.message_id if context is not None else None
         if send is not None:
             self.transactions.append({"send": send, "wait_ms": record.wait_ms,
                 "hold_ms": record.hold_ms, "outcome": record.outcome})
@@ -72,24 +73,22 @@ async def pg_registry_store(request, tmp_path):
 async def test_eight_session_send_contention(pg_registry_store):
     store, _ = pg_registry_store
     manager = JobManager(store)
-    runtimes, loops, models, sessions = [], [], [], []
+    runtimes, loops = [], []
+    model = Model()
+    coordinator, transport = MemorySessionOwnershipCoordinator(), MemoryMessageTransport()
     logger = logging.getLogger("power_loop.control.transactions")
     old_level, old_propagate = logger.level, logger.propagate
     timings = Timings()
     try:
         for index in range(8):
-            model = Model()
             runtime = TaskRuntime(manager, tenant_id="contention", principal_id="host",
                 executor_id=f"benchmark-{index}", boot_id="boot", boot_contract_hash="a" * 64)
-            loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-                tool_registry=ToolRegistry(), config=AgentLoopConfig(
-                    max_rounds=2, max_tokens=20, compactor=None, delegation_policy="single_level"))
+            loop = await RunningAgent(store=store, model=model, task_runtime=runtime,
+                coordinator=coordinator, transport=transport, registry=ToolRegistry(), config=AgentLoopConfig(
+                    max_rounds=2, max_tokens=20, compactor=None, delegation_policy="single_level")).start()
             runtimes.append(runtime)
             loops.append(loop)
-            models.append(model)
-            sid = await loop.new_session()
-            sessions.append(sid)
-            assert (await loop.send("warm", sid)).status == "completed"
+            assert (await loop.send("warm")).status == "completed"
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
         logger.addHandler(timings)
@@ -100,14 +99,11 @@ async def test_eight_session_send_contention(pg_registry_store):
         async def worker(index):
             await ready.wait()
             for step in range(sends_per_session):
-                token = _MEASURED_SEND.set(f"{index}:{step}")
-                try:
-                    began = time.perf_counter()
-                    result = await loops[index].send(f"measured {step}", sessions[index])
-                    latencies.append((time.perf_counter() - began) * 1000)
-                    assert result.status == "completed"
-                finally:
-                    _MEASURED_SEND.reset(token)
+                began = time.perf_counter()
+                result = await loops[index].send(f"measured {step}", message_id=f"{index}:{step}")
+                latencies.append((time.perf_counter() - began) * 1000)
+                assert result.status == "completed"
+
 
         workers = [asyncio.create_task(worker(i)) for i in range(8)]
         started = time.perf_counter()
@@ -121,7 +117,7 @@ async def test_eight_session_send_contention(pg_registry_store):
             await asyncio.gather(*workers, return_exceptions=True)
         elapsed = time.perf_counter() - started
         assert len(latencies) == 8 * sends_per_session
-        assert all(model.calls == sends_per_session + 1 for model in models)
+        assert model.calls == 8 * (sends_per_session + 1)
         assert timings.transactions and all(t["outcome"] == "committed" for t in timings.transactions)
         entry = {}
         for transaction in timings.transactions:
@@ -146,4 +142,5 @@ async def test_eight_session_send_contention(pg_registry_store):
         for runtime in runtimes:
             await runtime.shutdown(timeout_s=1)
         for loop in loops:
-            await loop.aclose(drain_timeout_s=.1)
+            await loop.aclose()
+        await transport.aclose()

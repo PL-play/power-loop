@@ -1,104 +1,66 @@
-"""Async × projection interaction — the cross-cutting behavior the per-feature tests miss.
+"""Append and background results retain projected history on the current runtime."""
+import asyncio
+import json
 
-These pin the contract documented in docs/user-guide/async-orchestration.md:
+from power_loop import AgentLoopConfig, JobRef, LLMResponse, ProjectedRepresentation, ToolDefinition
+from power_loop.agent.runtime_store import now_ms
+from power_loop.runtime.pricing import Free
+from power_loop.tools import create_default_tool_registry
+from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
-- a ``follow_up`` on an IDLE session is a fresh send → its own ``send_index`` → projected as its own
-  send (this is the path a timer/background-completion wake takes when the loop has gone idle);
-- ``follow_up`` on idle returns a ``StatefulResult`` (ran), not ``FollowUpQueued`` (queued);
-- background-task results re-enter via ``BackgroundRuntimeProjector``: unseen finished tasks are
-  injected once as a ``<background_updates>`` message and then marked seen (no re-injection).
+from .test_background_runtime_203 import BackgroundParent
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, _tool_resp
 
-Reuses the scripted-LLM helpers from test_stateful_loop / test_history_projection_loop.
-"""
-
-from __future__ import annotations
-
-from collections.abc import AsyncIterator
-
-import pytest
-
-from power_loop._vendor.llm_client.interface import LLMResponse
-from power_loop.agent.follow_up import FollowUpQueued
-from power_loop.runtime.history_projector import DefaultDeterministicProjector
-from power_loop.runtime.runtime_state import BackgroundRuntimeProjector
-from power_loop.runtime.store.store import SessionStore
-from tests.unit.test_history_projection_loop import _projector_loop
-from tests.unit.test_stateful_loop import _Scripted, _tool_resp
+__all__ = ['registry_store']
 
 
-@pytest.fixture
-async def store() -> AsyncIterator[SessionStore]:
-    s = await SessionStore.open(":memory:")
-    yield s
-    await s.close()
+async def test_idle_append_is_a_new_projected_send(registry_store):
+    store,_=registry_store
+    registry=ToolRegistry()
+    registry.register(ToolDefinition('echo','echo',pricing=Free('test')),lambda **kw:'a')
+    model=_Scripted([_tool_resp('echo','echo','{}'),LLMResponse(raw_text='done1'),LLMResponse(raw_text='done2')])
+    agent=await RunningAgent(store,model,registry,AgentLoopConfig(representation=ProjectedRepresentation(),compactor=None)).start()
+    try:
+        await agent.send('first')
+        assert {(r.send_index,r.kind) for r in await store.load_project_messages(agent.target.session_id)}=={(1,'user'),(1,'project')}
+        accepted=await agent.runtime.client.append(agent.target,'second',message_id='append',actor=agent.actor)
+        result=await agent.runtime.client.wait(accepted.input_ref,actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert result.status=='completed'
+        await agent.drain(after_input=accepted.input_ref)
+        assert {(r.send_index,r.kind) for r in await store.load_project_messages(agent.target.session_id)}=={(1,'user'),(1,'project'),(2,'user'),(2,'project')}
+    finally:
+        await agent.aclose()
 
 
-@pytest.mark.asyncio
-async def test_follow_up_on_idle_opens_new_projected_send(store: SessionStore) -> None:
-    """A wake (timer/background completion) on an idle session = a new send with its own
-    send_index, projected independently — not appended to the prior send."""
-    llm = _Scripted(responses=[
-        _tool_resp("c1", "echo", '{"text": "a"}'),
-        LLMResponse(raw_text="done1"),
-        LLMResponse(raw_text="done2"),
-    ])
-    loop = _projector_loop(store, llm, DefaultDeterministicProjector())
-    sid = await loop.new_session()
-
-    await loop.send("first", session_id=sid)
-    assert {(r.send_index, r.kind) for r in await store.load_project_messages(sid)} == {
-        (1, "user"), (1, "project"),
-    }
-
-    # follow_up on an IDLE session falls through to send() and runs the loop.
-    result = await loop.follow_up("second", session_id=sid)
-    assert not isinstance(result, FollowUpQueued)  # ran, didn't queue
-
-    # The wake became its OWN send (send_index 2), projected separately from send 1.
-    assert {(r.send_index, r.kind) for r in await store.load_project_messages(sid)} == {
-        (1, "user"), (1, "project"), (2, "user"), (2, "project"),
-    }
-
-
-@pytest.mark.asyncio
-async def test_background_updates_reenter_once_and_are_marked_seen(store: SessionStore) -> None:
-    """Background results re-enter the loop via BackgroundRuntimeProjector: a finished task is
-    injected exactly once as <background_updates>, then marked seen so it never re-injects."""
-    # new_session needs a loop; a bare store session is enough here.
-    from power_loop.runtime.store.types import SessionKind
-
-    sid = await store.create_session(kind=SessionKind.ROOT)
-    await store.upsert_background_task(
-        sid, task_id="bg-1", command="build", status="done", output_tail="BUILD OK",
-    )
-
-    projector = BackgroundRuntimeProjector()
-    first = await projector.project(store=store, session_id=sid, round_index=0, context=None)
-    assert len(first) == 1
-    body = str(first[0]["content"])
-    assert "<background_updates>" in body and "bg-1" in body and "BUILD OK" in body
-
-    # Not seen until acknowledged (the pipeline acks only after a SUCCESSFUL LLM call, so a
-    # failed call can't swallow the update — design/124 Z7) …
-    assert "_ack" in first[0]
-    again = await projector.project(store=store, session_id=sid, round_index=1, context=None)
-    assert len(again) == 1
-    # … acknowledged → the next round does not re-inject the same finished task.
-    await projector.acknowledge(store=store, session_id=sid, ack=again[0]["_ack"])
-    second = await projector.project(store=store, session_id=sid, round_index=2, context=None)
-    assert second == []
-
-
-@pytest.mark.asyncio
-async def test_background_projector_can_keep_reinjecting_when_mark_seen_false(store: SessionStore) -> None:
-    """mark_seen=False is the 'always show current state' mode — useful for a live status panel."""
-    from power_loop.runtime.store.types import SessionKind
-
-    sid = await store.create_session(kind=SessionKind.ROOT)
-    await store.upsert_background_task(
-        sid, task_id="bg-9", command="serve", status="running", output_tail="listening…",
-    )
-    projector = BackgroundRuntimeProjector(mark_seen=False)
-    assert len(await projector.project(store=store, session_id=sid, round_index=0, context=None)) == 1
-    # Still injected on the next round because it was never marked seen.
-    assert len(await projector.project(store=store, session_id=sid, round_index=1, context=None)) == 1
+async def test_background_completion_is_delivered_once_and_remains_queryable(registry_store,tmp_path):
+    store,_=registry_store
+    release=asyncio.Event()
+    async def slow():
+        await release.wait()
+        return 'BUILD OK'
+    registry=create_default_tool_registry(workspace_dir=tmp_path)
+    registry.register(ToolDefinition('slow','slow',async_capable=True,pricing=Free('test')),slow)
+    agent=await RunningAgent(store,BackgroundParent(),registry,
+        AgentLoopConfig(representation=ProjectedRepresentation(),compactor=None)).start()
+    try:
+        await agent.send('background build')
+        rows=await store.load_all_messages(agent.target.session_id)
+        receipt=json.loads(next(r.content for r in rows if r.role=='tool'))
+        ref=JobRef(**receipt['job_ref'])
+        release.set()
+        original=await agent.runtime.client.wait(ref,actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert original.final_text=='BUILD OK'
+        await agent.drain()
+        await agent.send('next turn')
+        rows=await store.load_all_messages(agent.target.session_id)
+        notices=[r for r in rows if '[background_tool_results]' in str(r.content)]
+        assert len(notices)==1 and 'BUILD OK' in notices[0].content
+        # Status panels may query repeatedly without reinjecting a result.
+        assert await agent.runtime.client.wait(ref,actor=agent.actor,deadline_ms=now_ms()+10000)==original
+        assert len([r for r in await store.load_all_messages(agent.target.session_id)
+                    if '[background_tool_results]' in str(r.content)])==1
+    finally:
+        release.set()
+        await agent.aclose()

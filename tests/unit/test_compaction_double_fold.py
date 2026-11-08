@@ -34,8 +34,8 @@ from hypothesis import strategies as st
 from power_loop import (
     AgentLoopConfig,
     MessageState,
+    RequestOptions,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
 )
@@ -458,24 +458,17 @@ class _EveryRoundCompactor:
 
 
 @pytest.mark.asyncio
-async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monkeypatch) -> None:
+async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monkeypatch, runtime_agent) -> None:
     """The real bug regime, end-to-end: a multi-round send that folds twice must
     leave a coherent, correctly-ordered session that reloads and recalls cleanly."""
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")  # tiny → folds every round
-    sid = await store.create_session(system_prompt="S")
+    cfg = AgentLoopConfig(system_prompt="S", max_rounds=6, max_tokens=4000, compactor=_EveryRoundCompactor())
+    loop = await runtime_agent(model=_ToolLooper(tool_rounds=3), store=store, config=cfg, registry=_blob_registry())
+    sid = loop.target.session_id
     for i in range(4):
         await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
         await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
-
-    cfg = AgentLoopConfig(
-        system_prompt="S", max_rounds=6, max_tokens=4000,
-        compactor=_EveryRoundCompactor(),
-    )
-    loop = StatefulAgentLoop(
-        llm=_ToolLooper(tool_rounds=3), store=store, config=cfg,
-        tool_registry=_blob_registry(),
-    )
-    r = await loop.send("go", session_id=sid, tools=["blob"])
+    r = await loop.send("go", options=RequestOptions(tools=["blob"]))
     assert r.status == "completed"
 
     # more than one fold actually happened (the regime that used to corrupt)
@@ -496,10 +489,11 @@ async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monke
     assert compacted, "folded originals must be retained for recall"
 
     # a follow-up send on the reloaded session still works
-    loop2 = StatefulAgentLoop(
-        llm=_ToolLooper(tool_rounds=0), store=store, config=cfg,
-        tool_registry=_blob_registry(),
+    await loop.aclose()
+    loop2 = await runtime_agent(
+        model=_ToolLooper(tool_rounds=0), store=store, config=cfg,
+        registry=_blob_registry(), target=loop.target,
     )
-    r2 = await loop2.send("again", session_id=sid, tools=["blob"])
+    r2 = await loop2.send("again", message_id="again", options=RequestOptions(tools=["blob"]))
     assert r2.status == "completed"
     assert (await store.load_active_messages(sid))[0].name == "compact_note"

@@ -8,9 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage
 from power_loop.runtime import completion_windows as windows
-from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.completion import CompletionWindow
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
 from power_loop.runtime.task_runtime import _OWNER, Execution, TaskRuntime
@@ -24,11 +23,11 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 async def registered(runtime, protocol=1):
     store, manager, main, root, root_lease, connect, now = runtime
     request = {} if protocol == "legacy" else {windows.PROTOCOL: protocol}
-    child = await manager.register_job(main, kind="subagent", parent=root_lease, independent=True,
-        system_key="window-owner", request=request)
     sid = await store.create_session(parent_session_id=main.session_id,
         metadata={"execution_role": "subagent", "standalone_subagent": True})
-    child = await manager.bind_session(main, child.job.job_id, sid)
+    registration = await manager.register_job(main, kind="subagent", session_id=sid,
+        parent=root_lease, independent=True, system_key="window-owner", request=request)
+    child = registration.job
     actor = replace(main, session_id=sid)
     return SimpleNamespace(store=store, manager=manager, actor=actor, main=main, root=root, child=child,
         sid=sid, connect=connect, now=now)
@@ -60,9 +59,6 @@ async def test_original_claim_and_reopened_manager_recall_one_unchanged_utc_dead
 async def test_expired_window_remains_recallable_but_cannot_authorize_execution_or_extension(original):
     c = original
     c.now[0] = c.saved["deadline_at_ms"]
-    # Isolate deadline from the independent short renewable execution lease.
-    await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET lease_until_ms=? WHERE job_id=?",
-        (c.now[0] + 10000, c.owner.job_id))
     assert await windows.read(c.manager, c.actor, c.owner.job_id) == c.saved
     with pytest.raises(JobError, match="owner_completion_deadline_exceeded"):
         await c.manager.check_execution(c.actor, c.owner)
@@ -188,27 +184,9 @@ async def test_original_window_cannot_be_missing_retimed_or_rebound(original, fa
         await c.manager.check_execution(c.actor, c.owner)
 
 
-async def test_wait_policy_cannot_reset_remaining_owner_deadline(original):
-    c = original
-    c.now[0] += 1000
-    source = await c.manager.register_job(c.actor, kind="send", parent=c.owner, session_id=c.sid,
-        system_key="window-source", request={"send_index": 1})
-    caller = await c.manager.claim_job(c.actor, source.job.job_id, executor_id="child", boot_id="boot", expected_version=1)
-    seq = await c.store.append_message(c.sid, role="assistant", send_index=1, round_index=0,
-        tool_calls=[{"id": "arm-window", "type": "function", "function": {"name": "wait", "arguments": "{}"}}])
-    kwargs = dict(caller=caller, call_ref=await c.store.message_ref(c.sid, seq), tool_call_id="arm-window",
-        request=waits.WaitRequest(c.now[0] + 100, "Original reason", "Continue original task"))
-    with pytest.raises(JobError, match="wait_deadline_exceeds_owner_window"):
-        await waits.register_wait(c.manager, c.actor, **kwargs,
-            policy=waits.WaitPolicy(c.now[0] + windows.DEFAULT_TIMEOUT_MS, max_wait_ms=3600000))
-    assert not await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='timer'")
-    registration = await waits.register_wait(c.manager, c.actor, **kwargs,
-        policy=waits.WaitPolicy(c.saved["deadline_at_ms"]))
-    saved = await waits.read_wait(c.manager, c.main, registration.job.job_id)
-    assert saved["request"]["policy"]["deadline_at_ms"] == c.saved["deadline_at_ms"]
 
 
-async def test_later_processing_error_preserves_already_paid_round_usage(registry_store, monkeypatch):
+async def test_later_processing_error_preserves_already_paid_round_usage(registry_store, monkeypatch, runtime_agent):
     store, _ = registry_store
     manager = JobManager(store)
     task_runtime = TaskRuntime(manager, tenant_id="original-usage", principal_id="host", executor_id="executor", boot_id="boot")
@@ -229,21 +207,20 @@ async def test_later_processing_error_preserves_already_paid_round_usage(registr
         async def close(self):
             pass
 
-    loop = StatefulAgentLoop(llm=Provider(), store=store, task_runtime=task_runtime,
+    from power_loop.agent.stateful_loop import _ExecutionLoop
+    agent = await runtime_agent(model=Provider(), store=store, task_runtime=task_runtime,
         config=AgentLoopConfig(max_rounds=3, delegation_policy="single_level"))
-    sid = await loop.new_session()
-    original = loop._run_with_tool_context
+    original = _ExecutionLoop._run_with_tool_context
 
-    async def unavailable(*args, **kwargs):
-        result = await original(*args, **kwargs)
+    async def unavailable(self, *args, **kwargs):
+        result = await original(self, *args, **kwargs)
         assert result.usage["total_tokens"] == 10
         raise RuntimeError("test: post-model processing unavailable")
 
-    monkeypatch.setattr(loop, "_run_with_tool_context", unavailable)
-    with pytest.raises(RuntimeError, match="post-model processing unavailable"):
-        await loop.send("Complete original request", sid)
+    monkeypatch.setattr(_ExecutionLoop, "_run_with_tool_context", unavailable)
+    result = await agent.send("Complete original request")
+    assert result.status == 'failed' and result.error == 'RuntimeError'
     assert len(calls) == 1
-    [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-    assert (await manager.execution_usage(task_runtime.actor(sid), job["job_id"]))["total_tokens"] == 10
-    [closed] = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND event_type='model_closed'", (job["job_id"],))
-    assert json.loads(closed["payload_json"])["evidence"]["usage"]["total_tokens"] == 10
+    [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='send'")
+    assert (await manager.execution_usage(task_runtime.actor(agent.target.session_id), job["job_id"]))["total_tokens"] == 10
+    assert result.usage['total_tokens'] == 10

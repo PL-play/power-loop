@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.core.agent_context import (
     reset_current_loop,
@@ -30,12 +29,12 @@ from tests.real._llm import make_llm
 pytestmark = pytest.mark.asyncio
 
 
-async def test_real_projection_compaction_and_recall() -> None:
+async def test_real_projection_compaction_and_recall(runtime_agent) -> None:
     llm = make_llm(max_tokens=2048, temperature=0.0)
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=llm, store=store,
+        loop = await runtime_agent(
+            model=llm, store=store,
             config=AgentLoopConfig(
                 system_prompt="You are terse. Reply with one short sentence.",
                 max_rounds=3, compactor=None,
@@ -45,11 +44,11 @@ async def test_real_projection_compaction_and_recall() -> None:
                 history_projector=DefaultDeterministicProjector(keep_last_sends=2),
             ),
         )
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         # 4 real sends. Sends 2-4 are assembled with PROJECTED plain-text history (not verbatim);
         # the live provider accepting them (status=completed) is the core validation.
         for i in range(1, 5):
-            r = await loop.send(f"Say the word apple{i} back to me.", session_id=sid)
+            r = await loop.send(f"Say the word apple{i} back to me.")
             assert r.status == "completed", f"send {i} status={r.status}"
 
         # Each finished send was projected (user + project rows).
@@ -70,4 +69,5 @@ async def test_real_projection_compaction_and_recall() -> None:
             reset_current_loop(t_loop)
         assert recalled.startswith("send #1") and "apple1" in recalled.lower()
     finally:
+        await loop.aclose()
         await store.close()

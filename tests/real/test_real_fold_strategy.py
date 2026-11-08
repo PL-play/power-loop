@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.core.agent_context import (
     reset_current_loop,
@@ -33,13 +32,13 @@ from tests.real._llm import make_llm
 pytestmark = pytest.mark.asyncio
 
 
-def _loop(store, representation, fold_strategy, *, budget=40):
+async def _loop(runtime_agent, store, representation, fold_strategy, *, budget=40):
     # The FOLD budget is tiny so a few short sends cross it; the OUTPUT cap is not. The two used
     # to be one knob (max_tokens=40), which only worked on models that answer without thinking —
     # a reasoning model (the suite runs on deepseek-flash) spends 40 tokens before its first word
     # and every send ended hit_round_limit. context_budget_tokens is the fold budget on its own.
-    return StatefulAgentLoop(
-        llm=make_llm(max_tokens=2048, temperature=0.0),
+    return await runtime_agent(
+        model=make_llm(max_tokens=2048, temperature=0.0),
         store=store,
         config=AgentLoopConfig(
             system_prompt="You are terse. Reply with one short sentence.",
@@ -51,55 +50,56 @@ def _loop(store, representation, fold_strategy, *, budget=40):
 
 async def _drive(loop, sid, n=5):
     for i in range(1, n + 1):
-        r = await loop.send(f"Note the word apple{i} and reply OK.", session_id=sid)
+        r = await loop.send(f"Note the word apple{i} and reply OK.")
         assert r.status == "completed", f"send {i} status={r.status}"
 
 
 # ── verbatim × {default, agentic}: in-place compaction via the mapped compactor ──
 
 
-async def test_real_verbatim_llm_summary_fold(monkeypatch) -> None:
+async def test_real_verbatim_llm_summary_fold(monkeypatch, runtime_agent) -> None:
     # The in-place compactor honors CONTEXT_COMPACT_THRESHOLD (env) as an absolute override; clear
     # it so the fold triggers at context_budget_tokens × trigger_ratio in this small test.
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     store = await SessionStore.open(":memory:")
     try:
-        loop = _loop(store, VerbatimRepresentation(), LLMSummaryFold(keep_last_sends=2))
-        sid = await loop.new_session()
+        loop = await _loop(runtime_agent, store, VerbatimRepresentation(), LLMSummaryFold(keep_last_sends=2))
+        sid = loop.target.session_id
         await _drive(loop, sid, 5)
         # Verbatim folds in place: a real LLM-summary compaction must have been recorded.
         comps = await store.list_compactions(sid)
         assert comps, "expected at least one in-place compaction"
         assert any(m.name == "compact_note" for m in await store.load_active_messages(sid))
     finally:
+        await loop.aclose()
         await store.close()
 
 
-async def test_real_verbatim_agentic_fold(monkeypatch) -> None:
+async def test_real_verbatim_agentic_fold(monkeypatch, runtime_agent) -> None:
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     store = await SessionStore.open(":memory:")
     try:
-        loop = _loop(store, VerbatimRepresentation(), AgenticFold(keep_last_sends=2, max_rounds=3))
-        sid = await loop.new_session()
-        await loop.send("Remember: my project is Zephyr; I prefer metric units. Reply OK.",
-                        session_id=sid)
+        loop = await _loop(runtime_agent, store, VerbatimRepresentation(), AgenticFold(keep_last_sends=2, max_rounds=3))
+        sid = loop.target.session_id
+        await loop.send("Remember: my project is Zephyr; I prefer metric units. Reply OK.")
         await _drive(loop, sid, 5)
         comps = await store.list_compactions(sid)
         assert comps, "expected at least one in-place (agentic) compaction"
         notes = await store.list_notes(sid)  # model-discretionary
         assert isinstance(notes, list)
     finally:
+        await loop.aclose()
         await store.close()
 
 
 # ── projection × {default, agentic}: derived-layer fold via the strategy's LLM call ──
 
 
-async def test_real_projection_llm_summary_fold() -> None:
+async def test_real_projection_llm_summary_fold(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
-        loop = _loop(store, ProjectedRepresentation(), LLMSummaryFold(keep_last_sends=2))
-        sid = await loop.new_session()
+        loop = await _loop(runtime_agent, store, ProjectedRepresentation(), LLMSummaryFold(keep_last_sends=2))
+        sid = loop.target.session_id
         await _drive(loop, sid, 4)
         compact = await store.latest_project_compact(sid)
         assert compact is not None and compact.compact_from_send == 1 and compact.compact_to_send == 2
@@ -114,23 +114,21 @@ async def test_real_projection_llm_summary_fold() -> None:
             reset_current_loop(t_loop)
         assert recalled.startswith("send #1") and "apple1" in recalled.lower()
     finally:
+        await loop.aclose()
         await store.close()
 
 
-async def test_real_projection_agentic_fold() -> None:
+async def test_real_projection_agentic_fold(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
-        loop = _loop(store, ProjectedRepresentation(),
+        loop = await _loop(runtime_agent, store, ProjectedRepresentation(),
                      AgenticFold(keep_last_sends=2, summary_max_tokens=2048, max_rounds=3))
-        sid = await loop.new_session()
-        await loop.send("Remember: my project is Zephyr; I prefer metric units. Reply OK.",
-                        session_id=sid)
+        sid = loop.target.session_id
+        await loop.send("Remember: my project is Zephyr; I prefer metric units. Reply OK.")
         await _drive(loop, sid, 4)
         compact = await store.latest_project_compact(sid)
         assert compact is not None and (compact.content or {}).get("summary")
         assert isinstance(await store.list_notes(sid), list)
     finally:
+        await loop.aclose()
         await store.close()
-
-
-# ── mode switch: verbatim → projection migrates prior history (one-time, never throws) ──

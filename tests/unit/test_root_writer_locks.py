@@ -16,13 +16,33 @@ from power_loop.runtime.session_controls import ControlTransaction
 from power_loop.runtime.store.factory import _make_database
 from power_loop.runtime.task_runtime import TaskRuntime
 
-from .test_budget_policy_admission import wait_for_admission_lock
 from .test_executor_drain_trees import stop_worker, wait_ready
 from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled
 
 __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
+
+
+async def wait_for_admission_lock(manager, observer, action):
+    engine = manager.db.dialect.name
+    async with asyncio.timeout(5):
+        while not action.done():
+            if engine == 'sqlite':
+                waiting = manager.db._lock.locked() and not manager.db._conn.in_transaction
+            elif engine == 'postgres':
+                waiting = await observer.fetchone('SELECT pid FROM pg_stat_activity '
+                    "WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE ?",
+                    ('%'+manager.prefix+'%',))
+            else:
+                waiting = await observer.fetchone('SELECT w.REQUESTING_ENGINE_TRANSACTION_ID '
+                    'FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks l '
+                    'ON l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID '
+                    'WHERE l.OBJECT_SCHEMA=DATABASE() AND l.OBJECT_NAME LIKE ?', (manager.prefix+'%',))
+            if waiting:
+                break
+            await asyncio.sleep(.01)
+    assert not action.done(), 'writer passed the conflicting root lock'
 
 
 @pytest.mark.parametrize('target', ['root', 'child', 'other-root', 'checkpoint'])

@@ -1,122 +1,97 @@
-"""Prove existing global-lock behavior before considering a lock replacement."""
-from __future__ import annotations
-
+"""Concurrency through current workers and independently owned task sessions."""
 import asyncio
 import json
 import os
 import sys
-from pathlib import Path
+from dataclasses import asdict
 
 import pytest
 
-from power_loop import LLMResponse, LLMService
+from power_loop import AgentLoopConfig, ExecutionEnvironment, LLMResponse, LLMService, RegistryRuntimeFactory, Runtime
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.jobs import JobError, JobManager
 
 from .test_job_registry_192 import registry_store, runtime
-from .test_round_change_signals import fixture_loop
+from .test_runtime_messaging_203 import fixture
 
-__all__ = ["registry_store", "runtime"]
-pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
-
-
-async def stop_process(process):
-    if process.returncode is None:
-        process.kill()
-    await process.communicate()
+__all__=['registry_store','runtime']
 
 
-async def test_separate_processes_never_dispatch_two_models_for_one_session(registry_store, tmp_path):
-    store, connect = registry_store
-    backend = store._db.dialect.name
-    dsn = str(tmp_path / "registry.db") if backend == "sqlite" else os.environ[
-        "POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
-    sid = await store.create_session()
-    release = tmp_path / "release"
-    first_result, second_result = tmp_path / "first.json", tmp_path / "second.json"
-
-    async def spawn(path, role):
-        return await asyncio.create_subprocess_exec(sys.executable, "-m", "tests.unit._concurrent_send_worker",
-            dsn, store.table_prefix, sid, str(path), str(release), role,
-            cwd=Path(__file__).resolve().parents[2], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-
-    first = await spawn(first_result, "first")
-    second = None
+async def test_separate_default_processes_never_dispatch_two_models(registry_store):
+    store,_=registry_store
+    _,target,actor=await fixture(store)
+    kind=store._db.dialect.name
+    dsn=store._db.path if kind=='sqlite' else os.environ['POWER_LOOP_TASK_PG_DSN' if kind=='postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
+    env={**os.environ,'P7A_DB_DSN':dsn,'P7A_TABLE_PREFIX':store.table_prefix,
+         'P7A_ACTOR':json.dumps(asdict(actor)),'P7A_SESSION':target.session_id}
+    processes=[]
+    async def spawn():
+        p=await asyncio.create_subprocess_exec(sys.executable,'-m','tests.concurrent_send_worker_208',env=env,
+            stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+        processes.append(p)
+        return p
     try:
-        async with asyncio.timeout(15):
-            while not first_result.exists():
-                if first.returncode is not None:
-                    output, _ = await first.communicate()
-                    raise AssertionError(output.decode())
-                await asyncio.sleep(.01)
-        assert json.loads(first_result.read_text()) == {"status": "model_entered", "calls": 1}
-        second = await spawn(second_result, "second")
-        output, _ = await asyncio.wait_for(second.communicate(), 15)
-        assert second.returncode == 0, output.decode()
-        assert json.loads(second_result.read_text()) == {"status": "busy", "calls": 0}
-        release.touch()
-        output, _ = await asyncio.wait_for(first.communicate(), 15)
-        assert first.returncode == 0, output.decode()
-        assert json.loads(first_result.read_text()) == {"status": "completed", "calls": 1}
-        cold = await connect(schema="compatible")
-        messages = await cold.load_all_messages(sid)
-        assert [row.role for row in messages] == ["user", "assistant"]
-        assert [row.content for row in messages] == ["first", "first"]
-        jobs = await cold._db.fetchall(f"SELECT status,supervision_status FROM {cold.table_prefix}jobs WHERE session_id=?", (sid,))
-        assert [(row["status"], row["supervision_status"]) for row in jobs] == [("model_closed", "closed")]
+        first=await spawn()
+        async with asyncio.timeout(20):
+            assert await first.stdout.readline()==b'model_entered\n'
+            second=await spawn()
+            out,error=await second.communicate()
+            assert second.returncode==0 and out==b'invalid_options\n',error.decode()
+            first.stdin.write(b'release\n')
+            await first.stdin.drain()
+            out,error=await first.communicate()
+            assert first.returncode==0 and out==b'completed\n',error.decode()
+        assert [r.content for r in await store.load_all_messages(target.session_id)]==['first','first']
     finally:
-        release.touch()
-        await stop_process(first)
-        if second is not None:
-            await stop_process(second)
+        for p in processes:
+            if p.returncode is None:
+                p.kill()
+                await p.wait()
 
 
 async def test_different_sessions_enter_models_concurrently_and_close_without_deadlock(registry_store):
-    store, connect = registry_store
-    stores = [store, await connect(schema="compatible")]
-    entered, release = asyncio.Event(), asyncio.Event()
-    arrivals = []
-
+    store,_=registry_store
+    _,first,actor=await fixture(store)
+    _,second,_=await fixture(store)
+    entered,release=asyncio.Event(),asyncio.Event()
+    arrivals=[]
     class Model(LLMService):
-        def __init__(self, label):
-            self.label = label
-        async def complete(self, request, **kwargs):
-            arrivals.append(self.label)
-            if len(arrivals) == 2:
+        def __init__(self,sid): self.sid=sid
+        async def complete(self,request,**kwargs):
+            arrivals.append(self.sid)
+            if len(arrivals)==2:
                 entered.set()
             await release.wait()
-            return LLMResponse(raw_text=self.label)
-        def stream(self, request):
-            raise AssertionError("nonstream fixture")
-        async def close(self):
-            pass
-
-    pairs = [fixture_loop(s, Model(str(i))) for i, s in enumerate(stores)]
-    sessions = [await loop.new_session() for _, loop in pairs]
-    tasks = [asyncio.create_task(loop.send(str(i), sid)) for i, ((_, loop), sid) in enumerate(zip(pairs, sessions, strict=True))]
+            return LLMResponse(raw_text=self.sid)
+        async def close(self): pass
+    factory=RegistryRuntimeFactory()
+    async def build(descriptor,context):
+        return ExecutionEnvironment(Model(context.session_id),None,AgentLoopConfig(compactor=None))
+    factory.register('test.agent@1',build)
+    worker=Runtime(store=store,factory=factory,node_id='concurrent',capacity=2,timers_enabled=False)
+    await worker.worker.start()
     try:
-        await asyncio.wait_for(entered.wait(), 10)
-        assert sorted(arrivals) == ["0", "1"]
+        receipts=await asyncio.gather(*(worker.client.send(t,'start',message_id='start',actor=actor) for t in (first,second)))
+        await asyncio.wait_for(entered.wait(),10)
+        assert set(arrivals)=={first.session_id,second.session_id}
         release.set()
-        results = await asyncio.wait_for(asyncio.gather(*tasks), 15)
-        assert [result.final_text for result in results] == ["0", "1"]
-        for i, (s, sid) in enumerate(zip(stores, sessions, strict=True)):
-            assert [row.content for row in await s.load_all_messages(sid)] == [str(i), str(i)]
-        assert all(not runtime.manager._execution_controls for runtime, _ in pairs)
+        results=await asyncio.gather(*(worker.client.wait(r.input_ref,actor=actor,deadline_ms=now_ms()+10000) for r in receipts))
+        assert [r.final_text for r in results]==[first.session_id,second.session_id]
     finally:
         release.set()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for runtime, loop in pairs:
-            await runtime.shutdown(timeout_s=1)
-            await loop.aclose(drain_timeout_s=.1)
+        await worker.worker.shutdown()
+        await worker.client.aclose()
+        await worker.transport.aclose()
 
 
 @pytest.mark.parametrize("order", ["stop_first", "results_first", "interleaved"])
 async def test_same_tree_stop_new_send_and_duplicate_child_completions_do_not_deadlock(runtime, order):
     _store, manager, actor, root, parent, connect, _now = runtime
-    others = [JobManager(await connect(schema="compatible"), now_ms=manager.now) for _ in range(3)]
+    others = [JobManager(await connect(schema="verify"), now_ms=manager.now) for _ in range(3)]
     children = []
     for i in range(2):
-        registered = await manager.register_job(actor, kind="subagent", parent=parent, system_key=f"child-{i}")
+        sid = await _store.create_session(parent_session_id=actor.session_id)
+        registered = await manager.register_job(actor, kind="subagent", session_id=sid, parent=parent, system_key=f"child-{i}")
         lease = await manager.claim_job(actor, registered.job.job_id, executor_id=f"worker-{i}",
                                         boot_id="boot", expected_version=1)
         children.append(lease)

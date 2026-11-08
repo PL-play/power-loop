@@ -1,33 +1,34 @@
-"""Durable timers (0.11.0): store CRUD, agent tools, TimerRunner firing
-semantics, TIMER_FIRE hook veto, restart recovery."""
-
+"""Default timer behavior through the current RuntimeClient and store backend."""
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
 from power_loop import (
-    AgentEventBus,
-    AgentEventType,
     AgentLoopConfig,
-    HookDirective,
-    HookPoint,
-    StatefulAgentLoop,
-    TimerFireCtx,
+    ExecutionEnvironment,
+    RegistryRuntimeFactory,
+    Runtime,
+    RuntimeRequestError,
+    StoreTimerBackend,
+    TimerContext,
     TimerRunner,
     create_default_tool_registry,
     get_tool_definitions,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
-from power_loop.runtime.pricing import Free
 from power_loop.tools import DEFAULT_TOOL_HANDLERS
+from tests.runtime_fixture import RunningAgent
 
+from .test_job_registry_192 import registry_store
+
+__all__ = ['registry_store']
 
 @dataclass
 class _Scripted(LLMService):
@@ -67,402 +68,134 @@ def _tool_resp(call_id: str, name: str, args: str) -> LLMResponse:
     )
 
 
-def _loop(tmp_path, responses=None, hooks=None, bus=None, with_tools=False):
-    registry = None
-    if with_tools:
-        registry = create_default_tool_registry(preset="core", bind=False)
-        for d in get_tool_definitions(include=["schedule_wakeup", "current_time"]):
-            registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
-    return StatefulAgentLoop(
-        llm=_Scripted(responses=responses or []),
-        db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=registry,
-        hooks=hooks,
-        event_bus=bus,
-    )
 
-
-# ── store + external API ────────────────────────────────────────────────
-
-
-async def test_schedule_cancel_list_external_api(tmp_path):
-    loop = _loop(tmp_path)
-    sid = await loop.new_session()
-    t = await loop.schedule_timer(sid, delay_s=3600, note="check the report")
-    assert t.status == "armed" and t.timer_id == 1
-    assert [x.timer_id for x in await loop.list_timers(sid)] == [1]
-    assert await loop.cancel_timer(sid, 1) is True
-    assert await loop.cancel_timer(sid, 1) is False  # already cancelled
-    assert await loop.list_timers(sid) == []
-    with pytest.raises(ValueError):
-        await loop.schedule_timer(sid, note="missing delay")
-    with pytest.raises(ValueError):
-        await loop.schedule_timer(sid, delay_s=10, note="   ")
-    await loop.aclose()
-
-
-async def test_timers_cascade_delete_with_session(tmp_path):
-    loop = _loop(tmp_path)
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, delay_s=60, note="n")
-    await loop.close_session(sid)
-    assert await loop.store.list_timers(sid) == []
-    await loop.aclose()
-
-
-# ── agent tools ─────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_agent_schedules_and_lists_wakeups_via_tools(tmp_path):
-    loop = _loop(
-        tmp_path,
-        responses=[
-            _tool_resp("c1", "schedule_wakeup",
-                       '{"action": "schedule", "delay_seconds": 60, "note": "ping the build"}'),
-            _tool_resp("c2", "schedule_wakeup", '{"action": "list"}'),
-            LLMResponse(raw_text="scheduled", content_text="scheduled"),
-        ],
-        with_tools=True,
-    )
-    sid = await loop.new_session()
-    res = await loop.send("remind yourself", session_id=sid)
-    assert res.status == "completed"
-    timers = await loop.list_timers(sid)
-    assert len(timers) == 1 and timers[0].note == "ping the build"
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_current_time_tool(tmp_path):
-    loop = _loop(
-        tmp_path,
-        responses=[
-            _tool_resp("c1", "current_time", "{}"),
-            LLMResponse(raw_text="ok", content_text="ok"),
-        ],
-        with_tools=True,
-    )
-    sid = await loop.new_session()
-    res = await loop.send("what time is it", session_id=sid)
-    assert res.status == "completed" and res.tool_calls == 1
-    await loop.aclose()
-
-
-# ── TimerRunner firing ──────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_due_timer_fires_into_idle_session(tmp_path):
-    events: list = []
-    bus = AgentEventBus(suppress_subscriber_errors=True)
-    bus.subscribe(AgentEventType.TIMER_FIRED, events.append)
-    loop = _loop(tmp_path, responses=[
-        LLMResponse(raw_text="woke up and did the thing",
-                    content_text="woke up and did the thing"),
-    ], bus=bus)
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="do the thing")
-    runner = TimerRunner(loop)
-    fired = await runner.scan_once()
-    assert fired == 1
-    assert events and events[0].data.outcome == "delivered"
-    # the timer message reached the session as a user turn
-    msgs = await loop.get_messages(sid)
-    assert any("do the thing" in str(m.get("content")) for m in msgs if m.get("role") == "user")
-    assert (await loop.store.get_timer(sid, 1)).status == "fired"
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_not_due_timer_does_not_fire(tmp_path):
-    loop = _loop(tmp_path)
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, delay_s=3600, note="later")
-    assert await TimerRunner(loop).scan_once() == 0
-    assert (await loop.store.get_timer(sid, 1)).status == "armed"
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_hook_can_skip_cancel_and_postpone(tmp_path):
-    decisions = iter(["postpone", "skip", "cancel"])
-    seen: list[str] = []
-
-    def gate(ctx: TimerFireCtx):
-        d = next(decisions)
-        seen.append(d)
-        if d == "postpone":
-            ctx.postpone_s = 3600
-        elif d == "skip":
-            ctx.directive = HookDirective.SKIP
-        elif d == "cancel":
-            ctx.directive = HookDirective.BREAK
-
-    from power_loop.core.hooks import AgentHooks
-
-    hooks = AgentHooks()
-    hooks.register(HookPoint.TIMER_FIRE, gate)
-    loop = _loop(tmp_path, hooks=hooks)
-    sid = await loop.new_session()
-    past = int(time.time() * 1000) - 1000
-    for note in ("a", "b", "c"):
-        await loop.schedule_timer(sid, due_at_ms=past, note=note)
-    runner = TimerRunner(loop)
-    await runner.scan_once()
-    statuses = {t.timer_id: t.status
-                for t in await loop.store.list_timers(sid, statuses=("armed", "fired", "cancelled"))}
-    assert statuses[1] == "armed"      # postponed → re-armed in the future
-    assert statuses[2] == "fired"      # skipped → done without delivery
-    assert statuses[3] == "cancelled"  # vetoed
-    # nothing was delivered (LLM never called → no assistant messages)
-    assert not [m for m in await loop.get_messages(sid) if m.get("role") == "assistant"]
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_stale_firing_rows_recovered_on_start(tmp_path):
-    loop = _loop(tmp_path, responses=[LLMResponse(raw_text="ok", content_text="ok")])
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="n")
-    # Simulate a runner that died mid-fire long ago.
-    assert await loop.store.transition_timer(sid, 1, from_status="armed", to_status="firing")
-    await loop.store._db.execute(  # age the row past the stale window
-        f"UPDATE {loop.store.t.timers} SET updated_at = updated_at - 600000 WHERE session_id=?",
-        (sid,),
-    )
-    runner = TimerRunner(loop, stale_firing_s=120)
-    await runner.start()
+@asynccontextmanager
+async def timers(store, model=None):
+    from .test_runtime_messaging_203 import fixture
+    _, target, actor = await fixture(store)
+    factory = RegistryRuntimeFactory()
+    async def build(descriptor, context):
+        return ExecutionEnvironment(model or _Scripted(), None, AgentLoopConfig(compactor=None))
+    factory.register('test.agent@1', build)
+    runtime = Runtime(store=store, factory=factory, node_id='timer-test')
+    await runtime.worker.start()
+    # Explicit scans make time/races deterministic; lifecycle itself is tested below.
+    await runtime.timer_driver.stop()
     try:
-        await asyncio.sleep(0)  # let start() finish; recovery is synchronous
-        assert (await loop.store.get_timer(sid, 1)).status in ("armed", "firing", "fired")
-        fired = await runner.scan_once()
-        assert fired >= 0  # recovered row is firable again
+        yield runtime, target, actor, TimerContext(store.store_id, target.session_id, actor)
     finally:
-        await runner.stop()
-    assert (await loop.store.get_timer(sid, 1)).status == "fired"
-    await loop.aclose()
+        await runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
 
 
-@pytest.mark.asyncio
-async def test_recurring_timer_rearms_until_cancelled(tmp_path):
-    loop = _loop(tmp_path, responses=[
-        LLMResponse(raw_text="beat 1", content_text="beat 1"),
-        LLMResponse(raw_text="beat 2", content_text="beat 2"),
+async def test_store_schedule_list_cancel_limits_and_future(registry_store):
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        backend = runtime.timer_backend
+        for i in range(10):
+            await backend.create(source, delay_s=3600, note=f'future {i}')
+        with pytest.raises(RuntimeRequestError, match='timer_limit_reached'):
+            await backend.create(source, delay_s=3600, note='overflow')
+        assert await runtime.timer_driver.scan_once() == 0
+        assert len(await backend.list(source)) == 10
+        assert await backend.cancel(source, 1)
+        assert not await backend.cancel(source, 1)
+        assert len(await backend.list(source)) == 9
+        for kwargs in ({'note':'missing'}, {'delay_s':1,'due_at_ms':2,'note':'both'}, {'delay_s':1,'note':' '}):
+            with pytest.raises(RuntimeRequestError, match='invalid_options'):
+                await backend.create(source, **kwargs)
+
+
+async def test_default_tool_schedule_list_cancel_and_time(registry_store):
+    store, _ = registry_store
+    registry = create_default_tool_registry(preset='core', bind=False)
+    for definition in get_tool_definitions(include=['schedule_wakeup','current_time']):
+        registry.register(definition, DEFAULT_TOOL_HANDLERS[definition.name], overwrite=True)
+    model = _Scripted(responses=[
+        _tool_resp('create','schedule_wakeup','{"action":"schedule","delay_seconds":3600,"note":"check"}'),
+        _tool_resp('list','schedule_wakeup','{"action":"list"}'),
+        _tool_resp('cancel','schedule_wakeup','{"action":"cancel","timer_id":1}'),
+        _tool_resp('time','current_time','{}'),
     ])
-    sid = await loop.new_session()
-    past = int(time.time() * 1000) - 1000
-    await loop.schedule_timer(sid, due_at_ms=past, note="heartbeat", interval_s=3600)
-    runner = TimerRunner(loop)
-    assert await runner.scan_once() == 1
-    row = await loop.store.get_timer(sid, 1)
-    assert row.status == "armed"          # re-armed, not fired
-    assert row.fire_count == 1
-    assert row.due_at > int(time.time() * 1000)  # fixed-delay: now + interval
-    # not due yet → second scan is a no-op
-    assert await runner.scan_once() == 0
-    # force it due again → second delivery
-    await loop.store.transition_timer(sid, 1, from_status="armed", to_status="armed", due_at=past)
-    assert await runner.scan_once() == 1
-    assert (await loop.store.get_timer(sid, 1)).fire_count == 2
-    # cancel is the only exit
-    assert await loop.cancel_timer(sid, 1) is True
-    assert (await loop.store.get_timer(sid, 1)).status == "cancelled"
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_hook_skip_keeps_recurring_cycle(tmp_path):
-    from power_loop import HookDirective
-    from power_loop.core.hooks import AgentHooks
-
-    hooks = AgentHooks()
-    hooks.register(HookPoint.TIMER_FIRE, lambda ctx: setattr(ctx, "directive", HookDirective.SKIP))
-    loop = _loop(tmp_path, hooks=hooks)
-    sid = await loop.new_session()
-    await loop.schedule_timer(
-        sid, due_at_ms=int(time.time() * 1000) - 1000, note="n", interval_s=3600
-    )
-    await TimerRunner(loop).scan_once()
-    row = await loop.store.get_timer(sid, 1)
-    assert row.status == "armed"  # skipped this period, cycle continues
-    # nothing delivered
-    assert not [m for m in await loop.get_messages(sid) if m.get("role") == "user"]
-    await loop.aclose()
-
-
-async def test_one_shot_vs_recurring_declared_at_creation(tmp_path):
-    loop = _loop(tmp_path)
-    sid = await loop.new_session()
-    one = await loop.schedule_timer(sid, delay_s=60, note="once")
-    rec = await loop.schedule_timer(sid, delay_s=60, note="repeat", interval_s=300)
-    assert one.interval_s is None and rec.interval_s == 300
-    with pytest.raises(ValueError):
-        await loop.schedule_timer(sid, delay_s=60, note="bad", interval_s=0)
-    await loop.aclose()
-
-
-async def test_heartbeat_firing_timer_store_cas(tmp_path):
-    """heartbeat_firing_timer re-stamps only a row that is actually 'firing'."""
-    loop = _loop(tmp_path)
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, delay_s=3600, note="n")
-    # armed row → not firing → heartbeat is a no-op
-    assert await loop.store.heartbeat_firing_timer(sid, 1) is False
-    assert await loop.store.transition_timer(sid, 1, from_status="armed", to_status="firing")
-    before = (await loop.store.get_timer(sid, 1)).updated_at
-    await loop.store._db.execute(  # age it so the bump is observable
-        f"UPDATE {loop.store.t.timers} SET updated_at = updated_at - 5000 WHERE session_id=?",
-        (sid,),
-    )
-    assert await loop.store.heartbeat_firing_timer(sid, 1) is True
-    assert (await loop.store.get_timer(sid, 1)).updated_at >= before
-    # once it leaves 'firing', heartbeat can no longer claim it
-    await loop.store.finish_firing_timer(sid, 1)
-    assert await loop.store.heartbeat_firing_timer(sid, 1) is False
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_live_slow_delivery_is_not_reclaimed_as_stale(tmp_path):
-    """A delivery longer than the stale window must NOT be re-armed by the
-    recovery sweep and double-fired — the heartbeat keeps the 'firing' row
-    fresh. Pre-fix the row aged past stale_firing_s mid-delivery and fired
-    a second time."""
-
-    @dataclass
-    class _SlowLLM(LLMService):
-        delay_s: float = 0.8
-
-        async def complete(self, request, *, on_chunk_delta_text=None,
-                           on_chunk_think=None, on_stream_end=None):
-            await asyncio.sleep(self.delay_s)
-            return LLMResponse(raw_text="woke", content_text="woke")
-
-        def stream(self, request):
-            async def _e():
-                if False:
-                    yield LLMStreamChunk()
-            return _e()
-
-        async def close(self):
-            return None
-
-    loop = StatefulAgentLoop(
-        llm=_SlowLLM(delay_s=0.8),
-        db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=2),
-    )
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="do the thing")
-    # stale window 0.5s << 0.8s delivery; heartbeat every 0.05s keeps it alive.
-    runner = TimerRunner(loop, stale_firing_s=0.5, heartbeat_interval_s=0.05)
-
-    scan_task = asyncio.create_task(runner.scan_once())
-    reclaimed_total = 0
-    # Hammer the recovery sweep throughout the slow delivery.
-    while not scan_task.done():
-        reclaimed_total += await loop.store.recover_stale_firing_timers(older_than_ms=500)
-        await asyncio.sleep(0.05)
-    fired = await scan_task
-
-    assert fired == 1
-    assert reclaimed_total == 0, "live delivery was wrongly reclaimed as stale"
-    row = await loop.store.get_timer(sid, 1)
-    assert row.status == "fired"
-    assert row.fire_count == 1, f"timer double-fired: fire_count={row.fire_count}"
-    delivered = [m for m in await loop.get_messages(sid)
-                 if m.get("role") == "user" and "do the thing" in str(m.get("content"))]
-    assert len(delivered) == 1, f"expected exactly one delivery, got {len(delivered)}"
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_timer_for_deleted_session_is_cancelled(tmp_path):
-    loop = _loop(tmp_path)
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="n")
-    # Delete the session but keep the timer row (simulate external cleanup).
-    await loop.store._db.execute(
-        f"DELETE FROM {loop.store.t.sessions} WHERE session_id=?", (sid,)
-    )
-    await TimerRunner(loop).scan_once()
-    assert (await loop.store.get_timer(sid, 1)).status == "cancelled"
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
-async def test_stop_aborts_inflight_timer_delivery_promptly(tmp_path) -> None:
-    # M-async-control-2: a due timer firing into an IDLE session runs a full agent send via
-    # follow_up. stop() must abort that in-flight run and return promptly. Cancellation is
-    # cooperative at ROUND boundaries, so this LLM loops (a tool call every round) and would run
-    # ~1000 rounds; stop() can only cut it short if the runner's token actually reaches the send
-    # (the fix). The LLM does NOT peek at the runner token — abortion must flow through follow_up.
-    from power_loop import ToolDefinition
-    from power_loop.tools.registry import ToolRegistry
-
-    started = asyncio.Event()
-
-    @dataclass
-    class _LoopingLLM(LLMService):
-        n: int = 0
-
-        async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
-                           on_chunk_think=None, on_stream_end=None) -> LLMResponse:
-            started.set()
-            self.n += 1
-            await asyncio.sleep(0.02)
-            return _tool_resp(f"c{self.n}", "echo", '{"text": "x"}')  # always a tool call → next round
-
-        def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-            async def _e() -> AsyncIterator[LLMStreamChunk]:
-                if False:
-                    yield LLMStreamChunk()
-            return _e()
-
-        async def close(self) -> None:
-            return None
-
-    reg = ToolRegistry()
-    reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
-    loop = StatefulAgentLoop(
-        llm=_LoopingLLM(), db_path=str(tmp_path / "s.db"), tool_registry=reg,
-        config=AgentLoopConfig(system_prompt="t", max_rounds=1000, compactor=None),
-    )
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="ping")
-    runner = TimerRunner(loop, scan_interval_s=0.05)
-
-    await runner.start()
+    agent = await RunningAgent(store, model, registry, AgentLoopConfig(max_rounds=6)).start()
     try:
-        await asyncio.wait_for(started.wait(), timeout=5)  # delivery (full send) is underway
-        # ~1000 rounds × 0.02s ≈ 20s if it runs to completion; stop() must cut it short.
-        await asyncio.wait_for(runner.stop(), timeout=5)
+        result = await agent.send('schedule/list/cancel and time')
+        assert result.status == 'completed'
+        rows = await store.load_active_messages(agent.target.session_id)
+        outputs = [row for row in rows if row.role=='tool']
+        assert len(outputs) == 4 and all('Error:' not in str(r.content) and '"error"' not in str(r.content) for r in outputs), [r.content for r in outputs]
+        assert (await store.get_timer(agent.target.session_id,1)).status == 'cancelled'
     finally:
-        with contextlib.suppress(Exception):
-            await runner.stop()
-        await loop.aclose()
+        await agent.aclose()
 
 
-@pytest.mark.asyncio
-async def test_foreign_owner_leaves_due_timer_pending_without_invoking_hook(tmp_path):
-    from power_loop import AgentHooks, MemorySessionOwnershipCoordinator
+async def test_periodic_fixed_delay_and_unknown_occurrence_not_replayed(registry_store):
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        timer = await runtime.timer_backend.create(source, due_at_ms=1, note='repeat', interval_s=60)
+        before = int(time.time()*1000)
+        assert await runtime.timer_driver.scan_once() == 1
+        row = await store.get_timer(target.session_id,timer.timer_id)
+        assert row.status == 'armed' and row.fire_count == 1 and row.due_at >= before+60000
+        assert await runtime.timer_driver.scan_once() == 0
+        # Restart abandons a stale unknown occurrence; it never submits it again.
+        one = await runtime.timer_backend.create(source, due_at_ms=1, note='unknown')
+        for item in (timer,one):
+            await store.transition_timer(target.session_id,item.timer_id,from_status='armed',to_status='firing')
+        await store._db.execute(f"UPDATE {store.t.timers} SET updated_at=1 WHERE status='firing'")
+        recovered = TimerRunner(store=store,client=runtime.client)
+        assert await recovered.scan_once() == 0
+        periodic = await store.get_timer(target.session_id,timer.timer_id)
+        assert periodic.status == 'armed' and periodic.fire_count == 2
+        assert (await store.get_timer(target.session_id,one.timer_id)).status == 'cancelled'
+        rows = await store._db.fetchall(f'SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=?',(target.session_id,))
+        assert len(rows) == 1
 
-    calls = []
-    hooks = AgentHooks()
-    hooks.register(HookPoint.TIMER_FIRE, lambda ctx: calls.append(ctx))
-    loop = _loop(tmp_path, hooks=hooks)
-    loop.session_coordinator = coordinator = MemorySessionOwnershipCoordinator()
-    sid = await loop.new_session()
-    await loop.schedule_timer(sid, due_at_ms=int(time.time()*1000)-1000, note='pending wake')
-    lease = await coordinator.acquire(f'{loop.store.store_id}/{sid}', owner_id='foreign',
-                                      ttl_s=30, on_lost=lambda: None)
-    try:
-        assert await TimerRunner(loop).scan_once() == 0
-        assert (await loop.store.get_timer(sid, 1)).status == 'armed'
-        assert not calls and not await loop.get_messages(sid)
-    finally:
-        await coordinator.release(lease)
-        await loop.aclose()
+
+async def test_busy_append_and_driver_stop_do_not_wait_for_or_cancel_model(registry_store):
+    store, _ = registry_store
+    class Blocking(_Scripted):
+        def __init__(self):
+            self.entered, self.release = asyncio.Event(), asyncio.Event()
+            self.calls = []
+        async def complete(self, request, **kwargs):
+            self.calls.append(str(request.messages))
+            if len(self.calls)==1:
+                self.entered.set()
+                await self.release.wait()
+            return LLMResponse(raw_text='done')
+    model = Blocking()
+    async with timers(store,model) as (runtime,target,actor,source):
+        receipt = await runtime.client.send(target,'start',message_id='original',actor=actor)
+        await asyncio.wait_for(model.entered.wait(),10)
+        await runtime.timer_backend.create(source,due_at_ms=1,note='WAKE_NOTE')
+        try:
+            assert await asyncio.wait_for(runtime.timer_driver.scan_once(),5) == 1
+            await asyncio.wait_for(runtime.timer_driver.stop(),1)
+            assert not model.release.is_set()
+            model.release.set()
+            result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=int(time.time()*1000)+10000)
+            assert result.status=='completed' and len(model.calls)==2 and 'WAKE_NOTE' in model.calls[1]
+            jobs = await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='send'")
+            assert len(jobs)==1
+        finally:
+            model.release.set()
+
+
+async def test_runtime_lifecycle_reopen_and_session_cleanup(registry_store):
+    store,connect = registry_store
+    async with timers(store) as (runtime,target,actor,source):
+        await runtime.timer_backend.create(source,delay_s=3600,note='survives runtime')
+        await runtime.timer_driver.start()
+        assert runtime.timer_driver.status().ready
+    assert not runtime.timer_driver.status().ready
+    other = await connect()
+    assert len(await StoreTimerBackend(other).list(source))==1
+    async with timers(other) as (reopened,_,_,_):
+        assert reopened.timer_driver.status().ready is False  # helper stopped it after start
+        await reopened.timer_driver.start()
+        assert reopened.timer_driver.status().ready
+        await reopened.timer_driver.stop()
+    assert await store.close_session(target.session_id)==1
+    assert await store.list_timers(target.session_id,statuses=('armed','fired','cancelled'))==[]

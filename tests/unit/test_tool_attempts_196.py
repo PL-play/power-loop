@@ -21,10 +21,11 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def prepared(c, call_id='call-1'):
     reg = await c.manager.register_job(c.runtime.actor(c.sid), kind='send', session_id=c.sid,
-        system_key='tool-send', request={'model_attempt_protocol': 1, 'tool_call_plan_protocol': 1, 'send_index': 1})
+        system_key='tool-send', request={'input_ref': {'message_id': 'tool-input'}, 'send_index': 1})
     binding = await c.runtime.claim(c.runtime.actor(c.sid), reg)
     from power_loop.runtime.model_attempts import enable
     await enable(binding)
+    binding.resource_evidence["_runtime_send_index"] = 1
     seq = await c.store.append_message(c.sid, role='assistant', send_index=1, tool_calls=[
         {'id': call_id, 'type': 'function', 'function': {'name': 'echo', 'arguments': json.dumps({'text': 'hello'})}}])
     ref = await c.store.message_ref(c.sid, seq)
@@ -125,7 +126,7 @@ async def test_dispatch_without_host_grant_and_second_dispatch_are_rejected(budg
 
 @pytest.mark.parametrize('failed', [False, True])
 @pytest.mark.parametrize('charged_error', [False, True])
-async def test_real_agent_loop_bills_original_tool_and_does_not_reexecute_on_delivery_retry(registry_store, failed, charged_error):
+async def test_real_agent_loop_bills_original_tool_and_does_not_reexecute_on_delivery_retry(registry_store, failed, charged_error, runtime_agent):
     from decimal import Decimal
 
     from power_loop import (
@@ -133,7 +134,6 @@ async def test_real_agent_loop_bills_original_tool_and_does_not_reexecute_on_del
         LLMResponse,
         LLMService,
         LLMTokenUsage,
-        StatefulAgentLoop,
         ToolResult,
         record_billing_receipt,
     )
@@ -194,35 +194,38 @@ async def test_real_agent_loop_bills_original_tool_and_does_not_reexecute_on_del
         budget_config=BudgetConfig('tools-196', (LocalBudgetScope('shared', max_calls=8),), host))
     model = Model()
     host.service = model
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
+    observations = {}
+    prepare_usage = host.prepare_usage
+    async def observe(context, grant, observation):
+        observations[context["attempt_id"]] = observation
+        return await prepare_usage(context, grant, observation)
+    host.prepare_usage = observe
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, registry=registry,
         config=AgentLoopConfig(model='test-model', max_tokens=20, max_rounds=3, delegation_policy='single_level'))
-    sid = await loop.new_session()
     try:
-        result = await loop.send('echo hello', sid)
-        states = await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_budget_attempts')
-        for row in states:
-            assert sum(len(str(value).encode()) for value in row.values() if value is not None) <= 1536
-        reader = JobManager(store)
-        tool_states = [await budgets.get_budget(reader, runtime.actor(sid), row['attempt_id']) for row in states
-                       if json.loads(row['state_json'])['kind'] == 'tool']
-        assert len(tool_states) == 1 and calls == ['hello']
-        state = tool_states[0]
-        assert state['submission']['request']['evidence']['charge']['quality'] == 'provider_reported'
-        assert state['submission']['request']['evidence']['charge']['amount'] == '0.25'
-        assert state['submission']['request']['evidence']['outcome'] == ('failed' if charged_error else 'returned')
-        assert state['phase'] == 'settling'
-        host.apply_unavailable = False
-        if failed:
-            assert state['pending']
-            await budgets.reconcile_usage(runtime, runtime.actor(sid), state['job_id'], state['attempt_id'])
+        result = await loop.send('echo hello')
+        tool_observations = [(identity, evidence) for identity, evidence in observations.items() if 'charge' in evidence]
+        assert len(tool_observations) == 1 and calls == ['hello']
+        identity, evidence = tool_observations[0]
+        assert evidence['charge']['quality'] == 'provider_reported'
+        assert evidence['charge']['amount'] == '0.25'
+        assert evidence['outcome'] == ('failed' if charged_error else 'returned')
+        if not failed:
+            assert identity in host.applied and result.status == 'completed', result
         else:
-            assert not state['pending'] and result.status == 'completed'
+            # A failed host write may be lost. It cannot re-execute the provider
+            # or block an unrelated new input after the host is available again.
+            assert host.apply_calls > 0
+        host.apply_unavailable = False
+        following = await loop.send('new independent input')
+        assert following.status == 'completed', following
         assert calls == ['hello']
-        assert state['attempt_id'] in host.applied
+        for row in await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_budget_attempts'):
+            assert sum(len(str(value).encode()) for value in row.values() if value is not None) <= 1536
+
     finally:
         host.apply_unavailable = False
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
+        await loop.aclose()
 
 
 async def test_unstarted_tool_refunds_once_and_cannot_dispatch_after_release(budget_case):

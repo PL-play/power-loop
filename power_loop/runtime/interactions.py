@@ -38,7 +38,7 @@ async def save_wait(start, tx, binding, evidence):
     manager.after_outcome(lambda: forget_completed(binding), lambda: None)
 
 
-async def answer(client, ref, *, interaction_id, wait_round, value, message_id, actor):
+async def answer(client, ref, *, interaction_id, wait_round, value, message_id, actor, review_id=None):
     from .jobs import JobManager
     port = client.inputs
     job = await port.resolve_job(port.db, ref, actor)
@@ -72,6 +72,12 @@ async def answer(client, ref, *, interaction_id, wait_round, value, message_id, 
                 or pending.get("round_index") != wait_round or len(matches) != 1):
             raise RuntimeRequestError("interaction_expired")
         interaction = matches[0]
+        review = interaction.get("metadata", {}).get("wait_review")
+        if review is not None:
+            from .wait_review import event_id
+            if (review_id != event_id(interaction) or review['decision'] != 'continue'
+                    or actor.session_id not in (None, review['main_session_id'])):
+                raise RuntimeRequestError('forbidden', 'the original main must explicitly continue this review')
         expires = interaction.get("metadata", {}).get("expires_at_ms")
         if expires is not None and expires <= now_ms():
             raise RuntimeRequestError("interaction_expired")
@@ -79,7 +85,7 @@ async def answer(client, ref, *, interaction_id, wait_round, value, message_id, 
         # The accepted answer and its tool response share the state lock and
         # transaction; another node cannot answer the same question differently.
         receipt = await port.accept_input(tx, Command(item_id, target, "answer", {"body": ""}, "control",
-            expected_job_generation=ref.generation), actor,
+            expected_job_generation=ref.generation, expires_at_ms=expires if review else None), actor,
             descriptor=RuntimeDescriptor(**original.meta["descriptor"]))
         seq, timestamp = state["next_seq"], now_ms()
         await tx.execute(f"INSERT INTO {port.store.t.messages} "

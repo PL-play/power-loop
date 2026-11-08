@@ -1,190 +1,92 @@
-# Tutorial: Tool Calling
+# Tool calling
 
-[中文](../../zh/tutorials/tool-calling.md) | [Tutorials](../index.md)
+SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
 
-**Goal**: Build an agent with weather, calculator, and bash tools — 60 lines.
+Define the tool schema and handler, register it, and return the registry from ExecutionEnvironment. The runtime validates arguments, checks allowlists and invokes before/after hooks. Business permissions and budget remain in the authoritative host backend.
 
-**You'll learn**: `ToolRegistry`, `ToolDefinition`, JSON Schema, sync & async handlers, multi-round tool use.
+The following source is executable from this checkout. It imports the shared example composition helper, [examples/_runtime.py](../../../examples/_runtime.py); keep that file alongside the example. The helper starts and closes a real Runtime. For independent application setup, follow [Quickstart](../user-guide/quickstart.md).
 
-## 1. Define Tools
-
-```python
-from power_loop import ToolRegistry, ToolDefinition
-
-# Sync tool
-def get_weather(city: str) -> str:
-    return f"Weather in {city}: sunny, 22°C"
-
-# Async tool
-async def search_web(query: str) -> str:
-    # Real implementation would call an API
-    return f"Search results for '{query}': (mock result)"
-
-registry = ToolRegistry()
-registry.register(
-    ToolDefinition(
-        name="get_weather",
-        description="Get current weather for a city. Param: city (string).",
-        input_schema={
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-        },
-    ),
-    get_weather,
-)
-registry.register(
-    ToolDefinition(
-        name="search_web",
-        description="Search the web. Param: query (string).",
-        input_schema={
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        },
-    ),
-    search_web,
-)
+```bash
+.venv/bin/python examples/02_tool_calling.py
 ```
 
-## 2. Create the Agent
-
 ```python
-from power_loop import (
-    StatefulAgentLoop, AgentLoopConfig, create_llm_service_from_env,
-)
+"""02 · Custom free tool through the Runtime; the demo model is deterministic."""
+from __future__ import annotations
 
-llm = create_llm_service_from_env()
-loop = StatefulAgentLoop(
-    llm=llm,
-    tool_registry=registry,
-    config=AgentLoopConfig(
-        system_prompt=(
-            "You have get_weather and search_web tools. "
-            "Use them to answer user questions."
-        ),
-        max_rounds=4,  # room for tool call + reply
-    ),
-)
-```
-
-## 3. Run
-
-```python
-sid = await loop.new_session()
-
-result = await loop.send("What's the weather in Tokyo?", session_id=sid)
-print(result.final_text)
-# Output: "The weather in Tokyo is sunny, 22°C."
-
-result = await loop.send("Search for Python async patterns", session_id=sid)
-print(result.final_text)
-# Output: "Search results for 'Python async patterns': (mock result)"
-```
-
-## 4. Add a Security Gate
-
-```python
-from power_loop import AgentHooks, HookPoint, HookDirective
-from power_loop.contracts.hook_contexts import ToolBeforeCtx
-
-hooks = AgentHooks()
-
-def block_if_dangerous(ctx: ToolBeforeCtx) -> None:
-    """Block any tool call containing 'rm' in its arguments."""
-    if "rm" in str(ctx.tool_args).lower():
-        ctx.output = "[blocked: potentially destructive]"
-        ctx.directive = HookDirective.SKIP
-
-hooks.register(HookPoint.TOOL_BEFORE, block_if_dangerous)
-
-loop = StatefulAgentLoop(llm=llm, hooks=hooks, tool_registry=registry, ...)
-```
-
-## 5. Validate Before Invoke
-
-```python
-from power_loop import ToolNotFound, ToolValidationError
-
-try:
-    result = await registry.invoke_async("get_weather", {"city": "Tokyo"})
-    print(result)  # → "Weather in Tokyo: sunny, 22°C"
-except ToolNotFound as exc:
-    print(f"Tool not found: {exc.tool_name}")
-except ToolValidationError as exc:
-    print(f"Invalid args: {exc.message}")
-```
-
-## Complete Code
-
-```python
 import asyncio
+import time
+
+from _runtime import demo_runtime
+
 from power_loop import (
-    StatefulAgentLoop, AgentLoopConfig, ToolRegistry, ToolDefinition,
-    AgentHooks, HookPoint, HookDirective,
-    create_llm_service_from_env,
+    AgentLoopConfig,
+    LLMResponse,
+    LLMService,
+    ToolDefinition,
+    ToolRegistry,
 )
-from power_loop.contracts.hook_contexts import ToolBeforeCtx
+from power_loop.runtime.pricing import Free
 
-def get_weather(city: str) -> str:
-    return f"Weather in {city}: sunny, 22°C"
+# ── 1. 定义工具 / Define tools ──────────────────────────────────────────
 
-async def search_web(query: str) -> str:
-    return f"Search results for '{query}': (mock)"
+DISHES = {
+    "tokyo": "sushi",
+    "rome": "cacio e pepe",
+    "lima": "ceviche",
+    "bangkok": "pad thai",
+}
 
-registry = ToolRegistry()
-registry.register(
-    ToolDefinition(
-        name="get_weather",
-        description="Get current weather. Param: city (string).",
-        input_schema={
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-        },
-    ),
-    get_weather,
-)
-registry.register(
-    ToolDefinition(
-        name="search_web",
-        description="Search the web. Param: query (string).",
-        input_schema={
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-        },
-    ),
-    search_web,
+
+def lookup_dish(**kwargs) -> str:
+    """Sync handler. handler 也可以是 ``async def``，ToolRegistry 自动适配。
+    / Sync handler. Handlers can also be ``async def`` — ToolRegistry adapts automatically."""
+    city = str(kwargs.get("city") or "").strip().lower()
+    return DISHES.get(city, f"No data for {city!r}")
+
+
+LOOKUP_TOOL = ToolDefinition(
+    pricing=Free("local example tool"),
+    name="lookup_dish",
+    description="Return the signature local dish for a given city.",
+    input_schema={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+    required_params=("city",),   # 校验在 handler 之前，缺参直接报错给模型
+                                  # validation runs before handler; missing params → error to model
 )
 
-hooks = AgentHooks()
-def safety(ctx: ToolBeforeCtx) -> None:
-    if "rm" in str(ctx.tool_args).lower():
-        ctx.output = "[blocked]"
-        ctx.directive = HookDirective.SKIP
-hooks.register(HookPoint.TOOL_BEFORE, safety)
+
+# ── 2. 注册并跑循环 / Register and run the loop ─────────────────────────
+
+
+class DishModel(LLMService):
+    async def complete(self, request, **kwargs):
+        outputs = [m['content'] for m in request.messages if m['role'] == 'tool']
+        if outputs:
+            return LLMResponse(raw_text=outputs[-1])
+        return LLMResponse(raw_text='', tool_calls=[{'id':'dish', 'type':'function', 'function':{
+            'name':'lookup_dish', 'arguments':'{"city":"Bangkok"}'}}])
+
+    async def close(self):
+        pass
+
 
 async def main():
-    llm = create_llm_service_from_env()
-    loop = StatefulAgentLoop(
-        llm=llm, tool_registry=registry, hooks=hooks,
-        config=AgentLoopConfig(
-            system_prompt="Use tools to answer. Be concise.",
-            max_rounds=4,
-        ),
-    )
-    try:
-        sid = await loop.new_session()
-        result = await loop.send("What's the weather in Tokyo?", session_id=sid)
-        print(f"Bot: {result.final_text}")
-    finally:
-        loop.close()
+    registry = ToolRegistry()
+    registry.register(LOOKUP_TOOL, lookup_dish)
+    async with demo_runtime(DishModel(), registry, config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+        result = await loop.send(target, "What is Bangkok's signature dish?", message_id='dish-1', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and result.final_text == 'pad thai'
+        print(result.final_text)
+        return result.final_text
 
-asyncio.run(main())
+
+if __name__ == '__main__':
+    asyncio.run(main())
 ```
 
-## Next
-
-- [Human-in-the-Loop](human-in-the-loop.md) — ask users before running tools
-- [Multi-Agent System](multi-agent.md) — delegate to sub-agents
+[tools](../user-guide/tools.md) · [API](../api/index.md)

@@ -1,17 +1,9 @@
-from __future__ import annotations
-
+"""Load the shared example Runtime composition without installing examples."""
 import importlib.util
 from pathlib import Path
-from typing import Any
 
-_PARENT_HELPER = Path(__file__).resolve().parents[1] / "_helpers.py"
-_SPEC = importlib.util.spec_from_file_location("_power_loop_examples_helpers", _PARENT_HELPER)
-if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load examples helper: {_PARENT_HELPER}")
-
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
-
-make_llm: Any = _MODULE.make_llm
-
-__all__ = ["make_llm"]
+_path = Path(__file__).resolve().parents[1] / '_runtime.py'
+_spec = importlib.util.spec_from_file_location('_example_runtime', _path)
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+demo_runtime = _module.demo_runtime

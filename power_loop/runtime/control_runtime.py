@@ -177,7 +177,6 @@ async def open_control(binding, *, policy_source=None):
     from .budget_policy_sources import prepared as prepare_policy
     from .model_attempts import _no_unknown_sends
     from .model_budgets import ensure_policy, flush_observed_controls
-    from .owner_waits import dispatch_policy
 
     await flush_observed_controls(binding)
     async with prepare_policy(runtime, source=policy_source), manager._write() as tx:
@@ -189,7 +188,6 @@ async def open_control(binding, *, policy_source=None):
         await ensure_policy(binding, transaction=tx, job=source)
         if not binding.resource_evidence.get("explicit_resume"):
             await _no_unknown_sends(manager, tx, source)
-        wait_deadline, wait_owners = await dispatch_policy(manager, tx, source)
         import json
 
         length = "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
@@ -244,8 +242,6 @@ async def open_control(binding, *, policy_source=None):
     binding.resource_evidence["_control_ancestors"] = tuple(ancestors)
     binding.resource_evidence["_control_create_request"] = creation_request
     binding.resource_evidence["_control_tool_plan_required"] = plan_required
-    binding.resource_evidence["_control_wait_deadline"] = wait_deadline
-    binding.resource_evidence["_control_wait_owners"] = wait_owners
     binding.resource_evidence["_control_state"] = state
     from .root_context import _authority
     binding.resource_evidence["_control_authority"] = _authority(runtime)

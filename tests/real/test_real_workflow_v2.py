@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import tempfile
-
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop, create_llm_service_from_env
-from power_loop.workflow import create_workflow
+from ._workflow_runtime import run_workflow
 
 pytestmark = pytest.mark.real_llm
 
@@ -31,10 +28,9 @@ SPEC = {
 }
 
 
-async def test_real_dotted_ref_carries_structured_verdict():
-    loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path=tempfile.mktemp(suffix=".db"),
-                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3))
-    res = await create_workflow(SPEC, parent_loop=loop).run()
+async def test_real_dotted_ref_carries_structured_verdict(runtime_agent):
+
+    res = await run_workflow(runtime_agent, SPEC)
     assert res.status == "completed", res.errors
     verdict = res.results["review-1"].payload
     assert verdict and verdict["pass"] is False and verdict["problems"]
@@ -63,10 +59,9 @@ LOOP_SPEC = {
 }
 
 
-async def test_real_loop_dev_review_fix_converges():
-    loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path=tempfile.mktemp(suffix=".db"),
-                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3))
-    res = await create_workflow(LOOP_SPEC, parent_loop=loop).run()
+async def test_real_loop_dev_review_fix_converges(runtime_agent):
+
+    res = await run_workflow(runtime_agent, LOOP_SPEC)
     assert res.status == "completed", res.errors
     agg = res.results["pier"].payload
     assert agg["converged"] is True and agg["iterations"] >= 2, agg
@@ -97,10 +92,9 @@ MATRIX_LOOP_SPEC = {
 }
 
 
-async def test_real_matrix_of_loops_each_scene_fixes_its_own_key():
-    loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path=tempfile.mktemp(suffix=".db"),
-                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3))
-    res = await create_workflow(MATRIX_LOOP_SPEC, parent_loop=loop).run()
+async def test_real_matrix_of_loops_each_scene_fixes_its_own_key(runtime_agent):
+
+    res = await run_workflow(runtime_agent, MATRIX_LOOP_SPEC)
     assert res.status == "completed", res.errors
     items = res.results["scenes"].payload["items"]
     assert len(items) == 3

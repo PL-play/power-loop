@@ -21,7 +21,6 @@ from power_loop import (
     CompleteDecideCtx,
     HookDirective,
     HookPoint,
-    StatefulAgentLoop,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from power_loop.contracts.tools import ToolDefinition
@@ -95,7 +94,7 @@ def _echo_registry(handler=None) -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_budget_exceeded_stops_at_round_boundary(tmp_path):
+async def test_budget_exceeded_stops_at_round_boundary(tmp_path, runtime_agent):
     # Round 1 spends 1000+100 (over the 500 budget) but completes its tool
     # call; the loop then stops before paying for round 2.
     llm = _Scripted(responses=[
@@ -105,49 +104,35 @@ async def test_budget_exceeded_stops_at_round_boundary(tmp_path):
     events: list = []
     bus = AgentEventBus(suppress_subscriber_errors=True)
     bus.subscribe(AgentEventType.STATUS_CHANGED, events.append)
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=6, max_tokens_per_run=500),
-        tool_registry=_echo_registry(), event_bus=bus,
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
-    assert res.status == "budget_exceeded"
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=6, max_tokens_per_run=500), registry=_echo_registry(), event_bus=bus)
+    res = await loop.send("hi")
+    assert res.status == "interrupted" and res.error == "budget_exceeded"
     assert res.usage["prompt_tokens"] == 1000  # round 2 never ran
     # No dangling tool_calls: a follow-up send must work without healing.
-    res2 = await loop.send("again", session_id=sid)
-    assert res2.status in ("completed", "budget_exceeded")
+    res2 = await loop.send("again")
+    assert res2.status == "completed" or (res2.status == "interrupted" and res2.error == "budget_exceeded")
     kinds = [(e.payload or {}).get("kind") for e in events]
     assert "budget_exceeded" in kinds
     await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_budget_disabled_by_default(tmp_path):
+async def test_budget_disabled_by_default(tmp_path, runtime_agent):
     llm = _Scripted(responses=[_resp("ok", prompt=10**6, completion=10)])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t"),
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t"))
+    res = await loop.send("hi")
     assert res.status == "completed"
     await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_zero_budget_means_unlimited(tmp_path):
+async def test_zero_budget_means_unlimited(tmp_path, runtime_agent):
     llm = _Scripted(responses=[
         _tool_resp("c1", "echo", prompt=10**6, completion=10),
         _resp("finished", prompt=10**6, completion=10),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4, max_tokens_per_run=0),
-        tool_registry=_echo_registry(),
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4, max_tokens_per_run=0), registry=_echo_registry())
+    res = await loop.send("hi")
     assert res.status == "completed"
     assert res.final_text == "finished"
     assert llm._idx == 2
@@ -155,7 +140,7 @@ async def test_zero_budget_means_unlimited(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_budget_exceeded_complete_decide_runs_bounded_finalize(tmp_path):
+async def test_budget_exceeded_complete_decide_runs_bounded_finalize(tmp_path, runtime_agent):
     # Round 0 crosses the normal budget. COMPLETE_DECIDE injects a durable
     # finalizer and grants exactly one extra round; that round may run despite
     # the exhausted budget, then the standard forced summary closes the send.
@@ -174,24 +159,20 @@ async def test_budget_exceeded_complete_decide_runs_bounded_finalize(tmp_path):
         ctx.extra_rounds = 1
         ctx.directive = HookDirective.SHORT_CIRCUIT
 
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=10, max_tokens_per_run=500),
-        tool_registry=_echo_registry(),
-    )
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=10, max_tokens_per_run=500), registry=_echo_registry())
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, finalize)
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    sid = loop.target.session_id
+    res = await loop.send("hi")
 
     assert reasons == ["budget_exceeded", "hit_round_limit"]
-    assert res.status == "hit_round_limit"
+    assert res.status == "interrupted" and res.error == "hit_round_limit"
     assert "forced wrap-up" in res.final_text
     # 1 normal round + exactly 1 injected round + the stock forced wrap-up.
     # If the old main-loop allowance leaked into finalize, this would complete
     # from _Scripted's fallback instead of reaching the forced wrap-up here.
     assert llm._idx == 3
-    messages = await loop.get_messages(sid)
-    assert any(m.get("content") == "[system] budget exhausted — finalize now" for m in messages)
+    messages = await loop.runtime.store.load_all_messages(sid)
+    assert any(m.content == "[system] budget exhausted — finalize now" for m in messages)
     await loop.aclose()
 
 
@@ -199,20 +180,17 @@ async def test_budget_exceeded_complete_decide_runs_bounded_finalize(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_session_stats_accumulate_across_sends(tmp_path):
+async def test_session_stats_accumulate_across_sends(tmp_path, runtime_agent):
     llm = _Scripted(responses=[
         _resp("one", prompt=10, completion=1),
         _resp("two", prompt=20, completion=2),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t"),
-    )
-    sid = await loop.new_session()
-    assert await loop.get_session_stats(sid) is None  # before first send
-    await loop.send("a", session_id=sid)
-    await loop.send("b", session_id=sid)
-    stats = await loop.get_session_stats(sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t"))
+    sid = loop.target.session_id
+    assert await loop.runtime.store.get_session_stats(sid) is None  # before first send
+    await loop.send("a")
+    await loop.send("b")
+    stats = await loop.runtime.store.get_session_stats(sid)
     assert stats is not None
     assert (stats.sends, stats.llm_calls) == (2, 2)
     assert stats.prompt_tokens == 30
@@ -220,10 +198,10 @@ async def test_session_stats_accumulate_across_sends(tmp_path):
     assert stats.rounds == 2 and stats.tool_calls == 0
     assert stats.first_send_at is not None
     assert stats.first_send_at <= stats.last_send_at
-    assert (await loop.list_session_stats())[0].session_id == sid
+    assert (await loop.runtime.store.list_session_stats())[0].session_id == sid
     # cascade delete with the session
-    await loop.close_session(sid)
-    assert await loop.store.get_session_stats(sid) is None
+    await loop.runtime.store.close_session(sid)
+    assert await loop.runtime.store.get_session_stats(sid) is None
     await loop.aclose()
 
 
@@ -231,7 +209,7 @@ async def test_session_stats_accumulate_across_sends(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sync_tool_does_not_block_event_loop(tmp_path):
+async def test_sync_tool_does_not_block_event_loop(tmp_path, runtime_agent):
     main_thread = threading.current_thread().name
     seen: dict[str, Any] = {}
 
@@ -244,12 +222,8 @@ async def test_sync_tool_does_not_block_event_loop(tmp_path):
         _tool_resp("c1", "echo"),
         _resp("final"),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=_echo_registry(slow_echo),
-    )
-    sid = await loop.new_session()
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_echo_registry(slow_echo))
+    sid = loop.target.session_id
 
     ticks = 0
 
@@ -260,13 +234,13 @@ async def test_sync_tool_does_not_block_event_loop(tmp_path):
             ticks += 1
 
     hb = asyncio.create_task(_heartbeat())
-    res = await loop.send("hi", session_id=sid)
+    res = await loop.send("hi")
     hb.cancel()
     assert res.status == "completed"
     assert seen["thread"] != main_thread  # ran in a worker thread
     assert ticks >= 4  # event loop kept ticking during the 0.3s sleep
-    assert res.tool_calls == 1
-    assert (await loop.get_session_stats(sid)).tool_calls == 1
+    assert (await loop.runtime.store.get_session_stats(sid)).tool_calls == 1
+    assert (await loop.runtime.store.get_session_stats(sid)).tool_calls == 1
     await loop.aclose()
 
 
@@ -274,18 +248,13 @@ async def test_sync_tool_does_not_block_event_loop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_all_emitted_events_have_data(tmp_path):
+async def test_all_emitted_events_have_data(tmp_path, runtime_agent):
     captured: list = []
     bus = AgentEventBus(suppress_subscriber_errors=True)
     bus.subscribe(None, captured.append)
     llm = _Scripted(responses=[_tool_resp("c1", "echo"), _resp("final")])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=_echo_registry(), event_bus=bus,
-    )
-    sid = await loop.new_session()
-    await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_echo_registry(), event_bus=bus)
+    await loop.send("hi")
     assert captured, "expected events"
     missing = [e.type for e in captured if e.data is None]
     assert not missing, f"events without typed data: {missing}"
@@ -296,17 +265,14 @@ async def test_all_emitted_events_have_data(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_logging_sink_emits_json_lines(tmp_path, caplog):
+async def test_logging_sink_emits_json_lines(tmp_path, caplog, runtime_agent):
     bus = AgentEventBus(suppress_subscriber_errors=True)
     attach_logging_sink(bus, events={AgentEventType.USAGE_UPDATED})
     llm = _Scripted(responses=[_resp("ok", prompt=7, completion=3)])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t"), event_bus=bus,
-    )
-    sid = await loop.new_session()
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t"), event_bus=bus)
+    sid = loop.target.session_id
     with caplog.at_level(logging.INFO, logger="power_loop.events"):
-        await loop.send("hi", session_id=sid)
+        await loop.send("hi")
     lines = [json.loads(r.message) for r in caplog.records
              if r.name == "power_loop.events"]
     assert lines and all(line["event"] == "usage_updated" for line in lines)

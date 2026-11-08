@@ -3,7 +3,7 @@ import pytest
 from tests.unit._native_no_return_stop_192 import exercise
 from tests.unit.test_job_registry_192 import registry_store
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 __all__ = ['registry_store']
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]

@@ -1,55 +1,18 @@
-"""19 · 旗舰示例 / Flagship: full-featured chatbot
-     (session + tools + hooks + events + memory + compaction)
+"""19 · Tools, memory, hooks and persisted history on a rebuilt local Runtime.
 
-## What you'll learn / 你将学到
-- 一个 ``StatefulAgentLoop`` 同时开启：session 持久化、两个自定义工具、安全门 hook、
-  流式事件订阅、跨会话 SQLite 记忆、默认上下文压缩。
-  / a single ``StatefulAgentLoop`` simultaneously enables: session persistence,
-  two custom tools, safety gate hook, streaming event subscription, cross-session
-  SQLite memory, and default context compaction
-- 这是 power-loop 的「全功能演示」——适合做集成测试或新人了解全部能力。
-  / this is power-loop's "full-feature demo" — ideal for integration tests or
-  newcomers wanting to see all capabilities at once
-
-## Prerequisites / 前提
-- 需要 ``.env`` 配置 ``POWER_LOOP_*``
-  / requires ``.env`` with ``POWER_LOOP_*``
-
-## Run / 运行
-    python examples/19_full_chatbot.py
-
-## Expected output / 预期输出
-    [Stream] I am the flagship demo of power-loop...
-    [Tool] get_weather → "Weather in Tokyo: sunny, 22°C"
-    [Memory] Session A ended, facts stored
-    [Session B] Agent recalls from memory
-    [Done] 3 sessions completed, all features verified
-
-## Key concepts / 关键概念
-- **Session persistence / 会话持久化**: 两个 session 共用同一个 ``db_path``，通过 ``session_id`` 延续。
-  / multiple sessions share the same ``db_path``, continued via ``session_id``
-- **Tools / 工具**: ``get_weather`` + ``calculator`` 两个自定义工具。/ two custom tools
-- **Hooks / 钩子**: ``TOOL_BEFORE`` 安全门——拦截危险操作。/ safety gate — blocks dangerous operations
-- **Events / 事件**: 订阅 ``STREAM_DELTA`` 做打字机效果，``TOOL_CALL_STARTED`` 追踪工具调用。
-  / subscribe to ``STREAM_DELTA`` for typewriter effect, ``TOOL_CALL_STARTED`` to track tool calls
-- **Memory / 记忆**: SQLite 事实库，跨 session 召回。/ SQLite fact store, cross-session recall
-- **Compaction / 压缩**: 默认开启（``DefaultCompactor``），长会话自动压缩。
-  / enabled by default (``DefaultCompactor``), auto-compacts long conversations
-
-## Next / 下一步
-这是 examples/ 的最后一站。完整文档见 `docs/en/index.md`。
-/ This is the last stop in examples/. Full documentation at `docs/en/index.md`.
+The fixed demo model avoids remote calls. A deployment resolves an actual
+provider and user-scoped memory service in its factory.
 """
-
 from __future__ import annotations
 
 import asyncio
 import re
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentEventBus,
@@ -58,8 +21,10 @@ from power_loop import (
     AgentLoopConfig,
     HookDirective,
     HookPoint,
+    LLMResponse,
+    LLMService,
     MemorySnapshot,
-    StatefulAgentLoop,
+    SessionStore,
     ToolDefinition,
     ToolRegistry,
 )
@@ -191,90 +156,39 @@ SYSTEM = (
 # ── 6. Main / 主程序 ─────────────────────────────────────────────────────
 
 
-async def main() -> None:
-    with tempfile.TemporaryDirectory(prefix="power_loop_ex19_") as tmp:
-        db_path = str(Path(tmp) / "sessions.db")
-        mem_path = str(Path(tmp) / "memory.db")
-        memory = SqliteFactMemory(mem_path)
+class ChatModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text='FACT: name=Alan\nAlan: weather is clear.')
+        return LLMResponse(raw_text='', tool_calls=[{'id':'weather','type':'function','function':{
+            'name':'weather','arguments':'{"city":"Tokyo"}'}}])
 
-        llm = make_llm(max_tokens=300, temperature=0.0)
-
-        # ── Session A: tool calling + memory ─────────────────────────────
-        #    工具调用 + 记忆
-        print("=== Session A: tool calling + memory ===\n")
-        bus_a, tool_log_a = build_event_bus()
-
-        loop = StatefulAgentLoop(
-            llm=llm, db_path=db_path, tool_registry=REGISTRY,
-            hooks=HOOKS, event_bus=bus_a,
-            config=AgentLoopConfig(
-                system_prompt=SYSTEM, max_rounds=4, memory=memory,
-            ),
-        )
-        try:
-            print("User: What's the weather in Tokyo and what is 15 * 7?")
-            sid_a = await loop.new_session(metadata={"label": "session-a"})
-            r1 = await loop.send(
-                "What's the weather in Tokyo and what is 15 * 7?",
-                session_id=sid_a,
-            )
-            print(f"\n\n[Session A] status={r1.status}, rounds={r1.rounds}")
-            print(f"[Session A] tools used: {tool_log_a}")
-        finally:
-            await loop.aclose()
-
-        # ── Session B: cross-session memory recall ───────────────────────
-        #    跨会话记忆召回
-        print("\n=== Session B: cross-session memory recall ===\n")
-        bus_b, tool_log_b = build_event_bus()
-
-        loop2 = StatefulAgentLoop(
-            llm=llm, db_path=db_path, tool_registry=REGISTRY,
-            hooks=HOOKS, event_bus=bus_b,
-            config=AgentLoopConfig(
-                system_prompt=SYSTEM, max_rounds=4, memory=memory,
-            ),
-        )
-        try:
-            print("User: My name is Alan. I live in Shanghai. Confirm in one sentence.")
-            sid_b = await loop2.new_session(metadata={"label": "session-b"})
-            r2 = await loop2.send(
-                "My name is Alan. I live in Shanghai. Confirm in one sentence.",
-                session_id=sid_b,
-            )
-            print(f"\n\n[Session B] status={r2.status}, rounds={r2.rounds}")
-        finally:
-            await loop2.aclose()
-
-        # ── Verify memory persisted / 验证记忆已持久化 ────────────────────
-        with sqlite3.connect(mem_path) as c:
-            facts = {r[0]: r[1] for r in c.execute("SELECT key, value FROM facts").fetchall()}
-        print(f"\n[Memory] facts stored: {facts}")
-
-        # ── Session C: new session, should recall Alan's facts ───────────
-        #    新会话，应当召回 Alan 的事实
-        print("\n=== Session C: recall from memory ===\n")
-        bus_c, _ = build_event_bus()
-
-        loop3 = StatefulAgentLoop(
-            llm=llm, db_path=db_path, tool_registry=REGISTRY,
-            hooks=HOOKS, event_bus=bus_c,
-            config=AgentLoopConfig(
-                system_prompt=SYSTEM, max_rounds=2, memory=memory,
-            ),
-        )
-        try:
-            print("User: What is my name and where do I live?")
-            sid_c = await loop3.new_session(metadata={"label": "session-c"})
-            r3 = await loop3.send("What is my name and where do I live?", session_id=sid_c)
-            print(f"\n\n[Session C] reply: {r3.final_text}")
-            print(f"[Session C] status={r3.status}, rounds={r3.rounds}")
-        finally:
-            await loop3.aclose()
-
-        print(f"\n[Done] 3 sessions completed. "
-              f"Session A={sid_a[-8:]}, B={sid_b[-8:]}, C={sid_c[-8:]}")
+    async def close(self):
+        pass
 
 
-if __name__ == "__main__":
+async def main():
+    with tempfile.TemporaryDirectory(prefix='power_loop_chat_test_') as directory:
+        path = str(Path(directory)/'sessions.db')
+        memory = SqliteFactMemory(str(Path(directory)/'memory.db'))
+        registry = ToolRegistry()
+        registry.register(ToolDefinition('weather','Weather lookup', required_params=('city',),
+            pricing=Free('local example')), get_weather)
+        hooks = AgentHooks()
+        hooks.register(HookPoint.TOOL_BEFORE, safety_gate)
+        target = None
+        for index in range(2):
+            store = await SessionStore.open(path)
+            bus, events = build_event_bus()
+            async with demo_runtime(ChatModel(), registry, store=store, target=target, hooks=hooks, event_bus=bus,
+                    config=AgentLoopConfig(memory=memory, max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+                result = await loop.send(target, 'Weather and remember Alan' if index == 0 else 'Continue our conversation',
+                    message_id=f'chat-{index}', actor=actor, deadline_ms=int(time.time()*1000)+10000)
+                assert result.status == 'completed'
+                print(result.final_text, 'events:', len(events))
+                rows = await store.load_all_messages(target.session_id)
+                assert sum(row.role == 'user' for row in rows) >= index+1
+
+
+if __name__ == '__main__':
     asyncio.run(main())

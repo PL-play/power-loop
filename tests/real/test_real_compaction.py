@@ -11,8 +11,7 @@ from power_loop import (
     AgentLoopConfig,
     MessageState,
     SessionStore,
-    StatefulAgentLoop,
-)
+    )
 from power_loop.runtime.compact import DefaultCompactor
 
 from ._llm import make_llm
@@ -20,13 +19,26 @@ from .judge import assert_passes
 
 
 @pytest.mark.asyncio
-async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch) -> None:
+async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch, runtime_agent) -> None:
     # Low env threshold so the heuristic estimator definitely fires on the
     # seeded fat history.
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "500")
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session(system_prompt="S")
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=256, temperature=0),
+            store=store,
+            config=AgentLoopConfig(
+                system_prompt=(
+                    "Earlier turns may have been summarized into a "
+                    "compact_note. Answer the user's latest question "
+                    "concisely in English."
+                ),
+                max_rounds=1, max_tokens=256, temperature=0,
+                compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1),
+            ),
+        )
+        sid = loop.target.session_id
         # Seed several fat turns that the compactor must fold.
         for i in range(4):
             await store.append_message(
@@ -39,21 +51,8 @@ async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch)
             )
         # Final user prompt the model should still answer correctly.
         # (Loop seeds the latest user via send().)
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
-            store=store,
-            config=AgentLoopConfig(
-                system_prompt=(
-                    "Earlier turns may have been summarized into a "
-                    "compact_note. Answer the user's latest question "
-                    "concisely in English."
-                ),
-                max_rounds=1, max_tokens=256, temperature=0,
-                compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1),
-            ),
-        )
         q = "Name the largest planet in our solar system."
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
 
         # Compaction must have been recorded + rows marked.
@@ -72,4 +71,5 @@ async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch)
             ),
         )
     finally:
+        await loop.aclose()
         await store.close()

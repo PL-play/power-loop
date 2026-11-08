@@ -3,25 +3,25 @@ import asyncio
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore
 from power_loop.runtime import model_budgets
 from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, BudgetUsageEvidence, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 from tests.unit.test_budget_revisions_192 import RevisionHost
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 class RealRevisionHost(RevisionHost):
     async def prepare(self, context, logical_request, *, service):
-        assert service is self.service
+        assert getattr(service, "provider", service) is self.service
         return BudgetPlan(16384, {"attempt_id": context["attempt_id"], "origin": context})
 
 
-async def test_real_original_response_is_not_replayed_when_late_receipt_ack_is_lost(tmp_path, record_property):
+async def test_real_original_response_is_not_replayed_when_late_receipt_ack_is_lost(tmp_path, record_property, runtime_agent):
     path = str(tmp_path / "late.db")
     store = await SessionStore.open(path, schema="tasks")
     provider, host = BoundedProvider(limit=1), RealRevisionHost()
@@ -34,12 +34,12 @@ async def test_real_original_response_is_not_replayed_when_late_receipt_ack_is_l
     opened, controls = [], []
     try:
         async with asyncio.timeout(120):
-            loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=original,
+            loop = await runtime_agent(model=provider, store=store, task_runtime=original,
                 config=AgentLoopConfig(delegation_policy="single_level", max_rounds=1, max_tokens=1024))
-            sid = await loop.new_session()
-            result = await loop.send("Reply only with the number 42.", sid)
+            sid = loop.target.session_id
+            result = await loop.send("Reply only with the number 42.")
             assert "42" in result.final_text and provider.calls == 1
-            await original.shutdown(timeout_s=5)
+            await loop.aclose()
             [row] = await store._db.fetchall(f"SELECT attempt_id,job_id FROM {store.table_prefix}task_budget_attempts")
             old = await model_budgets.get_budget(original.manager, original.actor(sid), row["attempt_id"])
             messages = await store.load_all_messages(sid)
@@ -50,7 +50,7 @@ async def test_real_original_response_is_not_replayed_when_late_receipt_ack_is_l
                 "actual", old["observation"]["usage"], details={"confirmation": "captured response verified"})
             host.lost_revision = 2
             for i in range(2):
-                current_store = await SessionStore.open(path, schema="compatible")
+                current_store = await SessionStore.open(path, schema="verify")
                 opened.append(current_store)
                 control = runtime(current_store, "control-" + str(i))
                 controls.append(control)
@@ -69,7 +69,7 @@ async def test_real_original_response_is_not_replayed_when_late_receipt_ack_is_l
             assert await store._db.fetchall(f"SELECT * FROM {store.table_prefix}task_budget_scopes") == counts
     finally:
         provider.report(record_property)
-        await original.shutdown(timeout_s=5)
+        await loop.aclose()
         for control in controls:
             await control.shutdown(timeout_s=5)
         for current_store in opened:

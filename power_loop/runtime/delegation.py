@@ -68,9 +68,6 @@ def _release_admission(run):
 async def readmit(run):
     acquired = await _acquire_admission(run)
     try:
-        if run.task_binding is not None:
-            from .owner_waits import check_deadline
-            await check_deadline(run.task_binding)
         yield
     finally:
         if acquired:

@@ -4,7 +4,6 @@ import threading
 
 import pytest
 
-
 from .test_real_model_attempts_192 import model_runtime
 
 __all__ = ['model_runtime']

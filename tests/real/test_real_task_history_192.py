@@ -6,20 +6,21 @@ import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, create_default_tool_registry
+from power_loop import AgentLoopConfig, SessionStore, create_default_tool_registry
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize("source", ["messages", "projection"])
-async def test_real_parent_reads_and_exports_existing_node_history_without_reexecution(tmp_path, record_property, source):
+async def test_real_parent_reads_and_exports_existing_node_history_without_reexecution(tmp_path, record_property, source, runtime_agent):
     store = await SessionStore.open(str(tmp_path/"history.db"), schema="tasks")
     manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id="real-history", principal_id="host", executor_id="executor", boot_id="boot")
@@ -30,13 +31,12 @@ async def test_real_parent_reads_and_exports_existing_node_history_without_reexe
         pass
     registry = create_default_tool_registry(include=["jobs", "recall_send"], workspace_dir=tmp_path)
     register_workflow_tool(registry, ports=WorkflowToolPorts(on_accepted=admission, on_complete=completed))
-    loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
-        config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
+    loop = await runtime_agent(model=provider, store=store, task_runtime=runtime, registry=registry, config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
             representation=ProjectedRepresentation(),
             system_prompt="Follow the exact requested workflow and read-only audit sequence. Create only when explicitly asked. "
                 "Reading or exporting history never resumes, repeats or executes the recorded task. "
-                "Report an actual assistant answer after each requested tool sequence, not just pass_turn.reason."))
-    sid = await loop.new_session()
+                "Report an actual assistant answer after each requested tool sequence, not just pass_turn.reason."), runtime_env=RuntimeEnv(workspace_dir=tmp_path))
+    sid = loop.target.session_id
     provider.root_sid, provider.hold_children = sid, True
     spec = {"name": "retained-audit", "root": {"type": "agent", "id": "calculate", "input": "19+23",
         "spec": {"name": "calculate", "system_prompt": "Compute the requested arithmetic and return its number in assistant text.",
@@ -45,12 +45,12 @@ async def test_real_parent_reads_and_exports_existing_node_history_without_reexe
         with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path)):
             async with asyncio.timeout(180):
                 await loop.send("Call workflow action=create exactly once with spec="+json.dumps(spec)+
-                    ". After acceptance finish with WAITING and no further tools.", sid)
+                    ". After acceptance finish with WAITING and no further tools.")
                 assert len(accepted) == 1
                 await asyncio.wait_for(provider.child_entered.wait(), 10)
                 provider.release_children.set()
-                await asyncio.wait_for(accepted[0].handle.task, 45)
-                await loop.flush_follow_ups(sid)
+                await asyncio.wait_for(accepted[0].handle.wait(deadline_ms=now_ms()+60000), 45)
+                await loop.drain()
                 [node] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node'")
                 [event] = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='node_session'")
                 physical = json.loads(event["payload_json"])["session_id"]
@@ -59,14 +59,14 @@ async def test_real_parent_reads_and_exports_existing_node_history_without_reexe
                 prior_views = len([m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "workflow"])
                 await loop.send("Inspect the saved workflow without executing anything. Call workflow action=leaves with run_id='"+
                     accepted[0].handle.run_id+"'. Then call workflow action=logs with the same run_id, node='calculate', source='"+source+
-                    "'. Report its saved arithmetic result in assistant text. No other tools.", sid)
+                    "'. Report its saved arithmetic result in assistant text. No other tools.")
                 views = [json.loads(m.content) for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "workflow"][prior_views:]
                 assert len(views) == 2 and views[0]["nodes"][0]["job_id"] == node["job_id"]
                 assert views[1]["status"] == "ok" and views[1]["session_id"] == physical and views[1]["source"] == source
                 args = {"job_id": node["job_id"], "source": source, "limit": 20}
                 answer = await loop.send("Audit only the existing completed node. First call jobs action=get with job_id='"+node["job_id"]+
                     "'. Then call recall_send exactly once with "+json.dumps(args)+
-                    ". Report the saved arithmetic answer from its history. Do not create, resume or nudge any task.", sid)
+                    ". Report the saved arithmetic answer from its history. Do not create, resume or nudge any task.")
                 assert answer.status == "completed" and "42" in answer.final_text
                 raw = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "recall_send"]
                 assert len(raw) == 1
@@ -77,7 +77,7 @@ async def test_real_parent_reads_and_exports_existing_node_history_without_reexe
                     target = next(r for r in history_before if r.role == "assistant" and "42" in (r.content or ""))
                     exact = {"job_id": node["job_id"], "message_id": str(target.id), "char_limit": 8000}
                     await loop.send("Read only the exact saved original. Call recall_send once with "+json.dumps(exact)+
-                        ". Then give its arithmetic result in assistant text. No other tools.", sid)
+                        ". Then give its arithmetic result in assistant text. No other tools.")
                     records = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "recall_send"]
                     exact_receipt = json.loads(records[-1].content)
                     assert exact_receipt["truncated"] is False
@@ -86,13 +86,13 @@ async def test_real_parent_reads_and_exports_existing_node_history_without_reexe
                     origin = await manager.get_operation(runtime.actor(sid), accepted[0].handle.operation_id)
                     await loop.send("Read only the existing workflow creation receipt. Call recall_send once with "+json.dumps({
                         "job_id": accepted[0].handle.job_id, "message_id": origin.receipt_ref["id"], "char_limit": 8000})+
-                        ". Then acknowledge in assistant text. Do not create or execute anything.", sid)
+                        ". Then acknowledge in assistant text. Do not create or execute anything.")
                     raw = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "recall_send"]
                     assert json.loads(json.loads(raw[-1].content)["text"])["message_ref"] == origin.receipt_ref
                 output = "audit/"+source+".jsonl"
                 exported = await loop.send("Export this existing selection only. Call recall_send exactly once with "+json.dumps({
                     "job_id": node["job_id"], "source": source, "output_file": output})+
-                    ". Omit char_limit/cursor/char_offset. Report the returned path and record count in assistant text; no other tools.", sid)
+                    ". Omit char_limit/cursor/char_offset. Report the returned path and record count in assistant text; no other tools.")
                 assert exported.status == "completed"
                 records = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "recall_send"]
                 receipt = json.loads(records[-1].content)
@@ -105,11 +105,12 @@ async def test_real_parent_reads_and_exports_existing_node_history_without_reexe
     finally:
         provider.release_children.set()
         try:
-            await asyncio.wait_for(asyncio.gather(*(a.handle.task for a in accepted), return_exceptions=True), 15)
+            await asyncio.wait_for(asyncio.gather(*(a.handle.wait(deadline_ms=now_ms()+60000) for a in accepted), return_exceptions=True), 15)
         finally:
             record_property("main_transcript", json.dumps([dict(id=str(m.id), seq=str(m.seq), role=m.role,
                 name=m.name, content=m.content, tool_calls=m.tool_calls, tool_call_id=m.tool_call_id)
                 for m in await store.load_all_messages(sid)], ensure_ascii=False))
             provider.report(record_property)
             await provider.close()
+            await loop.aclose()
             await store.close()

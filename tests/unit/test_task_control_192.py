@@ -27,7 +27,8 @@ async def control(registry_store):
     actor = JobActor("control", "host", sid)
     root = await m.register_job(actor, kind="send", session_id=sid, system_key="root", request={"send_index": 1})
     caller = await m.claim_job(actor, root.job.job_id, executor_id="root", boot_id="boot", expected_version=1)
-    child = await m.register_job(actor, kind="subagent", parent=caller, independent=True, system_key="child")
+    child_sid = await store.create_session(parent_session_id=sid)
+    child = await m.register_job(actor, kind="subagent", session_id=child_sid, parent=caller, independent=True, system_key="child")
     seq = await store.append_message(sid, role="assistant", send_index=1, round_index=0,
         tool_calls=[{"id": "stop-child", "type": "function", "function": {"name": "jobs", "arguments": json.dumps({"action": "stop", "ids": [child.job.job_id]})}}])
     ref = await store.message_ref(sid, seq)

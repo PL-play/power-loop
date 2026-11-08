@@ -4,7 +4,7 @@ import json
 import pytest
 
 from power_loop.runtime.jobs import JobError
-from power_loop.runtime.pending_calls import retire_pending
+from power_loop.runtime.pending_calls import retire_pending_runtime
 from power_loop.runtime.tool_call_plans import reconcile_pending
 
 from .test_job_registry_192 import registry_store
@@ -34,10 +34,10 @@ async def test_automatic_negative_is_atomic_and_recovered_without_effect_or_extr
     assert (await c.store.get_state(c.sid)).pending['tool_call_ids'] == ['original-call']
     loop, reviewer = await controller(c)
     try:
-        staged = await reconcile_pending(loop, c.actor, row['parent_job_id'])
+        staged = await reconcile_pending(c.runtime, c.actor, row['parent_job_id'])
         assert len(staged['notices']) == 1 and reviewer.calls == 0
         assert not staged['acknowledgement_created'] and not staged['billing_settled']
-        await retire_pending(loop, c.actor, row['parent_job_id'])
+        await retire_pending_runtime(c.runtime, c.actor, row['parent_job_id'])
         with pytest.raises(JobError):
             await c.manager.finalize_supervision(c.actor, row['parent_job_id'], generation=1)
         result = await loop.send('Review the original negative result. Do not execute the effect.', c.sid)

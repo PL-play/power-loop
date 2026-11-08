@@ -7,11 +7,12 @@ from contextlib import asynccontextmanager
 import pytest
 
 from power_loop import LLMResponse, LLMService
+from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.jobs import TRUST_OWN_WRITES, verify_stored
+from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
-from .test_round_change_signals import fixture_loop
 
 __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -75,7 +76,7 @@ async def test_resume_and_cold_reader_discover_stored_assistant_without_entry_hi
         token = TRUST_OWN_WRITES.set(True)
         try:
             assert (await store.last_assistant_ref(sid, 1)).seq == first
-            other = await connect(schema="compatible")
+            other = await connect(schema="verify")
             second = await other.append_message(sid, role="assistant", content="fresh", send_index=1)
 
             @verify_stored
@@ -119,7 +120,7 @@ async def test_cold_verification_reads_committed_values_even_inside_live_send(re
     store, connect = registry_store
     sid = await store.create_session(system_prompt="first")
     await store.set_runtime_state(sid, "send_index", 1)
-    other = await connect(schema="compatible")
+    other = await connect(schema="verify")
     @verify_stored
     async def inspect():
         return (await store.session_snapshot(sid), await store.state_snapshot(sid),
@@ -166,29 +167,35 @@ class Model(LLMService):
 async def test_next_send_reloads_changed_session_and_advances_original_index(registry_store):
     store, connect = registry_store
     model = Model()
-    runtime, loop = fixture_loop(store, model)
-    sid = await store.create_session(system_prompt="first")
+    runner = await RunningAgent(store, model, capacity=2).start()
+    sid = runner.target.session_id
+    await store.update_session_prompt(sid, "first")
     try:
-        assert (await loop.send("one", sid)).status == "completed"
-        other = await connect(schema="compatible")
+        assert (await runner.send("one")).status == "completed"
+        other = await connect(schema="verify")
         await other.update_session_prompt(sid, "second")
-        assert (await loop.send("two", sid)).status == "completed"
+        assert (await runner.send("two")).status == "completed"
         assert model.seen == [(sid, "first"), (sid, "second")]
         rows = await store.load_all_messages(sid)
         assert [row.send_index for row in rows] == [1, 1, 2, 2]
     finally:
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
+        await runner.aclose()
 
 
 async def test_concurrent_sessions_never_share_entry_reads(registry_store):
     store, _ = registry_store
     model = Model()
     model.gate = asyncio.Event()
-    runtime, loop = fixture_loop(store, model)
-    first, second = await store.create_session(system_prompt="alpha"), await store.create_session(system_prompt="beta")
+    runner = await RunningAgent(store, model, capacity=2).start()
+    loop = runner.loop
+    targets = [runner.target, await runner.runtime.open_session(runner.descriptor, actor=runner.actor)]
+    first, second = [target.session_id for target in targets]
+    await store.update_session_prompt(first, "alpha")
+    await store.update_session_prompt(second, "beta")
+    async def send(target, text):
+        return await loop.send(target, text, actor=runner.actor, message_id=text, deadline_ms=now_ms()+10000)
     try:
-        results = await asyncio.wait_for(asyncio.gather(loop.send("first", first), loop.send("second", second)), 10)
+        results = await asyncio.wait_for(asyncio.gather(send(targets[0], "first"), send(targets[1], "second")), 10)
         assert all(result.status == "completed" for result in results)
         assert sorted(model.seen) == sorted([(first, "alpha"), (second, "beta")])
         for sid in (first, second):
@@ -196,23 +203,23 @@ async def test_concurrent_sessions_never_share_entry_reads(registry_store):
             assert len(rows) == 2 and all(row.send_index == 1 for row in rows)
             assert (await store.get_state(sid)).next_seq == 3
     finally:
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
+        await runner.aclose()
 
 
 async def test_inherited_background_context_cannot_reuse_a_finished_sends_snapshot(registry_store):
     store, connect = registry_store
     model = Model()
-    runtime, loop = fixture_loop(store, model)
-    sid = await store.create_session(system_prompt="first")
+    runner = await RunningAgent(store, model, capacity=2).start()
+    sid = runner.target.session_id
+    await store.update_session_prompt(sid, "first")
     release = asyncio.Event()
     async def later():
         await release.wait()
-        return await loop.send("second", sid)
+        return await runner.send("second")
     model.spawn = later
     try:
-        assert (await loop.send("first", sid)).status == "completed"
-        other = await connect(schema="compatible")
+        assert (await runner.send("first")).status == "completed"
+        other = await connect(schema="verify")
         await other.update_session_prompt(sid, "second")
         release.set()
         assert (await asyncio.wait_for(model.child, 10)).status == "completed"
@@ -223,5 +230,4 @@ async def test_inherited_background_context_cannot_reuse_a_finished_sends_snapsh
         if model.child is not None and not model.child.done():
             model.child.cancel()
             await asyncio.gather(model.child, return_exceptions=True)
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=.1)
+        await runner.aclose()

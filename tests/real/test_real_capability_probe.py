@@ -19,7 +19,7 @@ import zlib
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMProviderConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentEventBus, AgentLoopConfig, LLMProviderConfig, RuntimeEnv, SessionStore
 from power_loop.runtime.capability_probe import _COLOURS, probe_capabilities
 from power_loop.tools import create_default_tool_registry
 
@@ -89,7 +89,7 @@ def _two_colour_png(left, right, size: int = 64) -> bytes:
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
-def _ask_about_file(tmp_path, capabilities) -> tuple[str, tuple, tuple, list[str]]:
+async def _ask_about_file(tmp_path, capabilities, runtime_agent) -> tuple[str, tuple, tuple, list[str]]:
     left, right = random.Random(11).sample(_COLOURS, 2)
     (tmp_path / "shot.png").write_bytes(_two_colour_png(left[2], right[2]))
     tools_called: list[str] = []
@@ -97,36 +97,40 @@ def _ask_about_file(tmp_path, capabilities) -> tuple[str, tuple, tuple, list[str
     async def _run() -> str:
         store = await SessionStore.open(":memory:")
         try:
-            loop = StatefulAgentLoop(
-                llm=make_llm(max_tokens=4096, temperature=0.0, capabilities=capabilities),
+            bus = AgentEventBus()
+            loop = await runtime_agent(
+                model=make_llm(max_tokens=4096, temperature=0.0, capabilities=capabilities),
                 store=store,
-                tool_registry=create_default_tool_registry(include=["view_image"], workspace_dir=tmp_path),
+                event_bus=bus, runtime_env=RuntimeEnv(workspace_dir=tmp_path),
+                registry=create_default_tool_registry(include=["view_image"], workspace_dir=tmp_path),
                 config=AgentLoopConfig(system_prompt="You can look at workspace images with view_image.",
                                        max_rounds=4, max_tokens=4096),
             )
             from power_loop import AgentEventType
 
-            loop.event_bus.subscribe(AgentEventType.TOOL_CALL_STARTED,
+            bus.subscribe(AgentEventType.TOOL_CALL_STARTED,
                                      lambda e: tools_called.append(e.data.name))
-            sid = await loop.new_session()
-            r = await loop.send("用 view_image 看 shot.png，告诉我左半边和右半边各是什么颜色。只回颜色。", sid)
+            r = await loop.send("用 view_image 看 shot.png，告诉我左半边和右半边各是什么颜色。只回颜色。")
             return r.final_text or ""
         finally:
+            await loop.aclose()
             await store.close()
 
-    return asyncio.run(_run()), left, right, tools_called
+    return await _run(), left, right, tools_called
 
 
-def test_view_image_lets_a_vision_model_see_a_workspace_file(tmp_path) -> None:
-    answer, left, right, called = _ask_about_file(tmp_path, {"supports_image_input": True})
+@pytest.mark.asyncio
+async def test_view_image_lets_a_vision_model_see_a_workspace_file(tmp_path, runtime_agent) -> None:
+    answer, left, right, called = await _ask_about_file(tmp_path, {"supports_image_input": True}, runtime_agent)
     assert "view_image" in called, called
     low = answer.lower()
     assert any(w in low for w in (left[0], *left[1])) and any(w in low for w in (right[0], *right[1])), (
         f"expected {left[0]}/{right[0]}: {answer!r}")
 
 
-def test_view_image_on_a_model_declared_blind_does_not_make_it_up(tmp_path) -> None:
-    answer, left, right, called = _ask_about_file(tmp_path, None)
+@pytest.mark.asyncio
+async def test_view_image_on_a_model_declared_blind_does_not_make_it_up(tmp_path, runtime_agent) -> None:
+    answer, left, right, called = await _ask_about_file(tmp_path, None, runtime_agent)
     assert "view_image" in called, called
     low = answer.lower()
     both = any(w in low for w in (left[0], *left[1])) and any(w in low for w in (right[0], *right[1]))

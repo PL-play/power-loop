@@ -6,11 +6,13 @@ from collections import Counter
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, ToolDefinition
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
 
@@ -27,17 +29,17 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
     store._db = counted = CountedDatabase(original_db)
     manager = JobManager(store)
     from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
-    from power_loop.runtime.response_capture import ResponseCaptureReceipt
 
     from .test_model_budgets_192 import Host
     host = Host()
-    captures = {}
-    async def capture(packet):
-        assert captures.setdefault(packet.capture_id, packet) == packet
-        return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
+    observations = []
+    prepare_usage = host.prepare_usage
+    async def record_usage(context, grant, observation):
+        observations.append(observation)
+        return await prepare_usage(context, grant, observation)
     async def tool_plan(context, call, *, pricing):
         return None
-    host.capture_response, host.prepare_tool = capture, tool_plan
+    host.prepare_usage, host.prepare_tool = record_usage, tool_plan
     config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=10000, max_tokens=1000000, max_inflight=64),), host)
     runtime = TaskRuntime(manager, tenant_id="memory-send", principal_id="host", executor_id="executor", boot_id="boot", boot_contract_hash="a" * 64,
                           budget_config=config if budgeted else None)
@@ -65,14 +67,14 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
 
     model = Model()
     host.service = model
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
-                             config=AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None, delegation_policy="single_level"))
-    sid = await loop.new_session()
+    loop = await RunningAgent(store, model, registry,
+        AgentLoopConfig(max_rounds=models+1, max_tokens=20, compactor=None), task_runtime=runtime).start()
+    sid = loop.target.session_id
     try:
         counted.sql = counted.transactions = 0
         counted.read_rows = counted.read_bytes = counted.parameter_bytes = 0
         counted.statements.clear()
-        result = await loop.send("run", sid)
+        result = await loop.send("run")
         total_sql, total_transactions = counted.sql, counted.transactions
         checkpoint_sql = sum("execution_batches" in sql or "execution_checkpoints" in sql for sql in counted.statements)
         statement_count = len(counted.statements)
@@ -86,19 +88,19 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
         messages = await store.load_all_messages(sid)
         assert seen == ["ok"] * ((models - 1) * tools_per_round), [(m.role, m.content) for m in messages]
         assert result.status == "completed" and model.calls == models
-        [row] = await manager.db.fetchall(f"SELECT summary_json FROM {manager.prefix}execution_checkpoints WHERE job_id=(SELECT job_id FROM {manager.jobs} ORDER BY created_at DESC,job_id DESC LIMIT 1)")
-        summary = json.loads(row['summary_json'])
-        assert summary['models'] == models and summary['tools'] == len(seen)
+        assert result.usage['total_tokens'] == 5 * models
+        # Persisted public results retain usage; transient checkpoints may be cleaned.
+        queried = await loop.runtime.client.wait(result.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
+        assert queried.usage == result.usage
         if budgeted:
-            assert len(captures) == models
+            assert len(observations) == models
             assert len(host.applied) == host.reserve_calls == models
             [scope] = await manager.db.fetchall(f"SELECT counters_json FROM {manager.prefix}task_budget_scopes")
             assert json.loads(scope["counters_json"]) == dict(used_calls=models, used_tokens=5 * models,
                                                              held_calls=0, held_tokens=0, inflight=0)
         assert not manager._execution_controls and not manager._live_budget_bindings
     finally:
-        await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
         store._db = original_db
 
 

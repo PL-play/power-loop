@@ -5,14 +5,13 @@ import re
 
 import pytest
 
-from power_loop.runtime import controller_handoff, controller_recovery, managed_delivery
-from power_loop.runtime.pending_calls import recover_runtime, recover_tree
+from power_loop.runtime import managed_delivery
+from power_loop.runtime.managed_effects import reconcile
 from power_loop.runtime.store.task_schema import task_tables_ddl
 
-from ._owned_pending_case_192 import owned_pending_case
-from .test_controller_handoff_192 import new_main
 from .test_job_registry_192 import registry_store
-from .test_owned_pending_review_192 import cleanup
+from .test_managed_delivery_192 import consume_notice, controller
+from .test_managed_effects_192 import scenario
 
 __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -50,12 +49,15 @@ def mysql_index_paths(rows):
 
 
 async def test_actual_recovery_queries_are_flat_and_every_task_relation_has_an_index_path(registry_store, monkeypatch, record_property):
-    c = await owned_pending_case(registry_store, 'workflow_node', effect_calls=2, native_tail='original_note')
+    c = await scenario(registry_store, pending=True, budgeted=True)
+    [effect] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    c.state.resolved = True
+    await reconcile(c.runtime, c.actor, effect['job_id'], c.adapter)
     loop = runtime = None
     plans = {}
     try:
-        loop, runtime = await new_main(c, registry_store)
-        actor = runtime.actor(c.state.root)
+        loop, model = await controller(c)
+        runtime, actor = c.runtime, c.actor
         backend = c.manager.db.dialect.name
         if backend == 'sqlite':
             from power_loop.runtime.store.backends.sqlite import SqliteDatabase, _SqliteTransaction
@@ -140,25 +142,19 @@ async def test_actual_recovery_queries_are_flat_and_every_task_relation_has_an_i
                         return await original(self, sql, params)
                     return instrumented
                 monkeypatch.setattr(cls, name, wrap(original))
-        result = await recover_runtime(runtime, actor, c.state.source)
-        assert result['state'] == 'queued_for_review'
-        source = await runtime.manager.get_job(actor, c.state.source)
-        await recover_tree(runtime, actor, source.root_job_id)
-        async with runtime.manager._write() as tx:
+        notice = await managed_delivery.enqueue_runtime(runtime, actor, effect['job_id'])
+        async with runtime.manager._read() as tx:
             assert await managed_delivery.pending_reviews(runtime.manager, tx, actor)
-            assert await controller_recovery.candidates(runtime.manager, tx, actor) == []
-        await loop.send('Handle all original outcomes without repeating actions.', c.state.root, tools=[])
-        await controller_recovery.reconcile(runtime, actor, c.state.owner_binding.lease.job_id)
-        assert await controller_handoff.handoff_retired_reviews(runtime, actor, c.state.owner_binding.lease.job_id) == []
-        root = await runtime.manager.get_job(actor, c.state.source)
-        await controller_recovery.recover_tree(runtime, actor, root.root_job_id)
-        await loop.send('Handle the original interrupted controller.', c.state.root, tools=[])
+        result = await consume_notice(loop, notice['notification_id'])
+        assert result.status == 'completed' and model.calls == 1
+        assert (await runtime.manager.get_job(actor, effect['job_id'])).result_status == 'handled'
         assert len(plans) >= 15
         record_property('indexed_task_sql_shapes', len(plans))
         record_property('task_sql_plan_details', json.dumps(plans, sort_keys=True))
-        assert c.state.native_calls == c.state.lookups == c.state.counts['AFTER'] == 0
+        assert c.state.prepared == c.state.dispatched == c.state.lookups == 1
     finally:
-        await cleanup(c, loop, runtime)
+        if loop is not None:
+            await loop.aclose()
 
 
 async def test_task_index_ddl_names_fit_all_supported_prefixes(registry_store):

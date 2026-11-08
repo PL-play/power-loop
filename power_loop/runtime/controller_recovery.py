@@ -306,10 +306,10 @@ async def enqueue(manager, tx, row, saved, *, result, delivery):
     if delivery is None:
         await _event(manager, tx, notice_id(manager, row), row, 'controller_result_delivery', data)
     await tx.set_event_recipient(notice_id(manager, row), data['main_session_id'])
-    columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
-    await manager.store.signal_changes(tx, data['main_session_id'], "inbox")
-    await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
-        (data['main_session_id'], notice_id(manager, row), 'controller_result', 'queue', 'pending', render(public), manager.now()))
+    from .jobs import JobActor
+    from .result_notices import accept
+    await accept(manager, tx, JobActor(row['tenant_id'], row['principal_id'], data['main_session_id']),
+        row['root_job_id'], notice_id(manager, row), 'controller_result', render(public))
 
 
 async def handled_references(manager, tx, row, *, _closures=None):

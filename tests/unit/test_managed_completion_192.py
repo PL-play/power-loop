@@ -57,7 +57,7 @@ async def test_real_callback_exit_retained_across_storage_failures_and_exact_ret
 async def test_new_connection_restores_durable_checkpoint_without_runtime_or_business_query(registry_store):
     c, row = await failure_case(registry_store)
     before = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
-    reader = JobManager(await registry_store[1](schema='compatible'))
+    reader = JobManager(await registry_store[1](schema="verify"))
     result = await restore_result(reader, c.actor, row['job_id'])
     assert await restore_result(reader, c.actor, row['job_id']) == result
     assert c.state.lookups == 0 and c.model.calls == c.host.reserve_calls == c.state.dispatched == 1
@@ -130,7 +130,7 @@ async def test_mechanical_result_repair_rolls_back_or_recalls_same_commit(regist
 
 async def test_parallel_readers_publish_only_one_original_result(registry_store):
     c, row = await failure_case(registry_store)
-    readers = [JobManager(await registry_store[1](schema='compatible')) for _ in range(2)]
+    readers = [JobManager(await registry_store[1](schema="verify")) for _ in range(2)]
     values = await asyncio.gather(*(restore_result(m, c.actor, row['job_id']) for m in readers))
     assert values[0] == values[1]
     assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='result'", (row['job_id'],))) == 1

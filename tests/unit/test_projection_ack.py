@@ -1,90 +1,59 @@
-"""Runtime projections are consumed only when the model actually saw them (design/124 Z7).
-
-``<background_updates>`` used to be marked seen while the request was being BUILT, so an LLM call
-that then failed (degraded after retries — or, with steering, an aborted stream) swallowed the
-news for good: the next request never mentioned the finished task.
-"""
-
-from __future__ import annotations
-
-from typing import Any
+"""A completed background result stays visible after a failed parent model call."""
+import asyncio
+import hashlib
+import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
-from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
-from power_loop.runtime.retry import LLMRetryPolicy
+from power_loop import InputRef, JobRef, LLMResponse, LLMService, ToolDefinition, create_default_tool_registry
+from power_loop.agent.runtime_store import now_ms
+from power_loop.runtime.pricing import Free
+from power_loop.runtime.result_revisions import result_id
 
 
-class _FailThenOk(LLMService):
-    def __init__(self, fail_first: int) -> None:
-        self.fail_first = fail_first
-        self.calls: list[list[dict[str, Any]]] = []
-
-    async def complete(self, request: LLMRequest, **kwargs: Any) -> LLMResponse:
-        self.calls.append([dict(m) for m in request.messages])
-        if len(self.calls) <= self.fail_first:
-            raise RuntimeError("provider exploded")
-        return LLMResponse(raw_text="ok")
-
-    async def close(self) -> None:
-        return None
-
-
-def _mentions_task(call: list[dict[str, Any]]) -> bool:
-    return any("bg-7" in str(m.get("content") or "") for m in call)
-
-
-@pytest.mark.asyncio
-async def test_failed_call_does_not_swallow_background_update() -> None:
-    store = await SessionStore.open(":memory:")
+@pytest.mark.parametrize('output', ['BUILD OK', 'image.webp'])
+async def test_original_background_result_survives_failed_parent_and_is_not_reinjected(runtime_agent, tmp_path, output):
+    release = asyncio.Event()
+    calls = []
+    class Model(LLMService):
+        failed = False
+        async def complete(self, request, **kwargs):
+            calls.append(request.messages)
+            if len(calls) == 1:
+                return LLMResponse(raw_text='', tool_calls=[{'id':'background','type':'function','function':{
+                    'name':'background_run','arguments':'{"action":"tool","tool":"build","args":{}}'}}])
+            if output in str(request.messages) and not self.failed:
+                self.failed = True
+                raise ConnectionError('parent model reply unknown')
+            return LLMResponse(raw_text='parent done')
+        async def close(self):
+            pass
+    invoked = []
+    async def build():
+        invoked.append(True)
+        await release.wait()
+        return output
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    registry.register(ToolDefinition('build','build',async_capable=True,pricing=Free('fixture')), build)
+    agent = await runtime_agent(model=Model(), registry=registry)
     try:
-        llm = _FailThenOk(fail_first=1)
-        loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(
-            system_prompt="S", max_rounds=2, compactor=None,
-            retry_policy=LLMRetryPolicy(max_attempts=1),
-        ))
-        sid = await loop.new_session()
-        await store.upsert_background_task(sid, task_id="bg-7", command="build",
-                                           status="done", output_tail="BUILD OK")
-        r1 = await loop.send("hi", sid)
-        assert r1.status == "degraded"
-        assert _mentions_task(llm.calls[0])
-        r2 = await loop.send("again", sid)
-        assert r2.status == "completed"
-        assert _mentions_task(llm.calls[1]), "the update vanished with the failed call"
-        # the successful call acknowledged it → gone from later requests
-        await loop.send("third", sid)
-        assert not _mentions_task(llm.calls[2])
-        for call in llm.calls:
-            assert all("_ack" not in m for m in call), "private marker leaked to the provider"
+        assert (await agent.send('build')).status == 'completed'
+        rows = await agent.runtime.store.load_all_messages(agent.target.session_id)
+        ref = JobRef(**json.loads(next(row.content for row in rows if row.tool_call_id=='background'))['job_ref'])
+        release.set()
+        child = await agent.runtime.client.wait(ref, actor=agent.actor, deadline_ms=now_ms()+10000)
+        assert child.status == 'completed' and child.final_text == output
+        parent_ref = InputRef(ref.store_id, agent.target.session_id,
+            hashlib.sha256(('result:'+result_id(child.job_ref.job_id, child.job_ref.generation)).encode()).hexdigest())
+        result = await agent.runtime.client.wait(parent_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
+        assert result.status == 'failed' and 'reply unknown' in result.error
+        await agent.finish(parent_ref, failed=True)
+        assert (await agent.send('continue from saved result')).status == 'completed'
+        assert output in str(calls[-1]) and invoked == [True]
+        notices = [r for r in await agent.runtime.store.load_all_messages(agent.target.session_id)
+                   if '[background_tool_results]' in str(r.content)]
+        assert len(notices) == 1 and output in notices[0].content
+        assert await agent.runtime.client.wait(ref, actor=agent.actor, deadline_ms=now_ms()+1000) == child
+        assert all('_ack' not in row and '_persist' not in row for request in calls for row in request)
     finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_typed_background_result_persists_once_across_failed_request_and_next_send():
-    from power_loop.runtime.background import record_key
-    store = await SessionStore.open(':memory:')
-    try:
-        llm = _FailThenOk(fail_first=1)
-        loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(
-            system_prompt='S', max_rounds=2, compactor=None,
-            retry_policy=LLMRetryPolicy(max_attempts=1)))
-        sid = await loop.new_session()
-        await store.set_runtime_state(sid, record_key('bg-7'), {
-            'task_id': 'bg-7', 'tool': 'image', 'args': {'prompt': 'test'},
-            'status': 'completed', 'result': 'image.webp', 'result_ref': record_key('bg-7')})
-        await store.upsert_background_task(sid, task_id='bg-7', command='image',
-                                           status='completed', output_tail='image.webp')
-        await loop.send('hi', sid)
-        await loop.send('retry', sid)
-        await loop.send('next', sid)
-        for call in llm.calls:
-            results = [m for m in call if m.get('name') == 'background_tool_results']
-            assert len(results) == 1
-            assert 'image.webp' in results[0]['content']
-            assert '_persist' not in results[0] and '_ack' not in results[0]
-        assert not await store.list_unseen_background_updates(sid)
-    finally:
-        await store.close()
+        release.set()

@@ -2,12 +2,12 @@
 
 [Back to examples](../README.md)
 
-These examples show how to build runtime-bound tools from public power-loop primitives. They call your configured real LLM, so make sure `.env` contains working provider credentials and be mindful of provider usage/cost.
+These examples use fixed model responses and the actual current Runtime factory. They need no model credentials. Deployment/restart handlers simulate actions locally; they do not operate a service.
 
 | File | Scenario | Key APIs |
 |---|---|---|
 | [`01_runtime_projector.py`](01_runtime_projector.py) | Incident commander state projected into the next LLM round | `SessionStore.set_runtime_state`, `RuntimeProjector` |
-| [`02_tool_runtime_context.py`](02_tool_runtime_context.py) | Tool queries the current session and writes runtime state | `get_tool_runtime_context`, `loop.get_messages()` |
+| [`02_tool_runtime_context.py`](02_tool_runtime_context.py) | Tool queries the current session and writes runtime state | `get_tool_runtime_context`, `SessionStore.load_all_messages` |
 | [`03_hooks_control_flow.py`](03_hooks_control_flow.py) | Approval hook rewrites a deployment tool call | `TOOL_BEFORE`, `TOOL_AFTER` |
 | [`04_events_observability.py`](04_events_observability.py) | Event subscriber builds an audit trail for custom tools | `AgentEventBus`, `TOOL_CALL_*` |
 

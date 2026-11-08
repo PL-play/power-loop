@@ -1,3 +1,5 @@
+> Historical B1 design. SDK 11 uses schema 15 / protocol 42 and the Runtime factory/client contract in [runtime-11.md](../runtime-11.md). The old activation and construction examples below are not current API.
+
 # Experimental task registry: B1 storage and identity ports
 
 Implementation: `runtime/jobs.py`, `runtime/message_ref.py`, `runtime/store/task_schema.py`.

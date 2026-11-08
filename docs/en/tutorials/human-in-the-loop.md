@@ -1,150 +1,64 @@
-# Tutorial: Human-in-the-Loop
+# Human input and approval
 
-[中文](../../zh/tutorials/human-in-the-loop.md) | [Tutorials](../index.md)
+SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
 
-**Goal**: Build an agent that asks the user before executing bash commands — 70 lines.
+Use request_user_input for a persisted interaction. Answer its exact interaction_id and wait_round through RuntimeClient.answer. TOOL_BEFORE approval controls whether a tool runs; its timeout/cancellation is not successful approval.
 
-**You'll learn**: Async `TOOL_BEFORE` hook, `HookDirective.SKIP`, `asyncio.Queue` for UI integration, blocking dangerous commands.
+The following source is executable from this checkout. It imports the shared example composition helper, [examples/_runtime.py](../../../examples/_runtime.py); keep that file alongside the example. The helper starts and closes a real Runtime. For independent application setup, follow [Quickstart](../user-guide/quickstart.md).
 
-## 1. Define the Bash Tool
-
-```python
-from power_loop import ToolRegistry, ToolDefinition
-
-def bash(command: str) -> str:
-    return f"(executed) {command}"
-
-registry = ToolRegistry()
-registry.register(
-    ToolDefinition(
-        name="bash",
-        description="Run a shell command. Param: command (string).",
-        input_schema={
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-    ),
-    bash,
-)
+```bash
+.venv/bin/python examples/21_request_user_input.py
 ```
 
-## 2. The Approval Hook
-
 ```python
-from power_loop import AgentHooks, HookPoint, HookDirective
-from power_loop.contracts.hook_contexts import ToolBeforeCtx
+"""21 · A paused task is answered by JobRef, interaction ID and wait round.
 
-SAFE_COMMANDS = {"ls", "pwd", "echo", "cat", "head", "tail", "wc", "find"}
-
-async def ask_before_bash(ctx: ToolBeforeCtx) -> None:
-    if ctx.tool_name != "bash":
-        return
-
-    cmd = ctx.tool_args.get("command", "").strip()
-    cmd_name = cmd.split()[0] if cmd else ""
-
-    # Auto-approve safe commands
-    if cmd_name in SAFE_COMMANDS:
-        return  # CONTINUE — let it run
-
-    # Ask the user
-    approved = await your_ui_confirm(cmd)
-    if not approved:
-        ctx.output = f"[denied by user: {cmd!r}]"
-        ctx.directive = HookDirective.SKIP
-```
-
-## 3. UI Integration via asyncio.Queue
-
-```python
+The demo supplies an answer. A UI may use the same visible pending state and
+submit a different choice; the original input remains the query identity.
+"""
 import asyncio
-from dataclasses import dataclass, field
+import json
+import time
 
-@dataclass
-class ApprovalRequest:
-    command: str
-    response: asyncio.Future[bool] = field(default_factory=asyncio.Future)
+from _runtime import demo_runtime
 
-queue: asyncio.Queue[ApprovalRequest] = asyncio.Queue()
+from power_loop import LLMResponse, LLMService, create_default_tool_registry
 
-async def ask_before_bash(ctx: ToolBeforeCtx) -> None:
-    if ctx.tool_name != "bash":
-        return
-    cmd = ctx.tool_args.get("command", "")
-    if cmd.split()[0] in SAFE_COMMANDS:
-        print(f"  [auto-approve] {cmd}")
-        return
 
-    req = ApprovalRequest(command=cmd)
-    await queue.put(req)
-    approved = await req.response  # wait for UI
-    if not approved:
-        ctx.output = f"[denied: {cmd!r}]"
-        ctx.directive = HookDirective.SKIP
+class AskingModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text=next(m['content'] for m in reversed(request.messages) if m.get('role') == 'tool'))
+        return LLMResponse(raw_text='', tool_calls=[{'id':'question','type':'function','function':{
+            'name':'request_user_input','arguments':json.dumps({'kind':'choice','prompt':'Choose tone',
+                'options':[{'id':'gentle','label':'Gentle'}, {'id':'direct','label':'Direct'}]})}}])
 
-# Worker: consumes queue, gets user input
-async def approval_worker():
-    while True:
-        req = await queue.get()
-        answer = input(f"  Approve '{req.command}'? [y/N]: ")
-        req.response.set_result(answer.lower().startswith("y"))
+    async def close(self):
+        pass
+
+
+async def main(answers=None):
+    registry = create_default_tool_registry(include=['request_user_input'])
+    async with demo_runtime(AskingModel(), registry) as (runtime, loop, target, actor):
+        receipt = await runtime.client.send(target, 'Ask for a tone', message_id='question', actor=actor)
+        async with asyncio.timeout(10):
+            while True:
+                status = await runtime.client.inspect(receipt.input_ref, actor=actor)
+                if status.state == 'waiting_input':
+                    break
+                await asyncio.sleep(.02)
+        pending = (await runtime.store.get_state(target.session_id)).pending
+        interaction = pending['pending_interactions'][0]
+        await runtime.client.answer(status.job_ref, interaction_id=interaction['interaction_id'],
+            wait_round=pending['round_index'], value={'choice':(answers or ['gentle'])[0]}, message_id='answer', actor=actor)
+        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        print(result.final_text)
+        return result.final_text
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
 ```
 
-## 4. Put It Together
-
-```python
-async def main():
-    llm = create_llm_service_from_env()
-    hooks = AgentHooks()
-    hooks.register(HookPoint.TOOL_BEFORE, ask_before_bash)
-
-    loop = StatefulAgentLoop(
-        llm=llm, tool_registry=registry, hooks=hooks,
-        config=AgentLoopConfig(
-            system_prompt=(
-                "You have a bash tool. For safe commands "
-                "(ls, pwd, cat, echo, find), use it directly. "
-                "For anything else, you'll be asked for confirmation."
-            ),
-            max_rounds=4,
-        ),
-    )
-
-    worker = asyncio.create_task(approval_worker())
-    try:
-        sid = await loop.new_session()
-        result = await loop.send("List files in the current directory.", session_id=sid)
-        print(f"Bot: {result.final_text}")
-    finally:
-        worker.cancel()
-        loop.close()
-```
-
-## 5. The Flow
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant L as AgentLoop
-    participant H as TOOL_BEFORE Hook
-    participant Q as asyncio.Queue
-
-    U->>L: new_session()
-    U->>L: send("delete cache.tmp", session_id=sid)
-    L->>L: LLM: bash(rm cache.tmp)
-    L->>H: TOOL_BEFORE(bash, rm cache.tmp)
-    H->>Q: put(ApprovalRequest)
-    Q->>U: "Approve 'rm cache.tmp'?"
-    U->>Q: yes/no
-    Q->>H: future.set_result(yes/no)
-    H-->>L: SKIP (if no) / CONTINUE (if yes)
-    L->>U: final_text
-```
-
-The hook **really waits** — no polling, no timeout. The LLM is paused until the user decides.
-
-## Next
-
-- [Multi-Agent System](multi-agent.md) — delegate to sub-agents
-- [Tools User Guide](../user-guide/tools.md) — full tool system reference
+[hooks](../user-guide/hooks.md) · [API](../api/index.md)

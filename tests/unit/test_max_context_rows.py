@@ -11,8 +11,8 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from power_loop import RequestOptions
 from power_loop._vendor.llm_client.interface import LLMResponse
-from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.runtime.fold import LLMSummaryFold
 from power_loop.runtime.representation import ProjectedRepresentation
@@ -32,9 +32,9 @@ class _UnavailableSummary(_Scripted):
         return LLMResponse(raw_text="")
 
 
-def _loop(store, llm, *, cap, fold=None):
-    return StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_echo_registry(),
+async def _loop(runtime_agent, store, llm, *, cap, fold=None):
+    return await runtime_agent(
+        model=llm, store=store, registry=_echo_registry(),
         config=AgentLoopConfig(
             system_prompt="S", max_rounds=2, representation=ProjectedRepresentation(),
             max_context_rows=cap,
@@ -48,12 +48,11 @@ def _loop(store, llm, *, cap, fold=None):
 
 
 @pytest.mark.asyncio
-async def test_cap_drops_oldest_sends_keeps_newest(store: SessionStore) -> None:
+async def test_cap_drops_oldest_sends_keeps_newest(store: SessionStore, runtime_agent) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 9)])
-    loop = _loop(store, llm, cap=5)
-    sid = await loop.new_session()
+    loop = await _loop(runtime_agent, store, llm, cap=5)
     for i in range(1, 8):
-        await loop.send(f"u{i}", session_id=sid)
+        await loop.send(f"u{i}")
     # The messages of the 7th send's LLM call: projected sends are 2 rows each (user+project);
     # cap=5 → at most 5 non-current rows + the current user turn.
     msgs = llm.calls[-1]
@@ -66,12 +65,11 @@ async def test_cap_drops_oldest_sends_keeps_newest(store: SessionStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cap_disabled_keeps_everything(store: SessionStore) -> None:
+async def test_cap_disabled_keeps_everything(store: SessionStore, runtime_agent) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 9)])
-    loop = _loop(store, llm, cap=None)
-    sid = await loop.new_session()
+    loop = await _loop(runtime_agent, store, llm, cap=None)
     for i in range(1, 8):
-        await loop.send(f"u{i}", session_id=sid)
+        await loop.send(f"u{i}")
     joined = "\n".join(str(m.get("content")) for m in llm.calls[-1])
     assert "u1" in joined and "u6" in joined
 
@@ -79,14 +77,14 @@ async def test_cap_disabled_keeps_everything(store: SessionStore) -> None:
 @pytest.mark.parametrize("options", [{}, {"max_context_rows": None}, {"max_context_rows": 0},
                                      {"max_context_rows": 20}], ids=["default", "none", "zero", "positive"])
 @pytest.mark.asyncio
-async def test_history_limit_is_explicit_beyond_previous_defaults(store: SessionStore, options) -> None:
+async def test_history_limit_is_explicit_beyond_previous_defaults(store: SessionStore, options, runtime_agent) -> None:
     """More than 400 rendered rows exposes both the old default and a hidden replacement cap."""
     llm = _Scripted(responses=[LLMResponse(raw_text="done")])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(
+    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
         system_prompt="S", representation=ProjectedRepresentation(), max_tokens=1_000_000,
         fold_strategy=LLMSummaryFold(keep_last_sends=2, summary_llm=_UnavailableSummary()), **options,
     ))
-    sid = await loop.new_session(metadata={})
+    sid = loop.target.session_id
     for send in range(1, 212):
         for kind, content in (("user", {"input": [f"history-user-{send:04d}"]}),
                               ("project", {"final_text": f"history-answer-{send:04d}"})):
@@ -94,7 +92,7 @@ async def test_history_limit_is_explicit_beyond_previous_defaults(store: Session
                                                projector_version=1)
     await store.set_runtime_state(sid, "send_index", 211)
     try:
-        assert (await loop.send("current", session_id=sid)).status == "completed"
+        assert (await loop.send("current")).status == "completed"
         prompt = str(llm.calls[0])
         assert "history-user-0211" in prompt and "current" in prompt
         assert ("history-user-0001" in prompt) == (options.get("max_context_rows") != 20)
@@ -104,7 +102,7 @@ async def test_history_limit_is_explicit_beyond_previous_defaults(store: Session
 
 
 @pytest.mark.asyncio
-async def test_cap_never_drops_the_fold_compact(store: SessionStore) -> None:
+async def test_cap_never_drops_the_fold_compact(store: SessionStore, runtime_agent) -> None:
     # Aggressive fold: after a few sends the older ones live in the compact summary. The cap must
     # keep that compact row even while dropping uncompacted old sends.
     llm = _Scripted(responses=[
@@ -113,10 +111,9 @@ async def test_cap_never_drops_the_fold_compact(store: SessionStore) -> None:
         LLMResponse(raw_text="d4"), LLMResponse(raw_text="d5"),
         LLMResponse(raw_text="d6"), LLMResponse(raw_text="d7"),
     ])
-    loop = _loop(store, llm, cap=3, fold=LLMSummaryFold(keep_last_sends=2, trigger_ratio=0.0001))
-    sid = await loop.new_session()
+    loop = await _loop(runtime_agent, store, llm, cap=3, fold=LLMSummaryFold(keep_last_sends=2, trigger_ratio=0.0001))
     for i in range(1, 7):
-        await loop.send(f"u{i}", session_id=sid)
+        await loop.send(f"u{i}")
     # llm.calls interleaves MAIN sends with the fold's own summarizer calls — pick the last MAIN one.
     main_calls = [
         c for c in llm.calls
@@ -134,7 +131,7 @@ def _tool_call(cid: str) -> LLMResponse:
 
 
 @pytest.mark.asyncio
-async def test_cap_counts_history_only_not_the_current_send(store: SessionStore) -> None:
+async def test_cap_counts_history_only_not_the_current_send(store: SessionStore, runtime_agent) -> None:
     """上限只管历史，不含当前 send（6.24.0）。
 
     此前当前 send 的消息也计入总数，于是一个多轮的 send 会把历史整段挤掉——历史的预算
@@ -146,11 +143,10 @@ async def test_cap_counts_history_only_not_the_current_send(store: SessionStore)
         _tool_call("t1"), _tool_call("t2"), _tool_call("t3"), _tool_call("t4"),
         LLMResponse(raw_text="done"),
     ])
-    loop = _loop(store, llm, cap=4)
-    sid = await loop.new_session()
+    loop = await _loop(runtime_agent, store, llm, cap=4)
     for i in range(1, 4):
-        await loop.send(f"u{i}", session_id=sid)
-    await loop.send("u4", session_id=sid, max_rounds=8)
+        await loop.send(f"u{i}")
+    await loop.send("u4", options=RequestOptions(max_rounds=8))
 
     non_system = [m for m in llm.calls[-1] if m.get("role") != "system"]
     joined = "\n".join(str(m.get("content")) for m in non_system)

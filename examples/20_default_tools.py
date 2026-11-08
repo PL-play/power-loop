@@ -1,106 +1,65 @@
-"""20 · 默认工具 / Default tools: exercise every built-in tool
-
-What you learn / 你将学到
---------------------------
-- ``create_default_tool_registry(preset="full")`` 一次性注册默认工具
-  / registers the full default tool set
-- ``read_file`` / ``write_file`` / ``edit_file`` / ``apply_patch`` 的安全写入流程
-  / safe read-before-write editing flow
-- ``glob`` / ``grep`` 用于代码定位，``bash`` 用于测试和构建命令
-  / search with dedicated tools, use bash for CLI-only work
-- ``background_run``（action=run / action=check）、``todo``、``load_skill`` 的基础调用
-  / background tasks (single tool, action=run / action=check), todo updates, and skill loading
-
-Run / 运行
-----------
-    python examples/20_default_tools.py
-"""
-
-from __future__ import annotations
-
+"""20 · File, shell, skill and background tools with explicit workspace grants."""
 import asyncio
+import json
 import time
-import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from power_loop import create_default_tool_registry
+from _runtime import demo_runtime
+
+from power_loop import AgentLoopConfig, JobRef, LLMResponse, LLMService, RuntimeEnv, create_default_tool_registry
 
 
-def show(title: str, value: object) -> None:
-    print(f"\n## {title}")
-    print(value)
+class ToolsModel(LLMService):
+    def __init__(self):
+        self.calls = iter([
+            ('write_file', {'path':'notes.txt','content':'alpha\nbeta\n'}),
+            ('read_file', {'path':'notes.txt'}),
+            ('edit_file', {'path':'notes.txt','old_text':'beta','new_text':'BETA'}),
+            ('apply_patch', {'path':'notes.txt','patch':'--- notes.txt\n+++ notes.txt\n@@ -1,2 +1,2 @@\n-alpha\n+ALPHA\n BETA\n'}),
+            ('todo', {'items':[{'id':'demo','text':'Verify tools','status':'completed'}]}),
+            ('glob', {'pattern':'*.txt'}),
+            ('grep', {'pattern':'BETA','path':'.'}),
+            ('bash', {'command':'cat notes.txt'}),
+            ('load_skill', {'name':'demo'}),
+            ('background_run', {'action':'run','command':'printf background-finished'})])
+        self.index = 0
+
+    async def complete(self, request, **kwargs):
+        call = next(self.calls, None)
+        if call is None:
+            return LLMResponse(raw_text='Tools finished.')
+        self.index += 1
+        name, args = call
+        return LLMResponse(raw_text='', tool_calls=[{'id':f'tool-{self.index}','type':'function',
+            'function':{'name':name,'arguments':json.dumps(args)}}])
+
+    async def close(self):
+        pass
 
 
-async def main() -> str:
-    with TemporaryDirectory(prefix="power_loop_default_tools_") as tmp:
-        workspace = Path(tmp)
-        skills_dir = workspace / "skills"
-        skills_dir.mkdir()
-        registry = create_default_tool_registry(
-            preset="full",
-            workspace_dir=workspace,
-            skills_dir=skills_dir,
-        )
-        root = workspace / ".tmp-default-tools-example" / uuid.uuid4().hex[:8]
-        root.mkdir(parents=True, exist_ok=True)
-        rel_root = root.relative_to(workspace).as_posix()
-        target = f"{rel_root}/notes.txt"
-
-        show("write_file", await registry.invoke_async("write_file", {"path": target, "content": "alpha\nbeta\ngamma\n"}))
-        show("read_file", await registry.invoke_async("read_file", {"path": target, "limit": 20}))
-
-        show(
-            "edit_file",
-            await registry.invoke_async(
-                "edit_file",
-                {"path": target, "old_text": "beta", "new_text": "BETA"},
-            ),
-        )
-
-        show(
-            "apply_patch",
-            await registry.invoke_async(
-                "apply_patch",
-                {
-                    "path": target,
-                    "patch": """@@ -1,3 +1,4 @@
- alpha
- BETA
--gamma
-+gamma!
-+delta""",
-                },
-            ),
-        )
-
-        (root / "code.py").write_text("VALUE = 'delta'\nprint(VALUE)\n", encoding="utf-8")
-        show("glob", await registry.invoke_async("glob", {"path": rel_root, "pattern": "*.py"}))
-        show("grep", await registry.invoke_async("grep", {"path": rel_root, "pattern": "VALUE", "include": "*.py"}))
-        show("bash", await registry.invoke_async("bash", {"command": f"python -m py_compile {rel_root}/code.py", "timeout": 10}))
-
-        show(
-            "todo",
-            await registry.invoke_async(
-                "todo",
-                {
-                    "items": [
-                        {"id": "inspect", "text": "Inspect files", "status": "completed"},
-                        {"id": "verify", "text": "Verify default tools", "status": "in_progress"},
-                    ]
-                },
-            ),
-        )
-
-        background = str(await registry.invoke_async("background_run", {"action": "run", "command": "printf 'background finished\\n'"}))
-        show("background_run (action=run)", background)
-        task_id = background.split()[2]
-        time.sleep(0.1)
-        show("background_run (action=check)", await registry.invoke_async("background_run", {"action": "check", "task_id": task_id}))
-
-        show("load_skill", await registry.invoke_async("load_skill", {"name": "example-missing-skill"}))
-        return str(Path(target))
+async def main():
+    with TemporaryDirectory(prefix='power_loop_tools_test_') as directory:
+        workspace = Path(directory)
+        skills = workspace/'skills'
+        (skills/'demo').mkdir(parents=True)
+        (skills/'demo'/'SKILL.md').write_text('---\nname: demo\ndescription: example skill\n---\nSay skill-loaded.\n')
+        registry = create_default_tool_registry(workspace_dir=workspace, skills_dir=skills)
+        async with demo_runtime(ToolsModel(), registry, runtime_env=RuntimeEnv(workspace_dir=workspace, skills_dir=skills),
+                config=AgentLoopConfig(max_rounds=12, compactor=None)) as (runtime, loop, target, actor):
+            result = await loop.send(target, 'Exercise the configured tools', message_id='tools', actor=actor,
+                                     deadline_ms=int(time.time()*1000)+15000)
+            assert result.status == 'completed'
+            rows = await runtime.store.load_all_messages(target.session_id)
+            outputs = [row for row in rows if row.role == 'tool']
+            assert len(outputs) == 10 and all(row.name in registry.names() for row in outputs) and not any(row.content.startswith('Error:') for row in outputs), [(row.name,row.content) for row in outputs]
+            receipt = json.loads(next(row.content for row in outputs if row.name=='background_run'))
+            child = await runtime.client.wait(JobRef(**receipt['job_ref']), actor=actor, deadline_ms=int(time.time()*1000)+10000)
+            assert child.status == 'completed' and 'background-finished' in child.final_text
+            assert (workspace/'notes.txt').read_text() == 'ALPHA\nBETA\n'
+            print([row.name for row in outputs], child.final_text)
+            return result.final_text
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

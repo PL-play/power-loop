@@ -30,6 +30,8 @@ class RuntimeEnv:
     # (LocalShellBackend). A host that runs untrusted shell can inject a
     # sandboxing backend here; see runtime.exec_backend.
     shell_backend: ShellBackend | None = None
+    # Explicit factory binding stop operations to the original execution target.
+    process_control: object = None
     # Shared coordination board for agents that share ``blackboard_id``, and this
     # agent's board id. Both None => no board (default; isolated). The board_*
     # tools resolve these at call time; inject a host implementation for a
@@ -46,7 +48,7 @@ class RuntimeEnv:
     # same path would also fall inside the workspace or the home allowlist.
     read_only_roots: tuple[Path, ...] = ()
     # Hard time limit for one `background_run(action="run")` command (seconds; 6.41.0). The command
-    # is killed when it runs longer and the task settles as "timeout". Was a fixed 300s — a host whose
+    # is killed when it runs longer and the task fails with TimeoutError. Was a fixed 300s — a host whose
     # agents run genuinely long jobs in the background (builds, batch processing) raises it.
     background_timeout_s: float = 300.0
     # The command rule layer for `bash` / `background_run` as data (6.42.0; see tools.command_rules):

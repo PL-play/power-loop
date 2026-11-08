@@ -3,11 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
-from power_loop.core.agent_context import get_current_loop, get_session_id
-from power_loop.runtime.jobs import JobManager
+from power_loop import AgentLoopConfig, ToolDefinition
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
 from .test_job_registry_192 import registry_store
@@ -17,27 +14,21 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("native", [False, True])
-async def test_empty_pass_cannot_recover_text_from_before_the_latest_input(tmp_path, native):
-    store = await SessionStore.open(str(tmp_path / "fresh-answer.db"), **({"schema": "tasks"} if native else {}))
-    try:
-        runtime = TaskRuntime(JobManager(store), tenant_id="freshness", principal_id="host",
-            executor_id="executor", boot_id="boot") if native else None
-        model = _Script(responses=[_call("old", "correct", {}, text="42"),
-            _call("pass", "pass_turn", {"reason": "Computed 43"})])
-        registry = ToolRegistry()
-        async def correct():
-            await get_current_loop().follow_up("Correction: return 43.", get_session_id())
-            return "Correction queued."
-        registry.register(ToolDefinition(name="correct", description="Queue correction", input_schema={"type": "object"}, pricing=Free("test_fixture")), correct)
-        loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
-            config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3))
-        sid = await loop.new_session()
-        result = await loop.send("Return 42, then apply any correction.", sid)
-        assert result.status == "completed" and result.passed and model.calls == 2
-        assert result.final_text == ""
-        assert result.texts[0]["text"] == "42"  # retained progress is not the current answer
-        rows = await store.load_all_messages(sid)
-        assert any(m.name == "follow_up" and "43" in str(m.content) for m in rows)
-    finally:
-        await store.close()
+async def test_empty_pass_cannot_recover_text_from_before_the_latest_input(registry_store, runtime_agent):
+    store, _ = registry_store
+    model = _Script(responses=[_call('old', 'correct', {}, text='42'),
+        _call('pass', 'pass_turn', {'reason':'Computed 43'})])
+    registry = ToolRegistry()
+    async def correct():
+        await agent.runtime.client.append(agent.target, 'Correction: return 43.', message_id='correction', actor=agent.actor)
+        return 'Correction queued.'
+    registry.register(ToolDefinition(name='correct', description='Queue correction',
+        input_schema={'type':'object'}, pricing=Free('test_fixture')), correct)
+    agent = await runtime_agent(model=model, store=store, registry=registry,
+        config=AgentLoopConfig(max_rounds=3, compactor=None))
+    result = await agent.send('Return 42, then apply any correction.')
+    assert result.status == 'completed' and model.calls == 2
+    assert result.final_text == ''
+    rows = await store.load_all_messages(agent.target.session_id)
+    assert any(row.role == 'assistant' and row.content == '42' for row in rows)
+    assert any(row.name == 'follow_up' and '43' in row.content for row in rows)

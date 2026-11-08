@@ -1,72 +1,29 @@
-# 用自己的工具扩展 power-loop
+# 扩展工具
 
-[English](../../en/user-guide/extending-tools.md) | [用户指南](../index.md)
+SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
 
-power-loop 是**内核**,不是开箱即用平台:它不带连接器、不带向量库、不带 SaaS 集成。这是刻意的——那些会带来依赖、固化的取舍和持续维护,不该塞进约 1.7 万行的内核。你通过 `ToolRegistry` 自带工具,要接外部系统就写一个薄工具或走 [MCP](#外部系统mcp)。本页就是配方。
+[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
 
-## 配方:定义 + handler + 注册
+用 JSON 输入结构定义 ToolDefinition，把同步或异步处理器注册到 ToolRegistry，再由执行工厂返回该注册表。RequestOptions.tools 是工具白名单，必需工具缺失时明确失败。处理器接收已校验参数，错误输出应可理解，不能虚构成功结果。
 
-一个工具是两样东西按同名绑定——`ToolDefinition`(模型看到的 JSON Schema)和 handler(你的代码):
+普通无状态工具可以执行本地计算。拥有外部任务、费用或受管资源的工具需要明确 ToolRuntimeContract 和对应宿主后端。不要捕获旧 loop 或调用其私有方法。执行身份来自可信 runtime 上下文，不从模型参数取得 tenant 或 session。
 
-```python
-from power_loop import ToolDefinition, ToolRegistry
+MCP 需安装 mcp extra，配置实际传输、注册发现的工具定义，并随执行资源关闭连接。编号示例启动本地 stdio 服务并实际调用。依赖不可用时明确报错，不静默回退。
 
-def search_docs(query: str, top_k: int = 1) -> str:
-    ...                      # 你的领域逻辑——DB、HTTP、向量库,随你
-    return "results…"
+业务权限和额度检查仍在权威 API。未知外部动作只按原身份查询或返回 unknown，不能因本地请求失败自动重放。
 
-registry = ToolRegistry()
-registry.register(
-    ToolDefinition(
-        name="search_docs",
-        description="检索知识库,返回最相关的笔记。",
-        input_schema={
-            "type": "object",
-            "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}},
-            "required": ["query"],
-        },
-        required_params=("query",),    # handler 运行前做缺参校验
-    ),
-    search_docs,
-)
+## 可执行示例
 
-loop = StatefulAgentLoop(llm=llm, tool_registry=registry)
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+
+| 示例 | 行为 |
+|---|---|
+| [02_tool_calling.py](../../../examples/02_tool_calling.py) | 定义与处理器 |
+| [37_custom_retrieval_tool.py](../../../examples/37_custom_retrieval_tool.py) | 检索 |
+| [38_mcp_tools.py](../../../examples/38_mcp_tools.py) | 本地 MCP |
+| [41_custom_async_tool.py](../../../examples/41_custom_async_tool.py) | 异步处理器 |
+| [42_build_your_own_tools.py](../../../examples/42_build_your_own_tools.py) | 受管工具契约 |
+
+```bash
+.venv/bin/python examples/02_tool_calling.py
 ```
-
-可运行示例:[`examples/37_custom_retrieval_tool.py`](../../../examples/37_custom_retrieval_tool.py)。
-
-## 同步 vs 异步 handler
-
-- **同步** handler 由 `invoke_async` 放到工作线程(`asyncio.to_thread`)跑,所以阻塞调用(DB、子进程、HTTP)不会卡事件循环;contextvars(运行时 env、会话身份)会传入线程。
-- **`async def`** handler 在循环上跑——用于本就异步的 I/O(`httpx`、异步 DB 驱动)。
-
-模型只看到 JSON Schema;返回值(字符串)成为 tool 消息。校验(`required_params`)在 handler 之前跑,所以你可以假定声明的入参都在。
-
-## 按调用白名单
-
-不必新建注册表就能限制某次运行可用的工具:
-
-```python
-await loop.send("…", session_id=sid, tools=["search_docs"])   # 模型只看到这些
-```
-
-`tools=` 接受名字列表(经 `registry.subset` 从 loop 注册表白名单)或直接一个 `ToolRegistry`。
-
-## 外部系统:MCP
-
-对住在另一个进程/服务里的工具,连接器路径是 **[Model Context Protocol](https://modelcontextprotocol.io)**,而不是捆绑集成。`power_loop.contrib.mcp` 把 MCP server 的工具映射成 power-loop 工具:
-
-```python
-from power_loop.contrib.mcp import StdioMCPClient, register_mcp_tools   # power-loop[mcp]
-
-client = await StdioMCPClient("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/data"]).connect()
-await register_mcp_tools(registry, client, prefix="fs.")   # MCP 工具 → ToolDefinition
-...
-await client.aclose()
-```
-
-接入点是小小的 `MCPToolSource` Protocol(`list_tools` / `call_tool`),所以 `mcp` SDK 是可选的——在任意客户端(HTTP/SSE、测试里的假实现)上实现该 Protocol 即可。`register_mcp_tools` 把每个工具的 `inputSchema` 直接映射成 `ToolDefinition`。
-
-## 为什么不捆绑连接器?
-
-你没写的连接器,是你没选的依赖、改不了的 schema、修不了的故障。内核给你**接缝**(`ToolRegistry`)和一条标准远程路径(MCP);上面 30 秒的配方通常比接一个通用连接器代码还少——而且是你自己的。

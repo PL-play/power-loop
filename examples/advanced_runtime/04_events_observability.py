@@ -1,45 +1,45 @@
 """Advanced runtime 04: events observe custom tool lifecycle.
-
-Scenario
---------
-An operations console wants an audit stream for tool calls without changing
-tool implementations. Subscribe to the event bus and collect lifecycle events.
-
-Note
-----
-This example calls your configured real LLM and asks it to invoke a tool.
-Make sure `.env` is configured and be mindful of provider usage/cost.
-
-Run:
-    python examples/advanced_runtime/04_events_observability.py
+Uses an offline model and the current Runtime factory; no real deployment occurs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 
-from _helpers import make_llm
+from _helpers import demo_runtime
 
 from power_loop import (
     AgentEvent,
     AgentEventBus,
     AgentEventType,
-    AgentLoopConfig,
-    SessionStore,
-    StatefulAgentLoop,
+    LLMResponse,
+    LLMService,
     ToolDefinition,
     ToolRegistry,
 )
+from power_loop.runtime.pricing import Free
 
 
 def restart_worker(name: str) -> str:
     return f"worker {name} restarted"
 
 
+class ToolModel(LLMService):
+    async def complete(self, request, **kwargs):
+        results = [m['content'] for m in request.messages if m.get('role') == 'tool']
+        if results:
+            return LLMResponse(raw_text=results[-1])
+        return LLMResponse(raw_text='', tool_calls=[{'id':'operation','type':'function','function':{
+            'name':'restart_worker','arguments':'{"name":"search-indexer"}'}}])
+    async def close(self):
+        pass
+
 async def main() -> list[str]:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
+            pricing=Free("local simulated action"),
             name="restart_worker",
             description="Restart a named worker process.",
             input_schema={
@@ -61,26 +61,13 @@ async def main() -> list[str]:
 
     bus.subscribe(None, on_event)
 
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=512, temperature=0.0),
-        store=SessionStore.open(":memory:"),
-        tool_registry=registry,
-        event_bus=bus,
-        config=AgentLoopConfig(
-            system_prompt=(
-                "You operate workers. Call restart_worker with name='search-indexer'. "
-                "After the tool returns, answer briefly."
-            ),
-            max_rounds=4,
-            compactor=None,
-        ),
-    )
-    sid = loop.new_session()
-
-    await loop.send("Restart the search indexer.", session_id=sid)
-    print("\n".join(audit))
+    async with demo_runtime(ToolModel(), registry, event_bus=bus) as (runtime, loop, target, actor):
+        result = await loop.send(target, 'Run simulated operation', message_id='operation', actor=actor,
+            deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+    assert audit == ['tool_call_started:restart_worker', 'tool_call_completed:restart_worker']
+    print(audit)
     return audit
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

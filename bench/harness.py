@@ -20,13 +20,23 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import (
+    AgentLoopConfig,
+    ExecutionEnvironment,
+    RegistryRuntimeFactory,
+    Runtime,
+    RuntimeDescriptor,
+    SessionStore,
+    StatefulAgentLoop,
+    TrustedActor,
+)
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
     LLMService,
     LLMStreamChunk,
 )
+from power_loop.agent.runtime_store import now_ms
 
 
 @dataclass
@@ -79,12 +89,23 @@ def _summarize_latencies(latencies_s: list[float]) -> dict[str, float]:
     }
 
 
-def _new_loop(store: SessionStore, latency_s: float) -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=FakeLLM(latency_s=latency_s),
-        store=store,
-        config=AgentLoopConfig(max_rounds=1, compactor=None),
-    )
+async def _composition(store: SessionStore, latency_s: float):
+    factory = RegistryRuntimeFactory()
+    async def build(descriptor, context):
+        return ExecutionEnvironment(FakeLLM(latency_s=latency_s), None,
+            config=AgentLoopConfig(max_rounds=1, compactor=None))
+    factory.register('bench.agent@1', build)
+    runtime = Runtime(store=store, factory=factory, node_id="bench", capacity=32, recovery_interval_s=None)
+    await runtime.worker.start()
+    return runtime, StatefulAgentLoop(runtime=runtime), RuntimeDescriptor(
+        1, 'agent', 'bench.agent@1', None, 'bench.tools@1', 'bench.hooks@1', 'bench.resources@1', {}, {}), TrustedActor('bench','host',None)
+
+
+async def _close(runtime, loop):
+    await runtime.worker.shutdown()
+    await loop.aclose()
+    await runtime.client.aclose()
+    await runtime.transport.aclose()
 
 
 async def run_fanout(
@@ -98,15 +119,15 @@ async def run_fanout(
 
     (The legacy SCALE-2 read pool is gone — the async SQLite backend offloads each
     statement to a worker thread and serializes writers with one ``asyncio.Lock``.)"""
-    store = await SessionStore.open(db_path)
+    store = await SessionStore.open(db_path, schema="tasks")
+    runtime, loop, descriptor, actor = await _composition(store, latency_s)
     try:
-        loop = _new_loop(store, latency_s)
-        sids = [await loop.new_session() for _ in range(sessions)]
+        sids = [await loop.new_session(descriptor, actor=actor) for _ in range(sessions)]
         latencies: list[float] = []
 
         async def _one(sid: str) -> None:
             t0 = time.perf_counter()
-            await loop.send("hello", session_id=sid)
+            await loop.send(sid, "hello", message_id="first", actor=actor, deadline_ms=now_ms()+120000)
             latencies.append(time.perf_counter() - t0)
 
         wall_t0 = time.perf_counter()
@@ -121,6 +142,7 @@ async def run_fanout(
             "send_latency": _summarize_latencies(latencies),
         }
     finally:
+        await _close(runtime, loop)
         await store.close()
 
 
@@ -130,21 +152,21 @@ async def run_big_history(
     """One session pre-seeded with ``history_size`` active messages, then ``sends``
     sequential sends. Per-send latency exposes the O(active-history) read + token-scan
     cost that runs each round."""
-    store = await SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:", schema="tasks")
+    runtime, loop, descriptor, actor = await _composition(store, latency_s)
     try:
-        loop = _new_loop(store, latency_s)
-        sid = await loop.new_session()
+        sid = await loop.new_session(descriptor, actor=actor)
         for i in range(history_size):
             await store.append_message(
-                sid,
+                sid.session_id,
                 role="user" if i % 2 == 0 else "assistant",
                 content="x" * 200,
                 round_index=i,
             )
         latencies: list[float] = []
-        for _ in range(sends):
+        for index in range(sends):
             t0 = time.perf_counter()
-            await loop.send("and another", session_id=sid)
+            await loop.send(sid, "and another", message_id=f"send-{index}", actor=actor, deadline_ms=now_ms()+120000)
             latencies.append(time.perf_counter() - t0)
         return {
             "scenario": "big_history",
@@ -154,21 +176,22 @@ async def run_big_history(
             "send_latency": _summarize_latencies(latencies),
         }
     finally:
+        await _close(runtime, loop)
         await store.close()
 
 
 async def run_throughput(*, total_sends: int, latency_s: float = 0.0) -> dict[str, Any]:
     """Sustained sequential sends on one session. Reports sends/sec — a steady-state
     write-path number without fan-out contention."""
-    store = await SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:", schema="tasks")
+    runtime, loop, descriptor, actor = await _composition(store, latency_s)
     try:
-        loop = _new_loop(store, latency_s)
-        sid = await loop.new_session()
+        sid = await loop.new_session(descriptor, actor=actor)
         latencies: list[float] = []
         wall_t0 = time.perf_counter()
-        for _ in range(total_sends):
+        for index in range(total_sends):
             t0 = time.perf_counter()
-            await loop.send("tick", session_id=sid)
+            await loop.send(sid, "tick", message_id=f"send-{index}", actor=actor, deadline_ms=now_ms()+120000)
             latencies.append(time.perf_counter() - t0)
         wall = time.perf_counter() - wall_t0
         return {
@@ -180,4 +203,5 @@ async def run_throughput(*, total_sends: int, latency_s: float = 0.0) -> dict[st
             "send_latency": _summarize_latencies(latencies),
         }
     finally:
+        await _close(runtime, loop)
         await store.close()

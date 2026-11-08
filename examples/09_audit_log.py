@@ -1,28 +1,4 @@
-"""09 · 全量审计日志 / Audit log: subscribe to all events → JSONL
-
-What you learn / 你将学到
---------------------------
-- ``bus.subscribe(None, fn)`` 订阅**所有**类型的事件——常用于审计 / 调试 / OTel
-  / subscribes to **all** event types — commonly used for audit / debugging / OTel
-- ``AgentEvent.payload`` 是 dict 形式（``data.to_dict()`` 自动填充），方便 JSON 序列化
-  / ``AgentEvent.payload`` is a dict (auto-populated via ``data.to_dict()``), easy to JSON serialize
-- ``AgentEvent.{type, session_id, round_index, stream_id, source}`` 是路由字段
-  / are routing fields
-- 订阅者错误默认隔离（``suppress_subscriber_errors=True``），不会污染主循环
-  / subscriber errors are isolated by default, won't affect the main loop
-- 适合 hook 到 ELK / Datadog / 自家 audit pipeline
-  / suitable for hooking into ELK / Datadog / custom audit pipelines
-
-Output / 输出
--------------
-跑完后会有一个 ``audit.jsonl`` 文件，每行一个 JSON 事件。
-/ After running, an ``audit.jsonl`` file is created, one JSON event per line.
-
-Run / 运行
-----------
-    python examples/09_audit_log.py
-"""
-
+"""09 · Current worker events to JSONL; close the subscriber and file explicitly."""
 from __future__ import annotations
 
 import asyncio
@@ -31,13 +7,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentEvent,
     AgentEventBus,
     AgentLoopConfig,
-    StatefulAgentLoop,
+    LLMResponse,
+    LLMService,
     ToolDefinition,
     ToolRegistry,
 )
@@ -64,7 +41,7 @@ ECHO_TOOL = ToolDefinition(
 )
 
 
-def attach_audit_writer(bus: AgentEventBus, path: Path) -> None:
+def attach_audit_writer(bus: AgentEventBus, path: Path):
     """全量订阅 → 写 JSONL / Subscribe to all → write JSONL."""
 
     # mode="a" 允许多次 run 追加到同一文件；测试里用 tempfile
@@ -87,48 +64,43 @@ def attach_audit_writer(bus: AgentEventBus, path: Path) -> None:
 
     # bus.subscribe(None, ...) 订阅所有事件类型 / subscribe to all event types
     bus.subscribe(None, on_event)
+    def close():
+        bus.unsubscribe(on_event)
+        fh.close()
+    return close
 
 
-async def main() -> Path:
-    audit_path = Path(tempfile.gettempdir()) / "power_loop_audit.jsonl"
-    audit_path.unlink(missing_ok=True)
+class EchoModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any(m['role'] == 'tool' for m in request.messages):
+            return LLMResponse(raw_text='audit log demo')
+        return LLMResponse(raw_text='', tool_calls=[{'id':'echo','type':'function','function':{
+            'name':'echo','arguments':'{"text":"audit log demo"}'}}])
 
-    bus = AgentEventBus(suppress_subscriber_errors=True)
-    attach_audit_writer(bus, audit_path)
+    async def close(self):
+        pass
 
+
+async def main():
+    directory = Path(tempfile.mkdtemp(prefix='power_loop_audit_test_'))
+    audit_path = directory/'audit.jsonl'
+    bus = AgentEventBus()
+    close = attach_audit_writer(bus, audit_path)
     registry = ToolRegistry()
     registry.register(ECHO_TOOL, echo_handler)
-
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=256, temperature=0),
-        db_path=":memory:",
-        event_bus=bus,
-        tool_registry=registry,
-        config=AgentLoopConfig(
-            system_prompt=(
-                "You have an `echo` tool. Use it to repeat any phrase the user gives you."
-            ),
-            max_rounds=3,
-            compactor=None,
-        ),
-    )
-    sid = await loop.new_session()
-    r = await loop.send("Echo back the phrase: 'audit log demo'.", session_id=sid)
-    print(f"\n[reply] {r.final_text}\n")
-
-    # 看一眼 audit 文件长什么样 / Peek at the audit file
-    lines = audit_path.read_text(encoding="utf-8").splitlines()
-    print(f"[audit] wrote {len(lines)} events to {audit_path}")
-    type_counter: dict[str, int] = {}
-    for line in lines:
-        t = json.loads(line)["type"]
-        type_counter[t] = type_counter.get(t, 0) + 1
-    print("[audit] event type histogram:")
-    for t, n in sorted(type_counter.items(), key=lambda x: -x[1]):
-        print(f"        {n:4d}  {t}")
-
+    try:
+        async with demo_runtime(EchoModel(), registry, event_bus=bus,
+                config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+            result = await loop.send(target, 'echo demo', message_id='audit', actor=actor,
+                                     deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed'
+    finally:
+        close()
+    rows = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert any(row['type'] == 'tool_call_completed' for row in rows)
+    print('audit:', audit_path, 'events:', len(rows))
     return audit_path
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

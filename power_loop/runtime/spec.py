@@ -289,7 +289,8 @@ def _model_service(parent_loop, spec, override=None):
     services = getattr(parent_loop.task_runtime, 'model_services', {})
     service = services.get(binding)
     if service is None or override is not None and override is not service:
-        raise ValueError('model_binding_unavailable')
+        from power_loop.agent.runtime_types import RuntimeRequestError
+        raise RuntimeRequestError('resource_unavailable', f'model_binding_unavailable: {binding}')
     return service
 
 

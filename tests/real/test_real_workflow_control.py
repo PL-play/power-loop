@@ -8,25 +8,17 @@ actual leaf agents against the live provider and rolling up usage.
 
 from __future__ import annotations
 
-import tempfile
-
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop, create_llm_service_from_env
-from power_loop.workflow import create_workflow
+from ._workflow_runtime import run_workflow
 
 pytestmark = pytest.mark.real_llm
 
 
-def _loop() -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=create_llm_service_from_env(),
-        db_path=tempfile.mktemp(suffix=".db"),
-        config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=4),
-    )
 
 
-async def test_real_parallel_branches_all_complete() -> None:
+
+async def test_real_parallel_branches_all_complete(runtime_agent) -> None:
     spec = {
         "name": "parallel_facts", "input": "x",
         "root": {"type": "parallel", "max_concurrency": 2, "branches": [
@@ -38,14 +30,14 @@ async def test_real_parallel_branches_all_complete() -> None:
              "input": "the Moon"},
         ]},
     }
-    result = await create_workflow(spec, parent_loop=_loop()).run()
+    result = await run_workflow(runtime_agent, spec)
     assert result.status == "completed", f"errors: {result.errors}"
     assert result.results["sun"].ok and result.results["sun"].text.strip()
     assert result.results["moon"].ok and result.results["moon"].text.strip()
     assert result.usage.get("total_tokens", 0) > 0  # both leaves' usage rolled up
 
 
-async def test_real_foreach_fans_out_one_leaf_per_item() -> None:
+async def test_real_foreach_fans_out_one_leaf_per_item(runtime_agent) -> None:
     spec = {
         "name": "foreach_fanout", "input": "x",
         "root": {"type": "foreach", "id": "fan", "items": ["apple", "banana", "cherry"],
@@ -54,7 +46,7 @@ async def test_real_foreach_fans_out_one_leaf_per_item() -> None:
                           "spec": {"name": "leaf", "system_prompt": "Reply with the color of the named fruit, one word."},
                           "input": "{{fruit}}"}},
     }
-    result = await create_workflow(spec, parent_loop=_loop()).run()
+    result = await run_workflow(runtime_agent, spec)
     assert result.status == "completed", f"errors: {result.errors}"
     items = result.results["fan"].payload["items"]
     assert len(items) == 3  # one real leaf per foreach item

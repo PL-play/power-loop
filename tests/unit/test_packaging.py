@@ -30,12 +30,10 @@ def test_stable_api_symbols_are_exported_and_real() -> None:
     assert not missing_all, f"STABLE_API names not in __all__: {missing_all}"
 
 
-# A FROZEN snapshot of the 1.0 STABLE tier. Adding to STABLE_API is fine; REMOVING or
-# RENAMING any of these without a MAJOR version bump (→ 2.0.0) must fail this test — that
-# is the SemVer promise the module docstring makes, made enforceable. The LLM-contract
-# symbols joined the frozen surface at 1.0 to give StatefulAgentLoop construction closure.
-_FROZEN_STABLE_V0 = frozenset({
-    "StatefulAgentLoop", "StatefulResult", "FollowUpQueued",
+# Frozen stable surface for 11.0: input receipts and durable results replace
+# the retired direct-loop result/queued-return types.
+_FROZEN_STABLE_V11 = frozenset({
+    "StatefulAgentLoop", "Receipt", "Result", "Runtime", "RuntimeClient", "RuntimeWorker",
     "AgentLoopConfig", "AgentLoopResult", "SessionStore", "SubagentLifecycle",
     "PowerLoopError", "SessionNotFoundError",
     "LLMTimeout", "LLMRetryExhausted", "CancellationRequested",
@@ -52,10 +50,10 @@ def test_stable_api_semver_guard() -> None:
     """No STABLE symbol may be dropped/renamed without a major bump (and a conscious
     edit to this frozen baseline)."""
     current = set(power_loop.STABLE_API)
-    removed = _FROZEN_STABLE_V0 - current
+    removed = _FROZEN_STABLE_V11 - current
     assert not removed, (
         f"STABLE_API dropped/renamed {sorted(removed)} — that's a breaking change "
-        "requiring a MAJOR version bump. If intentional, update _FROZEN_STABLE_V0."
+        "requiring a MAJOR version bump. If intentional, update _FROZEN_STABLE_V11."
     )
 
 

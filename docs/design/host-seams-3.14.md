@@ -1,3 +1,5 @@
+> 历史设计（3.14），不是 11.0.0 的装配指南。内联子任务与 `ChildRunGuard` 已删除；每次执行由 `RuntimeFactory` 创建独立 hooks/resources，并由 `ExecutionEnvironment.aclose()` 释放。当前接口见 [API](../en/api/index.md)。
+
 # Host Seams（3.14.0）— 接口级设计
 
 > 目标：一次「宿主接缝」主题的 minor 发版，让重宿主（DeepTalk `agent` 服务）删掉三处

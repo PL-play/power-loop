@@ -48,8 +48,9 @@ class _PgTransaction:
 
 
 class PostgresDatabase:
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, *, lock_connection_factory=None) -> None:
         self._pool = pool
+        self._lock_connection_factory = lock_connection_factory
         self.dialect: Dialect = PostgresDialect()
         self._closed = False
 
@@ -58,7 +59,13 @@ class PostgresDatabase:
         import asyncpg  # optional extra: power-loop[postgres]
 
         pool = await asyncpg.create_pool(dsn, min_size=min_size, max_size=max_size)
-        return cls(pool)
+        return cls(pool, lock_connection_factory=lambda: asyncpg.connect(dsn))
+
+    async def open_lock_connection(self):
+        if self._lock_connection_factory is None:
+            from power_loop.agent.runtime_types import RuntimeRequestError
+            raise RuntimeRequestError("invalid_options", "dedicated PostgreSQL lock connection is not configured")
+        return await self._lock_connection_factory()
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[_PgTransaction]:

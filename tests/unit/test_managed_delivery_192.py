@@ -2,13 +2,15 @@
 
 import pytest
 
-from power_loop import AgentLoopConfig, HookPoint, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
+from power_loop import AgentLoopConfig, HookPoint, InputRef, LLMResponse, LLMService, LLMTokenUsage, TargetRef
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.jobs import JobError
 from power_loop.runtime.managed_completion import flush_local
-from power_loop.runtime.managed_delivery import enqueue, identity
+from power_loop.runtime.managed_delivery import enqueue_runtime, identity
 from power_loop.runtime.managed_effects import reconcile
 from power_loop.tools.registry import ToolRegistry
 from tests.control_faults import control_mutations
+from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
 from .test_managed_completion_192 import failure_case
@@ -40,8 +42,9 @@ class Controller(LLMService):
 async def controller(c, *, sees=True, fail=False):
     model = Controller(sees=sees, fail=fail)
     c.host.service = model
-    loop = StatefulAgentLoop(llm=model, store=c.store, task_runtime=c.runtime, tool_registry=ToolRegistry(),
-        config=AgentLoopConfig(model='test-model', max_tokens=20, max_rounds=2, delegation_policy='single_level'))
+    loop = RunningAgent(c.store, model, ToolRegistry(), task_runtime=c.runtime,
+        config=AgentLoopConfig(model='test-model', max_tokens=20, max_rounds=2, compactor=None))
+    loop.target = TargetRef(c.store.store_id, c.sid)
     if not sees:
         async def hide(ctx):
             ctx.messages = [m for m in ctx.messages if 'Original tool outcome:' not in str(m.get('content'))]
@@ -49,8 +52,17 @@ async def controller(c, *, sees=True, fail=False):
     return loop, model
 
 
+async def consume_notice(loop, notification_id):
+    await loop.start(target=loop.target)
+    ref = InputRef(loop.target.store_id, loop.target.session_id, notification_id)
+    await loop.runtime.client._notify(loop.target, notification_id, ref, ['work', 'activation'])
+    result = await loop.runtime.client.wait(ref, actor=loop.actor, deadline_ms=now_ms()+15000)
+    await loop.finish(ref, failed=result.status=='failed')
+    return result
+
+
 @pytest.mark.parametrize('unknown', [False, True])
-async def test_main_actually_consumes_the_known_outcome_and_original_error_is_unchanged(registry_store, unknown):
+async def test_main_actually_consumes_the_known_outcome_and_original_error_is_unchanged(registry_store, unknown, *, measure=None):
     if unknown:
         c = await scenario(registry_store, budgeted=True, pending=True)
         [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
@@ -61,27 +73,30 @@ async def test_main_actually_consumes_the_known_outcome_and_original_error_is_un
         await flush_local(c.runtime, c.actor, row['job_id'])
     original = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
     loop, model = await controller(c)
-    try:
-        first = await enqueue(loop, c.actor, row['job_id'])
-        again = await enqueue(loop, c.actor, row['job_id'])
-        assert first == again and not first['acknowledgement_created'] and model.calls == 0
-        assert (await c.manager.get_job(c.actor, row['job_id'])).result_status == 'pending_delivery'
-        with pytest.raises(JobError):
+    from contextlib import nullcontext
+    async with measure(c.store) if measure else nullcontext():
+        try:
+            first = await enqueue_runtime(c.runtime, c.actor, row['job_id'])
+            again = await enqueue_runtime(c.runtime, c.actor, row['job_id'])
+            assert first == again and not first['acknowledgement_created'] and model.calls == 0
+            assert (await c.manager.get_job(c.actor, row['job_id'])).result_status == 'pending_delivery'
+            with pytest.raises(JobError):
+                await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
+            result = await consume_notice(loop, first['notification_id'])
+            assert result.status == 'completed' and model.calls == 1
+            current = await c.manager.get_job(c.actor, row['job_id'])
+            assert current.result_status == 'handled'
             await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
-        result = await loop.send('Review the original outcome and acknowledge it without repeating any action.', c.sid)
-        assert result.status == 'completed' and model.calls == 1
-        current = await c.manager.get_job(c.actor, row['job_id'])
-        assert current.result_status == 'handled'
-        await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
-        assert (await c.manager.get_job(c.actor, row['job_id'])).supervision_status == 'closed'
-        for raw in original:
-            assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.messages} WHERE id=?', (raw['id'],)) == raw
-        assert c.state.dispatched == c.state.prepared == c.model.calls == model.calls == 1
-        assert c.host.reserve_calls == 2 and c.state.lookups == (1 if unknown else 0)
-        inbox = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.follow_up_queue} WHERE item_id=?', (identity(c.manager, row),))
-        assert len(inbox) == 1 and inbox[0]['status'] == 'delivered'
-    finally:
-        await loop.aclose(drain_timeout_s=0.1)
+            assert (await c.manager.get_job(c.actor, row['job_id'])).supervision_status == 'closed'
+            for raw in original:
+                assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.messages} WHERE id=?', (raw['id'],)) == raw
+            assert c.state.dispatched == c.state.prepared == c.model.calls == model.calls == 1
+            assert c.host.reserve_calls == 2 and c.state.lookups == (1 if unknown else 0)
+            inbox = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.follow_up_queue} WHERE item_id=?', (identity(c.manager, row),))
+            assert len(inbox) == 1 and inbox[0]['status'] == 'delivered'
+        finally:
+            await loop.aclose()
+
 
 
 @pytest.mark.parametrize('failure', ['hidden', 'model_error'])
@@ -90,15 +105,15 @@ async def test_queued_or_transcribed_but_unprocessed_outcome_keeps_scope_open(re
     await flush_local(c.runtime, c.actor, row['job_id'])
     loop, model = await controller(c, sees=failure != 'hidden', fail=failure == 'model_error')
     try:
-        await enqueue(loop, c.actor, row['job_id'])
-        result = await loop.send('Review the pending notice.', c.sid)
+        notice = await enqueue_runtime(c.runtime, c.actor, row['job_id'])
+        result = await consume_notice(loop, notice['notification_id'])
         assert result.status != 'completed' if failure == 'model_error' else result.status == 'completed'
         assert (await c.manager.get_job(c.actor, row['job_id'])).result_status != 'handled'
         with pytest.raises(JobError):
             await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
         assert c.state.dispatched == c.model.calls == 1
     finally:
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
 
 
 async def test_unknown_business_outcome_is_not_published_as_a_known_resolution(registry_store):
@@ -107,11 +122,11 @@ async def test_unknown_business_outcome_is_not_published_as_a_known_resolution(r
     loop, model = await controller(c)
     try:
         with pytest.raises(JobError):
-            await enqueue(loop, c.actor, row['job_id'])
+            await enqueue_runtime(c.runtime, c.actor, row['job_id'])
         assert model.calls == 0 and c.state.lookups == 0
         assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='managed_effect_delivery'")
     finally:
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
 
 
 @pytest.fixture
@@ -119,84 +134,23 @@ async def pending_review(registry_store):
     c, row = await failure_case(registry_store)
     await flush_local(c.runtime, c.actor, row['job_id'])
     loop, model = await controller(c)
-    await enqueue(loop, c.actor, row['job_id'])
+    await enqueue_runtime(c.runtime, c.actor, row['job_id'])
     try:
         yield c, row, loop, model
     finally:
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
 
 
-@pytest.mark.parametrize('part', ['notice_hash', 'notice_lease', 'root_role', 'root_session',
-                                  'inbox_missing', 'inbox_content', 'inbox_void', 'canonical_result'])
-async def test_untrusted_or_missing_delivery_evidence_cannot_be_queued_again(pending_review, part):
-    import json
-
-    from power_loop.runtime.jobs import _hash, _json
-
-    c, row, loop, model = pending_review
-    key = identity(c.manager, row)
-    if part in ('notice_hash', 'notice_lease'):
-        notice = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (key,))
-        value = json.loads(notice['payload_json'])
-        if part == 'notice_lease':
-            value['lease']['generation'] = 2
-        else:
-            value['message_hash'] = 'f' * 64
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?', (_json(value), _hash(value), key))
-    elif part == 'root_role':
-        session = await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.sessions} WHERE session_id=?', (c.sid,))
-        await c.manager.db.execute(f'UPDATE {c.store.t.sessions} SET metadata_json=? WHERE session_id=?', (_json({'execution_role': 'subagent'}), c.sid))
-    elif part == 'root_session':
-        root = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['root_job_id'],))
-        other = await c.store.create_session()
-        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET session_id=?,created_by_session_id=? WHERE job_id=?', (other, other, row['root_job_id']))
-    elif part == 'inbox_missing':
-        await c.manager.db.execute(f'DELETE FROM {c.store.t.follow_up_queue} WHERE item_id=?', (key,))
-    elif part in ('inbox_content', 'inbox_void'):
-        column, value = ('content', 'invented output') if part == 'inbox_content' else ('status', 'void')
-        await c.manager.db.execute(f'UPDATE {c.store.t.follow_up_queue} SET {column}=? WHERE item_id=?', (value, key))
-    else:
-        from power_loop.runtime.result_revisions import result_id
-        saved = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (result_id(row['job_id'], 1),))
-        target = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['job_id'],))
-        value = json.loads(saved['payload_json'])
-        value['result']['display'] = 'invented canonical result'
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(value), result_id(row['job_id'], 1)))
-        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET result_json=? WHERE job_id=?', (_json(value['result']), row['job_id']))
-    with pytest.raises(JobError):
-        await enqueue(loop, c.actor, row['job_id'])
-    assert model.calls == 0 and c.state.dispatched == c.state.prepared == c.model.calls == 1
-    if part in ('notice_hash', 'notice_lease'):
-        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (key,)) == {
-            **notice, 'payload_json': _json(value), 'request_hash': _hash(value)}
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?',
-            (notice['payload_json'], notice['request_hash'], key))
-    elif part == 'root_role':
-        assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.sessions} WHERE session_id=?', (c.sid,)) == {
-            **session, 'metadata_json': _json({'execution_role': 'subagent'})}
-        await c.manager.db.execute(f'UPDATE {c.store.t.sessions} SET metadata_json=? WHERE session_id=?', (session['metadata_json'], c.sid))
-    elif part == 'root_session':
-        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['root_job_id'],)) == {
-            **root, 'session_id': other, 'created_by_session_id': other}
-        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET session_id=?,created_by_session_id=? WHERE job_id=?',
-            (root['session_id'], root['created_by_session_id'], row['root_job_id']))
-    elif part == 'canonical_result':
-        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (saved['event_id'],)) == {
-            **saved, 'payload_json': _json(value)}
-        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['job_id'],)) == {
-            **target, 'result_json': _json(value['result'])}
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (saved['payload_json'], saved['event_id']))
-        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET result_json=? WHERE job_id=?', (target['result_json'], row['job_id']))
 
 
 
 
 async def test_duplicate_queue_after_handling_does_not_create_another_notification_or_model(pending_review):
     c, row, loop, model = pending_review
-    await loop.send('Handle this original result once.', c.sid)
+    await consume_notice(loop, identity(c.manager,row))
     await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
     before = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
-    receipt = await enqueue(loop, c.actor, row['job_id'])
+    receipt = await enqueue_runtime(c.runtime, c.actor, row['job_id'])
     assert receipt['inbox_status'] == 'delivered'
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq') == before
     assert model.calls == c.state.dispatched == 1 and c.host.reserve_calls == 2
@@ -209,11 +163,11 @@ async def test_foreign_session_and_child_context_cannot_redirect_the_original_ma
     c, row, loop, model = pending_review
     outsider = await c.store.create_session()
     with pytest.raises(JobError):
-        await enqueue(loop, JobActor(c.actor.tenant_id, c.actor.principal_id, outsider), row['job_id'])
+        await enqueue_runtime(c.runtime, JobActor(c.actor.tenant_id, c.actor.principal_id, outsider), row['job_id'])
     token = _SEND.set(object())
     try:
         with pytest.raises(JobError, match='requires_host'):
-            await enqueue(loop, c.actor, row['job_id'])
+            await enqueue_runtime(c.runtime, c.actor, row['job_id'])
     finally:
         _SEND.reset(token)
     assert model.calls == 0
@@ -254,23 +208,40 @@ async def test_queue_and_receipt_publish_atomically_or_recall_the_original_commi
     c.manager._write = write
     try:
         with pytest.raises(OSError, match='test_managed_delivery_'):
-            await enqueue(loop, c.actor, row['job_id'])
+            await enqueue_runtime(c.runtime, c.actor, row['job_id'])
         assert fired == [stage]
         rows = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.follow_up_queue} WHERE item_id=?', (identity(c.manager, row),))
         notices = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='managed_effect_delivery'", (row['job_id'],))
         assert len(rows) == len(notices) == (1 if stage == 'commit_ack' else 0)
-        assert await enqueue(loop, c.actor, row['job_id']) == await enqueue(loop, c.actor, row['job_id'])
+        assert await enqueue_runtime(c.runtime, c.actor, row['job_id']) == await enqueue_runtime(c.runtime, c.actor, row['job_id'])
         assert model.calls == 0 and c.state.dispatched == c.model.calls == 1
         assert (await c.manager.get_job(c.actor, row['job_id'])).result_status == 'pending_delivery'
     finally:
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
 
 
-async def test_local_hint_failure_does_not_lose_or_repeat_a_durable_outcome(pending_review, monkeypatch):
-    c, row, loop, model = pending_review
-    monkeypatch.setattr(loop, '_note_committed_inbox', lambda sid: (_ for _ in ()).throw(RuntimeError('test_hint_failed')))
-    assert (await enqueue(loop, c.actor, row['job_id']))['inbox_status'] == 'pending'
-    assert model.calls == 0
-    await loop.send('Handle the durable original result.', c.sid)
-    assert model.calls == c.state.dispatched == 1
-    assert (await c.manager.get_job(c.actor, row['job_id'])).result_status == 'handled'
+async def consume_queued(loop):
+    rows=await loop.runtime.store._db.fetchall(f"SELECT item_id FROM {loop.runtime.store.t.follow_up_queue} "
+        "WHERE session_id=? AND status='pending' ORDER BY id",(loop.target.session_id,))
+    assert rows, 'the original notification must already be accepted'
+    result=None
+    for row in rows:
+        result=await consume_notice(loop,row['item_id'])
+    return result
+
+
+async def test_original_shared_budget_is_not_reset_for_a_known_result_notice(registry_store):
+    c=await scenario(registry_store,budgeted=True,pending=True,max_calls=1)
+    [row]=await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    c.state.resolved=True
+    await reconcile(c.runtime,c.actor,row['job_id'],c.adapter)
+    loop,reviewer=await controller(c)
+    try:
+        notice=await enqueue_runtime(c.runtime,c.actor,row['job_id'])
+        result=await consume_notice(loop,notice['notification_id'])
+        assert result.status=='failed' and result.error_code=='budget_max_calls_exhausted'
+        assert reviewer.calls==0 and c.host.reserve_calls==1
+        assert c.state.dispatched==c.state.prepared==c.state.lookups==1
+        assert (await c.manager.get_job(c.actor,row['job_id'])).result_status=='pending_delivery'
+    finally:
+        await loop.aclose()

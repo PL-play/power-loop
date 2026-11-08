@@ -1,198 +1,89 @@
-"""G3 regression: a background task's terminal status must never be lost when its owning
-event loop is gone.
-
-The daemon thread persists the final status via ``run_coroutine_threadsafe`` on the loop
-captured at submit time (the store's lock / a PG-MySQL pool are loop-bound). Pre-fix, if
-that loop was closed (a per-call ``asyncio.run`` that already returned, or shutdown), the
-write-back was silently swallowed and the durable row stayed at ``running`` forever. Now an
-undeliverable write-back is deferred and recovered by the next ``check`` or by ``aclose``.
-"""
-
-from __future__ import annotations
-
+"""Background results use persisted jobs and current runtime lifecycle."""
 import asyncio
+import json
 
 import pytest
 
-from power_loop.agent.stateful_loop import StatefulAgentLoop
-from power_loop.core.agent_context import (
-    reset_current_loop,
-    reset_session_id,
-    set_current_loop,
-    set_session_id,
-)
-from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop import AgentLoopConfig, LLMResponse, RuntimeEnv, create_default_tool_registry
+from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import JobRef
+from power_loop.runtime.background import load_record
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.store.store import SessionStore
-from power_loop.runtime.stub_provider import EchoLLMService
-from power_loop.tools.default_tools import BackgroundManager
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, _tool_resp
+
+__all__ = ['registry_store']
 pytestmark = pytest.mark.unit
 
 
-class _FakeLoop:
-    """Minimal stand-in so get_tool_runtime_context() resolves a store + session."""
-
-    def __init__(self, store: object) -> None:
-        self.store = store
-        self.config = None
-
-
-def _run_bg(mgr: BackgroundManager, store: object, sid: str, workspace, command: str) -> str:
-    """Fire a background task on a throwaway loop, then let that loop CLOSE — reproducing a
-    captured loop that is dead by the time the daemon thread writes the terminal status."""
-
-    async def fire() -> str:
-        tok_l = set_current_loop(_FakeLoop(store))
-        tok_s = set_session_id(sid)
-        try:
-            with runtime_env_context(RuntimeEnv(workspace_dir=workspace)):
-                return await mgr.run(command)
-        finally:
-            reset_current_loop(tok_l)
-            reset_session_id(tok_s)
-
-    return asyncio.run(fire())
-
-
-def test_orphaned_writeback_recovered_on_check(tmp_path) -> None:
-    store = asyncio.run(SessionStore.open(str(tmp_path / "bg.db")))
-    sid = asyncio.run(store.create_session())
-    mgr = BackgroundManager()
-
-    # The sleep makes the subprocess outlive fire()'s loop, so the write-back targets a
-    # closed loop.
-    started = _run_bg(mgr, store, sid, tmp_path, "sleep 0.3; echo done")
-    task_id = started.split()[2]
-
-    assert mgr.join_pending(timeout=5.0) == 0  # daemon thread (and its write-back attempt) finished
-
-    # Could not reach the closed loop → deferred, NOT silently dropped; row still 'running'.
-    row = asyncio.run(store.get_background_task(sid, task_id))
-    assert row is not None and row.status == "running"
-    assert any(o["task_id"] == task_id for o in mgr._orphaned)
-
-    # A later background_run action=check on a live loop self-heals the durable row.
-    async def chk() -> str:
-        tok_l = set_current_loop(_FakeLoop(store))
-        tok_s = set_session_id(sid)
-        try:
-            return await mgr.check(task_id)
-        finally:
-            reset_current_loop(tok_l)
-            reset_session_id(tok_s)
-
-    out = asyncio.run(chk())
-    assert "completed" in out
-    row2 = asyncio.run(store.get_background_task(sid, task_id))
-    assert row2.status == "completed" and "done" in (row2.output_tail or "")
-    assert mgr._orphaned == []
-    asyncio.run(store.close())
-
-
-async def test_aclose_drains_background_writeback(tmp_path) -> None:
-    """aclose() must drain in-flight background tasks so their terminal status lands on the
-    still-open store before it is closed (the second G3 trigger)."""
-    loop = StatefulAgentLoop(llm=EchoLLMService(), db_path=str(tmp_path / "x.db"))
-    sid = await loop.new_session()
-
-    tok_l = set_current_loop(loop)
-    tok_s = set_session_id(sid)
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['success', 'timeout', 'cancel'])
+async def test_background_command_result_survives_worker_shutdown(registry_store, tmp_path, outcome):
+    store, _ = registry_store
+    command = 'echo command-finished' if outcome == 'success' else 'sleep 30; echo never'
+    model = _Scripted([_tool_resp('bg', 'background_run', json.dumps({'action':'run','command':command})),
+        LLMResponse(raw_text='parent returned')])
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    env = RuntimeEnv(workspace_dir=tmp_path, background_timeout_s=.2 if outcome == 'timeout' else 30)
+    runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None), runtime_env=env).start()
     try:
-        with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path)):
-            started = await _fire(loop, "echo done")
+        assert (await runner.send('start command')).status == 'completed'
+        rows = await store.load_all_messages(runner.target.session_id)
+        receipt = json.loads(next(row.content for row in rows if row.tool_call_id == 'bg'))
+        ref = JobRef(**receipt['job_ref'])
+        if outcome == 'cancel':
+            async with asyncio.timeout(10):
+                while True:
+                    status = await runner.runtime.client.inspect(ref, actor=runner.actor)
+                    if status.job_ref.generation > 0:
+                        break
+                    await asyncio.sleep(.01)
+            await runner.runtime.client.cancel(status.job_ref, actor=runner.actor)
+        result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+15000)
+        assert result.status == {'success':'completed','timeout':'failed','cancel':'cancelled'}[outcome]
+        if outcome == 'success':
+            assert 'command-finished' in result.final_text
+        elif outcome == 'timeout':
+            assert 'timed out' in result.final_text and 'never' not in result.final_text
+        await runner.drain()
+        await runner.runtime.worker.shutdown()
+        saved = await load_record(store, runner.target.session_id, ref.job_id)
+        assert saved['status'] == result.status and saved['result'] == result.final_text
+        assert (await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+1000)) == result
     finally:
-        reset_current_loop(tok_l)
-        reset_session_id(tok_s)
-    task_id = started.split()[2]
-
-    await loop.aclose()  # drains + persists before closing the store
-
-    verify = await SessionStore.open(str(tmp_path / "x.db"))
-    row = await verify.get_background_task(sid, task_id)
-    assert row is not None and row.status == "completed"
-    await verify.close()
-
-
-async def _fire(loop: StatefulAgentLoop, command: str) -> str:
-    from power_loop.tools.default_tools import BG
-
-    return await BG.run(command)
-
-
-# ── 6.8.0 action=tool：async_capable 工具后台化 ──────────────────────────────────
-
-
-
-class _ToolTaskReg(ToolRegistry):
-    def __init__(self, defs):
-        from functools import partial
-
-        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-
-        super().__init__()
-        self.calls = []
-        for definition in defs:
-            handler = (DEFAULT_TOOL_HANDLERS["background_run"] if definition.name == "background_run"
-                       else partial(self._invoke_original, definition.name))
-            self.register(definition, handler)
-
-    async def _invoke_original(self, name, **args):
-        self.calls.append((name, dict(args)))
-        await asyncio.sleep(0.01)
-        if args.get("boom"):
-            raise RuntimeError("provider down")
-        return f"image saved: {args.get('prompt', '')[:20]}"
-
-
-class _ToolTaskLoop:
-    def __init__(self, reg):
-        self.tool_registry = reg
+        await runner.aclose()
 
 
 @pytest.mark.asyncio
-async def test_action_tool_runs_async_capable_tool_and_notifies(monkeypatch):
-    from power_loop.contracts.tools import ToolDefinition
-    from power_loop.core import agent_context
-    from power_loop.tools import default_tools as dt
-
-    reg = _ToolTaskReg([
-        ToolDefinition(name="generate_image", description="d", async_capable=True, pricing=Free("test_fixture")),
-        ToolDefinition(name="write_file", description="d", pricing=Free("test_fixture")),
-        ToolDefinition(name="background_run", description="d", pricing=Free("test_fixture")),
-    ])
-    monkeypatch.setattr(agent_context, "get_current_loop", lambda: _ToolTaskLoop(reg))
-    monkeypatch.setattr(dt, "_current_store_and_session", lambda: (None, None))
-    done = []
-
-    async def _cb(sid, task_id, status):
-        done.append((task_id, status))
-
-    dt.register_tool_task_callback(_cb)
+@pytest.mark.parametrize('allowed', [True, False])
+async def test_action_tool_failure_and_async_permission(registry_store, tmp_path, allowed):
+    from power_loop import ToolDefinition
+    store, _ = registry_store
+    invoked = []
+    async def image():
+        invoked.append(True)
+        raise RuntimeError('provider down')
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    registry.register(ToolDefinition('image', 'generate', async_capable=allowed, pricing=Free('fixture')), image)
+    model = _Scripted([_tool_resp('bg', 'background_run', '{"action":"tool","tool":"image","args":{}}')])
+    runner = await RunningAgent(store, model, registry).start()
     try:
-        # 未标记的工具拒绝
-        with pytest.raises(ValueError, match="不能后台跑"):
-            await dt.BG.run_tool("write_file", {})
-        # 递归入口拒绝
-        with pytest.raises(ValueError, match="不允许后台化"):
-            await dt.BG.run_tool("background_run", {})
-        # happy path：立即返回 task_id，完成后回调 + check 可取结果
-        out = await dt.BG.run_tool("generate_image", {"prompt": "a cat"})
-        assert "task_id=" in out
-        tid = out.split("task_id=", 1)[1].split("（", 1)[0]
-        await asyncio.sleep(0.05)
-        assert done and done[0] == (None, "completed") or done[0][1] == "completed"
-        got = await dt.BG.check(tid)
-        assert "[completed]" in got and "image saved" in got
-        # 失败是任务结果不是崩溃
-        out2 = await dt.BG.run_tool("generate_image", {"boom": True})
-        tid2 = out2.split("task_id=", 1)[1].split("（", 1)[0]
-        await asyncio.sleep(0.05)
-        assert "[failed]" in await dt.BG.check(tid2)
-        assert "provider down" in await dt.BG.check(tid2)
+        await runner.send('start image')
+        rows = await store.load_all_messages(runner.target.session_id)
+        output = next(row.content for row in rows if row.tool_call_id == 'bg')
+        jobs = await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='background_tool'")
+        if allowed:
+            ref = JobRef(**json.loads(output)['job_ref'])
+            result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+10000)
+            assert result.status == 'failed' and 'provider down' in result.final_text
+            assert invoked == [True] and len(jobs) == 1
+        else:
+            assert 'does not allow background execution' in output and not invoked and not jobs
     finally:
-        dt.register_tool_task_callback(None)
+        await runner.aclose()
 
 
 def test_async_capable_suffix_only_with_background_run_mounted():
@@ -246,113 +137,57 @@ def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
     assert "action=\"check\")" not in out["generate_image"], "后缀不该教它去 check 取结果"
 
 
-# ── 6.40.0: a finished COMMAND task calls the host back, like a tool task ─────────────────────
+@pytest.mark.asyncio
+@pytest.mark.parametrize('boundary', ['enable', 'execution'])
+async def test_cancel_after_claim_before_callback_records_original_result(registry_store, monkeypatch, boundary, tmp_path):
+    from contextlib import asynccontextmanager
 
+    from power_loop import ToolDefinition
+    from power_loop.runtime import model_attempts
+    from power_loop.runtime.task_runtime import TaskRuntime
 
-async def _fire_live(mgr: BackgroundManager, store: object, sid: str, workspace, command: str) -> str:
-    tok_l = set_current_loop(_FakeLoop(store))
-    tok_s = set_session_id(sid)
+    entered, release, called = asyncio.Event(), asyncio.Event(), []
+    async def barrier(binding):
+        if binding.runtime.manager._joined_write.get() is not None:
+            return  # Main admission holds its transaction; this barrier is after child claim.
+        row = await binding.runtime.manager.get_job(binding.actor, binding.lease.job_id)
+        if row.kind == 'background_tool':
+            entered.set()
+            await release.wait()
+    if boundary == 'enable':
+        original = model_attempts.enable
+        async def enable(binding):
+            await barrier(binding)
+            return await original(binding)
+        monkeypatch.setattr(model_attempts, 'enable', enable)
+    else:
+        original = TaskRuntime.execution
+        @asynccontextmanager
+        async def execution(runtime, binding, **kwargs):
+            await barrier(binding)
+            async with original(runtime, binding, **kwargs) as result:
+                yield result
+        monkeypatch.setattr(TaskRuntime, 'execution', execution)
+    async def operation():
+        called.append('unexpected')
+        return 'effect'
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    registry.register(ToolDefinition('operation', 'one finite action', async_capable=True, pricing=Free('fixture')), operation)
+    model = _Scripted([_tool_resp('bg', 'background_run', '{"action":"tool","tool":"operation","args":{}}'), LLMResponse(raw_text='queued')])
+    runner = await RunningAgent(registry_store[0], model, registry).start()
     try:
-        with runtime_env_context(RuntimeEnv(workspace_dir=workspace)):
-            return await mgr.run(command)
+        await runner.send('launch')
+        await asyncio.wait_for(entered.wait(), 10)
+        [row] = await registry_store[0]._db.fetchall(f"SELECT * FROM {registry_store[0].table_prefix}jobs WHERE kind='background_tool'")
+        ref = JobRef(registry_store[0].store_id, row['job_id'], row['generation'])
+        assert ref.generation == 1
+        await runner.runtime.client.cancel(ref, actor=runner.actor)
+        release.set()
+        result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+15000)
+        assert result.status == 'cancelled' and result.error_code == 'cancel_requested'
+        await runner.drain()
+        assert not called
+        assert (await load_record(registry_store[0], runner.target.session_id, ref.job_id))['status'] == 'cancelled'
     finally:
-        reset_current_loop(tok_l)
-        reset_session_id(tok_s)
-
-
-def test_finished_command_task_calls_the_host_back(tmp_path) -> None:
-    """Before 6.40.0 only action=tool tasks called back, so a host could never wake an agent that
-    had pass_turn'ed while its command ran — the promised result was silently never reported."""
-    from power_loop.tools.default_tools import register_tool_task_callback
-
-    calls: list[tuple] = []
-    done = asyncio.Event()
-
-    async def on_done(sid, task_id, status):
-        calls.append((sid, task_id, status))
-        done.set()
-
-    async def scenario() -> None:
-        store = await SessionStore.open(str(tmp_path / "cb.db"))
-        try:
-            sid = await store.create_session()
-            mgr = BackgroundManager()
-            register_tool_task_callback(on_done)
-            try:
-                started = await _fire_live(mgr, store, sid, tmp_path, "sleep 0.2; echo done")
-                task_id = started.split()[2]
-                await asyncio.wait_for(done.wait(), 10)
-                assert calls == [(sid, task_id, "completed")]
-                row = await store.get_background_task(sid, task_id)
-                assert row is not None and row.status == "completed"   # the host reads a settled row
-            finally:
-                register_tool_task_callback(None)
-        finally:
-            await store.close()
-
-    asyncio.run(scenario())
-
-
-def test_a_command_stopped_by_request_does_not_call_back(tmp_path) -> None:
-    from power_loop.tools.default_tools import register_tool_task_callback
-
-    calls: list[tuple] = []
-
-    async def on_done(sid, task_id, status):
-        calls.append((sid, task_id, status))
-
-    async def scenario() -> None:
-        store = await SessionStore.open(str(tmp_path / "stop.db"))
-        try:
-            sid = await store.create_session()
-            mgr = BackgroundManager()
-            register_tool_task_callback(on_done)
-            try:
-                started = await _fire_live(mgr, store, sid, tmp_path, "sleep 30")
-                task_id = started.split()[2]
-                await asyncio.sleep(0.3)
-                await mgr.cancel_task(task_id, grace_s=1.0)
-                for _ in range(50):                       # let the thread finish its write-back
-                    row = await store.get_background_task(sid, task_id)
-                    if row is not None and row.status != "running":
-                        break
-                    await asyncio.sleep(0.1)
-                await asyncio.sleep(0.2)
-                assert calls == []
-            finally:
-                register_tool_task_callback(None)
-        finally:
-            await store.close()
-
-    asyncio.run(scenario())
-
-
-def test_background_command_timeout_comes_from_the_runtime_env(tmp_path) -> None:
-    """6.41.0: the hard limit was a fixed 300s; now RuntimeEnv.background_timeout_s (default 300)."""
-
-    async def scenario() -> None:
-        store = await SessionStore.open(str(tmp_path / "to.db"))
-        try:
-            sid = await store.create_session()
-            mgr = BackgroundManager()
-            tok_l = set_current_loop(_FakeLoop(store))
-            tok_s = set_session_id(sid)
-            try:
-                with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, background_timeout_s=1)):
-                    started = await mgr.run("sleep 10; echo never")
-            finally:
-                reset_current_loop(tok_l)
-                reset_session_id(tok_s)
-            task_id = started.split()[2]
-            for _ in range(60):
-                row = await store.get_background_task(sid, task_id)
-                if row is not None and row.status != "running":
-                    break
-                await asyncio.sleep(0.1)
-            assert row is not None and row.status == "timeout", row
-            assert "Timeout (1s)" in (row.output_tail or "")
-        finally:
-            await store.close()
-
-    asyncio.run(scenario())
-    assert RuntimeEnv().background_timeout_s == 300.0
+        release.set()
+        await runner.aclose()

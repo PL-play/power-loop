@@ -1,112 +1,62 @@
-"""Real model uses independently named host control tools through the SDK base."""
-
+"""A real model invokes named host control tools through their declared contract."""
 import asyncio
 
 import pytest
 
-from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, HookPoint, ToolDefinition
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
-from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.runtime.tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 from .test_real_budget_tree_192 import RealBudgetHost
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("expired", [False, True])
-@pytest.mark.parametrize("name", ["read_probe", "task_snapshot"])
-async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path, record_property, name, expired):
-    store = await SessionStore.open(str(tmp_path / "generic-control.db"), schema="tasks")
-    provider, host = BoundedProvider(limit=2), RealBudgetHost()
-    host.service = provider
-    runtime = TaskRuntime(
-        JobManager(store),
-        tenant_id="generic-control",
-        principal_id="host",
-        executor_id="executor",
-        boot_id="boot",
-        boot_contract_hash="e" * 64,
-        budget_config=BudgetConfig("control-v1", (LocalBudgetScope("authority", max_calls=2),), host),
-    )
-
-    original_clock = runtime.manager.now
-    if expired:
-        complete = provider.complete
-        async def expire_after_real_response(request, **kwargs):
-            response = await complete(request, **kwargs)
-            runtime.manager.now = lambda: original_clock() + 600000
-            return response
-        provider.complete = expire_after_real_response
-
-    class OriginalSnapshot(RuntimeTool):
-        calls = 0
-
+@pytest.mark.parametrize('name',['read_probe','task_snapshot'])
+async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path,record_property,runtime_agent,name):
+    from power_loop import SessionStore
+    store=await SessionStore.open(str(tmp_path/'host-contract.db'))
+    provider,host=BoundedProvider(limit=2),RealBudgetHost()
+    host.service=provider
+    runtime=TaskRuntime(JobManager(store),tenant_id='host-contract',principal_id='host',executor_id='worker',boot_id='boot',
+        budget_config=BudgetConfig('control-v1',(LocalBudgetScope('authority',max_calls=2),),host))
+    class Snapshot(RuntimeTool):
+        calls=0
         @property
         def runtime_contract(self):
-            return ToolRuntimeContract("example.original-snapshot", allowed_roles=("main",))
-
-        def dispatch_policy(self, arguments, *, runtime=None):
-            return ToolDispatchPolicy(native_admitted=True, control_only=True)
-
-        async def __call__(self, **arguments):
-            self.calls += 1
-            assert arguments == {}
-            execution = _SEND.get()
-            original = await runtime.manager.get_job(execution.actor, execution.lease.job_id)
-            assert original.status == "running"
-            return "SNAPSHOT_OK"
-
-    implementation, registry = OriginalSnapshot(), ToolRegistry()
-    definition = ToolDefinition(
-        name, "Read the original task snapshot once. No arguments.", input_schema={"type": "object", "properties": {}}
-    , pricing=Free("test_fixture"))
-    registry.register(definition, implementation)
-    loop = StatefulAgentLoop(
-        llm=provider,
-        store=store,
-        task_runtime=runtime,
-        tool_registry=registry,
-        config=AgentLoopConfig(
-            max_rounds=3, max_tokens=2048, delegation_policy="single_level", retry_policy=LLMRetryPolicy(max_attempts=1)
-        ),
-    )
-
+            return ToolRuntimeContract('example.original-snapshot',allowed_roles=('main',))
+        def dispatch_policy(self,arguments,*,runtime=None):
+            return ToolDispatchPolicy(native_admitted=True,control_only=True)
+        async def __call__(self,**arguments):
+            self.calls+=1
+            assert arguments=={}
+            execution=_SEND.get()
+            original=await runtime.manager.get_job(execution.actor,execution.lease.job_id)
+            assert original.status=='running'
+            return 'SNAPSHOT_OK'
+    implementation,registry=Snapshot(),ToolRegistry()
+    definition=ToolDefinition(name,'Read the original task snapshot once, without arguments.',
+        input_schema={'type':'object','properties':{}},pricing=Free('fixture'))
+    registry.register(definition,implementation)
+    agent=await runtime_agent(model=provider,store=store,registry=registry,task_runtime=runtime,
+        config=AgentLoopConfig(max_rounds=3,max_tokens=2048,compactor=None))
     async def schema(ctx):
-        ctx.tools = [definition.to_openai_tool()] if provider.calls == 0 else []
-
-    loop.hooks.register(HookPoint.LLM_BEFORE, schema, name="test.generic-control-schema")
+        ctx.tools=[definition.to_openai_tool()] if provider.calls==0 else []
+    agent.hooks.register(HookPoint.LLM_BEFORE,schema)
     try:
         async with asyncio.timeout(150):
-            sid = await loop.new_session()
-            try:
-                result = await loop.send(
-                    f"Call {name} exactly once with no arguments. After SNAPSHOT_OK reply only DONE. Never call other tools.",
-                    sid,
-                )
-            except JobError as exc:
-                assert expired and exc.code == "execution_lease_expired"
-                result = None
-            if expired:
-                assert result is None or result.status == "degraded"
-                [raw] = [row for row in await store.load_all_messages(sid) if row.role == "tool"]
-                assert raw.name == name and raw.content == "SNAPSHOT_OK"
-            else:
-                assert result.status == "completed" and result.final_text.strip() == "DONE"
-            assert implementation.calls == 1
-            assert provider.calls == host.reserve_calls == len(host.applied) == (1 if expired else 2)
-            assert len(await runtime.manager.db.fetchall(f"SELECT job_id FROM {runtime.manager.jobs}")) == 1
+            result=await agent.send('Call '+name+' exactly once with no arguments. After SNAPSHOT_OK reply only DONE. Never call other tools.')
+            assert result.status=='completed' and result.final_text.strip()=='DONE'
+            assert implementation.calls==1
+            assert provider.calls==host.reserve_calls==len(host.applied)==2
+            assert len(await runtime.manager.db.fetchall(f'SELECT job_id FROM {runtime.manager.jobs}'))==1
     finally:
-        runtime.manager.now = original_clock
+        await agent.aclose()
         provider.report(record_property)
-        record_property("snapshot_queries", implementation.calls)
-        try:
-            await loop.aclose(drain_timeout_s=0.1)
-        finally:
-            await provider.close()
-            await store.close()
+        record_property('snapshot_queries',implementation.calls)
+        await store.close()

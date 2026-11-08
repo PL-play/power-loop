@@ -19,7 +19,6 @@ from power_loop import (
     LLMService,
     LLMStreamChunk,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
 )
@@ -68,7 +67,7 @@ class _ToolThenDone(LLMService):
 
 
 @pytest.mark.asyncio
-async def test_durable_injection_becomes_a_real_user_row(tmp_path) -> None:
+async def test_durable_injection_becomes_a_real_user_row(tmp_path, runtime_agent) -> None:
     img = tmp_path / "shot.png"
     img.write_bytes(_png())
     store = await SessionStore.open(":memory:")
@@ -87,14 +86,14 @@ async def test_durable_injection_becomes_a_real_user_row(tmp_path) -> None:
                            input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
             _look,
         )
-        loop = StatefulAgentLoop(
-            llm=llm, store=store, tool_registry=registry,
+        loop = await runtime_agent(
+            model=llm, store=store, registry=registry,
             config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
         )
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         sid_holder["sid"] = sid
         discard_queued_images(sid)
-        await loop.send("看看这张图", session_id=sid)
+        await loop.send("看看这张图")
 
         rows = await store.load_all_messages(sid)
         # ① 落库：图成了一条真实的 user 行，排在宣告它的 tool 结果之后
@@ -114,11 +113,12 @@ async def test_durable_injection_becomes_a_real_user_row(tmp_path) -> None:
         assert "[image: shot.png · file_uuid=u-1]" in distilled
         assert "base64" not in distilled
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_ephemeral_injection_is_not_stored(tmp_path) -> None:
+async def test_ephemeral_injection_is_not_stored(tmp_path, runtime_agent) -> None:
     img = tmp_path / "shot.png"
     img.write_bytes(_png())
     store = await SessionStore.open(":memory:")
@@ -136,17 +136,18 @@ async def test_ephemeral_injection_is_not_stored(tmp_path) -> None:
                            input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
             _look,
         )
-        loop = StatefulAgentLoop(
-            llm=llm, store=store, tool_registry=registry,
+        loop = await runtime_agent(
+            model=llm, store=store, registry=registry,
             config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
         )
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         sid_holder["sid"] = sid
         discard_queued_images(sid)
-        await loop.send("看看", session_id=sid)
+        await loop.send("看看")
 
         rows = await store.load_all_messages(sid)
         assert len([r for r in rows if r.role == "user"]) == 1   # 只有原始输入
         assert any(isinstance(m.get("content"), list) for m in llm.seen_rounds[1])  # 但这一轮看得见
     finally:
+        await loop.aclose()
         await store.close()

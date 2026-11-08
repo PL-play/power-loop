@@ -1,172 +1,58 @@
-# Tutorial: Multi-Agent System
+# Multi-agent workflows
 
-[中文](../../zh/tutorials/multi-agent.md) | [Tutorials](../index.md)
+SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
 
-**Goal**: Build a parent agent that delegates research to sub-agents with tool whitelists — 80 lines.
+Register spawn_agent on the execution node. Accepted child jobs run independently through Runtime; query/control them by their original JobRef. The child inherits permitted resources and bounded options, not the parent Python object. Workflows compose these jobs under explicit owners and budgets.
 
-**You'll learn**: `spawn_agent`, `AgentSpec`, `run_agent_spec`, child lifecycle, tool whitelisting.
+The following source is executable from this checkout. It imports the shared example composition helper, [examples/_runtime.py](../../../examples/_runtime.py); keep that file alongside the example. The helper starts and closes a real Runtime. For independent application setup, follow [Quickstart](../user-guide/quickstart.md).
 
-## 1. Register Sub-Agent Tools
-
-```python
-from power_loop import ToolRegistry, ToolDefinition, register_spawn_agent
-
-registry = ToolRegistry()
-
-# Parent tools
-def read_file(path: str) -> str:
-    return f"(contents of {path})"
-
-registry.register(
-    ToolDefinition(
-        name="read_file",
-        description="Read a file. Param: path (string).",
-        input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-    ),
-    read_file,
-)
-
-# Register the spawn_agent meta-tool (the former run_agent is merged in since 4.0)
-register_spawn_agent(registry)
+```bash
+.venv/bin/python examples/03_subagent_delegation.py
 ```
 
-## 2. Imperative: spawn_agent
-
-The LLM decides when to delegate:
-
 ```python
-loop = StatefulAgentLoop(
-    llm=llm,
-    tool_registry=registry,
-    config=AgentLoopConfig(
-        system_prompt=(
-            "You are a project manager. You can delegate research tasks "
-            "to sub-agents using spawn_agent. Whitelist tools via the "
-            "'tools' arg for code/file searches. For simple tasks, answer directly."
-        ),
-        max_rounds=8,
-    ),
-)
-
-sid = await loop.new_session()
-result = await loop.send(
-    "Find where authentication logic is implemented in this project. "
-    "Then tell me if it uses JWT or session tokens.",
-    session_id=sid,
-)
-# LLM: spawn_agent(task="search for auth code", tools=["grep", "read_file", "glob"])
-# → child runs with the whitelisted tools (grep, read_file, glob)
-# → parent gets result, synthesizes answer
-```
-
-## 3. Declarative: AgentSpec
-
-You control the child's configuration:
-
-```python
-from power_loop import AgentSpec, run_agent_spec
-
-# Define a specialized researcher
-spec = AgentSpec(
-    name="security-auditor",
-    system_prompt=(
-        "You are a security auditor. Find vulnerabilities in the code "
-        "snippets provided. Report only confirmed issues, not speculation."
-    ),
-    tools=["grep", "read", "glob"],  # whitelist: only these tools
-    max_rounds=5,
-    max_tokens=2000,
-    temperature=0.0,
-    lifecycle="ephemeral",
-)
-
-# Run directly (no LLM deciding — you control it)
-result = await run_agent_spec(
-    spec,
-    "Audit the authentication module for SQL injection.",
-    parent_loop=loop,
-)
-print(result["final_text"])
-```
-
-## 4. Two Approaches Compared
-
-| | spawn_agent | AgentSpec + run_agent_spec |
-|---|---|---|
-| Who decides | LLM (optional `system_prompt` / `tools` / `max_rounds` overrides) | You (host code) |
-| Tool whitelist | Optional `tools` arg | Explicit `tools` list |
-| Max rounds | Default (overridable) | You set |
-| Model | Parent's | Override per spec |
-| Use case | Dynamic delegation | Controlled, auditable sub-tasks |
-
-## 5. Lifecycle
-
-```python
-# EPHEMERAL (default) — deleted on success, kept on failure for debug
-AgentSpec(name="x", system_prompt="...", lifecycle="ephemeral")
-
-# LINKED — cascade-deleted when parent closes
-AgentSpec(name="x", system_prompt="...", lifecycle="linked")
-
-# DETACHED — independent, survives parent close
-AgentSpec(name="x", system_prompt="...", lifecycle="detached")
-```
-
-## 6. Depth Limit
-
-`MAX_SPAWN_DEPTH = 3` (the default) — sub-agents may nest up to this many levels below the root: root → child (depth 1) → grandchild (depth 2) → great-grandchild (depth 3) is allowed; creating a session at depth 4 raises an error. The ceiling is configurable per store: `SessionStore.open(max_spawn_depth=N)` or `StatefulAgentLoop(..., max_spawn_depth=N)`.
-
-## Complete Code
-
-```python
+"""03 · Capacity-one parent accepts a child, finishes, and receives its result."""
 import asyncio
-from power_loop import (
-    StatefulAgentLoop, AgentLoopConfig, ToolRegistry, ToolDefinition,
-    AgentSpec, run_agent_spec, register_spawn_agent,
-    create_llm_service_from_env,
-)
+import json
+import time
 
-registry = ToolRegistry()
-registry.register(
-    ToolDefinition(
-        name="read_file",
-        description="Read a file. Param: path (string).",
-        input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
-    ),
-    lambda path: f"(contents of {path})",
-)
-register_spawn_agent(registry)
+from _runtime import demo_runtime
+
+from power_loop import JobRef, LLMResponse, LLMService, ToolRegistry, register_spawn_agent
+
+
+class DelegatingModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if request.system_prompt.startswith('child'):
+            return LLMResponse(raw_text='Tokyo')
+        if not any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text='', tool_calls=[{'id':'spawn','type':'function','function':{
+                'name':'spawn_agent','arguments':json.dumps({'task':'Capital of Japan?',
+                    'system_prompt':'child', 'tools':[], 'max_rounds':1})}}])
+        return LLMResponse(raw_text='Parent accepted the task.')
+
+    async def close(self):
+        pass
+
 
 async def main():
-    llm = create_llm_service_from_env()
-    loop = StatefulAgentLoop(
-        llm=llm, tool_registry=registry,
-        config=AgentLoopConfig(
-            system_prompt="Delegate research with spawn_agent. Be concise.",
-            max_rounds=8,
-        ),
-    )
-    try:
-        # Imperative
-        sid = await loop.new_session()
-        r1 = await loop.send("Research: what does read_file return?", session_id=sid)
-        print(f"Imperative: {r1.final_text[:200]}")
+    registry = ToolRegistry()
+    register_spawn_agent(registry)
+    async with demo_runtime(DelegatingModel(), registry) as (runtime, loop, target, actor):
+        parent = await loop.send(target, 'Delegate the question', message_id='delegate', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert parent.status == 'completed'
+        rows = await runtime.store.load_all_messages(target.session_id)
+        receipt = json.loads(next(row.content for row in rows if row.tool_call_id == 'spawn'))
+        result = await runtime.client.wait(JobRef(**receipt['job_ref']), actor=actor,
+                                            deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and result.final_text == 'Tokyo'
+        print(result.final_text)
+        return result.final_text
 
-        # Declarative
-        spec = AgentSpec(
-            name="researcher",
-            system_prompt="Answer concisely. Use tools if available.",
-            tools=["read_file"], max_rounds=3,
-        )
-        r2 = await run_agent_spec(spec, "Read file 'config.py'", parent_loop=loop)
-        print(f"Declarative: {r2['final_text'][:200]}")
-    finally:
-        loop.close()
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
 ```
 
-## Next
-
-- [Sub-agents User Guide](../user-guide/subagents.md) — full reference
-- [Hooks User Guide](../user-guide/hooks.md) — intercept every phase
+[subagents](../user-guide/subagents.md) · [API](../api/index.md)

@@ -1558,45 +1558,22 @@ class SessionStore:
     # ── timers (durable wake-ups; see runtime/timers.py) ──────────────────
 
     async def create_timer(
-        self, session_id: str, *, due_at: int, note: str, interval_s: int | None = None
+        self, session_id: str, *, due_at: int, note: str, interval_s: int | None = None, tx=None
     ) -> TimerRow:
+        if tx is None:
+            async with self._db.transaction() as transaction:
+                await self._db.dialect.lock_state(transaction, self.t.session_state, session_id)
+                return await self.create_timer(session_id, due_at=due_at, note=note,
+                    interval_s=interval_s, tx=transaction)
         now = _now_ms()
-        ivl = int(interval_s) if interval_s else None
-        async with self._db.transaction() as tx:
-            # Per-session MAX+1 id alloc. Serialize it against concurrent writers the
-            # same way append_message does — take the session_state row lock (FOR UPDATE
-            # on a server backend) so two concurrent create_timer calls can't read the
-            # same MAX and collide on the (session_id, timer_id) PK. create_session always
-            # inserts a session_state row, so real sessions ARE serialized. RESIDUAL
-            # (store-core-3): a legacy/hand-made session with NO state row has nothing to lock,
-            # so on a server backend two concurrent allocs for that orphan can still race; SQLite
-            # is single-writer (gap-free) regardless. Give orphan sessions a state row to serialize.
-            with contextlib.suppress(ValueError):
-                await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            row = await tx.fetchone(
-                f"SELECT COALESCE(MAX(timer_id), 0) + 1 AS tid FROM {self.t.timers} "
-                "WHERE session_id=?",
-                (session_id,),
-            )
-            assert row is not None  # aggregate always returns one row
-            timer_id = int(row["tid"])
-            await tx.execute(
-                f"INSERT INTO {self.t.timers} (session_id, timer_id, due_at, note, status, "
-                "interval_s, created_at, updated_at) VALUES (?,?,?,?,'armed',?,?,?)",
-                (session_id, timer_id, int(due_at), note, ivl, now, now),
-            )
-        return TimerRow(
-            session_id=session_id,
-            timer_id=timer_id,
-            due_at=int(due_at),
-            note=note,
-            status="armed",
-            interval_s=ivl,
-            fire_count=0,
-            last_fired_at=None,
-            created_at=now,
-            updated_at=now,
-        )
+        row = await tx.fetchone(f"SELECT COALESCE(MAX(timer_id), 0) + 1 AS tid FROM {self.t.timers} "
+            "WHERE session_id=?", (session_id,))
+        timer_id = int(row["tid"])
+        await tx.execute(f"INSERT INTO {self.t.timers} (session_id,timer_id,due_at,note,status,"
+            "interval_s,created_at,updated_at) VALUES (?,?,?,?,'armed',?,?,?)",
+            (session_id,timer_id,int(due_at),note,interval_s,now,now))
+        return TimerRow(session_id=session_id,timer_id=timer_id,due_at=int(due_at),note=note,
+            status="armed",interval_s=interval_s,fire_count=0,last_fired_at=None,created_at=now,updated_at=now)
 
     async def get_timer(self, session_id: str, timer_id: int) -> TimerRow | None:
         row = await self._db.fetchone(
@@ -1634,6 +1611,8 @@ class SessionStore:
         from_status: str,
         to_status: str,
         due_at: int | None = None,
+        expected_due_at: int | None = None,
+        expected_fire_count: int | None = None,
     ) -> bool:
         """Compare-and-set status transition (claims are race-free even with several
         runners on one store). Optionally moves due_at (postpone). Returns False when
@@ -1641,8 +1620,10 @@ class SessionStore:
         async with self._db.transaction() as tx:
             affected = await tx.execute(
                 f"UPDATE {self.t.timers} SET status=?, due_at=COALESCE(?, due_at), "
-                "updated_at=? WHERE session_id=? AND timer_id=? AND status=?",
-                (to_status, due_at, _now_ms(), session_id, int(timer_id), from_status),
+                "updated_at=? WHERE session_id=? AND timer_id=? AND status=? "
+                "AND due_at=COALESCE(?,due_at) AND fire_count=COALESCE(?,fire_count)",
+                (to_status, due_at, _now_ms(), session_id, int(timer_id), from_status,
+                 expected_due_at, expected_fire_count),
             )
         return affected > 0
 
@@ -1664,33 +1645,21 @@ class SessionStore:
             )
         return affected > 0
 
-    async def heartbeat_firing_timer(self, session_id: str, timer_id: int) -> bool:
-        """Re-stamp a 'firing' row's ``updated_at`` so a slow-but-live delivery isn't
-        reclaimed as stale by :meth:`recover_stale_firing_timers` and double-fired.
-        Returns False if the row is no longer 'firing' (already finished, re-armed, or
-        cancelled) — the caller has lost the claim."""
-        async with self._db.transaction() as tx:
-            affected = await tx.execute(
-                f"UPDATE {self.t.timers} SET updated_at=? "
-                "WHERE session_id=? AND timer_id=? AND status='firing'",
-                (_now_ms(), session_id, int(timer_id)),
-            )
-        return affected > 0
-
-    async def recover_stale_firing_timers(self, *, older_than_ms: int) -> int:
-        """Re-arm 'firing' rows that never finished (process died mid-fire), cross-session.
-        At-least-once: a re-armed timer may deliver twice; the TIMER_FIRE hook is the place
-        to dedupe if that matters. A *live* slow delivery keeps its row fresh via
-        :meth:`heartbeat_firing_timer`, so only genuinely stuck rows (older than
-        ``older_than_ms``) are reclaimed. Returns the number of rows reclaimed."""
+    async def recover_stale_firing_timers(self, *, older_than_ms: int, limit: int = 50) -> int:
+        """End unknown occurrences without replay; recurring timers can continue."""
         cutoff = _now_ms() - int(older_than_ms)
-        async with self._db.transaction() as tx:
-            affected = await tx.execute(
-                f"UPDATE {self.t.timers} SET status='armed', updated_at=? "
-                "WHERE status='firing' AND updated_at<?",
-                (_now_ms(), cutoff),
-            )
-        return affected
+        rows = await self._db.fetchall(f"SELECT session_id,timer_id,updated_at FROM {self.t.timers} "
+            "WHERE status='firing' AND updated_at<? ORDER BY updated_at LIMIT ?", (cutoff, limit))
+        count = 0
+        for row in rows:
+            now = _now_ms()
+            count += await self._db.execute(f"UPDATE {self.t.timers} SET "
+                "status=CASE WHEN interval_s IS NULL THEN 'cancelled' ELSE 'armed' END,"
+                "due_at=CASE WHEN interval_s IS NULL THEN due_at ELSE ?+interval_s*1000 END,"
+                "fire_count=fire_count+1,updated_at=? WHERE session_id=? AND timer_id=? "
+                "AND status='firing' AND updated_at=?",
+                (now,now,row['session_id'],row['timer_id'],row['updated_at']))
+        return count
 
     async def prune_timers(
         self,

@@ -1,4 +1,4 @@
-"""Real-LLM smoke for the core StatefulAgentLoop send / multi-turn path.
+"""Real-LLM smoke for the core RequestOptions send / multi-turn path.
 
 Quality assertions go through the LLM-as-judge helper so the test stays
 robust across model wording drift.
@@ -8,18 +8,18 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore
 
 from ._llm import make_llm
 from .judge import assert_passes
 
 
 @pytest.mark.asyncio
-async def test_single_send_returns_meaningful_reply() -> None:
+async def test_single_send_returns_meaningful_reply(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0.2),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=256, temperature=0.2),
             store=store,
             config=AgentLoopConfig(
                 system_prompt="You are a concise assistant. Reply in English.",
@@ -28,8 +28,7 @@ async def test_single_send_returns_meaningful_reply() -> None:
             ),
         )
         q = "In one sentence, explain what HTTP stands for."
-        sid = await loop.new_session()
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
         assert r.final_text.strip()
         await assert_passes(
@@ -42,17 +41,18 @@ async def test_single_send_returns_meaningful_reply() -> None:
             ),
         )
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_multi_turn_carries_session_history() -> None:
+async def test_multi_turn_carries_session_history(runtime_agent) -> None:
     """Second send must see the first turn — model is told a fact, then
     asked about it implicitly. The judge checks coherence."""
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=256, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -63,13 +63,13 @@ async def test_multi_turn_carries_session_history() -> None:
                 compactor=None,
             ),
         )
-        sid = await loop.new_session()
-        r1 = await loop.send("My favorite color is teal. Acknowledge briefly.", session_id=sid)
+        sid = loop.target.session_id
+        r1 = await loop.send("My favorite color is teal. Acknowledge briefly.")
         assert r1.status == "completed"
 
         followup = "What did I just say my favorite color was?"
-        r2 = await loop.send(followup, session_id=sid)
-        assert r2.session_id == sid
+        r2 = await loop.send(followup)
+        assert r2.input_ref.session_id == sid
         await assert_passes(
             question=followup,
             answer=r2.final_text,
@@ -79,15 +79,16 @@ async def test_multi_turn_carries_session_history() -> None:
             ),
         )
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_close_session_removes_history_from_store() -> None:
+async def test_close_session_removes_history_from_store(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=128, temperature=0),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=128, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt="Reply in one word.",
@@ -95,11 +96,11 @@ async def test_close_session_removes_history_from_store() -> None:
                 compactor=None,
             ),
         )
-        sid = await loop.new_session()
-        r = await loop.send("Say OK.", session_id=sid)
-        assert await store.get_session(r.session_id) is not None
-        deleted = await loop.close_session(r.session_id)
+        r = await loop.send("Say OK.")
+        assert await store.get_session(r.input_ref.session_id) is not None
+        deleted = await store.close_session(r.input_ref.session_id)
         assert deleted >= 1
-        assert await store.get_session(r.session_id) is None
+        assert await store.get_session(r.input_ref.session_id) is None
     finally:
+        await loop.aclose()
         await store.close()

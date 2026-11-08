@@ -1,86 +1,59 @@
-"""Actual provider work under automatic boot startup and bounded shutdown."""
-from __future__ import annotations
-
+"""Actual provider work under Runtime startup and bounded worker shutdown."""
 import asyncio
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
-from power_loop.runtime import executor_registry as registry
-from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.task_runtime import TaskRuntime
+from power_loop import AgentLoopConfig
+from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import RuntimeRequestError
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-async def test_real_automatic_start_and_shutdown_retain_known_usage_and_block_new_provider_work(tmp_path, record_property):
-    store = await SessionStore.open(str(tmp_path/"auto-boot.db"), schema="tasks")
+async def test_real_shutdown_retains_known_usage_and_rejects_new_work(runtime_agent, record_property):
     provider = BoundedProvider(limit=3)
-    runtime = TaskRuntime(JobManager(store), tenant_id="real-auto", principal_id="host",
-        executor_id="executor", boot_id="boot", boot_contract_hash="a"*64)
+    agent = await runtime_agent(model=provider,
+        config=AgentLoopConfig(max_rounds=2, max_tokens=2048, compactor=None))
     try:
-        loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime,
-            config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2, max_tokens=2048))
-        sid = await loop.new_session()
-        async with asyncio.timeout(90):
-            result = await loop.send("Reply exactly 42 in plain assistant text, without tools or pass_turn.", sid)
-            assert result.final_text.strip() == "42" and provider.calls == 1
-            [job] = await runtime.manager.db.fetchall(f"SELECT * FROM {runtime.manager.jobs}")
-            assert result.usage["total_tokens"] > 0
-            stopped = await runtime.shutdown(timeout_s=5)
-            assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
-            assert not stopped["physical_stop_confirmed"] and not stopped["billing_settled"]
-            assert not (await registry.get(runtime.manager, runtime._lifecycle.identity))["admission_open"]
-            with pytest.raises(JobError, match="executor_not_accepting"):
-                await loop.send("Must not dispatch.", sid)
-            assert provider.calls == 1
+        result = await agent.send('Reply exactly 42 in plain assistant text, without tools or pass_turn.')
+        assert result.final_text.strip() == '42' and provider.calls == 1
+        assert result.usage['total_tokens'] > 0
+        stopped = await agent.runtime.worker.shutdown(timeout_s=5)
+        assert stopped.drained
+        with pytest.raises(RuntimeRequestError, match='session_closed'):
+            await agent.send('Must not dispatch.')
+        saved = await agent.runtime.client.wait(result.input_ref, actor=agent.actor, deadline_ms=now_ms()+1000)
+        assert saved == result and provider.calls == 1
     finally:
-        await runtime.shutdown(timeout_s=2)
         provider.report(record_property)
-        await provider.close()
-        await store.close()
 
 
-async def test_real_automatic_shutdown_signals_inflight_default_send_without_external_stop_token(tmp_path, record_property, monkeypatch):
-    store = await SessionStore.open(str(tmp_path/"auto-drain.db"), schema="tasks")
-    provider = BoundedProvider(limit=3)
-    runtime = TaskRuntime(JobManager(store), tenant_id="real-auto-stop", principal_id="host",
-        executor_id="executor", boot_id="boot", boot_contract_hash="a"*64)
-    sending = None
+async def test_real_shutdown_cancels_original_inflight_request(runtime_agent, record_property, monkeypatch):
+    provider, entered = BoundedProvider(limit=3), asyncio.Event()
+    complete = provider.complete
+    async def started(request, **kwargs):
+        work = asyncio.create_task(complete(request, **kwargs))
+        while provider.calls == 0:
+            await asyncio.sleep(0)
+        entered.set()
+        return await work
+    monkeypatch.setattr(provider, 'complete', started)
+    agent = await runtime_agent(model=provider,
+        config=AgentLoopConfig(max_rounds=2, max_tokens=2048, compactor=None))
+    client = agent.runtime.client
     try:
-        loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime,
-            config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2, max_tokens=2048))
-        sid = await loop.new_session()
-        entered = asyncio.Event()
-        complete = provider.complete
-        async def started(request, **kwargs):
-            work = asyncio.create_task(complete(request, **kwargs))
-            while provider.calls == 0:
-                await asyncio.sleep(0)
-            entered.set()
-            return await work
-        monkeypatch.setattr(provider, "complete", started)
-        async with asyncio.timeout(90):
-            sending = asyncio.create_task(loop.send("Write a detailed arithmetic explanation without tools.", sid))
-            await entered.wait()
-            await asyncio.sleep(.05)
-            assert not sending.done(), "provider returned before the in-flight boundary"
-            stopped = await runtime.shutdown(timeout_s=5, grace_s=1)
-            result = await sending
-            assert result.status == "cancelled" and provider.calls == 1
-            assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
-            [job] = await runtime.manager.db.fetchall(f"SELECT * FROM {runtime.manager.jobs}")
-            assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
-            with pytest.raises(JobError, match="executor_not_accepting"):
-                await loop.send("Do not replace the original request.", sid)
-            assert provider.calls == 1
+        receipt = await client.send(agent.target, 'Write a detailed arithmetic explanation without tools.',
+            message_id='original', actor=agent.actor)
+        await asyncio.wait_for(entered.wait(), 30)
+        status = await client.inspect(receipt.input_ref, actor=agent.actor)
+        assert status.state == 'running'
+        await agent.runtime.worker.shutdown(timeout_s=5, cancel_running=True)
+        result = await client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+1000)
+        assert result.status == 'cancelled' and provider.calls == 1
+        with pytest.raises(RuntimeRequestError, match='session_closed'):
+            await client.send(agent.target, 'Do not replace the original request.', message_id='rejected', actor=agent.actor)
+        assert provider.calls == 1
     finally:
-        await runtime.shutdown(timeout_s=2)
-        if sending is not None and not sending.done():
-            sending.cancel()
-            await asyncio.gather(sending, return_exceptions=True)
         provider.report(record_property)
-        await provider.close()
-        await store.close()

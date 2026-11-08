@@ -1,136 +1,48 @@
-"""21 · Request user input / 可恢复的人类输入
+"""21 · A paused task is answered by JobRef, interaction ID and wait round.
 
-This example uses a real LLM. It starts two independent sessions, lets each
-session pause through the built-in ``request_user_input`` tool, prints the
-returned ``StatefulResult``, asks you to fill the answers in a tiny terminal
-REPL, then resumes both sessions with ``submit_input``.
-
-Run:
-
-    python examples/21_request_user_input.py
+The demo supplies an answer. A UI may use the same visible pending state and
+submit a different choice; the original input remains the query identity.
 """
-
-from __future__ import annotations
-
 import asyncio
 import json
-import tempfile
-from collections.abc import Sequence
-from dataclasses import asdict, is_dataclass
-from typing import Any
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, create_default_tool_registry
-
-SYSTEM_PROMPT = """You are demonstrating resumable human input.
-
-Rules:
-- For each new user request, first call request_user_input exactly once.
-- Use kind="choice".
-- Provide two concise options with ids.
-- After the tool result arrives, produce one final sentence that mentions the chosen id.
-- Do not call request_user_input again after receiving its tool result.
-"""
-
-REQUESTS = {
-    "summary": (
-        "Draft a one-sentence relationship check-in. Before finalizing, ask "
-        "whether the tone should be 'gentle' or 'direct'."
-    ),
-    "send": (
-        "Prepare a one-sentence note to send. Before finalizing, ask whether "
-        "the caller wants to 'send' or 'revise'."
-    ),
-}
+from power_loop import LLMResponse, LLMService, create_default_tool_registry
 
 
-async def main(answers: Sequence[str] | None = None) -> list[dict[str, Any]]:
-    llm = make_llm(max_tokens=700, temperature=0.0)
-    registry = create_default_tool_registry(include=["request_user_input"])
-    provided_answers = list(answers or [])
+class AskingModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text=next(m['content'] for m in reversed(request.messages) if m.get('role') == 'tool'))
+        return LLMResponse(raw_text='', tool_calls=[{'id':'question','type':'function','function':{
+            'name':'request_user_input','arguments':json.dumps({'kind':'choice','prompt':'Choose tone',
+                'options':[{'id':'gentle','label':'Gentle'}, {'id':'direct','label':'Direct'}]})}}])
 
-    with tempfile.TemporaryDirectory(prefix="power-loop-input-") as tmp:
-        store = await SessionStore.open(f"{tmp}/sessions.sqlite3")
-        loop = StatefulAgentLoop(
-            llm=llm,
-            store=store,
-            tool_registry=registry,
-            config=AgentLoopConfig(system_prompt=SYSTEM_PROMPT, max_rounds=4, compactor=None),
-        )
-
-        try:
-            waiting: list[dict[str, Any]] = []
-            for label, request in REQUESTS.items():
-                sid = await loop.new_session(metadata={"label": label})
-                result = await loop.send(request, session_id=sid)
-                if result.status != "waiting_for_input" or not result.pending_interactions:
-                    raise RuntimeError(f"session {label} did not pause for input: {result!r}")
-
-                print(f"\n[{label}] first StatefulResult")
-                print(_json(result))
-                waiting.append({"label": label, "sid": sid, "result": result})
-
-            completed: list[dict[str, Any]] = []
-            for item in waiting:
-                label = item["label"]
-                result = item["result"]
-                interaction = result.pending_interactions[0]
-                answer = _next_answer(provided_answers, interaction)
-                resumed = await loop.submit_input(
-                    item["sid"],
-                    interaction["interaction_id"],
-                    {"choice": answer},
-                )
-
-                print(f"\n[{label}] resumed StatefulResult")
-                print(_json(resumed))
-                completed.append(
-                    {
-                        "label": label,
-                        "session_id": item["sid"],
-                        "answer": answer,
-                        "status": resumed.status,
-                        "final_text": resumed.final_text,
-                    }
-                )
-
-            return completed
-        finally:
-            await llm.close()
-            await store.close()
+    async def close(self):
+        pass
 
 
-def _next_answer(provided_answers: list[str], interaction: dict[str, Any]) -> str:
-    options = [str(option.get("id") or option.get("label") or "") for option in interaction.get("options", [])]
-    options = [option for option in options if option]
-    if provided_answers:
-        answer = provided_answers.pop(0)
-        print(f"\n[auto-answer] {interaction['prompt']} -> {answer}")
-        return answer
-
-    print("\n[input required]")
-    print(interaction["prompt"])
-    if options:
-        print("Options: " + ", ".join(options))
-    while True:
-        answer = input("> ").strip()
-        if answer and (not options or answer in options):
-            return answer
-        if options:
-            print("Please enter one of: " + ", ".join(options))
-        else:
-            print("Please enter a non-empty answer.")
+async def main(answers=None):
+    registry = create_default_tool_registry(include=['request_user_input'])
+    async with demo_runtime(AskingModel(), registry) as (runtime, loop, target, actor):
+        receipt = await runtime.client.send(target, 'Ask for a tone', message_id='question', actor=actor)
+        async with asyncio.timeout(10):
+            while True:
+                status = await runtime.client.inspect(receipt.input_ref, actor=actor)
+                if status.state == 'waiting_input':
+                    break
+                await asyncio.sleep(.02)
+        pending = (await runtime.store.get_state(target.session_id)).pending
+        interaction = pending['pending_interactions'][0]
+        await runtime.client.answer(status.job_ref, interaction_id=interaction['interaction_id'],
+            wait_round=pending['round_index'], value={'choice':(answers or ['gentle'])[0]}, message_id='answer', actor=actor)
+        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        print(result.final_text)
+        return result.final_text
 
 
-def _json(value: Any) -> str:
-    def default(obj: Any) -> Any:
-        if is_dataclass(obj):
-            return asdict(obj)
-        return repr(obj)
-
-    return json.dumps(value, ensure_ascii=False, indent=2, default=default)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

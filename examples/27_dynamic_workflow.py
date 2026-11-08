@@ -1,16 +1,17 @@
-"""Declarative workflow through the common runtime. Run with POWER_LOOP_* model settings.
+"""Declarative workflow through the common runtime, with an offline example model.
 
 The driver and leaves use independent sessions. This example uses the default
 single-process adapters; shared workers use host-supplied shared adapters.
 """
 import asyncio
+import json
 from uuid import uuid4
-
-from _helpers import make_llm
 
 from power_loop import (
     AgentLoopConfig,
     ExecutionEnvironment,
+    LLMResponse,
+    LLMService,
     RegistryRuntimeFactory,
     Runtime,
     RuntimeDescriptor,
@@ -78,13 +79,22 @@ SPEC = {
     },
 }
 
+class WorkflowModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if 'Break the topic' in request.system_prompt:
+            return LLMResponse(raw_text=json.dumps({'subtopics':['setting', 'utensils', 'sequence']}))
+        return LLMResponse(raw_text='Prepared tea, shared attentively.')
+
+    async def close(self):
+        pass
+
 async def main():
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
-        return ExecutionEnvironment(make_llm(), None, AgentLoopConfig(compactor=None))
+        return ExecutionEnvironment(WorkflowModel(), None, AgentLoopConfig(compactor=None))
     factory.register("example.workflow@1", build)
     store = await SessionStore.open(":memory:")
-    runtime = Runtime(store=store, factory=factory, node_id="example", capacity=4)
+    runtime = Runtime(store=store, factory=factory, node_id="example", capacity=1)
     actor = TrustedActor("example", "host", None)
     descriptor = RuntimeDescriptor(1, "agent", "example.workflow@1", None,
         "example.tools@1", "example.hooks@1", "example.resources@1", {}, {})
@@ -93,7 +103,10 @@ async def main():
         target = await runtime.open_session(descriptor, actor=actor)
         handle = await runtime.client.workflow(target, SPEC, message_id=uuid4().hex, actor=actor)
         print("Accepted", handle.job_ref)
-        print((await handle.wait()).summary())
+        result = await handle.wait()
+        assert result.status == 'completed', result
+        assert 'synthesize' in result.results
+        print(result.summary())
     finally:
         await runtime.aclose()
 

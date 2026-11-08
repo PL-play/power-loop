@@ -1,94 +1,28 @@
 # Hooks
 
-[English](../../en/user-guide/hooks.md) | [用户手册](../index.md)
+SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
 
-Hook 是**控制流**通道。与 [Events](events.md)（只读观测）不同，hook 可以修改消息、跳过工具、短路 LLM 调用或结束循环。
+[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
 
-## 快速示例
+在 ExecutionEnvironment.hooks 提供 AgentHooks。按 HookPoint 注册处理器，并使用该点约定的 HookDirective；任意替换对象不等于有效指令。Hooks 在执行节点运行，工厂需通过声明的 hook profile 重建。
 
-```python
-from power_loop import AgentHooks, HookPoint, HookDirective
-from power_loop.contracts.hook_contexts import ToolBeforeCtx
+TOOL_BEFORE 处理权限和参数决策；模型 hooks 处理短路或缓存；memory hooks 处理注入与压缩策略。普通工具参数改写后按实际参数计价。Hook 不能把取消、所有权丢失或未知外部动作改成虚假的成功。
 
-hooks = AgentHooks()
+TIMER_FIRE 保留继续、跳过、取消和延后决策。TimerFireCtx 携带可信定时器和会话来源，模型不能伪造。Runtime 定时驱动只等待任务受理，不等待模型完成。
 
-def block_dangerous(ctx: ToolBeforeCtx) -> None:
-    if ctx.tool_name == "bash" and "rm -rf" in str(ctx.tool_args):
-        ctx.output = "[已拦截：危险命令]"
-        ctx.directive = HookDirective.SKIP
+命名 hooks 支持 register、replace、remove、has，内置记忆 hook 可显式替换。EventBus 用于观察，hooks 参与执行并遵守时限。需要覆盖非模型调用方的宿主政策，仍在权威受理或写入接口执行。
 
-hooks.register(HookPoint.TOOL_BEFORE, block_dangerous)
+## 可执行示例
 
-loop = StatefulAgentLoop(llm=llm, hooks=hooks, config=config)
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+
+| 示例 | 行为 |
+|---|---|
+| [07_human_approval.py](../../../examples/07_human_approval.py) | 授权策略 |
+| [26_timers.py](../../../examples/26_timers.py) | 定时 hook 与驱动 |
+| [43_memory_hook_override.py](../../../examples/43_memory_hook_override.py) | 记忆替换 |
+| [44_hook_events_audit.py](../../../examples/44_hook_events_audit.py) | Hook 指令 |
+
+```bash
+.venv/bin/python examples/07_human_approval.py
 ```
-
-## Hook 点概览
-
-| Hook 点 | 何时 | 常见用途 |
-|---|---|---|
-| `session.start` | 第一轮之前 | 注入预热消息 |
-| `session.end` | 循环结束后 | 审计，关闭连接 |
-| `round.start` | 每轮开始前 | 预算检查，`BREAK` 停止 |
-| `round.end` | 每轮结束后 | 每轮指标上报 |
-| `llm.before` | LLM 调用前 | 修改请求，缓存命中 (`SHORT_CIRCUIT`) |
-| `llm.after` | LLM 返回后 | 内容审核，`BREAK` 停止 |
-| `round.decide` | 工具执行前 | 跳过所有工具 (`SKIP`) |
-| `tools.batch.before` | 工具批次前 | 批次级门控 |
-| `tools.batch.after` | 工具批次后 | 只读观测 |
-| `tool.before` | 每个工具前 | **安全门**，用户确认 |
-| `tool.after` | 工具成功后 | 裁剪输出，修改结果 |
-| `tool.error` | 工具异常时 | 吞错 (`SKIP`) 或重试 (`SHORT_CIRCUIT`) |
-| `compact.before` | 压缩前 | 跳过本轮压缩 |
-| `compact.after` | 压缩后 | 只读观测 |
-| `message.append` | 消息存储前 | PII 脱敏，metadata 注入 |
-| `memory.recalled` | 记忆召回后 | 过滤/脱敏记忆；`SKIP` 丢弃整批 |
-
-## 命名 hook：register / replace / remove / has
-
-`register()` 接受可选的 `name=`（一个稳定标识）和 `replace=`（两者同时设置时，会先删掉
-该 hook 点上同名的旧条目）。便捷方法都基于它：
-
-```python
-hooks.register(HookPoint.LLM_BEFORE, h, name="my.cache")   # 命名条目
-hooks.replace(HookPoint.LLM_BEFORE, h2, name="my.cache")   # 替换（或新增）该命名条目
-hooks.remove("my.cache")                                   # 按名移除（所有 hook 点）
-hooks.remove("my.cache", HookPoint.LLM_BEFORE)             # 限定单个 hook 点
-hooks.has("my.cache")                                      # -> bool
-```
-
-## 内置 hook（`builtin.*`）与覆盖方式
-
-power-loop 自带的 hook 会由循环以保留的 `builtin.*` 命名**自动注册**。例如只要设置了
-`AgentLoopConfig.memory`，`MemoryRecallHook` 就会以 `MemoryRecallHook.NAME ==
-"builtin.memory_recall"` 注册到 `HookPoint.LLM_BEFORE`。业务方可以按名接管或关闭某个内置
-hook：
-
-```python
-from power_loop.runtime.memory import MemoryRecallHook
-
-# 用你自己的记忆注入 handler 替换
-hooks.replace(HookPoint.LLM_BEFORE, my_handler, name=MemoryRecallHook.NAME)
-
-# 或者整个禁用（比如你想自己注入记忆）
-hooks.remove(MemoryRecallHook.NAME)
-```
-
-也可以在构造循环**之前**就用该名字**预注册**——循环不会覆盖已经以 `builtin.*` 名字存在的
-条目。（`AgentLoopConfig.builtin_memory_hook=False` 是关掉记忆 hook 的专用开关。）
-
-`LlmBeforeCtx` 带有 `session_id`，因此 `llm.before` handler——无论内置还是自定义——都能按
-会话区分行为。
-
-## Hook vs Event
-
-| | Hook | Event |
-|---|---|---|
-| 能改控制流？ | 是 (`SKIP`、`BREAK`、`SHORT_CIRCUIT`) | 否 |
-| 能改数据？ | 是（消息、工具、LLM 请求） | 否 |
-| 错误处理 | Handler 错误向上传播 | 订阅者错误默认隔离 |
-| 用于 | 安全、路由、缓存、审核 | 观测、审计、流式 |
-
-## 下一步
-
-- [Events](events.md) — 观测而不干扰
-- [完整 Hook 参考](../../hooks.md) — 每个 Ctx 字段和 directive 组合

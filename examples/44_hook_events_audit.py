@@ -23,30 +23,29 @@ Run / 运行
 from __future__ import annotations
 
 import asyncio
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import AgentLoopConfig, NoteMemory, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, NoteMemory, SessionStore
 
+
+class NoteModel(LLMService):
+    async def complete(self, request, **kwargs):
+        assert 'Bluefin' in str(request.messages)
+        return LLMResponse(raw_text='Bluefin')
+    async def close(self):
+        pass
 
 async def main() -> dict:
     store = await SessionStore.open(":memory:")
-    try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=200, temperature=0),
-            store=store,
-            config=AgentLoopConfig(
-                system_prompt="You are concise. Use the persistent notes you are given.",
-                max_rounds=1,
-                compactor=None,
-                memory=NoteMemory(store),       # → auto-registers the built-in MemoryRecallHook
-                record_hook_events="full",       # ← audit what the hook injects each round
-            ),
-        )
-        sid = await loop.new_session()
+    config = AgentLoopConfig(max_rounds=1, compactor=None, memory=NoteMemory(store), record_hook_events='full')
+    async with demo_runtime(NoteModel(), store=store, config=config) as (runtime, loop, target, actor):
+        sid = target.session_id
         await store.add_note(sid, "The user's project codename is 'Bluefin'.")
-
-        r = await loop.send("What is my project's codename?", session_id=sid)
+        r = await loop.send(target, 'What is the codename?', message_id='note', actor=actor,
+            deadline_ms=int(time.time()*1000)+10000)
+        assert r.status == 'completed'
         print(f"[answer]   {r.final_text}")
 
         # The ephemeral memory injection — gone from the request after the call — is now auditable.
@@ -64,6 +63,8 @@ async def main() -> dict:
         marker = "YOUR NOTES" if "YOUR NOTES" in injected else injected[:24]
         in_history = any(marker and marker in (m.content or "") for m in msgs)
 
+        assert "Bluefin" in injected and not in_history
+        assert ev.message_seq in {m.seq for m in msgs if m.role == "assistant"}
         return {
             "event_count": len(events),
             "hook": ev.hook,
@@ -74,8 +75,6 @@ async def main() -> dict:
             "audit_text_not_in_history": not in_history,
             "final_text": r.final_text,
         }
-    finally:
-        await store.close()
 
 
 if __name__ == "__main__":

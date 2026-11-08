@@ -22,7 +22,7 @@ from power_loop.core import agent_context
 from . import tool_attempts
 from .child_tasks import admit, tool_actor
 from .control_runtime import current, flush_binding, forget_completed, source
-from .jobs import _hash
+from .jobs import JobError, _hash
 from .pricing import BillingReceipt, PricedCall, PricingError
 from .store.types import SubagentLifecycle
 from .tool_contracts import background_allowed, validate_registration
@@ -169,78 +169,100 @@ async def run(worker, ctx, record, env, runtime):
         await port.bind_input_job(tx, record.ref, ctx.job_ref, ctx, claim_token=claimed[0].row["claim_token"])
         await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
             "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?", (now_ms(), ctx.session_id, record.ref.message_id))
-    await enable(binding)
-    loop = SimpleNamespace(config=env.config, tool_registry=env.tool_registry, task_runtime=runtime,
-                           _runtime_worker=worker, _runtime_worker_context=ctx, store=worker.runtime.store)
-    with ExitStack() as stack:
-        for setter, value, reset in (
-            (agent_context.set_current_loop, loop, agent_context.reset_current_loop),
-            (agent_context.set_session_id, ctx.session_id, agent_context.reset_session_id),
-            (agent_context.set_current_cancel_token, ctx.stop, agent_context.reset_current_cancel_token)):
-            stack.enter_context(_context(setter, value, reset))
-        async with runtime.execution(binding, cancel_token=ctx.stop):
-            from power_loop.tools.registry import validate_pricing
-            pricing = validate_pricing(registered)
-            key = "toolattempt_" + _hash([ctx.store_id, asdict(binding.lease), "background"])[:48]
-            prepared = dict(version=1, attempt_id=key, scope=asdict(binding.lease), session_id=ctx.session_id,
-                call_ref=frozen["call_ref"], call_id=frozen["call_id"], request_hash=_hash(arguments), tool_name=name,
-                pricing_rule={"rule_id": pricing.rule_id, "rule_version": registered.pricing_version})
-            control = current(binding)
-            value = control.begin_attempt(key, "tool", prepared)
-            value["budget_required"] = (runtime._original_budget_config is not None
-                and callable(getattr(runtime._original_budget_config.provider, "prepare_tool", None)))
-            control.record("attempt", key, value)
-            attempt = tool_attempts.ToolAttempt(binding, key, prepared,
-                PricedCall(name, arguments, source(binding)["execution_role"]), pricing, asyncio.current_task())
-            receipt = BackgroundReceipt(attempt)
-            status, text, error = "completed", "", None
-            async def stop_original():
-                await ctx.stop.wait()
-                policy = env.config.stop_policy
-                grace = (policy.abort_tool_s if registered.definition.interrupt == "abort" else
-                         policy.subtask_s if registered.definition.interrupt == "background" else policy.finish_tool_s)
-                await asyncio.sleep(grace)
-                ctx.task.cancel("background cancellation grace elapsed")
-            stopper = asyncio.create_task(stop_original())
-            try:
-                await tool_attempts.reserve(attempt)
-                await tool_attempts.authorize_dispatch(attempt, None, source(binding))
-                with receipt_context(receipt):
-                    output = await env.tool_registry.invoke_async(name, arguments)
-                if isinstance(output, ToolResult):
-                    if output.billing_receipt:
-                        receipt.record(output.billing_receipt)
-                    output = output.content
-                text = output if isinstance(output, str) else canonical(output)
-                if text.startswith("Error:"):
-                    status = "failed"
-            except BaseException as exc:
-                error = exc
-                status = "interrupted" if ctx.shutdown_interrupted else "cancelled" if ctx.stop.is_cancelled() else "failed"
-                text = f"{type(exc).__name__}: {exc}"
-            finally:
-                stopper.cancel()
-                await asyncio.gather(stopper, return_exceptions=True)
-                if control.get("attempt", key)["phase"] == "prepared":
-                    from .model_budgets import close_unstarted
-                    await close_unstarted(attempt)
-                    control.abort_prepared(key)
-                else:
-                    tool_attempts.capture(attempt, receipt.billing_receipt, error)
-                    await tool_attempts.finish(attempt)
-                async with manager.joined_write() as tx:
-                    route = await port._lock_result_sessions(tx, ctx.job_ref)
-                    await flush_binding(binding, close=True, transaction=tx)
-                    row = await manager._row(tx, ctx.job_ref.job_id)
-                    if row["cancel_requested_at"] is not None:
-                        status = "cancelled"
-                    await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='settling',outcome=?,"
-                        "resource_state=?,intake='closed',version=version+1 WHERE job_id=? AND generation=? AND version=?",
-                        ("succeeded" if status == "completed" else status,
-                         "unknown" if ctx.shutdown_interrupted else binding.resource_evidence.get("resource_state", "stopped"), row["job_id"], row["generation"], row["version"]), obligations=True)
-                    parent_ref = await port._commit_result(tx, ctx.job_ref,
-                        Result(ctx.job_ref, record.ref, status, text, error=type(error).__name__ if error else None), ctx, route)
-                    manager.after_outcome(lambda: forget_completed(binding), lambda: None)
+    try:
+        await enable(binding)
+        loop = SimpleNamespace(config=env.config, tool_registry=env.tool_registry, task_runtime=runtime,
+                               _runtime_worker=worker, _runtime_worker_context=ctx, store=worker.runtime.store)
+        with ExitStack() as stack:
+            for setter, value, reset in (
+                (agent_context.set_current_loop, loop, agent_context.reset_current_loop),
+                (agent_context.set_session_id, ctx.session_id, agent_context.reset_session_id),
+                (agent_context.set_current_cancel_token, ctx.stop, agent_context.reset_current_cancel_token)):
+                stack.enter_context(_context(setter, value, reset))
+            async with runtime.execution(binding, cancel_token=ctx.stop):
+                from power_loop.tools.registry import validate_pricing
+                pricing = validate_pricing(registered)
+                key = "toolattempt_" + _hash([ctx.store_id, asdict(binding.lease), "background"])[:48]
+                prepared = dict(version=1, attempt_id=key, scope=asdict(binding.lease), session_id=ctx.session_id,
+                    call_ref=frozen["call_ref"], call_id=frozen["call_id"], request_hash=_hash(arguments), tool_name=name,
+                    pricing_rule={"rule_id": pricing.rule_id, "rule_version": registered.pricing_version})
+                control = current(binding)
+                value = control.begin_attempt(key, "tool", prepared)
+                value["budget_required"] = (runtime._original_budget_config is not None
+                    and callable(getattr(runtime._original_budget_config.provider, "prepare_tool", None)))
+                control.record("attempt", key, value)
+                attempt = tool_attempts.ToolAttempt(binding, key, prepared,
+                    PricedCall(name, arguments, source(binding)["execution_role"]), pricing, asyncio.current_task())
+                receipt = BackgroundReceipt(attempt)
+                status, text, error = "completed", "", None
+                async def stop_original():
+                    await ctx.stop.wait()
+                    policy = env.config.stop_policy
+                    grace = (policy.abort_tool_s if registered.definition.interrupt == "abort" else
+                             policy.subtask_s if registered.definition.interrupt == "background" else policy.finish_tool_s)
+                    await asyncio.sleep(grace)
+                    ctx.task.cancel("background cancellation grace elapsed")
+                stopper = asyncio.create_task(stop_original())
+                try:
+                    await tool_attempts.reserve(attempt)
+                    await tool_attempts.authorize_dispatch(attempt, None, source(binding))
+                    with receipt_context(receipt):
+                        output = await env.tool_registry.invoke_async(name, arguments)
+                    if isinstance(output, ToolResult):
+                        if output.billing_receipt:
+                            receipt.record(output.billing_receipt)
+                        output = output.content
+                    text = output if isinstance(output, str) else canonical(output)
+                    if text.startswith("Error:"):
+                        status = "failed"
+                except BaseException as exc:
+                    error = exc
+                    status = "interrupted" if ctx.shutdown_interrupted else "cancelled" if ctx.stop.is_cancelled() else "failed"
+                    text = f"{type(exc).__name__}: {exc}"
+                finally:
+                    stopper.cancel()
+                    await asyncio.gather(stopper, return_exceptions=True)
+                    if control.get("attempt", key)["phase"] == "prepared":
+                        from .model_budgets import close_unstarted
+                        await close_unstarted(attempt)
+                        control.abort_prepared(key)
+                    else:
+                        tool_attempts.capture(attempt, receipt.billing_receipt, error)
+                        await tool_attempts.finish(attempt)
+                    async with manager.joined_write() as tx:
+                        route = await port._lock_result_sessions(tx, ctx.job_ref)
+                        await flush_binding(binding, close=True, transaction=tx)
+                        row = await manager._row(tx, ctx.job_ref.job_id)
+                        if row["cancel_requested_at"] is not None:
+                            status = "cancelled"
+                        await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='settling',outcome=?,"
+                            "resource_state=?,intake='closed',version=version+1 WHERE job_id=? AND generation=? AND version=?",
+                            ("succeeded" if status == "completed" else status,
+                             "unknown" if ctx.shutdown_interrupted else binding.resource_evidence.get("resource_state", "stopped"), row["job_id"], row["generation"], row["version"]), obligations=True)
+                        parent_ref = await port._commit_result(tx, ctx.job_ref,
+                            Result(ctx.job_ref, record.ref, status, text, error=type(error).__name__ if error else None), ctx, route)
+                        manager.after_outcome(lambda: forget_completed(binding), lambda: None)
+    except JobError as exc:
+        if exc.code != 'cancel_requested':
+            raise
+        # Cancellation may arrive after the claim commits but before callback
+        # admission. No external action started, so finish that same generation.
+        async with manager.joined_write() as tx:
+            route = await port._lock_result_sessions(tx, ctx.job_ref)
+            await port.lock_owned(tx, TargetRef(ctx.store_id, ctx.session_id), ctx)
+            if binding.resource_evidence.get('_control_state') is not None:
+                await flush_binding(binding, close=True, transaction=tx)
+                manager.after_outcome(lambda: forget_completed(binding), lambda: None)
+            row = await manager._row(tx, ctx.job_ref.job_id)
+            changed = await tx.write_job(row['job_id'], f"UPDATE {manager.jobs} SET status='settling',outcome='cancelled',"
+                "resource_state='stopped',intake='closed',version=version+1 WHERE job_id=? AND generation=? "
+                "AND version=? AND outcome IS NULL AND cancel_requested_at IS NOT NULL",
+                (row['job_id'], ctx.job_ref.generation, row['version']), obligations=True)
+            if not changed:
+                raise RuntimeRequestError('stale_generation') from exc
+            parent_ref = await port._commit_result(tx, ctx.job_ref,
+                Result(ctx.job_ref, record.ref, 'cancelled', error='cancel_requested', error_code='cancel_requested'), ctx, route)
+
     if parent_ref:
         await worker.runtime.client._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
             parent_ref.message_id, parent_ref, ["work", "activation"])

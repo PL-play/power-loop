@@ -3,7 +3,6 @@ ShellBackend.session_key — power-loop 0.7.0 additions."""
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,8 +11,8 @@ from typing import Any
 from power_loop import (
     AgentLoopConfig,
     LocalShellBackend,
+    RequestOptions,
     RuntimeEnv,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
     create_default_tool_registry,
@@ -40,7 +39,7 @@ class _Recorder(LLMService):
         self.seen_tools.append([n for n in names if n and n != "pass_turn"])
         self.seen_system.append(request.system_prompt)
         self.seen_format.append(request.response_format)
-        return LLMResponse(raw_text="ok")
+        return LLMResponse(raw_text='{"ok":true}' if request.response_format else "ok")
 
     def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
         async def _e() -> AsyncIterator[LLMStreamChunk]:
@@ -63,11 +62,9 @@ def _registry() -> ToolRegistry:
     return r
 
 
-def _loop(llm: _Recorder, *, system_prompt: str = "BASE") -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=llm,
-        db_path=":memory:",
-        tool_registry=_registry(),
+async def _loop(runtime_agent, llm: _Recorder, *, system_prompt: str = "BASE"):
+    return await runtime_agent(
+        model=llm, registry=_registry(),
         config=AgentLoopConfig(system_prompt=system_prompt, max_rounds=1, compactor=None),
     )
 
@@ -83,66 +80,59 @@ def test_subset_keeps_only_named_tools():
 # ── per-send tools override ──────────────────────────────────────────────
 
 
-async def test_send_tools_allowlist_limits_what_model_sees():
+async def test_send_tools_allowlist_limits_what_model_sees(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm)
-    sid = await loop.new_session()
-    await loop.send("hi", sid, tools=["alpha"])
+    loop = await _loop(runtime_agent, llm)
+    await loop.send("hi", options=RequestOptions(tools=["alpha"]))
     assert llm.seen_tools[-1] == ["alpha"]
 
 
-async def test_send_without_override_sees_all_tools():
+async def test_send_without_override_sees_all_tools(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm)
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
+    loop = await _loop(runtime_agent, llm)
+    await loop.send("hi")
     assert sorted(llm.seen_tools[-1]) == ["alpha", "beta", "gamma"]
 
 
-async def test_send_tools_accepts_a_registry():
+async def test_send_tools_accepts_a_registry(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm)
-    sid = await loop.new_session()
+    loop = await _loop(runtime_agent, llm)
     only_beta = _registry().subset(["beta"])
-    await loop.send("hi", sid, tools=only_beta)
+    await loop.send("hi", options=RequestOptions(tools=list(only_beta.names())))
     assert llm.seen_tools[-1] == ["beta"]
 
 
 # ── per-send system_prompt override ──────────────────────────────────────
 
 
-async def test_send_system_prompt_override():
+async def test_send_system_prompt_override(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm, system_prompt="BASE")
-    sid = await loop.new_session()
-    await loop.send("hi", sid, system_prompt="OVERRIDE-PROMPT")
+    loop = await _loop(runtime_agent, llm, system_prompt="BASE")
+    await loop.send("hi", options=RequestOptions(system_prompt="OVERRIDE-PROMPT"))
     assert llm.seen_system[-1] is not None
     assert "OVERRIDE-PROMPT" in llm.seen_system[-1]
     assert "BASE" not in llm.seen_system[-1]
 
 
-async def test_send_default_uses_config_prompt():
+async def test_send_default_uses_config_prompt(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm, system_prompt="BASE-PROMPT")
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
+    loop = await _loop(runtime_agent, llm, system_prompt="BASE-PROMPT")
+    await loop.send("hi")
     assert "BASE-PROMPT" in (llm.seen_system[-1] or "")
 
 
-def test_send_sync_forwards_per_call_overrides():
+async def test_send_forwards_combined_overrides(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm, system_prompt="BASE")
-    sid = asyncio.run(loop.new_session())
-    loop.send_sync("hi", sid, tools=["gamma"], system_prompt="SYNC-PROMPT")
+    loop = await _loop(runtime_agent, llm, system_prompt="BASE")
+    await loop.send("hi", options=RequestOptions(tools=["gamma"], system_prompt="SYNC-PROMPT"))
     assert llm.seen_tools[-1] == ["gamma"]
     assert "SYNC-PROMPT" in (llm.seen_system[-1] or "")
 
 
-def test_follow_up_sync_forwards_overrides_when_idle():
+async def test_idle_input_forwards_combined_overrides(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm, system_prompt="BASE")
-    sid = asyncio.run(loop.new_session())
-    loop.follow_up_sync("hi", sid, tools=["beta"], system_prompt="FOLLOW-UP-PROMPT")
+    loop = await _loop(runtime_agent, llm, system_prompt="BASE")
+    await loop.send("hi", options=RequestOptions(tools=["beta"], system_prompt="FOLLOW-UP-PROMPT"))
     assert llm.seen_tools[-1] == ["beta"]
     assert "FOLLOW-UP-PROMPT" in (llm.seen_system[-1] or "")
 
@@ -228,41 +218,38 @@ def test_bash_sessions_are_cached_by_execution_target(tmp_path, monkeypatch):
 # 所以这必须是 per-run 覆盖，且不能污染 self.config。
 
 
-async def test_send_response_format_reaches_the_request():
+async def test_send_response_format_reaches_the_request(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm)
-    sid = await loop.new_session()
-    await loop.send("hi", sid, response_format={"type": "json_object"})
+    loop = await _loop(runtime_agent, llm)
+    await loop.send("hi", options=RequestOptions(response_format={"type": "json_object"}))
     assert llm.seen_format[-1] == {"type": "json_object"}
 
 
-async def test_send_without_response_format_sends_none():
+async def test_send_without_response_format_sends_none(runtime_agent):
     llm = _Recorder()
-    loop = _loop(llm)
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
+    loop = await _loop(runtime_agent, llm)
+    await loop.send("hi")
     assert llm.seen_format[-1] is None
 
 
-async def test_response_format_does_not_leak_into_shared_config():
+async def test_response_format_does_not_leak_into_shared_config(runtime_agent):
     """下一次不带它的 send 必须干净 —— 否则一次 JSON 请求会污染整个 loop。"""
     llm = _Recorder()
-    loop = _loop(llm)
-    a, b = await loop.new_session(), await loop.new_session()
-    await loop.send("hi", a, response_format={"type": "json_object"})
-    await loop.send("hi", b)
+    loop = await _loop(runtime_agent, llm)
+    await loop.send("hi", options=RequestOptions(response_format={"type": "json_object"}))
+    loop.target = await loop.loop.new_session(loop.descriptor, actor=loop.actor)
+    await loop.send("hi")
     assert llm.seen_format == [{"type": "json_object"}, None]
     assert loop.config.response_format is None
 
 
-async def test_config_level_response_format_still_applies():
+async def test_config_level_response_format_still_applies(runtime_agent):
     """没传 per-send 时,配置里的那份照常生效（不许被覆盖成 None）。"""
     llm = _Recorder()
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=":memory:", tool_registry=_registry(),
+    loop = await runtime_agent(
+        model=llm, registry=_registry(),
         config=AgentLoopConfig(system_prompt="B", max_rounds=1, compactor=None,
                                response_format={"type": "json_object"}),
     )
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
+    await loop.send("hi")
     assert llm.seen_format[-1] == {"type": "json_object"}

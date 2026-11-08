@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Run B1 tests in SQLite and a disposable PostgreSQL *_test DB.
+"""Run a selected database pass plus ordinary tests.
 
-Uses the existing local Postgres container without restarting it. MySQL tests
-are explicitly excluded at the user's request. Real LLM tests use tests/.env
+Uses the existing local Postgres container without restarting it. Select --backend sqlite, postgres or mysql; MySQL requires an isolated configured DSN. Real LLM tests use tests/.env
 configuration and must actually run, never silently skip.
 """
 from __future__ import annotations
@@ -18,9 +17,7 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
-
-REQUIRED_REAL_CASES = 117
+from urllib.parse import quote, urlparse
 
 
 class RunnerInterrupted(BaseException):
@@ -101,7 +98,8 @@ def stream_run(command, *, repo, env, log_path, sanitize):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--full", action="store_true", help="run all non-MySQL unit tests plus B1 real tests")
+    parser.add_argument("--backend", choices=("sqlite", "postgres", "mysql"), default="postgres")
+    parser.add_argument("--full", action="store_true", help="run all unit tests for this backend plus configured real tests")
     parser.add_argument("--container", default="deeptalk-infra-postgres-1")
     parser.add_argument("--label", help="unique artifact label (letters, numbers, dashes only)")
     parser.add_argument("--unit-shard", help="run one disjoint full unit shard INDEX/TOTAL, without real tests")
@@ -118,6 +116,10 @@ def main() -> int:
                 shard_numbers(selection)
             except ValueError as exc:
                 parser.error(str(exc))
+    if args.backend == "mysql":
+        mysql_dsn = os.environ.get("POWER_LOOP_TASK_MYSQL_DSN", "")
+        if not mysql_dsn or not urlparse(mysql_dsn).path.endswith("_test"):
+            parser.error("--backend mysql requires POWER_LOOP_TASK_MYSQL_DSN ending in _test")
     repo = Path(__file__).resolve().parents[1]
     out = repo.parent / "outputs/async-task-tests-20261022"
     out.mkdir(parents=True, exist_ok=True)
@@ -148,26 +150,12 @@ def main() -> int:
         "tests/unit/test_task_message_identity_192.py", "tests/unit/test_job_registry_192.py",
         "tests/unit/test_root_context_192.py", "tests/unit/test_root_control_192.py",
         "tests/unit/test_execution_membership_192.py",
-        "tests/unit/test_workflow_controller_192.py",
-        "tests/unit/test_workflow_node_output_192.py",
         "tests/unit/test_workflow_result_delivery_192.py",
         "tests/unit/test_workflow_projection_atomic_192.py",
-        "tests/unit/test_workflow_profile_192.py",
-        "tests/unit/test_workflow_resources_192.py",
         "tests/unit/test_workflow_continuation_budget_192.py",
-        "tests/unit/test_workflow_resource_profile_192.py",
-        "tests/unit/test_workflow_restore_resources_192.py",
-        "tests/unit/test_workflow_bound_restore_192.py",
         "tests/unit/test_completion_window_192.py",
-        "tests/unit/test_owner_waits_192.py",
-        "tests/unit/test_owner_wait_recovery_192.py",
-        "tests/unit/test_wait_reviews_192.py",
-        "tests/unit/test_wait_dispositions_192.py",
         "tests/unit/test_inbox_atomicity_192.py",
-        "tests/unit/test_input_dispositions_192.py",
-        "tests/unit/test_wait_inflight_deadline_192.py",
         "tests/unit/test_request_shutdown_handoff_192.py",
-        "tests/unit/test_wait_structured_output_192.py",
         "tests/unit/test_finalization_192.py",
         "tests/unit/test_model_attempts_192.py",
         "tests/unit/test_budget_contracts_192.py",
@@ -177,31 +165,20 @@ def main() -> int:
         "tests/unit/test_answer_freshness_192.py",
         "tests/unit/test_executor_registry_192.py",
         "tests/unit/test_executor_runtime_192.py",
-        "tests/unit/test_executor_process_192.py",
         "tests/unit/test_executor_lifecycle_192.py",
         "tests/unit/test_executor_ownership_192.py",
         "tests/unit/test_restored_answer_192.py",
-        "tests/unit/test_workflow_completion_scope_192.py",
-        "tests/unit/test_workflow_restore_plan_192.py",
-        "tests/unit/test_workflow_restore_history_192.py",
-        "tests/unit/test_workflow_resume_admission_192.py",
-        "tests/unit/test_workflow_resume_evidence_192.py",
-        "tests/unit/test_workflow_restore_runtime_192.py",
         "tests/unit/test_task_query_192.py",
         "tests/unit/test_task_control_192.py",
         "tests/unit/test_jobs_tool_192.py",
         "tests/unit/test_workflow_facade_192.py",
-        "tests/unit/test_workflow_control_192.py",
         "tests/unit/test_node_control_192.py",
         "tests/unit/test_task_sessions_192.py",
         "tests/unit/test_task_history_192.py",
         "tests/unit/test_task_events_192.py",
-        "tests/unit/test_workflow_node_facade_192.py",
-        "tests/unit/test_legacy_workflow_history_192.py",
         "tests/unit/test_tool_invocation_identity_192.py", "tests/unit/test_execution_roles_192.py",
         "tests/unit/test_task_runtime_192.py",
         "tests/unit/test_workflow_task_runtime_192.py",
-        "tests/unit/test_processing_decisions_192.py",
         "tests/unit/test_nudge_runtime_192.py",
         "tests/unit/test_node_nudge_runtime_192.py",
         "tests/unit/test_node_binding_generation_192.py",
@@ -210,8 +187,9 @@ def main() -> int:
         "tests/unit/test_workflow_output_file_inputs.py", "tests/unit/test_workflow_yaml_native.py",
         "tests/unit/test_subagent_resume_192.py",
         "tests/unit/test_subagent_output_192.py",
-        "tests/unit/test_workflow_live_continuation.py",
         "tests/unit/test_workflow_continuation_plan.py"]
+    scopes.extend(["tests/unit/test_wait_review_208.py", "tests/unit/test_wait_structured_output_192.py"])
+    scopes.append("tests/real/test_real_wait_review_208.py")
     scopes.append("tests/real/test_real_task_registry_192.py")
     scopes.append("tests/real/test_real_root_control_192.py")
     scopes.append("tests/real/test_real_workflow_task_runtime_192.py")
@@ -239,23 +217,15 @@ def main() -> int:
     scopes.append("tests/real/test_real_completion_window_192.py")
     scopes.append("tests/real/test_real_model_attempts_192.py")
     scopes.append("tests/real/test_real_send_receipt_192.py")
-    scopes.append("tests/real/test_real_host_send_steps_192.py")
     scopes.append("tests/real/test_real_answer_freshness_192.py")
     scopes.append("tests/real/test_real_executor_registry_192.py")
     scopes.append("tests/real/test_real_executor_lifecycle_192.py")
     scopes.append("tests/real/test_real_budget_tree_192.py")
     scopes.append("tests/real/test_real_timer_roles_192.py")
-    scopes.append("tests/real/test_real_timer_waits_192.py")
-    scopes.append("tests/real/test_real_wait_handoff_192.py")
-    scopes.append("tests/real/test_real_wait_effects_192.py")
-    scopes.append("tests/real/test_real_wait_terminal_192.py")
     scopes.append("tests/real/test_real_completion_windows_192.py")
-    scopes.append("tests/real/test_real_owner_waits_192.py")
-    scopes.append("tests/real/test_real_wait_dispositions_192.py")
     scopes.append("tests/real/test_real_inbox_atomicity_192.py")
-    scopes.append("tests/real/test_real_input_dispositions_192.py")
-    scopes.append("tests/real/test_real_native_input_dispositions_192.py")
-    scopes.append("tests/real/test_real_wait_inflight_deadline_192.py")
+    scopes.extend(["tests/unit/test_owned_managed_outcomes_208.py", "tests/unit/test_managed_delivery_192.py",
+        "tests/real/test_real_owned_managed_outcomes_208.py", "tests/real/test_real_managed_delivery_192.py"])
     all_real_scopes = [scope for scope in scopes if scope.startswith("tests/real/")]
     run_real = args.unit_shard is None
     if args.real_only:
@@ -267,14 +237,14 @@ def main() -> int:
             parser.error(str(exc).replace("unit shard", "real shard"))
     if args.unit_shard:
         all_units = [str(path.relative_to(repo)) for path in repo.joinpath("tests/unit").rglob("test_*.py")
-                     if path.name != "test_store_parity_mysql.py"]
+]
         try:
             scopes = unit_partition(all_units, args.unit_shard)
         except ValueError as exc:
             parser.error(str(exc))
     command = [sys.executable, "-m", "pytest", "-v" if args.real_shard else "-q", "-p", "no:cacheprovider",
-               "-o", "junit_family=legacy", "--tb=short", "-k", "not mysql",
-               "--ignore=tests/unit/test_store_parity_mysql.py", *scopes, "--junitxml=" + str(report)]
+               "-o", "junit_family=legacy", "--tb=short", "-p", "tests.backend_selection",
+               "--test-backend="+args.backend, "--selection-report="+str(out/(label+".selection.json")), *scopes, "--junitxml=" + str(report)]
     env = {**os.environ, "POWER_LOOP_TASK_PG_DSN": dsn,
            "POWER_LOOP_TEST_PG_DSN": dsn, "POSTGRES_PASSWORD": password}
     metadata_path = out / f"{label}.meta.json"
@@ -307,13 +277,14 @@ def main() -> int:
             metadata["status"] = "collecting"
             save_metadata()
             collected = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "--color=no",
-                "-p", "no:cacheprovider", *all_real_scopes], cwd=repo, env=env,
+                "-p", "no:cacheprovider", "-p", "tests.backend_selection",
+                "--test-backend="+args.backend, *all_real_scopes], cwd=repo, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
             with (out / f"{label}.collect.log").open("x") as target:
                 target.write(sanitized(collected.stdout))
             try:
                 all_real = real_case_ids(collected.stdout)
-                if collected.returncode or len(all_real) != REQUIRED_REAL_CASES:
+                if collected.returncode:
                     raise ValueError("all configured real-provider cases must collect")
                 expected_real = selected_real_cases(all_real, scopes if args.real_shard else all_real_scopes)
             except ValueError as exc:
@@ -359,7 +330,7 @@ def main() -> int:
             psql(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
             metadata["database_cleanup_confirmed"] = True
             save_metadata()
-            print("Disposable PostgreSQL test database removed; MySQL tests excluded.")
+            print("Disposable PostgreSQL test database removed.")
         finally:
             for sig, handler in previous_signals.items():
                 signal.signal(sig, handler)

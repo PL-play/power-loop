@@ -1,26 +1,19 @@
-"""C1: ``background_run`` must honor the injected ShellBackend, like ``bash``.
-
-It used to run ``subprocess.run(command, shell=True)`` directly on the host —
-bypassing an installed sandbox and leaking the host environment — while the docs
-claimed it was sandboxed. It must now launch through ``env.shell_backend``.
-"""
-
-from __future__ import annotations
-
+"""Background commands use the factory's explicit shell and process-control ports."""
+import json
 import os
-import shlex
-import time
 from collections.abc import Hashable
 from pathlib import Path
 
 import pytest
 
-from power_loop.runtime.env import RuntimeEnv, runtime_env_context
-from power_loop.tools import default_tools
-from power_loop.tools.default_tools import BackgroundManager
+from power_loop import AgentLoopConfig, RuntimeEnv, create_default_tool_registry
+from power_loop.agent.runtime_store import now_ms
+from tests.runtime_fixture import RunningAgent
 
-pytestmark = pytest.mark.unit
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, _tool_resp
 
+__all__ = ['registry_store']
 
 class _MarkerBackend:
     """A stand-in sandbox backend: tags the launch env with a unique marker and
@@ -41,64 +34,29 @@ class _MarkerBackend:
         return ("marker", str(workspace_dir))
 
 
-def _wait(mgr: BackgroundManager, task_id: str, timeout: float = 5.0) -> str:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = mgr.tasks.get(task_id, {}).get("status")
-        if status and status != "running":
-            return status
-        time.sleep(0.01)
-    raise AssertionError("background task did not finish in time")
 
-
-async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_path) -> None:
-    captured: dict = {}
-
-    class _FakePopen:
-        """Stand-in for the Popen the background runner starts (its own process group since
-        design/124 — a stop signals the group)."""
-
-        pid = 999999
-        returncode = 0
-
-        def __init__(self, argv, **kw):
-            captured["argv"] = argv
-            captured["env"] = kw.get("env")
-            captured["cwd"] = kw.get("cwd")
-            captured["owned_supervision"] = True
-
-        def communicate(self, input=None, timeout=None):
-            captured["input"] = input
-            return "", ""
-
-        def poll(self):
-            return 0
-
-    monkeypatch.setattr(default_tools, "OwnedProcess", _FakePopen)
-
-    mgr = BackgroundManager()
-    with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, shell_backend=_MarkerBackend())):
-        started = await mgr.run("echo hi")
-    task_id = started.split()[2]
-    _wait(mgr, task_id)
-
-    # The command goes to the backend-launched shell's stdin — NOT
-    # subprocess.run("echo hi", shell=True) on the host.
-    assert captured["argv"] == ["/bin/bash", "--norc", "--noprofile"]
-    # the command, preceded by the task tag every process of it inherits (a stop finds them by it)
-    assert shlex.split(captured["input"])[-1] == "echo hi"
-    assert captured["input"].startswith(f"exec env PL_BG_TAG={task_id}")
-    assert captured["cwd"] == str(tmp_path)
-    assert captured["env"].get("PL_SANDBOX_MARKER") == "sandbox-123"
-    assert captured["owned_supervision"] is True   # its own process group: a stop reaches all of it
-
-
-async def test_background_run_executes_in_backend_environment(tmp_path) -> None:
-    """End-to-end with real bash: the command actually runs inside the backend's
-    environment (the host env alone would never define PL_SANDBOX_MARKER)."""
-    mgr = BackgroundManager()
-    with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, shell_backend=_MarkerBackend())):
-        started = await mgr.run("echo marker=$PL_SANDBOX_MARKER")
-    task_id = started.split()[2]
-    _wait(mgr, task_id)
-    assert "marker=sandbox-123" in (mgr.tasks[task_id]["result"] or "")
+@pytest.mark.parametrize('bound',[False,True])
+@pytest.mark.parametrize('invalid_control',[False,True])
+async def test_background_uses_factory_environment_and_control(registry_store,tmp_path,invalid_control,bound):
+    store,_=registry_store
+    model=_Scripted(responses=[_tool_resp('background','background_run',json.dumps({
+        'action':'run','command':'echo marker=$PL_SANDBOX_MARKER; touch ran'}))])
+    registry=create_default_tool_registry(preset='core',include=['background_run','bash'],bind=bound,workspace_dir=tmp_path)
+    environment=RuntimeEnv(workspace_dir=tmp_path,shell_backend=_MarkerBackend())
+    agent=await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None),runtime_env=environment,
+        process_control=(lambda *args,**kw: object()) if invalid_control else None).start()
+    try:
+        assert (await agent.send('run in sandbox')).status=='completed'
+        rows=await store.load_active_messages(agent.target.session_id)
+        receipt=json.loads(next(r.content for r in rows if r.role=='tool'))
+        from power_loop import JobRef
+        ref=JobRef(**receipt['job_ref'])
+        result=await agent.runtime.client.wait(ref,actor=agent.actor,deadline_ms=now_ms()+10000)
+        if invalid_control:
+            assert result.status=='failed' and result.error == 'TypeError' and 'ShellProcessControl' in result.final_text
+            assert not (tmp_path/'ran').exists()
+        else:
+            assert result.status=='completed' and 'marker=sandbox-123' in result.final_text
+            assert (tmp_path/'ran').exists()
+    finally:
+        await agent.aclose()

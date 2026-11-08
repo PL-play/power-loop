@@ -331,7 +331,7 @@ def redact_memory(ctx: MemoryRecalledCtx) -> None:
 ## 4. 注册 hook
 
 ```python
-from power_loop import StatefulAgentLoop, AgentHooks, HookPoint, HookDirective
+from power_loop import ExecutionEnvironment, AgentHooks, HookPoint, HookDirective
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
 
 hooks = AgentHooks()
@@ -343,7 +343,11 @@ def safety_filter(ctx: ToolBeforeCtx) -> None:
 
 hooks.register(HookPoint.TOOL_BEFORE, safety_filter)
 
-loop = StatefulAgentLoop(llm=..., db_path="...", hooks=hooks, ...)
+# 在当前节点工厂中装配；model、registry、config 由宿主提供。
+async def build(descriptor, execution):
+    return ExecutionEnvironment(model, registry, config, hooks=hooks)
+
+factory.register("application.agent@1", build)
 ```
 
 支持 `def` 和 `async def`；pipeline 自动判断并 await。

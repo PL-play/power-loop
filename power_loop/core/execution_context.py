@@ -47,7 +47,8 @@ def get_execution_context(required=True):
         if required:
             raise RuntimeError("execution context is not bound")
         return None
-    return replace(provider(), host_context=_HOST_CONTEXT.get())
+    snapshot = provider()
+    return replace(snapshot, host_context=_freeze({**snapshot.host_context, **(_HOST_CONTEXT.get() or {})}))
 
 
 @contextmanager

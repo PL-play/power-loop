@@ -238,10 +238,7 @@ async def try_handle(loop,sid,error,stop_event,*,window=None,caller_consumes=Fal
             row = await manager._authorize(tx,actor,source)
             await require_live(manager,tx,actor,row,ticket)
             closed,_,_,_,_ = await _original(manager,tx,row)
-        from functools import partial
-
-        from .owner_waits import _confirm
-        await _confirm(partial(_reconcile,permit=ticket),loop,actor,source)
+        await _reconcile(runtime,actor,source,permit=ticket)
         ref = closed['evidence'].get('last_assistant_ref',{})
         spent = ref.get('round_index',0)+1
         if type(spent) is not int or spent >= ticket.round_limit:

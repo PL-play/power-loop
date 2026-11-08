@@ -7,21 +7,18 @@ import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig
 from power_loop._vendor.llm_client.attempt_scope import single_attempt
 from power_loop._vendor.llm_client.interface import OpenAICompatibleChatConfig
 from power_loop._vendor.llm_client.llm_factory import OpenAICompatibleChatLLMService
-from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.retry import LLMRetryPolicy
-from power_loop.runtime.task_runtime import TaskRuntime
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("native", [True, False])
 @pytest.mark.parametrize("fault", ["http_status", "stream_interrupted"])
-async def test_native_ledger_has_one_wire_request_without_changing_legacy_retry_policy(tmp_path, native, fault):
-    openai = pytest.importorskip("openai")
+async def test_unknown_provider_result_is_not_retried_by_any_transport_layer(runtime_agent, fault):
+    import openai
     requests, handlers = [], set()
     async def respond(reader, writer):
         task = asyncio.current_task()
@@ -55,33 +52,21 @@ async def test_native_ledger_has_one_wire_request_without_changing_legacy_retry_
         max_retries=1, retry_base_delay_s=0, stream_resume_on_error=True, stream_max_restarts=2))
     service._client = openai.AsyncOpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="local-test-only", timeout=5,
         max_retries=1, http_client=openai.DefaultAsyncHttpxClient(trust_env=False))
-    store = await SessionStore.open(str(tmp_path / "http-attempt.db"), **({"schema": "tasks"} if native else {}))
+    agent = await runtime_agent(model=service,
+        config=AgentLoopConfig(max_rounds=2, max_tokens=100, compactor=None,
+            retry_policy=LLMRetryPolicy(max_attempts=1, backoff_initial=0)))
     try:
-        runtime = TaskRuntime(JobManager(store), tenant_id="wire-test", principal_id="host", executor_id="executor", boot_id="boot") if native else None
-        loop = StatefulAgentLoop(llm=service, store=store, task_runtime=runtime,
-            config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2, max_tokens=100,
-                retry_policy=LLMRetryPolicy(max_attempts=1, backoff_initial=0)))
-        sid = await loop.new_session()
         async with asyncio.timeout(30):
-            result = await loop.send("Return one test result.", sid)
-        assert result.status == "degraded"
-        assert len(requests) == (1 if native else 4 if fault == "http_status" else 3)
-        assert single_attempt.get() is False  # no policy leak into another send/host
-        if native:
-            [job] = await runtime.manager.db.fetchall(f"SELECT * FROM {runtime.manager.jobs}")
-            assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
-            assert result.usage["prompt_tokens"] > 0
-            if fault == "stream_interrupted":
-                assert result.usage["completion_tokens"] > 0
+            result = await agent.send('Return one test result.')
+        assert result.status == 'failed'
+        assert len(requests) == 1
+        assert single_attempt.get() is False
+        assert result.usage['prompt_tokens'] > 0
+        if fault == 'stream_interrupted':
+            assert result.usage['completion_tokens'] > 0
     finally:
-        try:
-            await service.close()
-        finally:
-            if native:
-                from tests.obligation_invariants import assert_obligation_projection
-                await assert_obligation_projection(store, store.table_prefix)
-            await store.close()
-            server.close()
-            await server.wait_closed()
-            if handlers:
-                await asyncio.gather(*list(handlers), return_exceptions=True)
+        await agent.aclose()
+        server.close()
+        await server.wait_closed()
+        if handlers:
+            await asyncio.gather(*list(handlers), return_exceptions=True)

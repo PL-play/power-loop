@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMProviderConfig, LLMRequest, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMProviderConfig, LLMRequest, SessionStore
+from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.runtime import model_attempts, model_budgets
 from power_loop.runtime.budget_contracts import (
@@ -30,7 +31,7 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
 
-from .test_real_async_boundaries_192 import BoundedProvider
+from ._bounded import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
@@ -42,7 +43,7 @@ class RealBudgetHost:
         self.grants, self.applied = {}, {}
 
     async def prepare(self, context, logical_request, *, service):
-        assert service is self.service
+        assert getattr(service, "provider", service) is self.service
         return BudgetPlan(16384, {"attempt_id": context["attempt_id"], "origin": context})
 
     async def reserve(self, plan):
@@ -84,7 +85,7 @@ async def report(store, provider, record_property):
     record_property("original_messages", json.dumps(evidence, ensure_ascii=False, default=str))
 
 
-async def test_real_new_main_roots_share_authority_cap_and_third_call_never_dispatches(tmp_path, record_property):
+async def test_real_new_main_roots_share_authority_cap_and_third_call_never_dispatches(tmp_path, record_property, runtime_agent):
     store = await SessionStore.open(str(tmp_path / "root-cap.db"), schema="tasks")
     provider, host = BoundedProvider(limit=2), RealBudgetHost()
     host.service = provider
@@ -106,19 +107,13 @@ async def test_real_new_main_roots_share_authority_cap_and_third_call_never_disp
         ),
     )
     try:
-        loop = StatefulAgentLoop(
-            llm=provider,
-            store=store,
-            task_runtime=runtime,
-            config=AgentLoopConfig(max_rounds=2, max_tokens=2048, delegation_policy="single_level"),
-        )
-        sid = await loop.new_session()
+        loop = await runtime_agent(model=provider, store=store, task_runtime=runtime, config=AgentLoopConfig(max_rounds=2, max_tokens=2048, delegation_policy="single_level"))
         async with asyncio.timeout(150):
             for _ in range(2):
-                result = await loop.send("Reply exactly 42 in assistant text. Do not call tools or pass_turn.", sid)
+                result = await loop.send("Reply exactly 42 in assistant text. Do not call tools or pass_turn.")
                 assert result.final_text.strip() == "42"
-            rejected = await loop.send("Reply 43. This request must be rejected before the provider.", sid)
-            assert rejected.status == "degraded" and "budget_max_calls_exhausted" in rejected.final_text
+            rejected = await loop.send("Reply 43. This request must be rejected before the provider.")
+            assert rejected.status == "failed" and "budget_max_calls_exhausted" in rejected.error
             assert provider.calls == host.reserve_calls == len(host.applied) == 2
             rows = await runtime.manager.db.fetchall(
                 f"SELECT limits_json,counters_json FROM {runtime.manager.prefix}task_budget_scopes"
@@ -127,13 +122,14 @@ async def test_real_new_main_roots_share_authority_cap_and_third_call_never_disp
             assert sorted(r["used_calls"] for r in roots) == [0, 1, 1]
             assert all(r["held_calls"] == 0 for r in roots)
     finally:
+        await loop.aclose()
         await runtime.shutdown(timeout_s=5)
         await report(store, provider, record_property)
         await provider.close()
         await store.close()
 
 
-async def test_real_workflow_owner_cap_blocks_review_before_its_provider_request(tmp_path, record_property):
+async def test_real_workflow_owner_cap_blocks_review_before_its_provider_request(tmp_path, record_property, runtime_agent):
     store = await SessionStore.open(str(tmp_path / "workflow-cap.db"), schema="tasks")
     provider, host, accepted, roles = BoundedProvider(limit=6), RealBudgetHost(), [], Counter()
     host.service = provider
@@ -198,22 +194,13 @@ async def test_real_workflow_owner_cap_blocks_review_before_its_provider_request
         },
     }
     try:
-        loop = StatefulAgentLoop(
-            llm=provider,
-            store=store,
-            task_runtime=runtime,
-            tool_registry=registry,
-            config=AgentLoopConfig(max_rounds=3, max_tokens=2048, delegation_policy="single_level"),
-        )
-        sid = await loop.new_session()
+        loop = await runtime_agent(model=provider, store=store, task_runtime=runtime, registry=registry, config=AgentLoopConfig(max_rounds=3, max_tokens=2048, delegation_policy="single_level"))
+        sid = loop.target.session_id
         async with asyncio.timeout(180):
-            first = await loop.send(
-                'Call workflow exactly once with action="create" and the following spec. After acceptance, reply WAITING in plain text. Do not poll, retry, create another task, or call pass_turn. Spec: '
-                + json.dumps(spec),
-                sid,
-            )
+            first = await loop.send('Call workflow exactly once with action="create" and the following spec. After acceptance, reply WAITING in plain text. Do not poll, retry, create another task, or call pass_turn. Spec: '
+                + json.dumps(spec))
             assert first.status == "completed" and len(accepted) == 1
-            await accepted[0].handle.task
+            await accepted[0].handle.wait(deadline_ms=now_ms()+120000)
             workflow = await runtime.manager.get_job(runtime.actor(sid), accepted[0].handle.job_id)
             assert workflow.outcome == "failed" and "budget_max_calls_exhausted" in str(workflow.result)
             assert roles["BUILD"] == 1 and roles["REVIEW"] == 0
@@ -228,7 +215,8 @@ async def test_real_workflow_owner_cap_blocks_review_before_its_provider_request
             assert counter["used_calls"] == 1 and counter["held_calls"] == counter["inflight"] == 0
     finally:
         if accepted:
-            await asyncio.wait_for(asyncio.gather(*(a.handle.task for a in accepted), return_exceptions=True), 10)
+            await asyncio.wait_for(asyncio.gather(*(a.handle.wait(deadline_ms=now_ms()+120000) for a in accepted), return_exceptions=True), 10)
+        await loop.aclose()
         await runtime.shutdown(timeout_s=5)
         await report(store, provider, record_property)
         await provider.close()

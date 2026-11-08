@@ -15,7 +15,6 @@ from power_loop import (
     AgentLoopConfig,
     LLMRetryPolicy,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
@@ -53,7 +52,7 @@ def _tool_call(cid: str, name: str) -> LLMResponse:
         {"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}])
 
 
-async def test_round_limit_final_call_routes_through_call_llm() -> None:
+async def test_round_limit_final_call_routes_through_call_llm(runtime_agent) -> None:
     bus = AgentEventBus()
     events: list = []
     bus.subscribe(None, events.append)
@@ -63,12 +62,12 @@ async def test_round_limit_final_call_routes_through_call_llm() -> None:
     # round 0 makes a tool call (resolves); max_rounds=1 → the summary call fires.
     llm = _Scripted(responses=[_tool_call("c1", "echo"),
                                LLMResponse(raw_text="summary", content_text="summary")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=await SessionStore.open(":memory:"), tool_registry=reg, event_bus=bus,
+    loop = await runtime_agent(
+        model=llm, registry=reg, event_bus=bus,
         config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
     )
-    res = await loop.send("go", session_id=await loop.new_session())
-    assert res.status == "hit_round_limit"
+    res = await loop.send("go")
+    assert res.status == "interrupted" and res.error == "hit_round_limit"
     starts = sum(1 for e in events if e.type == AgentEventType.STREAM_STARTED)
     completes = sum(1 for e in events if e.type == AgentEventType.STREAM_COMPLETED)
     # round-0 call AND the final summary call both route through call_llm → 2 each.
@@ -76,7 +75,7 @@ async def test_round_limit_final_call_routes_through_call_llm() -> None:
     assert starts == 2 and completes == 2
 
 
-async def test_round_limit_summary_is_persisted_to_transcript() -> None:
+async def test_round_limit_summary_is_persisted_to_transcript(runtime_agent) -> None:
     # M-stateful-loop-2: the wrap-up summary returned to the caller must ALSO be recorded as the
     # assistant turn, so the next send's history isn't a dangling "summarize…" prompt with no answer.
     reg = ToolRegistry()
@@ -85,15 +84,16 @@ async def test_round_limit_summary_is_persisted_to_transcript() -> None:
     llm = _Scripted(responses=[_tool_call("c1", "echo"),
                                LLMResponse(raw_text="here is my summary", content_text="here is my summary")])
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=reg,
+    loop = await runtime_agent(
+        model=llm, store=store, registry=reg,
         config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
     )
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
-    assert res.status == "hit_round_limit"
-    msgs = await loop.get_messages(sid)
-    assert any(m["role"] == "assistant" and m.get("content") == "here is my summary" for m in msgs), msgs
+    sid = loop.target.session_id
+    res = await loop.send("go")
+    assert res.status == "interrupted" and res.error == "hit_round_limit"
+    msgs = await store.load_active_messages(sid)
+    assert any(m.role == "assistant" and m.content == "here is my summary" for m in msgs), msgs
+    await loop.aclose()
     await store.close()
 
 
@@ -113,19 +113,19 @@ class _FailLLM(LLMService):
         return None
 
 
-async def test_call_llm_emits_stream_completed_on_failure() -> None:
+async def test_call_llm_emits_stream_completed_on_failure(runtime_agent) -> None:
     bus = AgentEventBus()
     events: list = []
     bus.subscribe(None, events.append)
-    loop = StatefulAgentLoop(
-        llm=_FailLLM(), store=await SessionStore.open(":memory:"), event_bus=bus,
+    loop = await runtime_agent(
+        model=_FailLLM(), event_bus=bus,
         config=AgentLoopConfig(
             system_prompt="o", max_rounds=2, compactor=None,
             retry_policy=LLMRetryPolicy(max_attempts=2, backoff_initial=0.001, backoff_max=0.002),
         ),
     )
-    res = await loop.send("go", session_id=await loop.new_session())
-    assert res.status == "degraded"
+    res = await loop.send("go")
+    assert res.status == "failed"
     starts = sum(1 for e in events if e.type == AgentEventType.STREAM_STARTED)
     completes = sum(1 for e in events if e.type == AgentEventType.STREAM_COMPLETED)
     # the call failed (retry exhausted) but the stream still got a terminal event

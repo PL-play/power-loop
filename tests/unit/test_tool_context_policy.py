@@ -161,34 +161,45 @@ async def test_fuse_with_tool_context_is_capacity_only_and_uses_post_retirement_
     assert p.ctx.token_usage == {'prompt_tokens': 81000}
 
 
-async def test_background_delegates_target_keep(env):
-    from power_loop.runtime.background import encode_results, record_key
-    store, sid, _, llm, _, engine, source = env
-    record = {'task_id': 'task-1', 'tool': 'bash', 'args': {**source.arguments, 'context_policy': 'keep'},
-              'result': source.result, 'status': 'completed'}
-    await store.set_runtime_state(sid, record_key('task-1'), record)
-    from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-    engine.registry.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS['background_run'])
-    wrapped = replace(source, name='background_run', arguments={'action': 'check', 'task_id': 'task-1'},
-                      result=encode_results([record]))
-    assert await engine.distill(wrapped, 'insend_fuse') is None
-    assert 'task=task-1: checks' in await engine.distill(wrapped, 'general')
-    assert not llm.calls
+async def test_background_delegates_target_keep(env, tmp_path):
+    from power_loop import JobRef
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.runtime.background import encode_results, load_record
+    from power_loop.runtime.env import RuntimeEnv
+    from tests.unit.test_tool_background_contracts_192 import start_background
+
+    store, _, registry, llm, _, engine, source = env
+    registered = registry.get('bash')
+    registry.register(replace(registered.definition, async_capable=True), registered.handler, overwrite=True)
+    runner, row = await start_background(store, registry, 'bash',
+        {**source.arguments, 'command': 'printf result', 'context_policy': 'keep'},
+        runtime_env=RuntimeEnv(workspace_dir=tmp_path))
+    try:
+        receipt = json.loads(row.content)
+        result = await runner.runtime.client.wait(JobRef(**receipt['job_ref']), actor=runner.actor,
+                                                  deadline_ms=now_ms()+10000)
+        assert result.status == 'completed', result
+        task_id = receipt['task_id']
+        record = await load_record(store, runner.target.session_id, task_id)
+        wrapped = replace(source, session_id=runner.target.session_id, name='defer_work',
+                          arguments={'action': 'check', 'task_id': task_id}, result=encode_results([record]))
+        assert await engine.distill(wrapped, 'insend_fuse') is None
+        assert f'task={task_id}: checks' in await engine.distill(wrapped, 'general')
+        assert not llm.calls
+    finally:
+        await runner.aclose()
 
 
-async def test_send_with_tool_context_makes_only_main_model_requests(env):
-    from power_loop.agent.stateful_loop import StatefulAgentLoop
+async def test_send_with_tool_context_makes_only_main_model_requests(env, runtime_agent):
     from power_loop.agent.types import AgentLoopConfig
     from power_loop.runtime.representation import ProjectedRepresentation
     store, _, registry, _, config, _, _ = env
     main = _Scripted([_tool_resp('c', 'bash', '{"description": "checks"}'), LLMResponse(raw_text='done'),
                       LLMResponse(raw_text='next')])
-    loop = StatefulAgentLoop(llm=main, store=store, tool_registry=registry,
-        config=AgentLoopConfig(tool_context=config, representation=ProjectedRepresentation()))
-    sid = await loop.new_session()
+    loop = await runtime_agent(model=main, store=store, registry=registry, config=AgentLoopConfig(tool_context=config, representation=ProjectedRepresentation()))
     try:
-        first = await loop.send('test', sid)
-        second = await loop.send('next', sid)
+        first = await loop.send('test')
+        second = await loop.send('next')
         assert first.final_text == 'done' and second.final_text == 'next'
         assert len(main.calls) == 3
         assert not {'auxiliary_pending', 'tool_distill_calls'} & set(first.usage)

@@ -6,12 +6,12 @@ provides the separate acknowledgement; no old tool row is manufactured or edited
 from __future__ import annotations
 
 import json
-import logging
+
+from power_loop.agent.runtime_types import canonical
 
 from .jobs import JobError, _hash, _json
 from .result_revisions import result_id
 
-_LOG = logging.getLogger(__name__)
 CONSTRAINTS = (
     'This is the known original outcome of an existing tool call.\n'
     'Read the linked original evidence and decide how to handle this outcome. '
@@ -127,7 +127,7 @@ async def _inbox(manager, tx, row, notice):
                               (data['main_session_id'], key))
     if (inbox is None or inbox['kind'] != 'managed_result' or inbox['mode'] != 'queue'
             or inbox['status'] not in ('pending', 'claimed', 'delivered')
-            or inbox['content'] != render(data['public'])):
+            or inbox['content'] != canonical(render(data['public']))):
         raise JobError('managed_delivery_inbox_mismatch')
     if (inbox['status'] == 'delivered' and (type(inbox['delivered_seq']) is not int or inbox['delivered_seq'] <= 0
             or type(inbox['delivered_send_index']) is not int or inbox['delivered_send_index'] <= 0)
@@ -136,23 +136,7 @@ async def _inbox(manager, tx, row, notice):
     return inbox
 
 
-async def enqueue(loop, actor, job):
-    """Queue the original outcome, then provide a best-effort local inbox hint."""
-    from .managed_completion import _host_only
-    _host_only()
-    runtime = getattr(loop, 'task_runtime', None)
-    if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
-        raise JobError('task_runtime_required')
-    response = await enqueue_runtime(runtime, actor, job)
-    if response['inbox_status'] == 'pending':
-        try:
-            loop._note_committed_inbox(actor.session_id)
-        except Exception:
-            _LOG.exception('managed result is durably queued; local hint failed: %s', response['notification_id'])
-    return response
-
-
-async def enqueue_runtime(runtime, actor, job):
+async def enqueue_runtime(runtime, actor, job, *, client=None):
     """Mechanical host port; no model object, callback or execution is needed."""
     from .managed_completion import _host_only
     from .managed_effects import _event
@@ -172,20 +156,16 @@ async def enqueue_runtime(runtime, actor, job):
             raise JobError('managed_delivery_requires_original_main')
         notice = await read(manager, tx, row, result, required=False)
         if notice is None:
-            if row['supervision_status'] == 'closed' and row['generation'] != 0:
-                raise JobError('managed_delivery_already_closed')
             key = identity(manager, row)
-            columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
-            await manager.store.signal_changes(tx, actor.session_id, "inbox")
-            await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
-                (actor.session_id, key, 'managed_result', 'queue', 'pending', render(data['public']), manager.now()))
+            from .result_notices import accept
+            await accept(manager, tx, actor, data['root']['job_id'], key, 'managed_result', render(data['public']))
             await _event(manager, tx, row, 'delivery', data)
             await tx.set_event_recipient(key, actor.session_id)
             # Any former tool receipt describes the old pending/error boundary.
             # This new, resolved outcome now has its own processing obligation.
             if row['generation'] != 0:
                 await tx.update_event(job, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (result['event_id'],), notify=True)
-                await tx.write_job(job, f"UPDATE {manager.jobs} SET result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job), obligations=True)
+                await tx.write_job(job, f"UPDATE {manager.jobs} SET result_status='pending_delivery',supervision_status='open',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job), obligations=True)
             else:
                 from .pending_calls import SNAPSHOT, model
                 source = await manager._row(tx, row['parent_job_id'])
@@ -200,6 +180,9 @@ async def enqueue_runtime(runtime, actor, job):
         response = {'job_id': job, 'generation': row['generation'], 'notification_id': notice[0]['event_id'],
             'main_session_id': actor.session_id, 'inbox_status': inbox['status'],
             'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}
+    if client is not None and inbox['status'] == 'pending':
+        from .result_notices import notify
+        await notify(client, actor, response['notification_id'])
     return response
 
 

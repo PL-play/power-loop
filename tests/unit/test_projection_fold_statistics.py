@@ -9,43 +9,34 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse
 from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.fold import FoldResult
 from power_loop.runtime.representation import ProjectedRepresentation, ProjectionFoldPolicy
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.projection_fold import OWNER_PREFIX, STATE_KEY, read_state
-from power_loop.runtime.store.schema import _STORE_TABLES
 from tests.unit.test_stateful_loop import _Scripted
+
+from .test_job_registry_192 import registry_store
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.fixture(params=["sqlite", "postgres"])
-async def fold_store(request, tmp_path):
-    import os
 
-    if request.param == "sqlite":
-        dsn = str(tmp_path / "fold.sqlite")
-    else:
-        dsn = os.environ.get("POWER_LOOP_FOLD_TEST_PG_DSN")
-        if not dsn:
-            pytest.skip("Set POWER_LOOP_FOLD_TEST_PG_DSN to an isolated *_test database")
-        assert urlparse(dsn).path.endswith("_test"), "refusing a non-test PostgreSQL database"
-    store = await open_store(dsn, table_prefix="pf_")
-    store.test_dsn = dsn
-    try:
-        if request.param == "postgres":
-            actual = await store._db.fetchone("SELECT current_database() AS name")
-            assert actual["name"].endswith("_test")
-            await store._db.execute("TRUNCATE " + ",".join(getattr(store.t, t) for t in _STORE_TABLES))
-        yield store
-    finally:
-        await store.close()
+__all__ = ['registry_store']
+
+
+@pytest.fixture
+async def fold_store(registry_store, tmp_path):
+    import os
+    store, _ = registry_store
+    backend = store._db.dialect.name
+    store.test_dsn = str(tmp_path / 'registry.db') if backend == 'sqlite' else os.environ[
+        'POWER_LOOP_TASK_PG_DSN' if backend == 'postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
+    return store
 
 
 class ProjectionReads:
@@ -263,7 +254,7 @@ async def test_changed_projection_rejects_a_fold_without_cursor_change(fold_stor
     for n in range(1, 3):
         await append(fold_store, sid, n)
     candidate = await append(fold_store, sid, 3, threshold=0)
-    other = await open_store(fold_store.test_dsn, table_prefix="pf_")
+    other = await open_store(fold_store.test_dsn, table_prefix=fold_store.table_prefix)
     try:
         await other.upsert_project_message(sid, send_index=1, kind="user", content={"input": ["corrected"]})
         assert await fold_store.commit_projection_fold(
@@ -281,7 +272,7 @@ async def test_candidate_read_does_not_hold_the_session_lock(fold_store, monkeyp
     for n in range(1, 140):
         await append(fold_store, sid, n)
     original = fold_store._db.fetchall
-    other = await open_store(fold_store.test_dsn, table_prefix="pf_")
+    other = await open_store(fold_store.test_dsn, table_prefix=fold_store.table_prefix)
     changed = False
 
     async def concurrent_write(sql, params=()):
@@ -316,19 +307,20 @@ class CaptureFold:
         return FoldResult({"summary": "all selected history"}, max(r.send_index for r in rows))
 
 
-async def test_fold_reads_all_candidates_despite_history_cap_and_pages(fold_store, monkeypatch):
-    sid = await fold_store.create_session(metadata={})
+async def test_fold_reads_all_candidates_despite_history_cap_and_pages(fold_store, monkeypatch, runtime_agent):
+    fold = CaptureFold()
+    loop = await runtime_agent(store=fold_store, model=_Scripted([LLMResponse(raw_text="done")]),
+        config=AgentLoopConfig(system_prompt="S", representation=ProjectedRepresentation(),
+                               fold_strategy=fold, context_budget_tokens=1, max_context_rows=6))
+    sid = loop.target.session_id
     for n in range(1, 322):
         await append(fold_store, sid, n)
         await fold_store.append_message(sid, role="user", content=f"original {n}", send_index=n)
     await fold_store.set_runtime_state(sid, "send_index", 321)
-    fold = CaptureFold()
-    loop = StatefulAgentLoop(store=fold_store, llm=_Scripted([LLMResponse(raw_text="done")]),
-        config=AgentLoopConfig(system_prompt="S", representation=ProjectedRepresentation(),
-                               fold_strategy=fold, context_budget_tokens=1, max_context_rows=6))
+
     probe = ProjectionReads(fold_store, monkeypatch)
     try:
-        assert (await loop.send("next", sid)).status == "completed"
+        assert (await loop.send("next")).status == "completed"
         assert {r.send_index for r in fold.seen} == set(range(1, 321))
         assert (await fold_store.latest_project_compact(sid)).compact_to_send == 320
         assert len(await fold_store.load_all_messages(sid)) == 323  # originals never pruned
@@ -346,7 +338,7 @@ async def test_statistics_survive_reopening_the_store(fold_store, monkeypatch):
     sid = await fold_store.create_session()
     for n in range(1, 6):
         await append(fold_store, sid, n)
-    other = await open_store(fold_store.test_dsn, table_prefix="pf_")
+    other = await open_store(fold_store.test_dsn, table_prefix=fold_store.table_prefix)
     try:
         probe = ProjectionReads(other, monkeypatch)
         await append(other, sid, 6)
@@ -388,20 +380,21 @@ async def test_long_single_send_is_not_truncated_or_split(fold_store):
     assert {r.send_index for r in candidate.rows} == {1, 2}
 
 
-async def test_fold_cannot_advance_over_unprocessed_sends(fold_store):
+async def test_fold_cannot_advance_over_unprocessed_sends(fold_store, runtime_agent):
     class BadCursorFold(CaptureFold):
         async def fold(self, rows, *, context):
             return FoldResult({"summary": "invalid cursor"}, max(r.send_index for r in rows) + 1)
 
-    sid = await fold_store.create_session(metadata={})
+    loop = await runtime_agent(store=fold_store, model=_Scripted([LLMResponse(raw_text="done")]),
+        config=AgentLoopConfig(system_prompt="S", representation=ProjectedRepresentation(),
+                               fold_strategy=BadCursorFold(), context_budget_tokens=1))
+    sid = loop.target.session_id
     for n in range(1, 4):
         await append(fold_store, sid, n)
     await fold_store.set_runtime_state(sid, "send_index", 3)
-    loop = StatefulAgentLoop(store=fold_store, llm=_Scripted([LLMResponse(raw_text="done")]),
-        config=AgentLoopConfig(system_prompt="S", representation=ProjectedRepresentation(),
-                               fold_strategy=BadCursorFold(), context_budget_tokens=1))
+
     try:
-        assert (await loop.send("next", sid)).status == "completed"
+        assert (await loop.send("next")).status == "completed"
         assert await fold_store.latest_project_compact(sid) is None
         assert len(await fold_store.load_project_messages(sid)) == 8
     finally:
@@ -410,7 +403,7 @@ async def test_fold_cannot_advance_over_unprocessed_sends(fold_store):
 
 @pytest.mark.parametrize("options", [{}, {"max_context_rows": None}, {"max_context_rows": 0},
                                      {"max_context_rows": 20}])
-async def test_history_limit_contract_on_each_backend(fold_store, options):
+async def test_history_limit_contract_on_each_backend(fold_store, options, runtime_agent):
     from tests.unit.test_max_context_rows import test_history_limit_is_explicit_beyond_previous_defaults
 
-    await test_history_limit_is_explicit_beyond_previous_defaults(fold_store, options)
+    await test_history_limit_is_explicit_beyond_previous_defaults(fold_store, options, runtime_agent)

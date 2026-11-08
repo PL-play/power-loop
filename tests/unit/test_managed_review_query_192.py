@@ -2,7 +2,7 @@
 import pytest
 
 from power_loop.runtime import task_query
-from power_loop.runtime.pending_calls import retire_pending
+from power_loop.runtime.pending_calls import retire_pending_runtime
 from power_loop.runtime.tool_call_plans import reconcile_pending
 
 from .test_job_registry_192 import registry_store
@@ -31,8 +31,8 @@ async def test_recovered_negative_review_is_visible_until_real_main_processing_a
     loop, reviewer = await controller(c)
     deleted = []
     try:
-        await reconcile_pending(loop, c.actor, source_id)
-        await retire_pending(loop, c.actor, source_id)
+        await reconcile_pending(c.runtime, c.actor, source_id)
+        await retire_pending_runtime(c.runtime, c.actor, source_id)
         before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
         details = await task_query.get_job(c.manager, c.actor, negative['job_id'])
         assert details['node']['processing_obligation']['state'] == 'pending'

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, ToolDefinition
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
 from power_loop.runtime.managed_effects import (
     FunctionManagedTool,
@@ -21,6 +21,7 @@ from power_loop.runtime.managed_effects import (
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
 
@@ -54,7 +55,6 @@ async def scenario(
     max_calls=2,
 ):
     store, _ = registry_store
-    sid = await store.create_session()
     manager = JobManager(store)
     from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 
@@ -212,24 +212,16 @@ async def scenario(
     model = Model()
     if host:
         host.service = model
-    loop = StatefulAgentLoop(
-        llm=model,
-        store=store,
-        task_runtime=runtime,
-        tool_registry=registry,
-        config=AgentLoopConfig(
-            max_rounds=3,
-            model="test-model",
-            max_tokens=20,
-            delegation_policy="single_level",
-            **({"tool_result_max_chars": capacity} if capacity is not None else {}),
-        ),
-    )
+    loop = await RunningAgent(store, model, registry,
+        AgentLoopConfig(max_rounds=3, model='test-model', max_tokens=20, compactor=None,
+            **({'tool_result_max_chars':capacity} if capacity is not None else {})),
+        task_runtime=runtime).start()
+    sid = loop.target.session_id
     try:
         if configure is not None:
             await configure(loop, state)
         try:
-            result = await asyncio.wait_for(loop.send("Post the original effect once", sid), 10)
+            result = await asyncio.wait_for(loop.send("Post the original effect once"), 10)
         except (OSError, JobError) as exc:
             expected_failure = (receipt_bind_failure and str(exc) == "test_original_receipt_store_unavailable"
                                 or raw_receipt_failure and str(exc) == 'test_original_raw_tool_unavailable'
@@ -253,7 +245,7 @@ async def scenario(
             fault=fault,
         )
     finally:
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
 
 
 async def test_known_effect_has_required_child_and_exact_tool_receipt(registry_store):
@@ -532,7 +524,7 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
         f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type IN ('managed_effect_dispatch','managed_effect_prepared','managed_effect_tool_receipt')",
         (row["job_id"],),
     )
-    store = await registry_store[1](schema="compatible")
+    store = await registry_store[1](schema="verify")
     assert await terminate_unstarted(JobManager(store), c.actor, row["job_id"]) == result
     assert await read_raw_receipt(JobManager(store), c.actor, row["job_id"]) == observed
     assert (
@@ -613,7 +605,7 @@ async def test_retained_original_row_is_rebound_after_storage_failure_without_re
     with pytest.raises(JobError, match="evidence_missing"):
         await read_raw_receipt(c.manager, c.actor, row["job_id"])
     before = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq")
-    restored = JobManager(await registry_store[1](schema="compatible"))
+    restored = JobManager(await registry_store[1](schema="verify"))
     observed = await reconcile_raw_receipt(restored, c.actor, row["job_id"])
     assert observed["call_ref"]["id"] != observed["receipt_ref"]["id"]
     assert not observed["acknowledges_result"] and not observed["execution_authority"]
@@ -694,7 +686,7 @@ async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
 
     c = await scenario(registry_store, claim_failure=True, receipt_bind_failure=True)
     [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    manager = JobManager(await registry_store[1](schema="compatible"))
+    manager = JobManager(await registry_store[1](schema="verify"))
     write = manager._write
 
     class Proxy:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -7,12 +8,10 @@ from typing import Any
 import pytest
 
 from power_loop import (
-    MAX_SPAWN_DEPTH,
     AgentLoopConfig,
     AgentSpec,
     AgentSpecError,
     SessionStore,
-    StatefulAgentLoop,
     SubagentLifecycle,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
@@ -155,200 +154,96 @@ def test_filtered_registry_whitelist_subset() -> None:
 # ── spawn_agent / run_agent end-to-end ─────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_spawn_agent_creates_retained_child_and_returns_async_receipt(store):
-    import asyncio
-    import json
-
-    from power_loop.core.agent_context import reset_current_loop, reset_session_id, set_current_loop, set_session_id
-    from power_loop.runtime.delegation import _TASKS
-    from power_loop.tools.spawn_agent import _handle_spawn_agent
-    loop = StatefulAgentLoop(llm=_Scripted(responses=[LLMResponse(raw_text="child summary")]),
-                             store=store, config=AgentLoopConfig(max_rounds=4))
-    sid = await loop.new_session()
-    tok, stok = set_current_loop(loop), set_session_id(sid)
-    try:
-        receipt = json.loads(await _handle_spawn_agent(task="summarize topic X"))
-        assert receipt["status"] == "queued" and receipt["mode"] == "create"
-        while _TASKS:
-            await asyncio.gather(*list(_TASKS))
-    finally:
-        reset_current_loop(tok)
-        reset_session_id(stok)
-    child = await store.get_session(receipt["session_id"])
-    assert child.parent_session_id == sid and child.lifecycle == SubagentLifecycle.LINKED
-    record = await store.get_runtime_state(sid, "subagent:run:" + receipt["run_id"])
-    assert record["result"]["final_text"] == "child summary"
+async def _child(runtime_agent, store, model, spec, *, registry=None, config=None, task_runtime=None):
+    from power_loop.core.agent_context import get_current_loop
+    registry = registry or ToolRegistry()
+    async def delegate():
+        return await run_agent_spec(spec, "do work", parent_loop=get_current_loop())
+    registry.register(ToolDefinition(name="delegate", description="host delegation",
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), delegate)
+    agent = await runtime_agent(model=model, store=store, registry=registry,
+        config=config or AgentLoopConfig(compactor=None), task_runtime=task_runtime, command=("delegate", {}))
+    result = await agent.send("go")
+    assert result.status == "completed", result
+    return agent, json.loads(result.final_text)
 
 
-@pytest.mark.asyncio
-async def test_spawn_agent_honors_name_and_system_prompt_override(store):
-    import asyncio
-    import json
-
-    from power_loop.core.agent_context import reset_current_loop, reset_session_id, set_current_loop, set_session_id
-    from power_loop.runtime.delegation import _TASKS
-    from power_loop.tools.spawn_agent import _handle_spawn_agent
-    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=AgentLoopConfig(max_rounds=3))
-    parent = await loop.new_session()
-    tok, stok = set_current_loop(loop), set_session_id(parent)
-    try:
-        receipt = json.loads(await _handle_spawn_agent(task="summarize", name="summarizer",
-                                                        system_prompt="You summarize.", max_rounds=2))
-        while _TASKS:
-            await asyncio.gather(*list(_TASKS))
-    finally:
-        reset_current_loop(tok)
-        reset_session_id(stok)
-    child = await store.get_session(receipt["session_id"])
-    assert child.system_prompt == "You summarize." and child.metadata["spec_name"] == "summarizer"
-
-
-@pytest.mark.asyncio
-async def test_spawn_agent_with_missing_task_returns_error(store: SessionStore) -> None:
-    parent_llm = _Scripted(responses=[
-        _spawn_call_kwargs("tc3", {"name": "x"}),  # missing task → tool error string
-        LLMResponse(raw_text="parent recovered"),
-    ])
+@pytest.mark.parametrize("arguments", [
+    {"task": "summarize topic X"},
+    {"task": "summarize", "name": "summarizer", "system_prompt": "You summarize.", "max_rounds": 2},
+])
+async def test_spawn_agent_creates_retained_child_with_frozen_settings(store, runtime_agent, arguments):
+    from power_loop import JobRef
+    from power_loop.agent.runtime_store import now_ms
+    # Parent finishes after admission; the capacity-one worker then runs the child.
+    model = _Scripted(responses=[_spawn_call_kwargs("spawn", arguments), LLMResponse(raw_text="parent done"),
+                                LLMResponse(raw_text="child summary")])
     registry = ToolRegistry()
     register_spawn_agent(registry)
-    loop = StatefulAgentLoop(
-        llm=parent_llm, store=store, tool_registry=registry,
-        config=AgentLoopConfig(max_rounds=2),
-    )
-    sid = await loop.new_session()
-    r = await loop.send("go", session_id=sid)
-    # The tool returns an error string; parent loop continues; final = "parent recovered".
-    assert r.final_text == "parent recovered"
+    agent = await runtime_agent(model=model, store=store, registry=registry, config=AgentLoopConfig(compactor=None))
+    parent = await agent.send("go")
+    assert parent.status == "completed"
+    rows = await store.load_active_messages(agent.target.session_id)
+    receipt = json.loads(next(row.content for row in rows if row.tool_call_id == "spawn"))
+    assert receipt["status"] == "accepted" and receipt["mode"] == "create"
+    result = await agent.runtime.client.wait(JobRef(**receipt["job_ref"]), actor=agent.actor,
+        deadline_ms=now_ms()+10000)
+    await agent.drain()
+    assert result.status == "completed" and result.final_text == "child summary"
+    child = await store.get_session(receipt["session_id"])
+    assert child.parent_session_id == agent.target.session_id and child.lifecycle == SubagentLifecycle.LINKED
+    if "system_prompt" in arguments:
+        assert child.system_prompt == arguments["system_prompt"]
+        assert child.metadata["runtime_descriptor"]["config"]["child_spec"]["name"] == "summarizer"
 
-    # No child sessions should have been created.
-    assert await store.list_children(r.session_id) == []
+
+async def test_spawn_agent_with_missing_task_returns_error(store, runtime_agent):
+    registry = ToolRegistry()
+    register_spawn_agent(registry)
+    agent = await runtime_agent(model=_Scripted(responses=[_spawn_call_kwargs("tc3", {"name": "x"}),
+        LLMResponse(raw_text="parent recovered")]), store=store, registry=registry,
+        config=AgentLoopConfig(max_rounds=2))
+    result = await agent.send("go")
+    assert result.final_text == "parent recovered"
+    assert await store.list_children(agent.target.session_id) == []
 
 
-@pytest.mark.asyncio
-async def test_subagent_parent_link_recorded_when_lifecycle_linked(store: SessionStore) -> None:
-    spec = AgentSpec(
-        name="kept", system_prompt="P",
-        lifecycle=SubagentLifecycle.LINKED.value,
-    )
-    parent_llm = _Scripted(responses=[
-        LLMResponse(raw_text="parent immediate"),  # parent finishes round 1 with no tool
-    ])
-    parent_loop = StatefulAgentLoop(
-        llm=parent_llm, store=store,
-        config=AgentLoopConfig(max_rounds=1),
-    )
-    # Drive the parent once so a parent session exists in contextvars-scoped runs.
-    parent_created_sid = await parent_loop.new_session()
-    pr = await parent_loop.send("hi", session_id=parent_created_sid)
-    parent_sid = pr.session_id
-
-    # Now call run_agent_spec directly with a fresh child LLM scripted.
-    parent_loop.llm = _Scripted(responses=[LLMResponse(raw_text="child output")])
-    # Re-establish the contextvar by entering parent_loop._run_loop semantics:
-    from power_loop.core.agent_context import set_current_loop, set_session_id
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(parent_sid)
-    try:
-        child_result = await run_agent_spec(spec, "do work", parent_loop=parent_loop)
-    finally:
-        from power_loop.core.agent_context import reset_current_loop, reset_session_id
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-    assert child_result["status"] == "completed"
-    assert child_result["session_id"] is not None  # preserved (LINKED)
-    children = await store.list_children(parent_sid)
-    assert len(children) == 1
-    assert children[0].parent_session_id == parent_sid
+async def test_subagent_parent_link_recorded_when_lifecycle_linked(store, runtime_agent):
+    agent, child = await _child(runtime_agent, store, _Scripted(responses=[LLMResponse(raw_text="child output")]),
+        AgentSpec(name="kept", system_prompt="P", lifecycle=SubagentLifecycle.LINKED.value))
+    assert child["status"] == "completed"
+    children = await store.list_children(agent.target.session_id)
+    assert len(children) == 1 and children[0].session_id == child["session_id"]
     assert children[0].lifecycle is SubagentLifecycle.LINKED
 
 
-@pytest.mark.asyncio
-async def test_subagent_failure_preserves_session_even_when_ephemeral(store: SessionStore) -> None:
-    """Hit_round_limit child must NOT be deleted (EPHEMERAL only deletes on completed)."""
-    spec = AgentSpec(name="hopeless", system_prompt="P", max_rounds=1)
-
-    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent done")])
-    parent_loop = StatefulAgentLoop(
-        llm=parent_llm, store=store, config=AgentLoopConfig(max_rounds=1),
-    )
-    parent_created_sid = await parent_loop.new_session()
-    pr = await parent_loop.send("hi", session_id=parent_created_sid)
-    parent_sid = pr.session_id
-
-    # Replace LLM so child always emits tool_calls → never completes → hit_round_limit.
-    import json
-    def _toolish() -> LLMResponse:
-        return LLMResponse(
-            raw_text="",
-            tool_calls=[{
-                "id": "tcz", "type": "function",
-                "function": {"name": "spawn_agent", "arguments": json.dumps({"task": "loop"})},
-            }],
-        )
-    parent_loop.llm = _Scripted(responses=[_toolish(), LLMResponse(raw_text="after limit")])
-    # Child has no tool_registry → spawn_agent inside child returns an error string
-    # but the child loop completes that round; we instead want hit_round_limit.
-    # Simpler: spec.max_rounds=1, child LLM emits a tool_call → child hits limit.
-    parent_loop.tool_registry = None
-
-    from power_loop.core.agent_context import (
-        reset_current_loop,
-        reset_session_id,
-        set_current_loop,
-        set_session_id,
-    )
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(parent_sid)
-    try:
-        result = await run_agent_spec(spec, "go", parent_loop=parent_loop)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
+async def test_subagent_failure_preserves_session_even_when_ephemeral(store, runtime_agent):
+    _, result = await _child(runtime_agent, store, _Scripted(responses=[_spawn_call("tc", "forbidden")]),
+        AgentSpec(name="hopeless", system_prompt="P", max_rounds=1))
     assert result["status"] != "completed"
-    # Preserved for debugging despite EPHEMERAL lifecycle.
-    assert result["session_id"] is not None
-    assert await store.get_session(result["session_id"]) is not None
+    assert result["session_id"] and await store.get_session(result["session_id"]) is not None
 
 
-@pytest.mark.asyncio
-async def test_spawn_depth_rejection(store: SessionStore) -> None:
-    """When depth would exceed MAX_SPAWN_DEPTH, run_agent_spec returns rejected
-    instead of creating a child session."""
-    # Pre-create a parent chain at depth MAX_SPAWN_DEPTH so the next spawn fails.
-    sid = await store.create_session()
-    cur = sid
-    for _ in range(MAX_SPAWN_DEPTH):
-        cur = await store.create_session(parent_session_id=cur)
-    deep_parent_sid = cur  # at depth = MAX_SPAWN_DEPTH
-
-    parent_loop = StatefulAgentLoop(
-        llm=_Scripted(), store=store, config=AgentLoopConfig(max_rounds=1),
-    )
-
-    from power_loop.core.agent_context import (
-        reset_current_loop,
-        reset_session_id,
-        set_current_loop,
-        set_session_id,
-    )
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(deep_parent_sid)
-    try:
-        result = await run_agent_spec(
-            AgentSpec(name="n", system_prompt="p"),
-            "go", parent_loop=parent_loop,
-        )
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-    assert result["status"] == "rejected"
-    assert result["session_id"] is None
-    # No new sessions created beyond the chain we built.
-    assert await store.list_children(deep_parent_sid) == []
+async def test_spawn_depth_rejection(store, runtime_agent):
+    # All Runtime children use the single-level policy, including host commands.
+    from power_loop.core.agent_context import get_current_loop
+    attempts = []
+    registry = ToolRegistry()
+    async def deeper():
+        try:
+            return await run_agent_spec(AgentSpec(name="grandchild", system_prompt="G"), "go",
+                                        parent_loop=get_current_loop())
+        except ValueError as exc:
+            attempts.append(str(exc))
+            raise
+    registry.register(ToolDefinition(name="deeper", description="attempt nested delegation",
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), deeper)
+    response = LLMResponse(raw_text="", tool_calls=[{"id":"nested", "type":"function",
+        "function":{"name":"deeper", "arguments":"{}"}}])
+    _, child = await _child(runtime_agent, store, _Scripted(responses=[response, LLMResponse(raw_text="recovered")]),
+        AgentSpec(name="child", system_prompt="C", lifecycle="linked"), registry=registry)
+    assert attempts == ["execution_role_forbids_subagent"]
+    assert await store.list_children(child["session_id"]) == []
 
 
 def test_spawn_agent_outside_loop_returns_clear_error() -> None:
@@ -359,178 +254,60 @@ def test_spawn_agent_outside_loop_returns_clear_error() -> None:
     assert "must be invoked from inside" in out
 
 
-@pytest.mark.asyncio
-async def test_subagent_empty_final_text_recovers_last_assistant_text(store: SessionStore) -> None:
-    """A child that "spoke" via tools and then went permanently blank still returns its
-    real content, via TWO chained defenses:
-      1. pipeline layer: an empty turn (no text, no tool call) is a provider hiccup, so it
-         is retried up to _EMPTY_RESPONSE_MAX_RETRIES rounds instead of completing at "".
-      2. subagent layer: once retries are exhausted and final_text is genuinely still "",
-         the fallback recovers the last non-empty assistant text from the transcript
-         before the ephemeral cleanup deletes it.
-    So the child must stay blank past the retry cap for the transcript fallback to engage."""
+async def test_subagent_empty_final_text_recovers_last_assistant_text(store, runtime_agent):
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
-    spec = AgentSpec(name="quiet", system_prompt="P", max_rounds=5)
-
-    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent done")])
-    parent_loop = StatefulAgentLoop(
-        llm=parent_llm, store=store, tool_registry=reg,
-        config=AgentLoopConfig(max_rounds=1),
-    )
-    parent_created_sid = await parent_loop.new_session()
-    pr = await parent_loop.send("hi", session_id=parent_created_sid)
-    parent_sid = pr.session_id
-
-    # Child: round 0 = meaningful text + a tool call; rounds 1..4 = blank. The blanks exhaust
-    # the pipeline's empty-retry budget (3), so round 4 finally completes with final_text="" —
-    # and the subagent fallback then recovers "the real review findings" from the transcript.
-    # max_rounds=5 leaves room for round 0 + four blank rounds without hitting the round cap.
-    parent_loop.llm = _Scripted(responses=[
-        LLMResponse(raw_text="the real review findings", tool_calls=[{
-            "id": "c1", "type": "function",
-            "function": {"name": "echo", "arguments": "{}"},
-        }]),
-        LLMResponse(raw_text=""),
-        LLMResponse(raw_text=""),
-        LLMResponse(raw_text=""),
-        LLMResponse(raw_text=""),
-    ])
-    from power_loop.core.agent_context import (
-        reset_current_loop,
-        reset_session_id,
-        set_current_loop,
-        set_session_id,
-    )
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(parent_sid)
-    try:
-        child_result = await run_agent_spec(spec, "review this", parent_loop=parent_loop)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-    assert child_result["status"] == "completed"
-    assert child_result["final_text"] == "the real review findings"
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
+    model = _Scripted(responses=[LLMResponse(raw_text="the real review findings", tool_calls=[{
+        "id":"c1", "type":"function", "function":{"name":"echo", "arguments":"{}"}}]),
+        *[LLMResponse(raw_text="") for _ in range(4)]])
+    _, child = await _child(runtime_agent, store, model, AgentSpec(name="quiet", system_prompt="P", max_rounds=5), registry=reg)
+    assert child["status"] == "completed"
+    assert child["final_text"] == "the real review findings"
 
 
-@pytest.mark.asyncio
-async def test_subagent_inherits_parent_retry_policy(store: SessionStore) -> None:
-    """The child loop must inherit the parent's retry_policy: without it a single
-    transient transport error (stale pooled connection → httpx.ReadError) on the
-    child's first LLM call kills the whole delegation."""
+async def test_subagent_unknown_model_action_is_not_replayed_and_new_call_works(store, runtime_agent):
     from power_loop import LLMRetryPolicy
-
-    spec = AgentSpec(name="resilient", system_prompt="P", max_rounds=2)
-    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent done")])
-    policy = LLMRetryPolicy(max_attempts=3, backoff_initial=0.001, backoff_max=0.002)
-    parent_loop = StatefulAgentLoop(
-        llm=parent_llm, store=store,
-        config=AgentLoopConfig(max_rounds=1, retry_policy=policy),
-    )
-    parent_created_sid = await parent_loop.new_session()
-    pr = await parent_loop.send("hi", session_id=parent_created_sid)
-    parent_sid = pr.session_id
-
-    class _FlakyOnce(_Scripted):
-        failed_once: bool = False
-
-        async def complete(self, request, *, on_chunk_delta_text=None,
-                           on_chunk_think=None, on_stream_end=None):
-            if not self.failed_once:
-                self.failed_once = True
-                raise ConnectionError()  # str() == "" like httpx.ReadError
-            return await super().complete(request)
-
-    parent_loop.llm = _FlakyOnce(responses=[LLMResponse(raw_text="child made it")])
-    from power_loop.core.agent_context import (
-        reset_current_loop,
-        reset_session_id,
-        set_current_loop,
-        set_session_id,
-    )
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(parent_sid)
-    try:
-        child_result = await run_agent_spec(spec, "go", parent_loop=parent_loop)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-    assert child_result["status"] == "completed"
-    assert child_result["final_text"] == "child made it"
+    class Flaky(_Scripted):
+        calls = 0
+        async def complete(self, request, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("supplier outcome unknown")
+            return LLMResponse(raw_text="child made it")
+    model = Flaky()
+    agent, first = await _child(runtime_agent, store, model, AgentSpec(name="resilient", system_prompt="P"),
+        config=AgentLoopConfig(retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=.001)))
+    assert first["status"] == "failed" and model.calls == 1
+    second = json.loads((await agent.send("new request")).final_text)
+    assert second["status"] == "completed" and second["final_text"] == "child made it"
+    assert model.calls == 2 and second["session_id"] != first["session_id"]
 
 
-@pytest.mark.asyncio
-async def test_run_agent_spec_llm_override_uses_another_service(store: SessionStore) -> None:
-    """6.26.0：``llm=`` 让子运行用另一个 LLM 服务（另一家供应商 / endpoint），而不只是 ``spec.model``
-    那种同一服务上的模型名覆盖。宿主的「答题子 agent」用它把模型指向后台配置的条目。"""
-    spec = AgentSpec(name="qa", system_prompt="P", lifecycle=SubagentLifecycle.EPHEMERAL.value)
-    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent immediate")])
-    parent_loop = StatefulAgentLoop(llm=parent_llm, store=store, config=AgentLoopConfig(max_rounds=1))
-    parent_sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
-
-    # 父 loop 的服务如果被用到会答「parent side」；覆盖的服务答「override side」。
-    parent_loop.llm = _Scripted(responses=[LLMResponse(raw_text="parent side")])
-    override = _Scripted(responses=[LLMResponse(raw_text="override side")])
-    from power_loop.core.agent_context import (
-        reset_current_loop,
-        reset_session_id,
-        set_current_loop,
-        set_session_id,
-    )
-    tok_loop, tok_sid = set_current_loop(parent_loop), set_session_id(parent_sid)
-    try:
-        r = await run_agent_spec(spec, "go", parent_loop=parent_loop, llm=override)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-    # 父 loop 的服务被调到的话答案会是「parent side」——final_text 本身就证明走的是覆盖的服务。
-    assert r["status"] == "completed" and r["final_text"] == "override side"
+async def test_run_agent_spec_model_binding_uses_another_service(store, runtime_agent):
+    from power_loop.runtime.jobs import JobManager
+    from power_loop.runtime.task_runtime import TaskRuntime
+    runtime = TaskRuntime(JobManager(store), tenant_id="test", principal_id="host", executor_id="fixture", boot_id="boot")
+    runtime.model_services = {"qa@1": _Scripted(responses=[LLMResponse(raw_text="override side")])}
+    _, result = await _child(runtime_agent, store, _Scripted(responses=[LLMResponse(raw_text="parent side")]),
+        AgentSpec(name="qa", system_prompt="P", metadata={"model_binding":"qa@1"}), task_runtime=runtime)
+    assert result["status"] == "completed" and result["final_text"] == "override side"
 
 
-@pytest.mark.asyncio
-async def test_subagent_inherits_parent_max_tokens(store: SessionStore) -> None:
-    """max_tokens 不传就跟父。
-
-    真实事故：子 agent 写死 3000、父是 40000，而两者用的是**同一个开了思考的模型**。
-    思考内容也算在 max_tokens 里，于是子运行整轮预算被思考吃光、正文一个字都没有 =
-    空回复；重试又是一轮空回复，最后整个子运行降级。
-    """
+async def test_subagent_inherits_parent_max_tokens(store, runtime_agent):
+    seen = []
+    class Recording(_Scripted):
+        async def complete(self, request, **kwargs):
+            seen.append(request.max_tokens)
+            return LLMResponse(raw_text="child")
     spec = AgentSpec(name="inherits", system_prompt="P", max_rounds=1)
-    assert spec.max_tokens is None, "默认应当是「跟父」，不是某个写死的小数字"
-    parent_loop = StatefulAgentLoop(
-        llm=_Scripted(responses=[LLMResponse(raw_text="parent")]), store=store,
-        config=AgentLoopConfig(max_rounds=1, max_tokens=40000),
-    )
-    sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
-    seen: dict[str, int] = {}
-
-    class _Recording(_Scripted):
-        async def complete(self, request, *, on_chunk_delta_text=None,
-                           on_chunk_think=None, on_stream_end=None):
-            seen["max_tokens"] = int(getattr(request, "max_tokens", 0) or 0)
-            return await super().complete(request)
-
-    parent_loop.llm = _Recording(responses=[LLMResponse(raw_text="child")])
-    from power_loop.core.agent_context import (
-        reset_current_loop,
-        reset_session_id,
-        set_current_loop,
-        set_session_id,
-    )
-    tok_loop, tok_sid = set_current_loop(parent_loop), set_session_id(sid)
-    try:
-        await run_agent_spec(spec, "go", parent_loop=parent_loop)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-    assert seen.get("max_tokens") == 40000
+    assert spec.max_tokens is None
+    await _child(runtime_agent, store, Recording(), spec, config=AgentLoopConfig(max_tokens=40000))
+    assert seen == [40000]
 
 
 @pytest.mark.asyncio
-async def test_think_only_round_is_not_retried_verbatim(store: SessionStore) -> None:
+async def test_think_only_round_is_not_retried_verbatim(store: SessionStore, runtime_agent) -> None:
     """只有思考、没有正文也没有工具调用 → 不当「打嗝」原样重试。
 
     输入不变，输出不会变：重试只会再烧一轮同样的预算。正确做法是改变输入——
@@ -543,17 +320,17 @@ async def test_think_only_round_is_not_retried_verbatim(store: SessionStore) -> 
         LLMResponse(raw_text="", think="想了很久但什么都没写"),   # 第 1 轮：只有思考
         LLMResponse(raw_text="这是结论"),                          # 第 2 轮：被提示后给出正文
     ])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=4))
-    sid = await loop.new_session()
-    r = await loop.send("问题", session_id=sid)
+    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(max_rounds=4))
+    sid = loop.target.session_id
+    r = await loop.send("问题")
     assert r.final_text == "这是结论"
-    rows = await store.load_active_messages(r.session_id or sid)
+    rows = await store.load_active_messages(sid)
     assert any(r0.role == "user" and _THINK_ONLY_NOTICE in str(r0.content or "") for r0 in rows), \
         "应当补一条提示改变输入，而不是原样重试"
 
 
 @pytest.mark.asyncio
-async def test_reasoning_content_is_echoed_back(store: SessionStore) -> None:
+async def test_reasoning_content_is_echoed_back(store: SessionStore, runtime_agent) -> None:
     """带过思考的 assistant 消息，**下一次请求**要把 reasoning_content 原样带回去。
 
     DeepSeek 的思考模式明确要求这一点，少了就是 400（硬错：重试同样的历史只会再错一遍），
@@ -576,9 +353,9 @@ async def test_reasoning_content_is_echoed_back(store: SessionStore) -> None:
                 "name": "echo", "arguments": '{"text":"ok"}'}}]),
         LLMResponse(raw_text="答案"),
     ])
-    loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=_echo_registry(),
+    loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(),
         config=AgentLoopConfig(max_rounds=3))
-    await loop.send("问题", session_id=await loop.new_session())
+    await loop.send("问题")
     assert len(seen) >= 2, "应当有第二次请求"
     echoed = [m for m in seen[-1]
               if m.get("role") == "assistant" and m.get("reasoning_content") == "推演过程"]
@@ -601,3 +378,13 @@ def test_store_strips_nul_bytes() -> None:
     assert _nul_safe("a\tb\nc—😀") == "a\tb\nc—😀"
     # JSON 那一路同样要干净（tool_calls / meta 都走它）
     assert "\x00" not in (_dumps({"k": "v\x00w"}) or "")
+
+
+async def test_missing_child_model_binding_is_visible_and_stops_incapable_node(store, runtime_agent):
+    agent, result = await _child(runtime_agent, store, _Scripted(),
+        AgentSpec(name="qa", system_prompt="P", metadata={"model_binding":"missing@1"}))
+    assert result["status"] == "failed" and result["error_code"] == "resource_unavailable"
+    assert "missing@1" in result["error"]
+    health = agent.runtime.status()
+    assert health["accepting"] is False
+    assert health["last_error"]["code"] == "resource_unavailable"

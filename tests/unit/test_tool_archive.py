@@ -130,8 +130,8 @@ def test_invalid_capacity(patch):
         ToolContextConfig(**patch)
 
 
-async def test_stateful_two_sends_result_cap_and_archive_between_sends():
-    from power_loop import AgentLoopConfig, StatefulAgentLoop
+async def test_stateful_two_sends_result_cap_and_archive_between_sends(runtime_agent):
+    from power_loop import AgentLoopConfig
     from power_loop._vendor.llm_client.interface import LLMResponse
     from power_loop.contracts.tools import ToolDefinition
     from power_loop.runtime.representation import ProjectedRepresentation
@@ -142,21 +142,21 @@ async def test_stateful_two_sends_result_cap_and_archive_between_sends():
         reg = ToolRegistry()
         reg.register(ToolDefinition('echo', '', pricing=Free("test_fixture")), lambda **kw: 'UNIQUE-RESULT' * 5000)
         llm = _Scripted([_tool_resp('a','echo','{}'), LLMResponse(raw_text='done'), LLMResponse(raw_text='next')])
-        loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg,
-            config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5,
+        loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5,
                 representation=ProjectedRepresentation(),
                 tool_context=ToolContextConfig(overrides={'echo': {'general': 'archive'}})))
-        sid = await loop.new_session()
-        first = await loop.send('work', session_id=sid)
+        sid = loop.target.session_id
+        first = await loop.send('work')
         assert first.status == 'completed'
         stored = next(r.content for r in await store.load_all_messages(sid) if r.role == 'tool')
         assert len(stored) == 20000 and 'chars omitted' in stored   # configurable cap, head + tail
         assert any(m.get('content') == stored for m in llm.calls[1])
-        await loop.send('continue', session_id=sid)
+        await loop.send('continue')
         text = json.dumps(llm.calls[-1], ensure_ascii=False)
         assert '（原文 recall_send(' in text and 'UNIQUE-RESULT' not in text
         assert 'done' in text
     finally:
+        await loop.aclose()
         await store.close()
 
 
@@ -199,39 +199,47 @@ async def test_original_pagination_is_lossless():
         await store.close()
 
 
-async def test_background_target_policy_and_original_delivery():
-    from power_loop.contracts.tools import ToolDefinition
-    from power_loop.runtime.background import encode_results, record_key, summarize_record
+@pytest.mark.parametrize('keep', [True, False])
+async def test_background_target_policy_and_original_delivery(tmp_path, keep):
+    from power_loop import JobRef
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.runtime.background import encode_results, load_record, summarize_record
+    from power_loop.runtime.env import RuntimeEnv
     from power_loop.runtime.tool_archive import _derive
     from power_loop.runtime.tool_context import ToolSource, active_engine
-    from power_loop.tools.registry import ToolRegistry
-    store, engine, p = await fixture({'bash': {'insend_fuse': 'truncate', 'general': 'archive'}}, n=1)
+    from tests.unit.test_tool_background_contracts_192 import start_background
+    store, engine, _ = await fixture({'bash': {'insend_fuse': 'truncate', 'general': 'archive'}}, n=1)
+    registry = create_default_tool_registry(include=['bash'], bind=False)
+    bash = registry.get('bash')
+    registry.register(replace(bash.definition, async_capable=True), bash.handler, overwrite=True)
+    runner, row = await start_background(store, registry, 'bash', {
+        'command': "printf '%05000d' 0 | tr 0 z", 'description': 'target description',
+        'context_policy': 'keep' if keep else 'retire'}, runtime_env=RuntimeEnv(workspace_dir=tmp_path))
+    engine.registry = registry
     token = active_engine.set(engine)
     try:
-        reg = ToolRegistry()
-        reg.register(ToolDefinition('bash', '', pricing=Free("test_fixture")), create_default_tool_registry(bind=False).get('bash').handler)
-        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-        reg.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS['background_run'])
-        engine.registry = reg
-        record = {'task_id': 'bg1', 'tool': 'bash', 'status': 'completed',
-                  'args': {'command': 'x' * 1500, 'description': 'target description', 'context_policy': 'keep'},
-                  'result': 'z' * 5000}
-        await store.set_runtime_state(engine.sid, record_key('bg1'), record)
+        assert row.content.startswith("{"), row.content
+        admitted = json.loads(row.content)
+        result = await runner.runtime.client.wait(JobRef(**admitted['job_ref']), actor=runner.actor,
+                                                  deadline_ms=now_ms()+10000)
+        assert result.status == 'completed'
+        record = await load_record(store, runner.target.session_id, admitted['task_id'])
         receipt = summarize_record(record)
         assert receipt['summary'] == record['result']
-        source = ToolSource(engine.sid, 1, 2, 'bg-wrapper', 'background_run', {'action': 'check'},
-                            encode_results([receipt]))
-        assert await _derive(engine, source, 'insend_fuse', 1) is None   # target keep: unchanged in-send
-        assert await _derive(engine, source, 'insend_fuse', 2) is None
-        record['args']['context_policy'] = 'retire'
-        await store.set_runtime_state(engine.sid, record_key('bg1'), record)
-        result = await _derive(engine, source, 'insend_fuse', 2)
-        assert 'target description' in result[1] and 'zzzz' not in result[1]
+        source = ToolSource(runner.target.session_id, 1, row.seq, 'bg-wrapper', 'defer_work',
+                           {'action': 'check'}, encode_results([receipt]))
+        if keep:
+            assert await _derive(engine, source, 'insend_fuse', 1) is None
+            assert await _derive(engine, source, 'insend_fuse', 2) is None
+        else:
+            derived = await _derive(engine, source, 'insend_fuse', 2)
+            assert 'target description' in derived[1] and 'zzzz' not in derived[1]
         engine.config = replace(engine.config, overrides={'bash': {'hard_preserve': True}})
-        result = await _derive(engine, source, 'general', 2)
-        assert json.loads(result[1])['targets'][0]['result'] == record['result']
+        derived = await _derive(engine, source, 'general', 2)
+        assert json.loads(derived[1])['targets'][0]['result'] == record['result']
     finally:
         active_engine.reset(token)
+        await runner.aclose()
         await store.close()
 
 
@@ -250,7 +258,7 @@ async def test_late_injection_admission_and_output_reserve():
 
 async def test_pg_projection_restart_and_raw_recall():
     import os
-    dsn = os.getenv('POWER_LOOP_TEST_PG_DSN')
+    dsn = os.getenv('POWER_LOOP_TASK_PG_DSN')
     if not dsn:
         pytest.skip('requires explicit isolated test database')
     from urllib.parse import urlparse
@@ -298,8 +306,8 @@ def test_bash_full_capture_and_required_description(tmp_path):
         dt.close_all_bash_sessions()
 
 
-async def test_pipeline_capacity_block_does_not_call_provider_again():
-    from power_loop import AgentLoopConfig, StatefulAgentLoop
+async def test_pipeline_capacity_block_does_not_call_provider_again(runtime_agent):
+    from power_loop import AgentLoopConfig
     from power_loop.contracts.tools import ToolDefinition
     from power_loop.runtime.representation import ProjectedRepresentation
     from power_loop.tools.registry import ToolRegistry
@@ -309,19 +317,19 @@ async def test_pipeline_capacity_block_does_not_call_provider_again():
         reg = ToolRegistry()
         reg.register(ToolDefinition('speech', '', pricing=Free("test_fixture")), lambda: 'SPEECH' * 10000)
         llm = _Scripted([_tool_resp('a', 'speech', '{}')])
-        loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg,
-            config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5, context_checkpoint_tokens=10,
+        loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5, context_checkpoint_tokens=10,
                 tool_result_max_chars=None,
                 representation=ProjectedRepresentation(), tool_context=ToolContextConfig(
                     trigger_tokens=1000, target_tokens=500,
                     window_tokens=5000, reserve_tokens=100, margin_tokens=100,
                     overrides={'speech': {'hard_preserve': True}})))
-        result = await loop.send('work', session_id=await loop.new_session())
-        assert result.status == 'degraded'
+        result = await loop.send('work')
+        assert result.status == 'failed'
         assert result.final_text.startswith('context capacity blocked')
         assert len(llm.calls) == 1
-        assert any(r.content == 'SPEECH' * 10000 for r in await store.load_all_messages(result.session_id))
+        assert any(r.content == 'SPEECH' * 10000 for r in await store.load_all_messages(loop.target.session_id))
     finally:
+        await loop.aclose()
         await store.close()
 
 

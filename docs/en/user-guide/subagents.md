@@ -1,130 +1,28 @@
-# Sub-Agents
+# Sub-agents and task ownership
 
-[中文](../../zh/user-guide/subagents.md) | [User Guide](../index.md)
+SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
 
-Sub-agents let the parent agent delegate tasks to specialized child agents. Each child gets its own `StatefulAgentLoop` with a custom system prompt and tool whitelist. Since 8.0, the model-facing tool is always asynchronous: `action=create` creates a child and `action=nudge` continues or steers the same child. Host code can still await `run_agent_spec` synchronously.
+[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
 
-## Two Paths
+Register spawn_agent in the factory's ToolRegistry. A model-visible create returns an accepted child reference without waiting for model execution. The child has its own session and Runtime job; completion is delivered to the parent inbox. Capacity one remains usable because waiting does not hold the only execution slot.
 
-| Path | Trigger | Control |
-|---|---|---|
-| **LLM-facing** (`spawn_agent`) | LLM calls the `spawn_agent` tool (optional `system_prompt` / `tools` / `max_rounds` overrides) | LLM decides what to delegate |
-| **Declarative** (`run_agent_spec` / `AgentSpec`) | Host code calls the Python API directly | You control system prompt, tools, model, max_rounds |
+AgentSpec selects name, system_prompt, tool allowlist, model options, round limits and optional output_schema. Validate those values before admission. Tool allowlists and depth limits apply on the child node. Model changes require the host's allowed_models declaration. Structured output is parsed and validated as a child result, not trusted solely because it looks like JSON.
 
-> Since 4.0 the former `run_agent` meta-tool is merged into `spawn_agent`: the LLM sees a single meta-tool, and hosts that need a fully declarative `AgentSpec` call `run_agent_spec()` from code.
+Use the original JobRef to inspect, wait, nudge, cancel or resume. Parent interruption does not silently cancel a healthy child; the result remains queryable. Workflow-node budgets and original owners continue across explicit resumes and do not refresh into a new root. Late child output retained in a finished node's history is not marked consumed until the node actually processes it.
 
-## Imperative: spawn_agent
+Factories reconstruct tools, workspace and hooks from stable profiles; neither a closure around a parent loop nor an old session handle is a deployment resource.
 
-```python
-from power_loop import register_spawn_agent
+## Runnable examples
 
-register_spawn_agent(registry)
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
 
-loop = StatefulAgentLoop(
-    llm=llm,
-    tool_registry=registry,
-    config=AgentLoopConfig(
-        system_prompt=(
-            "You can delegate research tasks using spawn_agent. "
-            "Use the tools whitelist to scope the child's capabilities."
-        ),
-        max_rounds=6,
-    ),
-)
-
-sid = await loop.new_session()
-result = await loop.send("Find where authentication logic is defined in this project.", session_id=sid)
-# LLM: spawn_agent(task="search for auth code", tools=["grep", "read_file", "glob"])
-# → immediate JSON receipt with session_id/run_id; completion arrives in the parent task_done inbox.
-# Hosts own idle-parent wake routing; the generic library persists the inbox without driving a host loop.
-```
-
-### Structured results: `output_schema`
-
-When the parent needs data rather than prose, it can pass `output_schema` — `{"name"?, "schema", "strict"?}`,
-a bare JSON Schema, or either one as a JSON string. The root must be `{"type": "object", ...}`.
-
-- The schema goes to the child as `AgentSpec.output_schema`: natively (`response_format: json_schema`) when the
-  model declares `supports_json_schema`, otherwise written into that request's system prompt.
-- `strict` defaults to **false** here: schemas an LLM writes rarely follow strict-mode rules (every key required,
-  no extra keys at any level), and a native provider rejects those with 400. Pass `"strict": true` for schemas
-  that do follow them.
-- The completion envelope contains final_text, execution status, usage and per-run messages/projection ranges. Validated structured data is in payload; invalid output is repaired once in the retained child, then reported as failed if still invalid.
-- `spawn_agent(action="nudge", sub_session="sess_...", message="additional input")` retains the original role, tool permissions and output contract. Each idle continuation gets a new run_id; running children receive steering.
-- `recall_send(sub_session="sess_...", source="messages", seq=37)` reads an original child record; `source="projection", ids=[lo,hi]` reads projections. Defaults are 20 records and an 8000-character total response budget. Follow returned cursors to continue.
-- `output_file="records/child.jsonl"` exports the full selection to a new workspace file without overwriting; omit character pagination. The response contains path/count, not the file body.
-- Fresh stores have identity projection IDs; old stores are not migrated and explicitly report ID lookup as unavailable.
-
-## Declarative: AgentSpec
-
-```python
-from power_loop import AgentSpec
-
-spec = AgentSpec(
-    name="researcher",
-    system_prompt="You are a code researcher. Use grep, read, and glob to find answers.",
-    tools=["grep", "read", "glob"],   # whitelist — only these tools
-    max_rounds=5,
-    max_tokens=2000,
-    temperature=0.0,
-    lifecycle="ephemeral",            # deleted on success, kept on failure for debug
-)
-
-# Direct call (no LLM involved)
-from power_loop import run_agent_spec
-result = await run_agent_spec(spec, "Find all SQL injection vulnerabilities", parent_loop=loop)
-```
-
-### AgentSpec Fields
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `name` | `str` | required | Unique name. Non-empty string. |
-| `system_prompt` | `str` | required | The child's system prompt. |
-| `tools` | `list[str] \| None` | `None` | Whitelist of tool names from the parent registry. `None` = all tools. |
-| `max_rounds` | `int` | `5` | Max LLM + tool rounds. Range: [1, 50]. |
-| `max_tokens` | `int` | `2000` | Per-request token cap. |
-| `temperature` | `float` | `0.0` | LLM temperature. |
-| `model` | `str \| None` | `None` | Override model. `None` = use parent's. |
-| `output_schema` | `dict \| None` | `None` | `{name, schema, strict?}` — the child must return one JSON object. `strict` defaults to `true`; set `false` for schemas that don't follow strict-mode rules. Helpers: `normalize_output_schema()`, `output_response_format()`. |
-| `lifecycle` | `str` | `"ephemeral"` | `"ephemeral"` / `"linked"` / `"detached"` |
-| `metadata` | `dict` | `{}` | Free-form metadata for audit. |
-
-### Validation
-
-`AgentSpec` has **strict validation**. Unknown fields, invalid lifecycle values, or out-of-range `max_rounds` raise `AgentSpecError` (a `SpecValidationError` → `PowerLoopError`):
-
-```python
-try:
-    spec = AgentSpec.from_dict({"name": "", "system_prompt": ""})
-except AgentSpecError as exc:
-    print(exc)  # "AgentSpec.name must be a non-empty string"
-```
-
-## Lifecycle
-
-| Lifecycle | Behavior |
+| Example | Behavior |
 |---|---|
-| `EPHEMERAL` (default) | Deleted on success. Preserved on failure for debugging. |
-| `LINKED` | Cascade-deleted when the parent session is closed. |
-| `DETACHED` | Independent of the parent. Survives parent close. |
+| [03_subagent_delegation.py](../../../examples/03_subagent_delegation.py) | Model delegation |
+| [06_declarative_subagent.py](../../../examples/06_declarative_subagent.py) | AgentSpec |
+| [14_structured_card.py](../../../examples/14_structured_card.py) | Structured results |
+| [27_dynamic_workflow.py](../../../examples/27_dynamic_workflow.py) | Workflow ownership |
 
-## Depth Limit
-
-`MAX_SPAWN_DEPTH = 3` is the default — sub-agents may nest up to this many levels below the root (depths 1, 2, 3 are allowed; a session at depth 4 raises). Enforced at `SessionStore.create_session()`. Override per store with `SessionStore.open(max_spawn_depth=N)` or `StatefulAgentLoop(..., max_spawn_depth=N)`.
-
-## Session Tree
-
-```mermaid
-flowchart TD
-    P["Parent Session sess_abc"] --> C1["Child researcher sess_def"]
-    P --> C2["Child reviewer sess_ghi"]
-    C1 --> GC1["Grandchild searcher sess_jkl"]
+```bash
+.venv/bin/python examples/03_subagent_delegation.py
 ```
-
-All children share the same `SessionStore` as the parent. `close_session(parent_sid, cascade=True)` recursively deletes the entire tree.
-
-## Next
-
-- [Hooks](hooks.md) — intercept tool execution
-- [Compaction](compaction.md) — auto-summarize long sessions

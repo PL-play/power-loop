@@ -427,7 +427,7 @@ Payload — `SubagentCompletedPayload`：同 `SubagentTextPayload` 字段。
 ## 3. 订阅 event
 
 ```python
-from power_loop import StatefulAgentLoop, AgentEvent, AgentEventBus, AgentEventType
+from power_loop import ExecutionEnvironment, AgentEvent, AgentEventBus, AgentEventType
 
 bus = AgentEventBus(suppress_subscriber_errors=True)
 
@@ -442,7 +442,11 @@ def on_round_usage(event: AgentEvent) -> None:
 bus.subscribe(AgentEventType.STREAM_DELTA, on_stream_delta)
 bus.subscribe(AgentEventType.STATUS_CHANGED, on_round_usage)
 
-loop = StatefulAgentLoop(llm=..., db_path="...", event_bus=bus, ...)
+# 在当前节点工厂中装配；model、registry、config 由宿主提供。
+async def build(descriptor, execution):
+    return ExecutionEnvironment(model, registry, config, event_bus=bus)
+
+factory.register("application.agent@1", build)
 ```
 
 订阅可以 sync 或 async；bus 会自动判断。

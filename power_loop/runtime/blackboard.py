@@ -8,29 +8,16 @@ differ only in **scope** (a run id vs a conversation id) and lifetime — so the
 primitive is keyed by an opaque ``board_id`` and the scope is the integrator's
 choice.
 
-Design (power-loop house style — Protocol + default impl + injectable):
-
-* :class:`Blackboard` is the async Protocol a host implements. The default
-  :class:`SqliteBlackboard` persists in the ``SessionStore``'s sqlite
-  (``session_runtime_state``), good for in-process workflow sub-agents. A host
-  whose board must outlive/span one process (e.g. a conversation-scoped board
-  across requests or machines) injects its own implementation — the same way one
-  injects a sandboxing ``ShellBackend`` for bash.
-* Entries are **append + per-entry update/remove** (never whole-document
-  overwrite), so concurrent authors don't clobber each other. Concurrency is the
-  implementation's to guarantee; the default serializes read-modify-write per
-  ``board_id``.
-* It's reached by tools (``board_*``) and an optional context injection; both
-  resolve the live board + id from :class:`~power_loop.runtime.env.RuntimeEnv`.
-
-``board_id = None`` (the default) means *no board* — most sub-agents are
-independent and should stay isolated; a board is opt-in for collaboration.
+The host selects an opaque board_id and authorizes access through RuntimeEnv.
+StoreBlackboard serializes each mutation in the database across connections and
+processes. Its owner calls delete when the board scope ends.
 """
 
 from __future__ import annotations
 
-import asyncio
-import weakref
+import json
+import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
@@ -38,7 +25,7 @@ from typing import Any, Protocol, runtime_checkable
 __all__ = [
     "BlackboardEntry",
     "Blackboard",
-    "SqliteBlackboard",
+    "StoreBlackboard",
     "BlackboardError",
     "render_entries",
     "STORE_KEY_PREFIX",
@@ -117,14 +104,12 @@ class Blackboard(Protocol):
     async def remove(self, board_id: str, entry_id: int) -> bool: ...
 
 
-class SqliteBlackboard:
-    """Default board, persisted in the ``SessionStore``'s sqlite via
-    ``session_runtime_state`` (key ``blackboard:<board_id>``).
+class StoreBlackboard:
+    """Database-atomic board. SQLite serializes writers; server stores lock the
+    unique owner/key row, including the first concurrent creation.
 
-    Read-modify-write is serialized per ``board_id`` with an ``asyncio.Lock`` —
-    safe for the in-process, single-event-loop case (workflow sub-agents sharing
-    one store). It is NOT a cross-process writer; for that, inject a host
-    implementation that funnels writes through your own single writer.
+    The host owns board_id and must scope access before exposing it to tools.
+    Call delete() when that scope ends; boards never create agent sessions.
     """
 
     def __init__(
@@ -133,20 +118,6 @@ class SqliteBlackboard:
         self._store = store
         self._max_entries = int(max_entries)
         self._max_text_len = int(max_text_len)
-        # Weak-valued so a per-run/per-conversation board_id's lock is dropped once no
-        # RMW holds it — otherwise a long-lived process driving many distinct board_ids
-        # accumulated one Lock per id forever (C24). The `async with self._lock(id)`
-        # critical section keeps a strong ref for its duration, so concurrent callers
-        # still share one lock; it is only collectible while idle.
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-
-    def _lock(self, board_id: str) -> asyncio.Lock:
-        lock = self._locks.get(board_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[board_id] = lock
-        return lock
-
     _DOC_KEY = "board"
 
     def _owner(self, board_id: str) -> str:
@@ -154,18 +125,36 @@ class SqliteBlackboard:
             raise BlackboardError("board_id is required")
         return f"{STORE_KEY_PREFIX}{board_id}"
 
-    async def _load_doc(self, board_id: str) -> dict[str, Any]:
-        # Stored in the SessionStore's `shared_state` table, owned by the
-        # board id (NOT a session — boards outlive any one agent session).
-        doc = await self._store.get_shared_state(self._owner(board_id), self._DOC_KEY, default=None)
-        if not isinstance(doc, dict) or not isinstance(doc.get("entries"), list):
-            return {"version": 1, "next_id": 1, "entries": []}
-        doc.setdefault("version", 1)
-        doc.setdefault("next_id", 1)
-        return doc
+    @staticmethod
+    def _empty():
+        return {"version": 1, "next_id": 1, "entries": []}
 
-    async def _save_doc(self, board_id: str, doc: dict[str, Any]) -> None:
-        await self._store.set_shared_state(self._owner(board_id), self._DOC_KEY, doc)
+    async def _load_doc(self, board_id):
+        return await self._store.get_shared_state(
+            self._owner(board_id), self._DOC_KEY, default=self._empty())
+
+    @asynccontextmanager
+    async def _edit(self, board_id):
+        db, table = self._store._db, self._store.t.shared_state
+        owner = self._owner(board_id)
+        async with db.transaction() as tx:
+            insert = (f"INSERT INTO {table} (owner,state_key,value_json,updated_at) VALUES (?,?,?,?) "
+                "ON DUPLICATE KEY UPDATE owner=VALUES(owner)" if db.dialect.name == "mysql" else
+                db.dialect.insert_ignore(table, ("owner", "state_key", "value_json", "updated_at")))
+            await tx.execute(insert,
+                (owner, self._DOC_KEY, json.dumps(self._empty()), int(time.time()*1000)))
+            suffix = "" if db.dialect.name == "sqlite" else " FOR UPDATE"
+            row = await tx.fetchone(f"SELECT value_json FROM {table} "
+                "WHERE owner=? AND state_key=?" + suffix, (owner, self._DOC_KEY))
+            doc = json.loads(row["value_json"])
+            yield doc
+            await tx.execute(f"UPDATE {table} SET value_json=?,updated_at=? "
+                "WHERE owner=? AND state_key=?",
+                (json.dumps(doc, ensure_ascii=False), int(time.time()*1000), owner, self._DOC_KEY))
+
+    async def delete(self, board_id):
+        """Release a board whose host-owned scope has ended."""
+        await self._store.delete_shared_state(self._owner(board_id), self._DOC_KEY)
 
     def _clean(self, text: str) -> str:
         return (text or "").strip()[: self._max_text_len]
@@ -181,8 +170,7 @@ class SqliteBlackboard:
         body = self._clean(text)
         if not body:
             raise BlackboardError("text is required")
-        async with self._lock(board_id):
-            doc = await self._load_doc(board_id)
+        async with self._edit(board_id) as doc:
             if len(doc["entries"]) >= self._max_entries:
                 raise BlackboardError(
                     f"board is full ({self._max_entries} entries); remove stale entries first"
@@ -195,7 +183,6 @@ class SqliteBlackboard:
                 created_at=now, updated_at=now,
             )
             doc["entries"].append(entry.to_dict())
-            await self._save_doc(board_id, doc)
             return entry
 
     async def update(
@@ -203,8 +190,7 @@ class SqliteBlackboard:
     ) -> BlackboardEntry:
         if text is None and status is None:
             raise BlackboardError("nothing to update: provide text and/or status")
-        async with self._lock(board_id):
-            doc = await self._load_doc(board_id)
+        async with self._edit(board_id) as doc:
             for e in doc["entries"]:
                 if int(e.get("id", -1)) == entry_id:
                     if text is not None:
@@ -215,16 +201,13 @@ class SqliteBlackboard:
                     if status is not None:
                         e["status"] = status
                     e["updated_at"] = _now_iso()
-                    await self._save_doc(board_id, doc)
                     return BlackboardEntry.from_dict(e)
             raise BlackboardError(f"no board entry with id #{entry_id}")
 
     async def remove(self, board_id: str, entry_id: int) -> bool:
-        async with self._lock(board_id):
-            doc = await self._load_doc(board_id)
+        async with self._edit(board_id) as doc:
             before = len(doc["entries"])
             doc["entries"] = [e for e in doc["entries"] if int(e.get("id", -1)) != entry_id]
             if len(doc["entries"]) == before:
                 raise BlackboardError(f"no board entry with id #{entry_id}")
-            await self._save_doc(board_id, doc)
             return True

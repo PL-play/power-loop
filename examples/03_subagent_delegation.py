@@ -1,83 +1,42 @@
-"""03 · 子代理委托 / Sub-agent delegation: parent delegates via ``spawn_agent``
-
-What you learn / 你将学到
---------------------------
-- ``register_spawn_agent`` 一行注入 ``spawn_agent`` meta-tool（4.0 起 ``run_agent`` 已并入）
-  / injects the ``spawn_agent`` meta-tool in one line (``run_agent`` merged in since 4.0)
-- 父 LLM 自主决定 ``spawn_agent`` → 自动新建子 session，跑独立的小循环
-  / parent LLM autonomously calls ``spawn_agent`` → creates child session, runs
-  independent sub-loop
-- 子结果进入父 session 的 inbox，宿主调用 ``flush_follow_ups`` 续接
-  / child result arrives in the parent's inbox; the host resumes with ``flush_follow_ups``
-- ``LINKED`` 生命周期：完成后保留子 session，可查看记录或续接原任务
-  / ``LINKED`` lifecycle: retain the child's history for inspection or continuation
-- ``store.list_children(parent_sid)`` 查看父下还存活的子 session
-  / inspect surviving child sessions under a parent
-
-Run / 运行
-----------
-    python examples/03_subagent_delegation.py
-"""
-
-from __future__ import annotations
-
+"""03 · Capacity-one parent accepts a child, finishes, and receives its result."""
 import asyncio
+import json
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import (
-    AgentLoopConfig,
-    SessionStore,
-    StatefulAgentLoop,
-    ToolRegistry,
-    register_spawn_agent,
-)
+from power_loop import JobRef, LLMResponse, LLMService, ToolRegistry, register_spawn_agent
 
 
-async def main() -> str:
+class DelegatingModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if request.system_prompt.startswith('child'):
+            return LLMResponse(raw_text='Tokyo')
+        if not any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text='', tool_calls=[{'id':'spawn','type':'function','function':{
+                'name':'spawn_agent','arguments':json.dumps({'task':'Capital of Japan?',
+                    'system_prompt':'child', 'tools':[], 'max_rounds':1})}}])
+        return LLMResponse(raw_text='Parent accepted the task.')
+
+    async def close(self):
+        pass
+
+
+async def main():
     registry = ToolRegistry()
-    register_spawn_agent(registry)        # ← 注册 spawn_agent meta-tool / registers spawn_agent
-
-    store = await SessionStore.open(":memory:")
-    try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=2048),
-            store=store,
-            tool_registry=registry,
-            config=AgentLoopConfig(
-                system_prompt=(
-                    "You are a delegating orchestrator. For any factual "
-                    "question, call the `spawn_agent` tool with a clear "
-                    "`task` description; do NOT answer from memory. After "
-                    "the sub-agent replies, summarize it in one sentence."
-                ),
-                max_rounds=5,
-                max_tokens=2048,
-                compactor=None,
-            ),
-        )
-        sid = await loop.new_session()
-        result = await loop.send(
-            "Delegate this and report back: what is the capital of Japan?",
-            session_id=sid,
-        )
-        # 接受回执后子任务仍在运行；宿主等待完成，再消费已入箱的结果。
-        # Acceptance is asynchronous: wait for the child, then consume its inbox result.
-        async with asyncio.timeout(120):
-            while any(job["kind"] == "subagent" for job in await loop.list_jobs(sid)):
-                await asyncio.sleep(0.05)
-        continued = await loop.flush_follow_ups(sid, tools=[])
-        if continued is not None:
-            result = continued
-        print(f"status        : {result.status}, rounds: {result.rounds}")
-        print(f"reply         : {result.final_text}")
-        # LINKED：完成后仍保留原子会话。
-        # LINKED: the original child session remains available after completion.
-        print(f"surviving subs: {await store.list_children(result.session_id)}")
+    register_spawn_agent(registry)
+    async with demo_runtime(DelegatingModel(), registry) as (runtime, loop, target, actor):
+        parent = await loop.send(target, 'Delegate the question', message_id='delegate', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert parent.status == 'completed'
+        rows = await runtime.store.load_all_messages(target.session_id)
+        receipt = json.loads(next(row.content for row in rows if row.tool_call_id == 'spawn'))
+        result = await runtime.client.wait(JobRef(**receipt['job_ref']), actor=actor,
+                                            deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and result.final_text == 'Tokyo'
+        print(result.final_text)
         return result.final_text
-    finally:
-        await store.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

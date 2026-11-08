@@ -1,116 +1,64 @@
-# 教程：人在回路
+# 用户输入与授权
 
-[English](../../en/tutorials/human-in-the-loop.md) | [教程](../index.md)
+SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
 
-**目标**：构建一个在执行 bash 命令前请求用户确认的 Agent——70 行。
+request_user_input 创建持久交互。通过 RuntimeClient.answer 回答对应 interaction_id 和 wait_round。TOOL_BEFORE 授权决定工具是否执行，超时或取消不能视为授权成功。
 
-**你会学到**：Async `TOOL_BEFORE` hook、`HookDirective.SKIP`、`asyncio.Queue` 集成 UI。
+以下源码可在本源码目录运行，依赖同目录的 [examples/_runtime.py](../../../examples/_runtime.py)。该辅助文件启动并关闭实际 Runtime；独立应用装配见[快速开始](../user-guide/quickstart.md)。
 
-## 核心——审批 Hook
-
-```python
-from power_loop import AgentHooks, HookPoint, HookDirective
-from power_loop.contracts.hook_contexts import ToolBeforeCtx
-
-SAFE = {"ls", "pwd", "echo", "cat", "head", "tail", "find"}
-
-async def ask_before_bash(ctx: ToolBeforeCtx) -> None:
-    if ctx.tool_name != "bash":
-        return
-    cmd = ctx.tool_args.get("command", "").strip()
-    if cmd.split()[0] in SAFE:
-        return  # 自动放行
-    approved = await your_ui_confirm(cmd)
-    if not approved:
-        ctx.output = f"[用户拒绝: {cmd!r}]"
-        ctx.directive = HookDirective.SKIP
+```bash
+.venv/bin/python examples/21_request_user_input.py
 ```
 
-## 流程
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant L as AgentLoop
-    participant H as TOOL_BEFORE Hook
-    participant Q as asyncio.Queue
-
-    U->>L: new_session()
-    U->>L: send("删除 cache.tmp", session_id=sid)
-    L->>L: LLM: bash(rm cache.tmp)
-    L->>H: TOOL_BEFORE
-    H->>Q: 放入审批请求
-    Q->>U: "允许 'rm cache.tmp'?"
-    U->>Q: yes/no
-    H-->>L: SKIP (拒绝) / CONTINUE (放行)
-    L->>U: final_text
-```
-
-Hook **真的在等**——没有轮询，没有超时。用户决定前 LLM 暂停。
-
-## 完整代码
-
 ```python
+"""21 · A paused task is answered by JobRef, interaction ID and wait round.
+
+The demo supplies an answer. A UI may use the same visible pending state and
+submit a different choice; the original input remains the query identity.
+"""
 import asyncio
-from dataclasses import dataclass, field
-from power_loop import (
-    StatefulAgentLoop, AgentLoopConfig, ToolRegistry, ToolDefinition,
-    AgentHooks, HookPoint, HookDirective,
-    create_llm_service_from_env,
-)
-from power_loop.contracts.hook_contexts import ToolBeforeCtx
+import json
+import time
 
-SAFE = {"ls", "pwd", "echo", "cat", "head", "tail", "find"}
+from _runtime import demo_runtime
 
-@dataclass
-class ApprovalRequest:
-    command: str
-    response: asyncio.Future[bool] = field(default_factory=asyncio.Future)
+from power_loop import LLMResponse, LLMService, create_default_tool_registry
 
-queue: asyncio.Queue[ApprovalRequest] = asyncio.Queue()
 
-async def ask_before_bash(ctx: ToolBeforeCtx) -> None:
-    if ctx.tool_name != "bash": return
-    cmd = ctx.tool_args.get("command", "")
-    if cmd.split()[0] in SAFE:
-        print(f"  [自动放行] {cmd}"); return
-    req = ApprovalRequest(command=cmd)
-    await queue.put(req)
-    if not await req.response:
-        ctx.output = f"[被拒绝: {cmd!r}]"; ctx.directive = HookDirective.SKIP
+class AskingModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text=next(m['content'] for m in reversed(request.messages) if m.get('role') == 'tool'))
+        return LLMResponse(raw_text='', tool_calls=[{'id':'question','type':'function','function':{
+            'name':'request_user_input','arguments':json.dumps({'kind':'choice','prompt':'Choose tone',
+                'options':[{'id':'gentle','label':'Gentle'}, {'id':'direct','label':'Direct'}]})}}])
 
-async def approval_worker():
-    while True:
-        req = await queue.get()
-        ans = input(f"  允许 '{req.command}'? [y/N]: ")
-        req.response.set_result(ans.lower().startswith("y"))
+    async def close(self):
+        pass
 
-async def main():
-    registry = ToolRegistry()
-    registry.register(
-        ToolDefinition(name="bash", description="执行 shell 命令。参数: command。",
-            input_schema={"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
-        lambda command: f"(已执行) {command}",
-    )
-    hooks = AgentHooks()
-    hooks.register(HookPoint.TOOL_BEFORE, ask_before_bash)
-    llm = create_llm_service_from_env()
-    loop = StatefulAgentLoop(
-        llm=llm, tool_registry=registry, hooks=hooks,
-        config=AgentLoopConfig(system_prompt="你有 bash 工具。安全命令自动执行，其他需确认。", max_rounds=4),
-    )
-    worker = asyncio.create_task(approval_worker())
-    try:
-        sid = await loop.new_session()
-        r = await loop.send("列出当前目录文件。", session_id=sid)
-        print(f"Bot: {r.final_text}")
-    finally:
-        worker.cancel(); loop.close()
 
-asyncio.run(main())
+async def main(answers=None):
+    registry = create_default_tool_registry(include=['request_user_input'])
+    async with demo_runtime(AskingModel(), registry) as (runtime, loop, target, actor):
+        receipt = await runtime.client.send(target, 'Ask for a tone', message_id='question', actor=actor)
+        async with asyncio.timeout(10):
+            while True:
+                status = await runtime.client.inspect(receipt.input_ref, actor=actor)
+                if status.state == 'waiting_input':
+                    break
+                await asyncio.sleep(.02)
+        pending = (await runtime.store.get_state(target.session_id)).pending
+        interaction = pending['pending_interactions'][0]
+        await runtime.client.answer(status.job_ref, interaction_id=interaction['interaction_id'],
+            wait_round=pending['round_index'], value={'choice':(answers or ['gentle'])[0]}, message_id='answer', actor=actor)
+        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        print(result.final_text)
+        return result.final_text
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
 ```
 
-## 下一步
-
-- [多 Agent 系统](multi-agent.md) — 委托给子代理
-- [工具用户手册](../user-guide/tools.md) — 完整工具系统参考
+[hooks](../user-guide/hooks.md) · [API](../api/index.md)

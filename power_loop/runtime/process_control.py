@@ -79,8 +79,7 @@ class BoundShellControl(ShellProcessControl):
             return ShellControlResult(False, 'original_target_control_unavailable')
 
 
-def bind_shell_control(backend, workspace_dir, *, argv, cwd, env) -> ShellProcessControl:
-    factory = getattr(backend, 'bind_process_control', None)
+def bind_shell_control(backend, workspace_dir, *, argv, cwd, env, factory=None) -> ShellProcessControl:
     control = (factory(workspace_dir, argv=tuple(argv), cwd=cwd, env=dict(env))
                if factory else BoundShellControl(argv, cwd, env))
     if not isinstance(control, ShellProcessControl):

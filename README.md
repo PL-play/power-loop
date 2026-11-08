@@ -12,6 +12,7 @@ P7 delivery report for the full regression status.
 
 - [Current API and startup guide](docs/runtime-11.md)
 - [Runnable single-process example](examples/design203_single_process.py)
+- [Runnable default timers](examples/26_timers.py)
 - [Changelog](CHANGELOG.md)
 - [Authoritative stable exports](power_loop/__init__.py)
 - [中文](README.zh.md)
@@ -25,3 +26,8 @@ resources in its registered `RuntimeFactory`.
 An acceptance receipt is not completion: wait for its original `InputRef`.
 Normal authorization, accounting, context and cleanup remain required. Failures
 may leave interrupted/unknown results; unknown external actions are not replayed.
+
+Finite child waits use `WaitPolicy` and `register_wait_handoff_tool`: the factory
+sets a deadline, the child releases capacity, and its original main explicitly
+continues, defers or cancels the same task. Configure the timer backend/driver in
+the Runtime; see [the contract and assembly](docs/runtime-11.md#finite-child-review).

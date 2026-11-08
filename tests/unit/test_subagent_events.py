@@ -14,22 +14,15 @@ All four carry ``source="subagent"`` and are attributed to the parent session.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, AgentSpec, SessionStore
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
-from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.contracts.events import AgentEventType
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.core.agent_context import (
-    reset_current_loop,
-    reset_session_id,
-    set_current_loop,
-    set_session_id,
-)
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import SUBAGENT_EVENT_SOURCE, run_agent_spec
 from power_loop.tools.registry import ToolRegistry
@@ -67,90 +60,47 @@ async def store() -> AsyncIterator[SessionStore]:
     await s.close()
 
 
-def _collect(loop: StatefulAgentLoop) -> tuple[list[AgentEvent], Callable[[AgentEventType], list[AgentEvent]]]:
-    events: list[AgentEvent] = []
-    loop.event_bus.subscribe(None, events.append)
-    return events, lambda t: [e for e in events if e.type == t]
+async def _run_child(runtime_agent, store, model, spec, *, bus=None, registry=None):
+    from power_loop.core.agent_context import get_current_loop
+    reg = registry or ToolRegistry()
+    async def delegate():
+        return await run_agent_spec(spec, "do work", parent_loop=get_current_loop())
+    reg.register(ToolDefinition(name="delegate", description="delegate",
+        input_schema={"type":"object", "properties":{}}, pricing=Free("test_fixture")), delegate)
+    agent = await runtime_agent(model=model, store=store, registry=reg, event_bus=bus,
+        config=AgentLoopConfig(compactor=None), command=("delegate", {}))
+    result = await agent.send("go")
+    assert result.status == "completed", result
+    await agent.drain()
+    return agent, json.loads(result.final_text)
 
 
-async def _run_child(parent_loop: StatefulAgentLoop, parent_sid: str, spec: AgentSpec,
-                     user_input: str) -> dict[str, Any]:
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(parent_sid)
-    try:
-        return await run_agent_spec(spec, user_input, parent_loop=parent_loop)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-
-async def test_completed_subagent_emits_start_text_completed(store: SessionStore) -> None:
-    parent_loop = StatefulAgentLoop(
-        llm=_Scripted(responses=[LLMResponse(raw_text="parent", content_text="parent")]),
-        store=store, config=AgentLoopConfig(max_rounds=1),
-    )
-    parent_sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
-    events, of_type = _collect(parent_loop)
-
-    parent_loop.llm = _Scripted(responses=[LLMResponse(raw_text="child out", content_text="child out")])
-    result = await _run_child(parent_loop, parent_sid, AgentSpec(name="c", system_prompt="P"), "do work")
-    assert result["status"] == "completed"
-
-    starts = of_type(AgentEventType.SUBAGENT_TASK_START)
-    texts = of_type(AgentEventType.SUBAGENT_TEXT)
-    dones = of_type(AgentEventType.SUBAGENT_COMPLETED)
-    assert len(starts) == 1 and len(texts) == 1 and len(dones) == 1
-    assert not of_type(AgentEventType.SUBAGENT_LIMIT)  # only on round-limit
-
-    # source + attribution
-    for e in starts + texts + dones:
-        assert e.source == SUBAGENT_EVENT_SOURCE
-        assert e.session_id == parent_sid
-    # payload fields wired
-    assert starts[0].data.task == "do work"
-    sub_sid = starts[0].data.sub_session_id
-    assert sub_sid and texts[0].data.sub_session_id == sub_sid == dones[0].data.sub_session_id
-    assert texts[0].data.final_text == "child out"
-    assert dones[0].data.status == "completed"
-
-    # ordering: START before COMPLETED
-    types_in_order = [e.type for e in events
-                      if e.type.value.startswith("subagent") and e.source == SUBAGENT_EVENT_SOURCE]
-    assert types_in_order[0] == AgentEventType.SUBAGENT_TASK_START
-    assert types_in_order[-1] == AgentEventType.SUBAGENT_COMPLETED
-
-
-async def test_round_limited_subagent_emits_limit_not_text(store: SessionStore) -> None:
-    parent_loop = StatefulAgentLoop(
-        llm=_Scripted(responses=[LLMResponse(raw_text="parent", content_text="parent")]),
-        store=store, config=AgentLoopConfig(max_rounds=1),
-    )
-    parent_sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
-    _, of_type = _collect(parent_loop)
-
-    # Child calls a resolvable tool every round so rounds are exhausted cleanly
-    # (rather than ending mid tool-call as pending_tools) → hit_round_limit.
+@pytest.mark.parametrize("limited", [False, True])
+async def test_child_lifecycle_events_keep_parent_attribution_and_order(store, runtime_agent, limited):
+    from power_loop import AgentEventBus
+    bus = AgentEventBus()
+    events = []
+    bus.subscribe(None, events.append)
     reg = ToolRegistry()
-    reg.register(
-        ToolDefinition(name="echo", description="echo", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
-        lambda **kw: "echoed",
-    )
-    parent_loop.tool_registry = reg
-
-    def _toolish() -> LLMResponse:
-        return LLMResponse(raw_text="", tool_calls=[{
-            "id": "tc", "type": "function",
-            "function": {"name": "echo", "arguments": json.dumps({})}}])
-
-    parent_loop.llm = _Scripted(responses=[_toolish(), _toolish(), _toolish()])
-    result = await _run_child(parent_loop, parent_sid,
-                              AgentSpec(name="hopeless", system_prompt="P", max_rounds=2), "go")
-    assert result["status"] == "hit_round_limit"
-
-    assert len(of_type(AgentEventType.SUBAGENT_TASK_START)) == 1
-    assert len(of_type(AgentEventType.SUBAGENT_LIMIT)) == 1
-    assert not of_type(AgentEventType.SUBAGENT_TEXT)  # no answer was produced
-    assert len(of_type(AgentEventType.SUBAGENT_COMPLETED)) == 1
-    limit = of_type(AgentEventType.SUBAGENT_LIMIT)[0]
-    assert limit.source == SUBAGENT_EVENT_SOURCE
-    assert limit.data.max_rounds == 2
+    reg.register(ToolDefinition(name="echo", description="echo",
+        input_schema={"type":"object", "properties":{}}, pricing=Free("test_fixture")), lambda **kw: "echoed")
+    responses = [LLMResponse(raw_text="child out")]
+    if limited:
+        responses = [LLMResponse(raw_text="", tool_calls=[{"id":f"tc{i}", "type":"function",
+            "function":{"name":"echo", "arguments":"{}"}}]) for i in range(2)]
+    agent, result = await _run_child(runtime_agent, store, _Scripted(responses=responses),
+        AgentSpec(name="c", system_prompt="P", max_rounds=2), bus=bus, registry=reg)
+    assert result["status"] == ("interrupted" if limited else "completed")
+    child_events = [e for e in events if e.type.value.startswith("subagent")]
+    expected = [AgentEventType.SUBAGENT_TASK_START,
+        AgentEventType.SUBAGENT_LIMIT if limited else AgentEventType.SUBAGENT_TEXT,
+        AgentEventType.SUBAGENT_COMPLETED]
+    assert [e.type for e in child_events] == expected
+    assert all(e.source == SUBAGENT_EVENT_SOURCE and e.session_id == agent.target.session_id for e in child_events)
+    assert all(e.data.sub_session_id == result["session_id"] for e in child_events)
+    assert child_events[0].data.task == "do work" and child_events[0].data.depth == 1
+    if limited:
+        assert child_events[1].data.max_rounds == 2
+    else:
+        assert child_events[1].data.final_text == "child out"
+        assert child_events[-1].data.status == "completed"

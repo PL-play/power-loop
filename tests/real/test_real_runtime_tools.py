@@ -6,7 +6,6 @@ from power_loop import (
     AgentLoopConfig,
     RuntimeProjector,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
     create_default_tool_registry,
@@ -27,10 +26,19 @@ class _RealCustomProjector(RuntimeProjector):
 
 
 @pytest.mark.asyncio
-async def test_real_llm_sees_sqlite_runtime_state(tmp_path) -> None:
+async def test_real_llm_sees_sqlite_runtime_state(tmp_path, runtime_agent) -> None:
     store = await SessionStore.open(tmp_path / "runtime.db")
     try:
-        sid = await store.create_session()
+        loop = await runtime_agent(model=make_llm(max_tokens=256, temperature=0.0), store=store, config=AgentLoopConfig(
+                system_prompt=(
+                    "You are a runtime-state verifier. If runtime messages contain "
+                    "RUNTIME_SQLITE_TODO_42 and BG_RUNTIME_DONE_42, reply with exactly: "
+                    "RUNTIME_STATE_VISIBLE"
+                ),
+                max_rounds=1,
+                compactor=None,
+            ))
+        sid = loop.target.session_id
         await store.set_runtime_state(
             sid,
             "todo",
@@ -48,39 +56,21 @@ async def test_real_llm_sees_sqlite_runtime_state(tmp_path) -> None:
             return_code=0,
             output_tail="BG_RUNTIME_DONE_42",
         )
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0.0),
-            store=store,
-            config=AgentLoopConfig(
-                system_prompt=(
-                    "You are a runtime-state verifier. If runtime messages contain "
-                    "RUNTIME_SQLITE_TODO_42 and BG_RUNTIME_DONE_42, reply with exactly: "
-                    "RUNTIME_STATE_VISIBLE"
-                ),
-                max_rounds=1,
-                compactor=None,
-            ),
-        )
-        result = await loop.send(
-            "Inspect the runtime messages provided to you and follow the system instruction.",
-            session_id=sid,
-        )
+
+        result = await loop.send("Inspect the runtime messages provided to you and follow the system instruction.")
         if "RUNTIME_STATE_VISIBLE" not in result.final_text:
             assert "RUNTIME_SQLITE_TODO_42" in result.final_text
             assert "BG_RUNTIME_DONE_42" in result.final_text
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_real_llm_todo_tool_persists_to_sqlite(tmp_path) -> None:
+async def test_real_llm_todo_tool_persists_to_sqlite(tmp_path, runtime_agent) -> None:
     store = await SessionStore.open(tmp_path / "todo.db")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0.0),
-            store=store,
-            tool_registry=create_default_tool_registry(include=["todo"]),
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=make_llm(max_tokens=512, temperature=0.0), store=store, registry=create_default_tool_registry(include=["todo"]), config=AgentLoopConfig(
                 system_prompt=(
                     "You must use the todo tool when the user asks you to create a todo. "
                     "Create exactly one todo item with id 'real' and text 'REAL_LLM_SQLITE_TODO'. "
@@ -88,19 +78,19 @@ async def test_real_llm_todo_tool_persists_to_sqlite(tmp_path) -> None:
                 ),
                 max_rounds=4,
                 compactor=None,
-            ),
-        )
-        sid = await loop.new_session()
-        result = await loop.send("Create the todo now using the todo tool.", session_id=sid)
+            ))
+        sid = loop.target.session_id
+        result = await loop.send("Create the todo now using the todo tool.")
         todo_state = await store.get_runtime_state(sid, "todo", default={}) or {}
         rendered = str(todo_state.get("rendered", ""))
         assert "REAL_LLM_SQLITE_TODO" in rendered, result.final_text
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path) -> None:
+async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path, runtime_agent) -> None:
     store = await SessionStore.open(tmp_path / "custom-tool.db")
     try:
         registry = ToolRegistry()
@@ -123,11 +113,7 @@ async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path) -> Non
             pricing=Free("test_fixture")),
             save_runtime_marker,
         )
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0.0),
-            store=store,
-            tool_registry=registry,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=make_llm(max_tokens=512, temperature=0.0), store=store, registry=registry, config=AgentLoopConfig(
                 system_prompt=(
                     "You must call save_runtime_marker with marker='REAL_CUSTOM_RUNTIME_42'. "
                     "After the tool result is returned, answer briefly."
@@ -135,19 +121,19 @@ async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path) -> Non
                 max_rounds=4,
                 compactor=None,
                 runtime_projectors=(_RealCustomProjector(),),
-            ),
-        )
-        sid = await loop.new_session()
-        result = await loop.send("Save the runtime marker using the tool now.", session_id=sid)
+            ))
+        sid = loop.target.session_id
+        result = await loop.send("Save the runtime marker using the tool now.")
 
         state = await store.get_runtime_state(sid, "real_custom", default={}) or {}
         assert state.get("marker") == "REAL_CUSTOM_RUNTIME_42", result.final_text
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path) -> None:
+async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path, runtime_agent) -> None:
     store = await SessionStore.open(tmp_path / "custom-projector.db")
     try:
         registry = ToolRegistry()
@@ -170,11 +156,7 @@ async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path) -> None
             pricing=Free("test_fixture")),
             save_runtime_marker,
         )
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0.0),
-            store=store,
-            tool_registry=registry,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=make_llm(max_tokens=512, temperature=0.0), store=store, registry=registry, config=AgentLoopConfig(
                 system_prompt=(
                     "First call save_runtime_marker with marker='REAL_PROJECTOR_VISIBLE_42'. "
                     "On the next round, if you see REAL_PROJECTOR_VISIBLE_42 in runtime state, "
@@ -183,12 +165,11 @@ async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path) -> None
                 max_rounds=4,
                 compactor=None,
                 runtime_projectors=(_RealCustomProjector(),),
-            ),
-        )
-        sid = await loop.new_session()
-        result = await loop.send("Run the custom runtime flow.", session_id=sid)
+            ))
+        result = await loop.send("Run the custom runtime flow.")
 
         if "CUSTOM_PROJECTOR_VISIBLE" not in result.final_text:
             assert "REAL_PROJECTOR_VISIBLE_42" in result.final_text
     finally:
+        await loop.aclose()
         await store.close()

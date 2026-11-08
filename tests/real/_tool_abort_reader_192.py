@@ -16,7 +16,7 @@ def forbidden(*args, **kwargs):
 async def main():
     socket.create_connection = forbidden
     socket.socket.connect = forbidden
-    store = await SessionStore.open(sys.argv[1], schema='compatible')
+    store = await SessionStore.open(sys.argv[1], schema="verify")
     try:
         manager = JobManager(store)
         actor = JobActor(**json.loads(sys.argv[2]))

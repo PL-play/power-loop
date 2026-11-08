@@ -1,47 +1,21 @@
-"""10 · 并发会话 + 异步审批队列 / Concurrent sessions + async approval queue
-
-What you learn / 你将学到
---------------------------
-- 一个 ``StatefulAgentLoop`` 实例**并发驱动多个 session**（每 session 一把
-  ``asyncio.Lock``，互不阻塞）
-  / a single ``StatefulAgentLoop`` instance **concurrently drives multiple sessions**
-  (one ``asyncio.Lock`` per session, no mutual blocking)
-- 用 ``asyncio.Queue`` 把工具审批从 hook 异步派发出去，由一个独立 worker
-  消费 → 模拟生产里 "UI 等用户点击"，多个 session 并行排队
-  / uses ``asyncio.Queue`` to dispatch tool approvals from hooks to an independent
-  worker → simulates "UI waits for user click" in production, multiple sessions queue in parallel
-- 拒绝路径仍走 ``HookDirective.SKIP``——同 example 07
-  / denial path still uses ``HookDirective.SKIP`` — same as example 07
-- 关键：审批 worker 决定速度，主循环**真的会等**，没有 timeout / 轮询
-  / key point: the approval worker decides the pace; the main loop **actually waits** — no timeout / polling
-
-适用场景 / Use cases
----------------------
-- 在线 Web 服务里多个用户同时聊天，每个的危险命令都要本人确认
-  / multiple users chatting simultaneously in a web service, each user's dangerous commands require their own confirmation
-- CLI / IDE 插件里只有一个用户界面，但后台跑多个 session
-  / CLI / IDE plugins with a single UI but multiple background sessions
-
-Run / 运行
-----------
-    python examples/10_concurrent_sessions.py
-"""
-
+"""10 · Three Runtime sessions and an independent asynchronous approval queue."""
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
 from power_loop import (
     AgentHooks,
-    AgentLoopConfig,
     HookDirective,
     HookPoint,
-    StatefulAgentLoop,
+    LLMResponse,
+    LLMService,
+    RuntimeDescriptor,
     ToolDefinition,
     ToolRegistry,
 )
@@ -156,61 +130,45 @@ async def approval_worker(
 # ── 4. 三个 session 并发跑 / Run three sessions concurrently ─────────────
 
 
-async def drive_session(
-    loop: StatefulAgentLoop,
-    label: str,
-    user_input: str,
-) -> dict[str, Any]:
-    sid = await loop.new_session(metadata={"label": label})
-    r = await loop.send(user_input, session_id=sid)
-    print(f"[{label}] done: status={r.status}, rounds={r.rounds}")
-    return {"label": label, "sid": r.session_id, "text": r.final_text}
+class CommandModel(LLMService):
+    async def complete(self, request, **kwargs):
+        outputs = [m['content'] for m in request.messages if m['role']=='tool']
+        if outputs:
+            return LLMResponse(raw_text=outputs[-1])
+        command = next(m['content'] for m in request.messages if m['role']=='user')
+        return LLMResponse(raw_text='', tool_calls=[{'id':'command','type':'function','function':{
+            'name':'bash','arguments':json.dumps({'command':command})}}])
+
+    async def close(self):
+        pass
 
 
-async def main() -> list[dict[str, Any]]:
-    queue: asyncio.Queue[ApprovalQueueItem] = asyncio.Queue()
+async def drive_session(runtime, loop, actor, label, command):
+    target = await runtime.open_session(RuntimeDescriptor(1,'agent','example@1',None,
+        'example.tools@1','builtin.none@1','builtin.none@1',{},{}), actor=actor)
+    result = await loop.send(target, command, message_id=label, actor=actor,
+                             deadline_ms=int(time.time()*1000)+10000)
+    assert result.status == 'completed'
+    return {'label':label, 'sid':target.session_id, 'text':result.final_text}
 
+
+async def main():
+    queue = asyncio.Queue()
     registry = ToolRegistry()
     registry.register(BASH_TOOL, fake_bash)
-
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=300, temperature=0),
-        db_path=":memory:",
-        tool_registry=registry,
-        hooks=build_approval_hook(queue),
-        config=AgentLoopConfig(
-            system_prompt=(
-                "You have a `bash` tool (param: `command`). Call it for any "
-                "shell action the user asks. If a tool call is denied, "
-                "summarize what failed and stop — do NOT retry."
-            ),
-            max_rounds=4,
-            compactor=None,
-        ),
-    )
-
-    # 决策策略：包含 'rm' 的命令一律拒绝，其它批准
-    # Decision policy: deny commands containing 'rm', approve everything else
-    def decide(cmd: str) -> bool:
-        return "rm" not in cmd
-
-    # 启动 worker 与三个 session 并行
-    # Start worker and three sessions in parallel
-    worker = asyncio.create_task(approval_worker(queue, decide=decide))
-    results = await asyncio.gather(
-        drive_session(loop, "S1", "List the project files."),
-        drive_session(loop, "S2", "Delete the file named cache.tmp."),
-        drive_session(loop, "S3",
-                       "Print the current working directory using bash."),
-    )
-    # 所有 session 跑完才停 worker，避免 "session 还没到 gate 就关 worker" 的 race
-    # Stop worker only after all sessions finish — avoids race where worker shuts down before a session reaches the gate
-    await queue.put(_STOP)
-    handled = await worker
-    print(f"\n[worker] handled {handled} approval request(s)")
-    print(f"[sessions] {len(results)} sessions completed")
-    return list(results)
+    approval = asyncio.create_task(approval_worker(queue, decide=lambda command: 'rm' not in command))
+    try:
+        async with demo_runtime(CommandModel(), registry, hooks=build_approval_hook(queue), capacity=3) as (runtime, loop, target, actor):
+            results = await asyncio.gather(*(drive_session(runtime, loop, actor, f'session-{i}', command)
+                for i, command in enumerate(['ls', 'rm cache.tmp', 'pwd'])))
+            assert len({result['sid'] for result in results}) == 3
+            assert 'denied' in results[1]['text']
+            print(results)
+            return results
+    finally:
+        await queue.put(_STOP)
+        await approval
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

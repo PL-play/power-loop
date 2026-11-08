@@ -1,8 +1,6 @@
-"""H2.9: import every examples/NN_*.py so a public-API rename breaks CI per-PR.
+"""Import all numbered examples, including the live provider example.
 
-This only IMPORTS each example (executing its top-level imports + definitions) — it
-does not run main(), which needs a live model. Semantic validation stays in the
-nightly real-LLM suite (tests/real/test_examples.py).
+Execution and behavior assertions are in test_examples_run_208.py.
 """
 
 from __future__ import annotations

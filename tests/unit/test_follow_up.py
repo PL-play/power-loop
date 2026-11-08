@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, FollowUpQueued, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.follow_up import (
     FOLLOW_UP_MESSAGE_NAME,
@@ -107,7 +107,7 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 @pytest.mark.asyncio
-async def test_no_tools_drained_round_emits_round_completed(store: SessionStore) -> None:
+async def test_no_tools_drained_round_emits_round_completed(store: SessionStore, runtime_agent) -> None:
     # pipeline-runner-3: a no-tools round that drains a queued follow-up (instead of completing)
     # must still close itself in the event stream — emit ROUND_COMPLETED + per-round usage — before
     # steering reopens the loop. Pre-fix the drained round was left unterminated.
@@ -120,12 +120,11 @@ async def test_no_tools_drained_round_emits_round_completed(store: SessionStore)
         LLMResponse(raw_text="thinking, no tools"),   # round 0: NO tool calls
         LLMResponse(raw_text="done after steering"),  # round 1: after the drained follow-up
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, event_bus=bus,
+    loop = await runtime_agent(
+        model=llm, store=store, event_bus=bus,
         config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
     )
-    sid = await loop.new_session()
-    send_task = asyncio.create_task(loop.send("start", sid))
+    send_task = asyncio.create_task(loop.send("start"))
     # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
     # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
     # window where steering queued here is drained into round 0 instead of round 1 — delivered,
@@ -138,7 +137,7 @@ async def test_no_tools_drained_round_emits_round_completed(store: SessionStore)
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    await loop.follow_up("steer me", sid)  # queued while round 0's LLM call is gated
+    await loop.runtime.client.append(loop.target, "steer me", message_id="steer me", actor=loop.actor)  # queued while round 0's LLM call is gated
     llm.release_first.set()
     result = await send_task
     assert result.status == "completed"
@@ -147,21 +146,21 @@ async def test_no_tools_drained_round_emits_round_completed(store: SessionStore)
 
 
 @pytest.mark.asyncio
-async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> None:
+async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore, runtime_agent) -> None:
     llm = _GateLLM(
         responses=[
             _tool_resp("c1", "echo", '{"text":"step1"}'),
             LLMResponse(raw_text="merged steering applied"),
         ]
     )
-    loop = StatefulAgentLoop(
-        llm=llm,
+    loop = await runtime_agent(
+        model=llm,
         store=store,
         config=AgentLoopConfig(system_prompt="S", max_rounds=4),
-        tool_registry=_echo_registry(),
+        registry=_echo_registry(),
     )
-    sid = await loop.new_session()
-    send_task = asyncio.create_task(loop.send("start", sid))
+    sid = loop.target.session_id
+    send_task = asyncio.create_task(loop.send("start"))
 
     # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
     # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
@@ -175,12 +174,10 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> N
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    first = await loop.follow_up("focus on feelings", sid)
-    second = await loop.follow_up("keep it short", sid)
-    assert isinstance(first, FollowUpQueued)
-    assert isinstance(second, FollowUpQueued)
-    assert first.queue_depth == 1
-    assert second.queue_depth == 2
+    first = await loop.runtime.client.append(loop.target, "focus on feelings", message_id="focus on feelings", actor=loop.actor)
+    second = await loop.runtime.client.append(loop.target, "keep it short", message_id="keep it short", actor=loop.actor)
+    assert first.state == second.state == "accepted"
+    assert first.input_ref != second.input_ref
 
     llm.release_first.set()
     result = await send_task
@@ -206,7 +203,7 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> N
 
 
 @pytest.mark.asyncio
-async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStore) -> None:
+async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStore, runtime_agent) -> None:
     """A break-deciding ROUND_START hook (host pass_turn pattern) must observe steering
     drained at the same boundary and be able to withdraw the break. Pre-3.18 the drain ran
     AFTER the hooks, so a BREAK silently stranded the queued input (conv-117 incident)."""
@@ -218,11 +215,11 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
             LLMResponse(raw_text="answered the steering"),   # round 1: runs only if un-broken
         ]
     )
-    loop = StatefulAgentLoop(
-        llm=llm,
+    loop = await runtime_agent(
+        model=llm,
         store=store,
         config=AgentLoopConfig(system_prompt="S", max_rounds=4),
-        tool_registry=_echo_registry(),
+        registry=_echo_registry(),
     )
     seen: list[int] = []
 
@@ -235,8 +232,8 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
                 ctx.directive = HookDirective.BREAK
 
     loop.hooks.register(HookPoint.ROUND_START, _pass_turn_like)
-    sid = await loop.new_session()
-    send_task = asyncio.create_task(loop.send("start", sid))
+    sid = loop.target.session_id
+    send_task = asyncio.create_task(loop.send("start"))
     # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
     # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
     # window where steering queued here is drained into round 0 instead of round 1 — delivered,
@@ -249,8 +246,8 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    queued = await loop.follow_up("please reply to the card", sid)
-    assert isinstance(queued, FollowUpQueued)
+    queued = await loop.runtime.client.append(loop.target, "please reply to the card", message_id="please reply to the card", actor=loop.actor)
+    assert queued.state == "accepted"
     llm.release_first.set()
     result = await send_task
     # The hook saw the drained steering (1) and withdrew the break → round 1 ran.
@@ -258,7 +255,7 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
     assert result.status == "completed"
     assert "answered the steering" in (result.final_text or "")
     # Nothing left stranded.
-    assert loop.pending_follow_up_count(sid) == 0
+    assert await store._db.fetchall(f"SELECT id FROM {loop.runtime.worker.inputs.q} WHERE session_id=? AND status='pending'", (sid,)) == []
     # The steering text actually reached the LLM.
     assert any(
         "please reply to the card" in str(m.get("content") or "")
@@ -267,61 +264,39 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
 
 
 @pytest.mark.asyncio
-async def test_flush_follow_ups_runs_stranded_queue(store: SessionStore) -> None:
-    """Steering accepted in a run's terminal window stays queued on the idle session;
-    the host detects it via pending_follow_up_count and flushes it as a fresh send."""
+async def test_idle_append_is_driven_without_host_flush_and_original_id_deduplicates(store, runtime_agent):
+    from power_loop.agent.runtime_store import now_ms
     llm = _GateLLM(responses=[LLMResponse(raw_text="handled stranded steering")])
-    llm.release_first.set()  # no gating needed here
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
-    )
-    sid = await loop.new_session()
-    # Simulate the terminal-window acceptance: park an item in the idle session's inbox (what a
-    # follow_up accepted while the lock was still held leaves behind).
-    store_ = await loop.ensure_store()
-    await store_.inbox_put(sid, [{"item_id": "card-1", "content": "stranded card submission"}])
-    from power_loop.agent.stateful_loop import _session_sync
-    _session_sync(sid).pending_hint += 1
-    assert loop.pending_follow_up_count(sid) == 1
-
-    result = await loop.flush_follow_ups(sid)
-    assert result is not None and result.status == "completed"
-    assert loop.pending_follow_up_count(sid) == 0
-    assert any(
-        "stranded card submission" in str(m.get("content") or "")
-        for call in llm.calls for m in call
-    )
-    # Idempotent: nothing left → None.
-    assert await loop.flush_follow_ups(sid) is None
+    llm.release_first.set()
+    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(compactor=None))
+    receipt = await loop.runtime.client.append(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
+    result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
+    assert result.status == "completed"
+    await loop.drain()
+    duplicate = await loop.runtime.client.append(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
+    assert not duplicate.newly_accepted and duplicate.input_ref == receipt.input_ref
+    assert len(llm.calls) == 1 and "stranded card submission" in str(llm.calls[0])
 
 
 @pytest.mark.asyncio
-async def test_flush_follow_ups_empty_or_busy_returns_none(store: SessionStore) -> None:
+async def test_empty_activation_and_busy_append_do_not_start_duplicate_execution(store, runtime_agent):
+    from power_loop.agent.runtime_transport import TransportPacket
     llm = _GateLLM(responses=[_tool_resp("c1", "echo", '{"text":"x"}'), LLMResponse(raw_text="ok")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
-        tool_registry=_echo_registry(),
-    )
-    sid = await loop.new_session()
-    assert await loop.flush_follow_ups(sid) is None  # empty queue
-    send_task = asyncio.create_task(loop.send("start", sid))
-    # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
-    # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
-    # window where steering queued here is drained into round 0 instead of round 1 — delivered,
-    # but not to the round these tests assert about. _GateLLM records `calls` from inside
-    # complete(), which the pipeline only reaches after that drain.
-    for _ in range(200):
-        if llm.calls:
-            break
-        await asyncio.sleep(0.005)
-    else:
-        pytest.fail("expected round 0 to reach the LLM during send")
-    await loop.follow_up("steer", sid)  # queued on the busy session
-    assert await loop.flush_follow_ups(sid) is None  # busy → owner drains, not us
+    loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(), config=AgentLoopConfig(compactor=None))
+    await loop.runtime.worker.recover()
+    assert not llm.calls
+    send_task = asyncio.create_task(loop.send("start"))
+    async with asyncio.timeout(5):
+        while not llm.calls:
+            await asyncio.sleep(.005)
+    await loop.runtime.client.append(loop.target, "steer", message_id="steer", actor=loop.actor)
+    for _ in range(3):
+        await loop.runtime.transport.publish(TransportPacket(42, loop.runtime.namespace, "duplicate-wake",
+                                                            loop.target, "activation"))
+    assert len(llm.calls) == 1
     llm.release_first.set()
-    await send_task
+    assert (await send_task).status == "completed"
+    assert len(llm.calls) == 2
 
 
 # ── multimodal steering (design/75) ──────────────────────────────────────────

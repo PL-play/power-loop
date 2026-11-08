@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 
 pytestmark = pytest.mark.unit
@@ -43,7 +43,7 @@ class _FakeLLM(LLMService):
         return None
 
 
-async def test_blocking_store_write_does_not_freeze_event_loop() -> None:
+async def test_blocking_store_write_does_not_freeze_event_loop(runtime_agent) -> None:
     """A blocking message INSERT (simulating a contended SQLite write) runs in the
     backend's worker thread, so a concurrent ticker keeps advancing."""
     store = await SessionStore.open(":memory:")
@@ -58,11 +58,7 @@ async def test_blocking_store_write_does_not_freeze_event_loop() -> None:
 
         db._b_exec = slow_b_exec  # type: ignore[method-assign]
 
-        loop_obj = StatefulAgentLoop(
-            llm=_FakeLLM(), store=store,
-            config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
-        )
-        sid = await loop_obj.new_session()
+        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
 
         ticks = 0
         stop = False
@@ -74,7 +70,7 @@ async def test_blocking_store_write_does_not_freeze_event_loop() -> None:
                 ticks += 1
 
         t = asyncio.create_task(ticker())
-        await loop_obj.send("hi", session_id=sid)  # ≥1 thread-offloaded slow write
+        await loop_obj.send("hi")  # ≥1 thread-offloaded slow write
         stop = True
         await t
 
@@ -82,10 +78,11 @@ async def test_blocking_store_write_does_not_freeze_event_loop() -> None:
         # responsive; without it the ticker would barely advance (~0 ticks).
         assert ticks >= 8, f"event loop appears blocked during the store write (ticks={ticks})"
     finally:
+        await loop_obj.aclose()
         await store.close()
 
 
-async def test_blocking_active_history_read_does_not_freeze_event_loop() -> None:
+async def test_blocking_active_history_read_does_not_freeze_event_loop(runtime_agent) -> None:
     """SCALE-3: the per-send ``load_active_messages`` read is offloaded too, so a
     large (slow) active-history load doesn't stall other tasks."""
     store = await SessionStore.open(":memory:")
@@ -100,11 +97,7 @@ async def test_blocking_active_history_read_does_not_freeze_event_loop() -> None
 
         db._b_fetchall = slow_b_fetchall  # type: ignore[method-assign]
 
-        loop_obj = StatefulAgentLoop(
-            llm=_FakeLLM(), store=store,
-            config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
-        )
-        sid = await loop_obj.new_session()
+        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
 
         ticks = 0
         stop = False
@@ -116,10 +109,11 @@ async def test_blocking_active_history_read_does_not_freeze_event_loop() -> None
                 ticks += 1
 
         t = asyncio.create_task(ticker())
-        await loop_obj.send("hi", session_id=sid)  # the slow read is offloaded
+        await loop_obj.send("hi")  # the slow read is offloaded
         stop = True
         await t
 
         assert ticks >= 8, f"event loop appears blocked during the history read (ticks={ticks})"
     finally:
+        await loop_obj.aclose()
         await store.close()

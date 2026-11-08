@@ -137,7 +137,7 @@ async def test_validation_uses_actual_schema_and_required_parameters_not_name(na
         await registry.invoke_async(name, {})
 
 
-async def test_generic_control_tool_can_query_expired_original_without_new_execution(control):
+async def test_generic_control_tool_can_query_unknown_original_without_reexecuting(control):
     from power_loop.runtime.model_attempts import enable
     c = control
     runtime = TaskRuntime(
@@ -152,12 +152,13 @@ async def test_generic_control_tool_can_query_expired_original_without_new_execu
     registry.register(ToolDefinition("original_execute", "", pricing=Free("test_fixture")), Probe())
     binding = Execution(runtime, c.actor, c.caller)
     await enable(binding)
-    c.now[0] += 30001
     token = _SEND.set(binding)
+    from power_loop.runtime.task_runtime import mark_unconfirmed_resource
+    mark_unconfirmed_resource()
     try:
         with invocation_context(c.actor.session_id, c.ref.seq, "stop-child"):
             await check_tool_dispatch(c.actor.session_id, "original_query", registry, {})
-            with pytest.raises(JobError, match="expired"):
+            with pytest.raises(JobError, match="unresolved_prior_attempt"):
                 await check_tool_dispatch(c.actor.session_id, "original_execute", registry, {})
         with pytest.raises(JobError, match="persisted_tool_call_required"):
             await check_tool_dispatch(c.actor.session_id, "original_query", registry, {})
@@ -215,8 +216,8 @@ async def test_registration_change_across_admission_await_cannot_execute(change)
         validate_registration(registry, "probe", admitted)
 
 
-async def test_actual_pipeline_does_not_invoke_a_replacement_after_admission(tmp_path, monkeypatch):
-    from power_loop import AgentLoopConfig, LLMResponse, SessionStore, StatefulAgentLoop
+async def test_actual_pipeline_does_not_invoke_a_replacement_after_admission(tmp_path, monkeypatch, runtime_agent):
+    from power_loop import AgentLoopConfig, LLMResponse, SessionStore
     from power_loop.runtime import task_runtime
 
     from .test_stateful_loop import _Scripted, _tool_resp
@@ -246,13 +247,13 @@ async def test_actual_pipeline_does_not_invoke_a_replacement_after_admission(tmp
     monkeypatch.setattr(task_runtime, "check_tool_dispatch", replace_during_admission)
     store = await SessionStore.open(str(tmp_path / "binding-race.db"))
     model = _Scripted([_tool_resp("probe-call", "probe"), LLMResponse(raw_text="DONE")])
-    loop = StatefulAgentLoop(llm=model, store=store, tool_registry=registry, config=AgentLoopConfig(max_rounds=3))
+    loop = await runtime_agent(model=model, store=store, registry=registry, config=AgentLoopConfig(max_rounds=3))
     try:
-        sid = await loop.new_session()
-        await loop.send("Read the probe", sid)
+        sid = loop.target.session_id
+        await loop.send("Read the probe")
         assert called == []
         messages = await store.load_all_messages(sid)
         assert any(row.role == "tool" and "tool_runtime_binding_changed" in row.content for row in messages)
     finally:
-        await loop.aclose(drain_timeout_s=0.1)
+        await loop.aclose()
         await store.close()

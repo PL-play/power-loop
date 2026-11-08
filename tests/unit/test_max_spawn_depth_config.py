@@ -12,25 +12,15 @@ The depth ceiling is no longer a hard module constant: it lives on the
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 
 import pytest
 
 from power_loop import (
     MAX_SPAWN_DEPTH,
-    AgentLoopConfig,
     AgentSpec,
     SessionStore,
-    StatefulAgentLoop,
 )
-from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
-from power_loop.core.agent_context import (
-    reset_current_loop,
-    reset_session_id,
-    set_current_loop,
-    set_session_id,
-)
-from power_loop.runtime.spec import run_agent_spec
+from power_loop._vendor.llm_client.interface import LLMResponse
 
 pytestmark = pytest.mark.unit
 
@@ -89,106 +79,13 @@ def test_property_setter_validates(store: SessionStore) -> None:
         store.max_spawn_depth = 0
 
 
-# ── loop-level convenience param ──────────────────────────────────────────
-
-
-@dataclass
-class _LLM(LLMService):
-    responses: list[LLMResponse] = field(default_factory=list)
-    _i: int = 0
-
-    async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
-                       on_chunk_think=None, on_stream_end=None) -> LLMResponse:
-        if self._i >= len(self.responses):
-            return LLMResponse(raw_text="done", content_text="done")
-        r = self.responses[self._i]
-        self._i += 1
-        return r
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _e() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-        return _e()
-
-    async def close(self) -> None:
-        return None
-
-
-async def test_loop_forwards_limit_to_owned_store() -> None:
-    loop = StatefulAgentLoop(llm=_LLM(), db_path=":memory:", max_spawn_depth=9)
-    try:
-        store = await loop._ensure_store()
-        assert store.max_spawn_depth == 9
-    finally:
-        await loop.aclose()
-
-
-def test_loop_overrides_shared_store_limit(store: SessionStore) -> None:
-    assert store.max_spawn_depth == MAX_SPAWN_DEPTH
-    StatefulAgentLoop(llm=_LLM(), store=store, max_spawn_depth=2)
-    assert store.max_spawn_depth == 2  # explicit arg overrode the shared store
-
-
-def test_loop_leaves_shared_store_when_unset(store: SessionStore) -> None:
-    store.max_spawn_depth = 4
-    StatefulAgentLoop(llm=_LLM(), store=store)  # no max_spawn_depth arg
-    assert store.max_spawn_depth == 4  # untouched
-
-
-async def test_run_agent_spec_honors_configured_limit(store: SessionStore) -> None:
-    """run_agent_spec's pre-check reads the store's configurable ceiling."""
-    store.max_spawn_depth = 1
-    parent_loop = StatefulAgentLoop(
-        llm=_LLM(responses=[LLMResponse(raw_text="p", content_text="p")]),
-        store=store, config=AgentLoopConfig(max_rounds=1),
-    )
-    # Build a parent chain already at depth 1 (== limit) so the next spawn bounces.
-    root = await store.create_session()
-    at_limit = await store.create_session(parent_session_id=root)  # depth 1
-
-    parent_loop.llm = _LLM(responses=[LLMResponse(raw_text="child", content_text="child")])
-    tok_loop = set_current_loop(parent_loop)
-    tok_sid = set_session_id(at_limit)
-    try:
-        result = await run_agent_spec(AgentSpec(name="c", system_prompt="P"), "go",
-                                      parent_loop=parent_loop)
-    finally:
-        reset_current_loop(tok_loop)
-        reset_session_id(tok_sid)
-
-    assert result["status"] == "rejected"
-    assert "exceeds max 1" in result["final_text"]
-
-
-async def test_run_agent_spec_falls_back_when_store_lacks_attr() -> None:
-    """A custom/legacy store with no `max_spawn_depth` falls back to the constant.
-
-    Every real store sets the attribute, so the `getattr(..., MAX_SPAWN_DEPTH)`
-    fallback in run_agent_spec's pre-check is otherwise unexercised.
-    """
-
-    class _Row:
-        spawn_depth = MAX_SPAWN_DEPTH  # already at the default ceiling
-
-    class _StoreNoAttr:  # duck-typed: only what the pre-check touches, no max_spawn_depth
-        async def get_session(self, sid: str) -> _Row:
-            return _Row()
-
-    class _FakeLoop:
-        store = _StoreNoAttr()
-
-        async def _ensure_store(self) -> _StoreNoAttr:
-            return self.store
-
-    tok = set_session_id("parent")
-    try:
-        result = await run_agent_spec(
-            AgentSpec(name="c", system_prompt="P"), "go", parent_loop=_FakeLoop(),
-        )
-    finally:
-        reset_session_id(tok)
-
-    # depth+1 (4) > fallback ceiling (MAX_SPAWN_DEPTH=3) → rejected with the default.
-    assert result["status"] == "rejected"
-    assert f"exceeds max {MAX_SPAWN_DEPTH}" in result["final_text"]
+@pytest.mark.parametrize("depth", [1, 2, 9])
+async def test_runtime_uses_explicit_store_depth_without_overriding_it(store, runtime_agent, depth):
+    from tests.unit.test_subagent import _child, _Scripted
+    store.max_spawn_depth = depth
+    agent, child = await _child(runtime_agent, store, _Scripted(responses=[LLMResponse(raw_text="child")]),
+        AgentSpec(name="child", system_prompt="P", lifecycle="linked"))
+    assert child["status"] == "completed"
+    assert store.max_spawn_depth == depth
+    row = await store.get_session(child["session_id"])
+    assert row.spawn_depth == 1 and row.parent_session_id == agent.target.session_id

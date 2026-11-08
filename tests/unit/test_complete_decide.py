@@ -18,14 +18,27 @@ from power_loop import (
     HookDirective,
     HookPoint,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+async def compose():
+    agents = []
+    async def start(*, llm, store, config, tool_registry):
+        agent = await RunningAgent(store, llm, tool_registry, config).start()
+        agents.append(agent)
+        return agent
+    yield start
+    for agent in agents:
+        await agent.aclose()
+        await agent.runtime.store.close()
 
 
 @dataclass
@@ -75,24 +88,24 @@ def _finalize_once(prompt: str, extra_rounds: int = 4):
     return handler
 
 
-async def test_natural_completion_injects_and_continues_same_send() -> None:
+async def test_natural_completion_injects_and_continues_same_send(compose) -> None:
     # round 0: plain text (would complete) → hook injects → round 1 runs → completes.
     llm = _Scripted(responses=[
         LLMResponse(raw_text="first answer", content_text="first answer"),
         LLMResponse(raw_text="finalized", content_text="finalized"),
     ])
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
+    loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt="o", max_rounds=10, compactor=None),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, _finalize_once("[system] wrap up now"))
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
+    sid = loop.target.session_id
+    res = await loop.send("go")
 
     assert res.status == "completed"
     assert res.final_text == "finalized"
-    msgs = await loop.get_messages(sid)
+    msgs = [{"role": row.role, "content": row.content} for row in await store.load_active_messages(sid)]
     contents = [(m["role"], m.get("content") or "") for m in msgs]
     # The injected prompt is a DURABLE user message in the same send,
     # between the two assistant turns.
@@ -103,7 +116,7 @@ async def test_natural_completion_injects_and_continues_same_send() -> None:
     assert first < idx[0] < last
 
 
-async def test_round_limit_injects_and_extends_budget() -> None:
+async def test_round_limit_injects_and_extends_budget(compose) -> None:
     # max_rounds=1; round 0 calls a tool → budget exhausted → hook injects →
     # round 1 runs and completes with text (no forced wrap-up call).
     llm = _Scripted(responses=[
@@ -111,24 +124,24 @@ async def test_round_limit_injects_and_extends_budget() -> None:
         LLMResponse(raw_text="made it past the limit", content_text="made it past the limit"),
     ])
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
+    loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, _finalize_once("[system] budget gone — wrap up", 2))
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
+    sid = loop.target.session_id
+    res = await loop.send("go")
 
     assert res.status == "completed"
     assert res.final_text == "made it past the limit"
-    msgs = await loop.get_messages(sid)
+    msgs = [{"role": row.role, "content": row.content} for row in await store.load_active_messages(sid)]
     texts = [(m.get("content") or "") for m in msgs]
     assert "[system] budget gone — wrap up" in texts
     # The stock "You have reached the maximum" prompt must NOT appear.
     assert not any("reached the maximum" in t for t in texts)
 
 
-async def test_handler_bounds_itself_with_fire_count() -> None:
+async def test_handler_bounds_itself_with_fire_count(compose) -> None:
     # A handler that fires every time it is allowed to (fire_count < 2):
     # two injections, then the send ends normally.
     fires: list[int] = []
@@ -147,46 +160,43 @@ async def test_handler_bounds_itself_with_fire_count() -> None:
         LLMResponse(raw_text="c", content_text="c"),
     ])
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
+    loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt="o", max_rounds=10, compactor=None),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, handler)
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
+    res = await loop.send("go")
 
     assert res.status == "completed"
     assert res.final_text == "c"
     assert fires == [0, 1, 2]  # consulted three times, injected twice
 
 
-async def test_no_hook_baseline_unchanged() -> None:
+async def test_no_hook_baseline_unchanged(compose) -> None:
     # Without a COMPLETE_DECIDE handler: natural completion and round-limit
     # behave exactly as before.
     llm = _Scripted(responses=[LLMResponse(raw_text="plain", content_text="plain")])
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
+    loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt="o", max_rounds=3, compactor=None),
     )
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
+    res = await loop.send("go")
     assert res.status == "completed" and res.final_text == "plain"
 
     llm2 = _Scripted(responses=[_tool_call("c1", "echo"),
                                 LLMResponse(raw_text="summary", content_text="summary")])
     store2 = await SessionStore.open(":memory:")
-    loop2 = StatefulAgentLoop(
+    loop2 = await compose(
         llm=llm2, store=store2, tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
     )
-    sid2 = await loop2.new_session()
-    res2 = await loop2.send("go", session_id=sid2)
-    assert res2.status == "hit_round_limit"
+    res2 = await loop2.send("go")
+    assert res2.status == "interrupted" and res2.error == "hit_round_limit"
     assert "summary" in (res2.final_text or "")
 
 
-async def test_empty_inject_or_wrong_directive_ends_normally() -> None:
+async def test_empty_inject_or_wrong_directive_ends_normally(compose) -> None:
     # SHORT_CIRCUIT with empty inject, or CONTINUE with inject set → no continuation.
     def empty_inject(ctx: CompleteDecideCtx):
         ctx.directive = HookDirective.SHORT_CIRCUIT
@@ -195,13 +205,13 @@ async def test_empty_inject_or_wrong_directive_ends_normally() -> None:
 
     llm = _Scripted(responses=[LLMResponse(raw_text="plain", content_text="plain")])
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
+    loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt="o", max_rounds=5, compactor=None),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, empty_inject)
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
+    sid = loop.target.session_id
+    res = await loop.send("go")
     assert res.status == "completed" and res.final_text == "plain"
-    msgs = await loop.get_messages(sid)
+    msgs = [{"role": row.role, "content": row.content} for row in await store.load_active_messages(sid)]
     assert sum(1 for m in msgs if m["role"] == "assistant") == 1

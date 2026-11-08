@@ -1,4 +1,4 @@
-"""An admitted original child stays controllable without a callback receipt."""
+"""Another process can cancel the original child even without a parent tool receipt."""
 import asyncio
 import json
 import os
@@ -6,129 +6,95 @@ import sys
 from dataclasses import asdict
 from urllib.parse import urlparse
 
-import pytest
-
-from power_loop import AgentLoopConfig, StatefulAgentLoop
-from power_loop.runtime import delegation
-from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.pending_calls import recover_runtime
+from power_loop import AgentLoopConfig, DatabasePollingTransport, JobRef, ToolRegistry
+from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
+from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.runtime.tool_contracts import RuntimeTool
-from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
+from tests.runtime_fixture import RunningAgent
 
 
 async def exercise(registry_store, model, record_property, *, target='child', real=False):
-    store, _ = registry_store
-    manager = JobManager(store)
-    runtime = TaskRuntime(manager, tenant_id='no-return', principal_id='host',
-                          executor_id='original-worker', boot_id='original-boot', lease_ms=1000)
-    registry = ToolRegistry()
+    store,_=registry_store
+    manager=JobManager(store)
+    managed=TaskRuntime(manager,tenant_id='no-return',principal_id='host',executor_id='original',boot_id='boot')
+    registry=ToolRegistry()
     register_spawn_agent(registry)
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
-        config=AgentLoopConfig(delegation_policy='single_level', max_rounds=3, max_tokens=2048))
-    sid = await loop.new_session()
-    if real:
-        model.root_sid, model.hold_children = sid, True
-        entered, release = model.child_entered, model.release_children
-    else:
-        model.root = sid
-        entered, release = model.entered, model.release
-    original = registry.get('spawn_agent')
-    callbacks = []
-
+    original=registry.get('spawn_agent')
+    callbacks=[]
+    entered,release=(model.child_entered,model.release_children) if real else (model.entered,model.release)
     class LostReturn(RuntimeTool):
         @property
         def runtime_contract(self):
             return original.handler.runtime_contract
-
-        def dispatch_policy(self, arguments, *, runtime=None):
-            return original.handler.dispatch_policy(arguments, runtime=runtime)
-
-        async def __call__(self, **arguments):
-            accepted = await original.handler(**arguments)
-            callbacks.append(accepted)
-            await asyncio.wait_for(entered.wait(), 10)
-            # The actual original spawn has committed and started the child.
-            # Interrupt before returning any string to the parent pipeline.
-            raise asyncio.CancelledError('original callback interrupted before return')
-
-    registry.register(original.definition, LostReturn(), overwrite=True)
-    before = set(delegation._TASKS)
-    process = None
+        def dispatch_policy(self,arguments,*,runtime=None):
+            return original.handler.dispatch_policy(arguments,runtime=runtime)
+        async def __call__(self,**arguments):
+            callbacks.append(await original.handler(**arguments))
+            await asyncio.wait_for(entered.wait(),10)
+            raise asyncio.CancelledError('callback interrupted before returning receipt')
+    registry.register(original.definition,LostReturn(),overwrite=True)
+    transport=DatabasePollingTransport(RuntimeInputStore(store),interval_s=.03,control_interval_s=.03)
+    agent=await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None,max_rounds=3,max_tokens=2048),
+        task_runtime=managed,capacity=2,transport=transport).start()
+    sid=agent.target.session_id
+    if real:
+        model.root_sid,model.hold_children=sid,True
+    else:
+        model.root=sid
+    process=None
     try:
-        with pytest.raises(asyncio.CancelledError):
-            await loop.send('Use spawn_agent exactly once to calculate 19+23. Set tools=[] and ask '
-                            'the child to return only the integer. Do not use any other tools.', sid)
-        await runtime.flush_control_checkpoints()
-        actor = runtime.actor(sid)
-        rows = await manager.db.fetchall(f'SELECT job_id,kind FROM {manager.jobs} WHERE created_by_session_id=?', (sid,))
-        children = [row['job_id'] for row in rows if row['kind'] == 'subagent']
-        assert len(children) == len(callbacks) == 1
-        child_id = children[0]
-        child = await manager.get_job(actor, child_id)
-        root_id = child.parent_job_id
-        pending = (await store.get_state(sid)).pending
-        raw = await manager.db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=? ORDER BY seq', (sid,))
-        assert pending and not any(r['role'] == 'tool' for r in raw)
-        assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='native_callback_returned'", (root_id,))
-        assert child.resource_state == 'running'
-        tasks = set(delegation._TASKS) - before
-        assert len(tasks) == 1 and all(not task.done() for task in tasks)
-        calls = model.calls if real else model.child_calls
-        if manager.db.dialect.name == 'sqlite':
-            dsn = next(row['file'] for row in await manager.db.fetchall('PRAGMA database_list') if row['name'] == 'main')
+        parent=await agent.send("Use spawn_agent exactly once with tools=[] to calculate 19+23, then wait for its result.")
+        assert parent.status=='cancelled' and len(callbacks)==1
+        [child]=await manager.db.fetchall(f"SELECT job_id,parent_job_id,generation,resource_state FROM {manager.jobs} WHERE kind='subagent'")
+        assert child['resource_state']=='running'
+        assert not any(r.role=='tool' and r.name=='spawn_agent' for r in await store.load_all_messages(sid))
+        calls=model.calls if real else model.child_calls
+        engine=manager.db.dialect.name
+        if engine=='sqlite':
+            dsn=next(r['file'] for r in await manager.db.fetchall('PRAGMA database_list') if r['name']=='main')
         else:
-            dsn = os.environ['POWER_LOOP_TASK_PG_DSN' if manager.db.dialect.name == 'postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
+            dsn=os.environ['POWER_LOOP_TASK_PG_DSN' if engine=='postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
             assert urlparse(dsn).path.endswith('_test')
-        code = '''import asyncio,json,sys
+        code='''import asyncio,json,sys
+from power_loop import RuntimeClient,DatabasePollingTransport,JobRef,TrustedActor
 from power_loop.runtime.store.factory import open_store
-from power_loop.runtime.jobs import JobActor,JobManager
+from power_loop.agent.runtime_store import RuntimeInputStore
 async def main():
  d=json.load(sys.stdin)
- store=await open_store(d['dsn'],table_prefix=d['prefix'],schema='tasks')
+ store=await open_store(d['dsn'],table_prefix=d['prefix'],schema='verify')
+ transport=DatabasePollingTransport(RuntimeInputStore(store),interval_s=.03)
+ client=RuntimeClient(store=store,transport=transport)
  try:
-  manager=JobManager(store);actor=JobActor(**d['actor'])
-  child=await manager.get_job(actor,d['child'])
-  assert child.parent_job_id==d['root'] and child.resource_state=='running'
-  first=await manager.request_cancel(actor,d['target'],system_key='original-no-return-stop',reason='Stop original admitted work')
-  second=await manager.request_cancel(actor,d['target'],system_key='original-no-return-stop',reason='Stop original admitted work')
-  assert first.operation_id==second.operation_id
-  print(json.dumps({'child':child.job_id,'operation_id':first.operation_id}))
- finally: await store.close()
+  ref=JobRef(store.store_id,d['target'],1)
+  actor=TrustedActor(**d['actor'])
+  one=await client.cancel(ref,actor=actor,scope='subtree',reason='stop original work')
+  two=await client.cancel(ref,actor=actor,scope='subtree',reason='stop original work')
+  assert one.target.job_id==two.target.job_id==d['target']
+  print(json.dumps({'job_id':one.target.job_id,'state':one.state}))
+ finally:
+  await client.aclose()
+  await transport.aclose()
+  await store.close()
 asyncio.run(main())'''
-        process = await asyncio.create_subprocess_exec(sys.executable, '-c', code,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        record_property('original_no_return_stop_pid', process.pid)
-        output, error = await asyncio.wait_for(process.communicate(json.dumps({'dsn': dsn,
-            'prefix': manager.prefix, 'actor': asdict(actor), 'child': child_id, 'root': root_id,
-            'target': root_id if target == 'root' else child_id}).encode()), 30)
-        assert process.returncode == 0, error[-1000:]
-        assert json.loads(output)['child'] == child_id
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
-        await runtime.flush_control_checkpoints()
-        child = await manager.get_job(actor, child_id)
-        # Actual local task exit is proven below. A cancelled model attempt
-        # has no provider completion proof, so resource certainty stays unknown.
-        assert child.resource_state == 'unknown' and child.outcome == 'cancelled', child
-        assert child.supervision_status == 'open'
-        with pytest.raises(JobError):
-            await manager.finalize_supervision(actor, child_id, generation=1)
-        assert all(t.done() for t in tasks) and not release.is_set()
-        assert len(callbacks) == 1 and (model.calls if real else model.child_calls) == calls
-        assert (await recover_runtime(runtime, actor, root_id))['state'] == 'unconfirmed'
-        assert (await store.get_state(sid)).pending == pending
-        assert (await manager.get_job(actor, root_id)).supervision_status == 'open'
-        with pytest.raises(JobError):
-            await manager.finalize_supervision(actor, root_id, generation=1)
-        assert await manager.db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=? ORDER BY seq', (sid,)) == raw
+        process=await asyncio.create_subprocess_exec(sys.executable,'-c',code,stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+        record_property('original_no_return_stop_pid',process.pid)
+        output,error=await asyncio.wait_for(process.communicate(json.dumps({'dsn':dsn,'prefix':store.table_prefix,
+            'actor':asdict(agent.actor),'target':child['parent_job_id'] if target=='root' else child['job_id']}).encode()),30)
+        assert process.returncode==0,error.decode()[-2000:]
+        assert json.loads(output)['state']=='applied'
+        result=await agent.runtime.client.wait(JobRef(store.store_id,child['job_id'],1),actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert result.status=='cancelled'
+        await agent.drain()
+        assert not release.is_set() and len(callbacks)==1
+        assert (model.calls if real else model.child_calls)==calls
+        assert (await manager.db.fetchone(f"SELECT COUNT(*) AS n FROM {manager.jobs} WHERE kind='subagent'"))['n']==1
     finally:
         if process is not None and process.returncode is None:
             process.kill()
             await process.wait()
         release.set()
-        tasks = set(delegation._TASKS) - before
-        if tasks:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
-        await runtime.flush_control_checkpoints()
-        await loop.aclose(drain_timeout_s=.1)
+        await agent.aclose()
+        await transport.aclose()

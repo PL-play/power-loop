@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop import AgentLoopConfig, MessageState, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, MessageState, SessionStore
 from power_loop.runtime.compact import AgenticMemoryCompactor
 
 from ._llm import make_llm
@@ -18,11 +18,23 @@ from .judge import assert_passes
 
 
 @pytest.mark.asyncio
-async def test_agentic_compaction_extracts_facts_to_notes_and_stays_coherent(monkeypatch) -> None:
+async def test_agentic_compaction_extracts_facts_to_notes_and_stays_coherent(monkeypatch, runtime_agent) -> None:
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "500")  # force the fold on the seeded history
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session(system_prompt="S")
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=512, temperature=0),
+            store=store,
+            config=AgentLoopConfig(
+                system_prompt=(
+                    "Earlier turns may have been summarized into a compact_note and durable facts "
+                    "saved as notes. Answer the user's latest question concisely in English."
+                ),
+                max_rounds=1, max_tokens=512, temperature=0,
+                compactor=AgenticMemoryCompactor(trigger_ratio=0.5, keep_last_n=1, max_rounds=4),
+            ),
+        )
+        sid = loop.target.session_id
         # Seed fat filler turns PLUS clear durable facts the compaction agent should remember.
         await store.append_message(
             sid, role="user", round_index=0,
@@ -36,20 +48,8 @@ async def test_agentic_compaction_extracts_facts_to_notes_and_stays_coherent(mon
             await store.append_message(sid, role="user", round_index=i, content="filler " + ("u" * 400))
             await store.append_message(sid, role="assistant", round_index=i, content="ok " + ("a" * 400))
 
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0),
-            store=store,
-            config=AgentLoopConfig(
-                system_prompt=(
-                    "Earlier turns may have been summarized into a compact_note and durable facts "
-                    "saved as notes. Answer the user's latest question concisely in English."
-                ),
-                max_rounds=1, max_tokens=512, temperature=0,
-                compactor=AgenticMemoryCompactor(trigger_ratio=0.5, keep_last_n=1, max_rounds=4),
-            ),
-        )
         q = "Name the largest planet in our solar system."
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
 
         # 1) compaction actually fired + persisted (same guarantees as the default compactor).
@@ -69,4 +69,5 @@ async def test_agentic_compaction_extracts_facts_to_notes_and_stays_coherent(mon
             rubric="Answer identifies Jupiter as the largest planet (case-insensitive).",
         )
     finally:
+        await loop.aclose()
         await store.close()

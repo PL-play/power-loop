@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import secrets
 from dataclasses import asdict, dataclass, field, replace
@@ -200,23 +199,11 @@ async def dispatch(attempt):
         raise JobError("model_attempt_owner_mismatch")
     if saved["phase"] != "prepared":
         raise JobError("model_attempt_dispatch_already_admitted")
-    if "_control_wait_deadline" not in binding.resource_evidence:
-        # A failed/unknown wait-registration transaction invalidates this hint.
-        # Resolve its durable policy before any provider dispatch; successful
-        # registrations publish their bound without another database round trip.
-        from .owner_waits import require_dispatch
-        manager = binding.runtime.manager
-        async with manager._write() as tx:
-            row = await manager._fence(tx, binding.actor, binding.lease)
-            deadline = await require_dispatch(manager, tx, row)
-        binding.resource_evidence["_control_wait_deadline"] = deadline
     if binding.runtime._original_budget_config is not None:
         from .execution_budget import authorize
         authorize(attempt)
     control.dispatch(attempt.attempt_id)
-    bound = binding.resource_evidence.get("_control_wait_deadline")
-    return None if bound is None else asyncio.get_running_loop().time() + max(
-        0, (bound - binding.runtime.manager.now()) / 1000)
+    return None
 
 
 async def _recall_dispatch(attempt):
@@ -235,10 +222,7 @@ async def _recall_dispatch_authority(attempt):
         return False, None
     if saved["phase"] != "dispatched":
         raise JobError("model_attempt_dispatch_conflict")
-    bound = attempt.binding.resource_evidence.get("_control_wait_deadline")
-    deadline = None if bound is None else asyncio.get_running_loop().time() + max(
-        0, (bound - attempt.binding.runtime.manager.now()) / 1000)
-    return True, deadline
+    return True, None
 
 
 async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amount=None, response_id=None,

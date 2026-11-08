@@ -186,7 +186,7 @@ def test_default_policy_sane() -> None:
 # ── end-to-end through the loop ────────────────────────────────────────────
 
 
-async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> None:
+async def test_note_tool_writes_and_next_send_injects(store: SessionStore, runtime_agent) -> None:
     """The model calls note(action=add) via the default tool; the following send sees
     its note injected as a memory_notes system message."""
     from collections.abc import Callable
@@ -195,7 +195,6 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
 
     from power_loop import (
         AgentLoopConfig,
-        StatefulAgentLoop,
         create_default_tool_registry,
     )
     from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMStreamChunk
@@ -250,30 +249,27 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
             LLMResponse(raw_text="second reply"),
         ]
     )
-    loop = StatefulAgentLoop(
-        llm=llm,
-        store=store,
-        tool_registry=create_default_tool_registry(include=["note"], bind=False),
-        config=AgentLoopConfig(
+    loop = await runtime_agent(model=llm, store=store, registry=create_default_tool_registry(include=["note"], bind=False), config=AgentLoopConfig(
             system_prompt="S",
             max_rounds=3,
             compactor=None,
             memory=SQLiteNoteMemory(store),
-        ),
-    )
-    sid = await loop.new_session()
-    r1 = await loop.send("remember the codename", sid)
+        ))
+    sid = loop.target.session_id
+    r1 = await loop.send("remember the codename")
     assert r1.status == "completed"
     notes = await store.list_notes(sid)
     assert len(notes) == 1 and "BLUEBIRD" in notes[0].content
 
-    await loop.send("what is the codename?", sid)
+    await loop.send("what is the codename?")
     last_request = llm.calls[-1]
-    injected = [
-        m for m in last_request if m.get("name") == "memory_notes" and m.get("role") == "system"
-    ]
-    assert len(injected) == 1
-    assert "BLUEBIRD" in injected[0]["content"]
+    # The current provider normalizes trailing system blocks into the user
+    # message. The note must still reach the next request exactly once, without
+    # being persisted into conversation history or recalled mid-send.
+    assert sum(str(m.get("content", "")).count("YOUR NOTES") for m in last_request) == 1
+    assert "BLUEBIRD" in str(last_request)
+    assert "YOUR NOTES" not in str(llm.calls[:-1])
+    assert not any("YOUR NOTES" in str(row.content) for row in await store.load_all_messages(sid))
     await loop.aclose()
 
 

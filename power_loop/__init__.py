@@ -36,7 +36,7 @@ from power_loop._vendor.llm_client.interface import (
     OpenAICompatibleChatConfig,
 )
 from power_loop._vendor.llm_client.multimodal import create_attachment_ref
-from power_loop.agent.follow_up import FollowUpQueued, InboxItem
+from power_loop.agent.follow_up import InboxItem
 
 # Design 203: the single ID-addressed execution API (11.0).
 from power_loop.agent.runtime import (
@@ -75,7 +75,7 @@ from power_loop.agent.runtime_types import (
 )
 from power_loop.agent.runtime_worker import RuntimeWorker
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
-from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
+from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.system_prompt import (
     BUILTIN_SECTIONS,
     DEFAULT_AGENT_SYSTEM_PROMPT,
@@ -170,7 +170,6 @@ from power_loop.contracts.hook_contexts import (
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
 from power_loop.contracts.protocols import (
-    ChildRunGuard,
     EventBusProtocol,
     HookManagerProtocol,
     ToolArgsValidator,
@@ -188,7 +187,7 @@ from power_loop.runtime.blackboard import (
     Blackboard,
     BlackboardEntry,
     BlackboardError,
-    SqliteBlackboard,
+    StoreBlackboard,
     render_entries,
 )
 from power_loop.runtime.budget import estimate_text_tokens, estimate_tokens, trim_history
@@ -283,9 +282,18 @@ from power_loop.runtime.structured import (
     StructuredOutputSpec,
     parse_structured,
 )
-from power_loop.runtime.timers import TimerDelivery, TimerRunner
+from power_loop.runtime.timer_backend import (
+    StoreTimerBackend,
+    TimerBackend,
+    TimerContext,
+    TimerDriver,
+    TimerDriverStatus,
+    timer_context,
+)
+from power_loop.runtime.timers import TimerRunner
 from power_loop.runtime.tool_billing import record_billing_receipt, tool_billing_active, tool_billing_managed
 from power_loop.runtime.tool_context import ToolContextConfig
+from power_loop.runtime.wait_review import WaitPolicy
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
     ToolRegistry,
@@ -306,6 +314,7 @@ from power_loop.tools.spawn_agent import (
     SPAWN_AGENT_DEFINITION,
     register_spawn_agent,
 )
+from power_loop.tools.wait_handoff import register_wait_handoff_tool
 
 from .llm_metrics import (
     CostExtractor,
@@ -326,6 +335,8 @@ _logging.getLogger("power_loop").addHandler(_logging.NullHandler())
 # docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed
 # without a major bump). Add freely; never remove/rename within a major version.
 STABLE_API = (
+    "WaitPolicy", "register_wait_handoff_tool",
+    "TimerBackend", "TimerContext", "timer_context", "TimerDriver", "TimerDriverStatus", "StoreTimerBackend", "TimerRunner", "StoreBlackboard",
     "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
     "RuntimeClient", "RuntimeWorker", "ExecutionContext", "OutputSubscription",
     "TargetRef", "InputRef", "JobRef", "Command", "RequestOptions", "RuntimeDescriptor",
@@ -335,8 +346,6 @@ STABLE_API = (
     "PublishReceipt", "SubscriptionSpec", "TransportCapabilities", "TransportPacket",
     "SessionOwnership", "SessionOwnershipCoordinator", "MemorySessionOwnershipCoordinator",
     "StatefulAgentLoop",
-    "StatefulResult",
-    "FollowUpQueued",
     "AgentLoopConfig",
     "AgentLoopResult",
     "SessionStore",
@@ -380,6 +389,7 @@ STABLE_API = (
 )
 
 __all__ = [
+    "WaitPolicy", "register_wait_handoff_tool",
     "SessionOwnership",
     "SessionOwnershipCoordinator",
     "MemorySessionOwnershipCoordinator",
@@ -400,7 +410,6 @@ __all__ = [
 	"__version__",
 	"STABLE_API",
 	"StatefulAgentLoop",
-	"StatefulResult",
 	"AgentLoopConfig",
 	"AgentLoopResult",
 	# LLM contract (STABLE as of 1.0 — see STABLE_API)
@@ -419,7 +428,7 @@ __all__ = [
 	"SessionStatsRow",
 	"TimerRow",
 	"TimerRunner",
-	"TimerDelivery",
+	"TimerBackend", "TimerContext", "timer_context", "TimerDriver", "TimerDriverStatus", "StoreTimerBackend",
 	"TimerFireCtx",
 	"TimerFiredPayload",
 	"SessionStatus",
@@ -477,7 +486,7 @@ __all__ = [
 	"Blackboard",
 	"BlackboardEntry",
 	"BlackboardError",
-	"SqliteBlackboard",
+	"StoreBlackboard",
 	"render_entries",
 	"register_blackboard_tools",
 	"HumanInputRequired",
@@ -585,7 +594,6 @@ __all__ = [
 	"EventBusProtocol",
 	"HookManagerProtocol",
 	"ToolArgsValidator",
-	"ChildRunGuard",
 	"get_effective_tools",
 	"ToolDefinition",
 	"ToolResult",
@@ -599,7 +607,6 @@ __all__ = [
 	"build_registry",
 	"create_default_tool_registry",
 	"DEFAULT_TOOL_HANDLERS",
-	"FollowUpQueued",
 	"InboxItem",
 	"get_tool_definitions",
 	"CORE_TOOL_NAMES",

@@ -2,15 +2,21 @@
 
 import asyncio
 import copy
+import json
 from dataclasses import replace
 from functools import wraps
-from types import SimpleNamespace
 
 import pytest
 
-from power_loop import ToolDefinition
-from power_loop.core import agent_context
-from power_loop.runtime.background import encode_results, record_key
+from power_loop import AgentLoopConfig, JobRef, ToolDefinition
+from power_loop.agent.runtime_store import now_ms
+from power_loop.runtime.background import encode_results, load_record
+from tests.runtime_fixture import RunningAgent
+
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, _tool_resp
+
+__all__ = ["registry_store"]
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.runtime.tool_contracts import (
@@ -22,78 +28,81 @@ from power_loop.runtime.tool_contracts import (
     result_container,
 )
 from power_loop.tools import create_default_tool_registry
-from power_loop.tools import default_tools as dt
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize('name', ['background_run', 'workflow', 'spawn_agent', 'ordinary'])
-async def test_name_alone_does_not_change_background_policy(monkeypatch, name):
-    registry, calls = ToolRegistry(), []
-    registry.register(ToolDefinition(name, '', async_capable=True, pricing=Free("test_fixture")), lambda **args: calls.append(args) or 'OK')
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
-    monkeypatch.setattr(dt, '_current_store_and_session', lambda: (None, None))
-    monkeypatch.setattr(dt, '_TOOL_TASK_ON_COMPLETE', None)
-    manager = dt.BackgroundManager()
+async def start_background(store, registry, name, arguments=None, *, runtime_env=None):
+    default = create_default_tool_registry(bind=False).get('background_run')
+    registry.register(replace(default.definition, name='defer_work'), default.handler)
+    model = _Scripted([_tool_resp('background','defer_work',json.dumps({
+        'action':'tool','tool':name,'args':arguments or {}}))])
+    runner = await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None), runtime_env=runtime_env).start()
+    await runner.send('start')
+    rows = await store.load_all_messages(runner.target.session_id)
+    return runner, next(row for row in rows if row.tool_call_id=='background')
+
+
+@pytest.mark.parametrize('name',['background_run','workflow','spawn_agent','ordinary'])
+async def test_name_alone_does_not_change_background_policy(registry_store,name):
+    store,_ = registry_store
+    registry,calls = ToolRegistry(),[]
+    registry.register(ToolDefinition(name,'',async_capable=True,pricing=Free('fixture')),lambda **args:calls.append(args) or 'OK')
+    runner,row = await start_background(store,registry,name,{'x':1})
     try:
-        receipt = await manager.run_tool(name, {'x': 1})
-        await asyncio.gather(*manager._workers.values())
-        assert 'task_id=' in receipt and calls == [{'x': 1}]
+        result = await runner.runtime.client.wait(JobRef(**json.loads(row.content)['job_ref']),actor=runner.actor,deadline_ms=now_ms()+10000)
+        assert result.status=='completed' and result.final_text=='OK' and calls==[{'x':1}]
     finally:
-        await asyncio.gather(*manager._workers.values(), return_exceptions=True)
+        await runner.aclose()
 
 
-@pytest.mark.parametrize('name', ['renamed_scheduler', 'research', 'send_message'])
-async def test_contract_forbids_background_before_any_task_is_created(monkeypatch, name):
-    registry, calls = ToolRegistry(), []
-    implementation = FunctionRuntimeTool(
-        lambda **args: calls.append(args), ToolRuntimeContract('example.orchestrator', background_allowed=False))
-    registry.register(ToolDefinition(name, '', async_capable=True, pricing=Free("test_fixture")), implementation)
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
-    manager = dt.BackgroundManager()
-    with pytest.raises(ValueError, match='注册契约禁止'):
-        await manager.run_tool(name, {})
-    assert not manager.tasks and not calls
+@pytest.mark.parametrize('name',['renamed_scheduler','research','send_message'])
+async def test_contract_forbids_background_before_any_task_is_created(registry_store,name):
+    store,_ = registry_store
+    registry,calls = ToolRegistry(),[]
+    implementation=FunctionRuntimeTool(lambda **args:calls.append(args),ToolRuntimeContract('example.orchestrator',background_allowed=False))
+    registry.register(ToolDefinition(name,'',async_capable=True,pricing=Free('fixture')),implementation)
+    runner,row = await start_background(store,registry,name)
+    try:
+        assert 'does not allow background execution' in row.content
+        assert not calls and not await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='background_tool'")
+    finally:
+        await runner.aclose()
 
 
-@pytest.mark.parametrize('change', ['replace', 'revoke', 'contract'])
-async def test_queued_call_cannot_use_replaced_or_mutated_registration(monkeypatch, change):
-    started, release, calls = asyncio.Event(), asyncio.Event(), []
-    registry = ToolRegistry()
-
-    async def original(**args):
-        calls.append(args['i'])
-        if len(calls) == 8:
-            started.set()
+@pytest.mark.parametrize('change',['replace','revoke','contract'])
+async def test_queued_call_cannot_use_replaced_or_mutated_registration(registry_store,change):
+    store,_ = registry_store
+    began,release,calls=asyncio.Event(),asyncio.Event(),[]
+    async def original(i):
+        calls.append(i)
+        began.set()
         await release.wait()
         return 'OK'
-
-    implementation = FunctionRuntimeTool(original, ToolRuntimeContract('example.worker'))
-    registry.register(ToolDefinition('work', '', async_capable=True, pricing=Free("test_fixture")), implementation)
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
-    monkeypatch.setattr(dt, '_current_store_and_session', lambda: (None, None))
-    monkeypatch.setattr(dt, '_TOOL_TASK_ON_COMPLETE', None)
-    manager = dt.BackgroundManager()
+    registry=create_default_tool_registry(bind=False)
+    implementation=FunctionRuntimeTool(original,ToolRuntimeContract('example.worker'))
+    registry.register(ToolDefinition('work','',async_capable=True,pricing=Free('fixture')),implementation)
+    model=_Scripted([_tool_resp(f'bg{i}','background_run',json.dumps({'action':'tool','tool':'work','args':{'i':i}})) for i in range(2)])
+    runner=await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None)).start()
     try:
-        for i in range(9):
-            await manager.run_tool('work', {'i': i})
-        await started.wait()
-        if change == 'replace':
-            registry.register(ToolDefinition('work', '', async_capable=True, pricing=Free("test_fixture")),
-                              lambda **args: calls.append('replacement'), overwrite=True)
-        elif change == 'revoke':
+        await runner.send('queue two')
+        await asyncio.wait_for(began.wait(),10)
+        if change=='replace':
+            registry.register(ToolDefinition('work','new',async_capable=True,pricing=Free('fixture')),lambda **args:calls.append('replacement'),overwrite=True)
+        elif change=='revoke':
             registry.unregister('work')
         else:
-            object.__setattr__(implementation, 'contract', replace(implementation.contract, background_allowed=False))
+            registry.register(ToolDefinition('work','',async_capable=True,pricing=Free('fixture')),
+                FunctionRuntimeTool(original,replace(implementation.contract,background_allowed=False)),overwrite=True)
         release.set()
-        await asyncio.gather(*manager._workers.values())
-        assert calls == list(range(8))
-        rows = list(manager.tasks.values())
-        assert rows[-1]['status'] == 'failed' and 'binding_changed' in rows[-1]['result']
+        rows=await store.load_all_messages(runner.target.session_id)
+        receipt=json.loads(next(row.content for row in rows if row.tool_call_id=='bg1'))
+        result=await runner.runtime.client.wait(JobRef(**receipt['job_ref']),actor=runner.actor,deadline_ms=now_ms()+10000)
+        assert result.status=='failed' and calls==[0]
     finally:
         release.set()
-        await asyncio.gather(*manager._workers.values(), return_exceptions=True)
+        await runner.aclose()
 
 
 @pytest.mark.parametrize('name', ['background_run', 'bash', 'custom'])
@@ -127,7 +136,8 @@ async def test_renamed_builtins_keep_schema_hints_wrappers_and_sync_shell(tmp_pa
     for name in ['defer_work', 'terminal']:
         spec = context_spec(registry.get(name), copy.deepcopy(registry.get(name).definition.to_openai_tool()))
         if name == 'defer_work':
-            assert 'command' not in spec['function']['parameters']['properties']
+            assert 'command' in spec['function']['parameters']['properties']
+            assert 'run' in spec['function']['parameters']['properties']['action']['enum']
         else:
             assert 'description' in spec['function']['parameters']['required']
     assert not defaults.get('bash').is_async
@@ -137,30 +147,25 @@ async def test_renamed_builtins_keep_schema_hints_wrappers_and_sync_shell(tmp_pa
     assert '可异步' not in str(registry.to_openai_tools())  # no arbitrary choice between two schedulers
 
 
-async def test_renamed_result_container_reads_originals_but_plain_same_name_does_not():
-    from power_loop import SessionStore
-    store = await SessionStore.open(':memory:')
-    sid = await store.create_session()
-    registry = ToolRegistry()
-    defaults = create_default_tool_registry(bind=False)
-    registry.register(replace(defaults.get('background_run').definition, name='defer_work'),
-                      defaults.get('background_run').handler)
-    registry.register(ToolDefinition('work', '', pricing=Free("test_fixture")), lambda **args: '')
-    registry.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), lambda **args: '')
-    engine = ToolContextEngine(config=ToolContextConfig(), store=store, owner_session_id=sid,
-                               owner_send_index=1, registry=registry, llm=None, model='unused')
-    record = {'task_id': 'original', 'tool': 'work', 'args': {}, 'result': 'EXACT', 'status': 'completed'}
-    await store.set_runtime_state(sid, record_key('original'), record)
-    source = ToolSource(sid, 1, 2, 'call', 'defer_work', {}, encode_results([record]))
+async def test_renamed_result_container_reads_originals_but_plain_same_name_does_not(registry_store):
+    store,_=registry_store
+    registry=ToolRegistry()
+    registry.register(ToolDefinition('work','',async_capable=True,pricing=Free('fixture')),lambda **args:'EXACT')
+    registry.register(ToolDefinition('background_run','',pricing=Free('fixture')),lambda **args:'')
+    runner,row=await start_background(store,registry,'work')
     try:
+        ref=JobRef(**json.loads(row.content)['job_ref'])
+        await runner.runtime.client.wait(ref,actor=runner.actor,deadline_ms=now_ms()+10000)
+        sid=runner.target.session_id
+        record=await load_record(store,sid,ref.job_id)
+        engine=ToolContextEngine(config=ToolContextConfig(),store=store,owner_session_id=sid,
+            owner_send_index=1,registry=registry,llm=None,model='unused')
+        source=ToolSource(sid,1,row.seq,'background','defer_work',{},encode_results([record]))
         assert engine.manages('defer_work') and not engine.manages('background_run')
-        assert (await engine._background_sources(source))[0].result == 'EXACT'
-        assert await engine._background_sources(replace(source, name='background_run')) == []
-        record['tool'] = 'defer_work'
-        await store.set_runtime_state(sid, record_key('original'), record)
-        assert await engine._background_sources(source) == []  # nested containers are not expanded
+        assert (await engine._background_sources(source))[0].result=='EXACT'
+        assert await engine._background_sources(replace(source,name='background_run'))==[]
     finally:
-        await store.close()
+        await runner.aclose()
 
 
 @pytest.mark.parametrize('field', ['background_allowed', 'result_container'])
@@ -182,25 +187,24 @@ async def test_contract_change_after_registration_is_rejected_by_every_consumer(
         registry.to_openai_tools()
 
 
-async def test_original_receipt_recall_survives_alias_and_registration_removal():
-    import json
-
-    from power_loop import SessionStore
+async def test_original_receipt_recall_survives_alias_and_registration_removal(registry_store):
     from power_loop.runtime.tool_archive import recall_original
-
-    store = await SessionStore.open(':memory:')
-    sid = await store.create_session()
-    record = {'task_id': 'old', 'tool': 'image', 'args': {'x': 1},
-              'result': 'FULL ORIGINAL', 'status': 'completed'}
+    store,_=registry_store
+    registry=ToolRegistry()
+    registry.register(ToolDefinition('image','',async_capable=True,pricing=Free('fixture')),lambda **args:'FULL ORIGINAL')
+    runner,row=await start_background(store,registry,'image',{'x':1})
     try:
-        await store.set_runtime_state(sid, record_key('old'), record)
-        await store.append_message(sid, send_index=1, role='assistant', tool_calls=[{
-            'id': 'old-call', 'type': 'function', 'function': {'name': 'retired_alias', 'arguments': '{}'}}])
-        seq = await store.append_message(sid, send_index=1, role='tool', tool_call_id='old-call',
-                                         content=encode_results([record]))
-        row = await store.get_message(sid, seq)
-        original = json.loads(await recall_original(store, sid, 1, row))
-        assert original['background_originals'] == [record]
-        assert (await store.get_message(sid, seq)).content == row.content
+        ref=JobRef(**json.loads(row.content)['job_ref'])
+        await runner.runtime.client.wait(ref,actor=runner.actor,deadline_ms=now_ms()+10000)
+        sid=runner.target.session_id
+        record=await load_record(store,sid,ref.job_id)
+        registry.unregister('image')
+        await store.append_message(sid,send_index=1,role='assistant',tool_calls=[{
+            'id':'old-call','type':'function','function':{'name':'retired_alias','arguments':'{}'}}])
+        seq=await store.append_message(sid,send_index=1,role='tool',tool_call_id='old-call',content=encode_results([record]))
+        row=await store.get_message(sid,seq)
+        original=json.loads(await recall_original(store,sid,1,row))
+        assert original['background_originals']==[record]
+        assert (await store.get_message(sid,seq)).content==row.content
     finally:
-        await store.close()
+        await runner.aclose()

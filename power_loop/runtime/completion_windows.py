@@ -37,8 +37,9 @@ async def _creation(manager, tx, row):
 
 
 async def read_row(manager, tx, row):
+    import json
+
     from .execution_membership import _lease, scope
-    from .timer_waits import _object
 
     creation, protocol = await _creation(manager, tx, row)
     event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id(manager, row["job_id"]),))
@@ -48,7 +49,7 @@ async def read_row(manager, tx, row):
         return None  # Legacy is explicit, never an invented original deadline.
     if event is None:
         raise JobError("completion_window_evidence_missing")
-    data = _object(event["payload_json"])
+    data = json.loads(event["payload_json"])
     keys = {"version", "origin", "creation_id", "creation_hash", "timeout_ms", "admitted_at_ms", "deadline_at_ms"}
     if (set(data) != keys or type(data["version"]) is not int or data["version"] != 1
             or type(data["timeout_ms"]) is not int or data["timeout_ms"] != DEFAULT_TIMEOUT_MS

@@ -77,8 +77,9 @@ class _MyTransaction:
 
 
 class MySQLDatabase:
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, *, lock_connection_factory=None) -> None:
         self._pool = pool
+        self._lock_connection_factory = lock_connection_factory
         self.dialect: Dialect = MySQLDialect()
         self._closed = False
 
@@ -88,7 +89,7 @@ class MySQLDatabase:
         from pymysql.constants import CLIENT  # aiomysql depends on PyMySQL
 
         u = urlparse(dsn)
-        pool = await aiomysql.create_pool(
+        connection_options = dict(
             host=u.hostname or "localhost",
             port=u.port or 3306,
             user=unquote(u.username) if u.username else None,
@@ -99,10 +100,15 @@ class MySQLDatabase:
             # Suppress benign Note-level diagnostics (e.g. "table already exists" from
             # CREATE TABLE IF NOT EXISTS); real Warnings/Errors still surface.
             init_command="SET SESSION sql_notes=0, transaction_isolation='READ-COMMITTED'",
-            minsize=minsize,
-            maxsize=maxsize,
         )
-        return cls(pool)
+        pool = await aiomysql.create_pool(**connection_options, minsize=minsize, maxsize=maxsize)
+        return cls(pool, lock_connection_factory=lambda: aiomysql.connect(**connection_options))
+
+    async def open_lock_connection(self):
+        if self._lock_connection_factory is None:
+            from power_loop.agent.runtime_types import RuntimeRequestError
+            raise RuntimeRequestError("invalid_options", "dedicated MySQL lock connection is not configured")
+        return await self._lock_connection_factory()
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[_MyTransaction]:

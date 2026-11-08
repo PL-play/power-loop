@@ -1,4 +1,4 @@
-"""Scoped shared blackboard: default SqliteBlackboard + board_* tools."""
+"""Scoped shared blackboard: default StoreBlackboard + board_* tools."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from power_loop import (
     BlackboardEntry,
     BlackboardError,
     SessionStore,
-    SqliteBlackboard,
-    StatefulAgentLoop,
+    StoreBlackboard,
     register_blackboard_tools,
     render_entries,
 )
@@ -37,11 +36,11 @@ async def store() -> AsyncIterator[SessionStore]:
     await s.close()
 
 
-# ── default SqliteBlackboard ──────────────────────────────────────────────────
+# ── default StoreBlackboard ──────────────────────────────────────────────────
 
 
 async def test_post_read_update_remove(store: SessionStore) -> None:
-    bb = SqliteBlackboard(store)
+    bb = StoreBlackboard(store)
     e = await bb.post("b1", text="claim the plan", kind="task", status="open", author="alice")
     assert isinstance(e, BlackboardEntry) and e.id == 1 and e.kind == "task"
 
@@ -56,7 +55,7 @@ async def test_post_read_update_remove(store: SessionStore) -> None:
 
 
 async def test_boards_are_isolated_by_id(store: SessionStore) -> None:
-    bb = SqliteBlackboard(store)
+    bb = StoreBlackboard(store)
     await bb.post("run-A", text="A only", author="x")
     await bb.post("run-B", text="B only", author="y")
     assert [e.text for e in await bb.read("run-A")] == ["A only"]
@@ -64,7 +63,7 @@ async def test_boards_are_isolated_by_id(store: SessionStore) -> None:
 
 
 async def test_two_authors_share_one_board(store: SessionStore) -> None:
-    bb = SqliteBlackboard(store)
+    bb = StoreBlackboard(store)
     await bb.post("shared", text="from alice", author="alice")
     await bb.post("shared", text="from bob", author="bob")
     entries = await bb.read("shared")
@@ -73,7 +72,7 @@ async def test_two_authors_share_one_board(store: SessionStore) -> None:
 
 
 async def test_caps_and_errors(store: SessionStore) -> None:
-    bb = SqliteBlackboard(store, max_entries=2, max_text_len=10)
+    bb = StoreBlackboard(store, max_entries=2, max_text_len=10)
     await bb.post("b", text="one")
     await bb.post("b", text="two")
     with pytest.raises(BlackboardError, match="full"):
@@ -125,10 +124,11 @@ def _tools() -> ToolRegistry:
 
 
 async def test_board_tools_end_to_end() -> None:
-    loop = StatefulAgentLoop(llm=_LLM(), db_path=":memory:",
-                             config=AgentLoopConfig(system_prompt="o", compactor=None))
-    sid = await loop.new_session(metadata={"spec_name": "alice"})
-    bb = SqliteBlackboard(loop.store)
+    from types import SimpleNamespace
+    store = await SessionStore.open(":memory:")
+    loop = SimpleNamespace(store=store, config=AgentLoopConfig())
+    sid = await store.create_session(metadata={"spec_name": "alice"})
+    bb = StoreBlackboard(loop.store)
     reg = _tools()
     board = reg.get("board").handler
 
@@ -147,6 +147,7 @@ async def test_board_tools_end_to_end() -> None:
     assert "task·done" in snap
     # author was resolved from session metadata, persisted under the board id
     assert [e.author for e in await bb.read("conv-7")] == ["alice"]
+    await store.close()
 
 
 async def test_board_tools_error_when_no_board_configured() -> None:
@@ -160,12 +161,13 @@ async def test_board_tools_error_when_no_board_configured() -> None:
 
 
 async def test_board_post_validates_kind() -> None:
-    loop = StatefulAgentLoop(llm=_LLM(), db_path=":memory:",
-                             config=AgentLoopConfig(system_prompt="o", compactor=None))
-    sid = await loop.new_session()
+    from types import SimpleNamespace
+    store = await SessionStore.open(":memory:")
+    loop = SimpleNamespace(store=store, config=AgentLoopConfig())
+    sid = await store.create_session()
     reg = _tools()
     board = reg.get("board").handler
-    with runtime_env_context(RuntimeEnv(blackboard=SqliteBlackboard(loop.store), blackboard_id="b")):
+    with runtime_env_context(RuntimeEnv(blackboard=StoreBlackboard(loop.store), blackboard_id="b")):
         tl = set_current_loop(loop)
         ts = set_session_id(sid)
         try:
@@ -174,3 +176,4 @@ async def test_board_post_validates_kind() -> None:
             reset_current_loop(tl)
             reset_session_id(ts)
     assert "kind must be one of" in out
+    await store.close()

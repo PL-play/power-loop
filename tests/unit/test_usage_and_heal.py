@@ -12,11 +12,12 @@ from typing import Any
 
 import pytest
 
-from power_loop import StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from power_loop.core.state import ContextManager
-from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
+from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_request_sanitize import StrictModel
+
+__all__ = ["registry_store"]
 
 
 @dataclass
@@ -93,7 +94,7 @@ def test_usage_totals_counts_calls_without_usage():
 
 
 @pytest.mark.asyncio
-async def test_send_result_carries_summed_usage(tmp_path):
+async def test_send_result_carries_summed_usage(registry_store, runtime_agent):
     from power_loop import AgentLoopConfig, create_default_tool_registry
 
     llm = _Scripted(responses=[
@@ -101,29 +102,23 @@ async def test_send_result_carries_summed_usage(tmp_path):
         _resp("final answer", prompt=150, completion=5),            # round 2: text
     ])
     reg = create_default_tool_registry(preset="core", bind=False)
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-        tool_registry=reg,
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(store=registry_store[0], model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=reg)
+    res = await loop.send("hi")
     assert res.status == "completed"
     assert res.usage["prompt_tokens"] == 250
     assert res.usage["completion_tokens"] == 15
     assert res.usage["calls"] == 2
-    loop.close()
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_tool_rounds_also_persist_per_round_usage_rows(tmp_path):
+async def test_tool_rounds_also_persist_per_round_usage_rows(registry_store, runtime_agent):
     """每一轮都要有 usage_rounds 行——包括带工具调用的回合。
 
     5.2.2 之前 on_round_ended(usage=…) 只在无工具回合的收尾路径上发：agent 会话里几乎
     每轮都带工具，于是一个 34 轮的叶子在表里只剩最后一轮那一行（2026-08-19 线上实锤）。
     总量从来没错（session_stats 用 send 结束时的内存聚合 bump），丢的是这张表存在的
     唯一意义——逐轮明细。"""
-    import sqlite3
 
     from power_loop import AgentLoopConfig, create_default_tool_registry
 
@@ -133,55 +128,48 @@ async def test_tool_rounds_also_persist_per_round_usage_rows(tmp_path):
         _resp("final answer", prompt=150, completion=5),            # round 3: text
     ])
     reg = create_default_tool_registry(preset="core", bind=False)
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=6),
-        tool_registry=reg,
-    )
-    sid = await loop.new_session()
-    res = await loop.send("hi", session_id=sid)
+    loop = await runtime_agent(store=registry_store[0], model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=6), registry=reg)
+    sid = loop.target.session_id
+    res = await loop.send("hi")
     assert res.status == "completed"
-    loop.close()
-    rows = sqlite3.connect(str(tmp_path / "s.db")).execute(
-        "SELECT round_index, prompt_tokens, completion_tokens FROM pl_usage_rounds "
-        "WHERE session_id=? ORDER BY round_index", (sid,)
-    ).fetchall()
-    assert [r[0] for r in rows] == [0, 1, 2], f"每轮一行，含工具回合；实际 {rows}"
-    assert [r[1] for r in rows] == [100, 120, 150]
-    assert [r[2] for r in rows] == [10, 12, 5]
+    await loop.aclose()
+    store = loop.runtime.store
+    rows = await store._db.fetchall(
+        f"SELECT round_index, prompt_tokens, completion_tokens FROM {store.t.usage_rounds} "
+        "WHERE session_id=? ORDER BY round_index", (sid,))
+    assert [r['round_index'] for r in rows] == [0, 1, 2]
+    assert [r['prompt_tokens'] for r in rows] == [100, 120, 150]
+    assert [r['completion_tokens'] for r in rows] == [10, 12, 5]
+
 
 
 @pytest.mark.asyncio
-async def test_each_send_gets_its_own_usage(tmp_path):
+async def test_each_send_gets_its_own_usage(registry_store, runtime_agent):
     from power_loop import AgentLoopConfig
 
     llm = _Scripted(responses=[
         _resp("one", prompt=10, completion=1),
         _resp("two", prompt=20, completion=2),
     ])
-    loop = StatefulAgentLoop(
-        llm=llm, db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t"),
-    )
-    sid = await loop.new_session()
-    r1 = await loop.send("a", session_id=sid)
-    r2 = await loop.send("b", session_id=sid)
+    loop = await runtime_agent(store=registry_store[0], model=llm, config=AgentLoopConfig(system_prompt="t"))
+    r1 = await loop.send("a")
+    r2 = await loop.send("b")
     assert r1.usage["prompt_tokens"] == 10
     assert r2.usage["prompt_tokens"] == 20  # NOT cumulative across sends
-    loop.close()
+    await loop.aclose()
 
 
 # ── default send recovery ─────────────────────────────────────────────
 
 
-async def _wedge_session(loop: StatefulAgentLoop, sid: str) -> None:
+async def _wedge_session(store, sid: str) -> None:
     """Simulate a run killed mid tool-call: pending tool_calls in the store."""
-    await loop.store.append_message(
+    await store.append_message(
         sid, role="assistant", content="",
         tool_calls=[{"id": "dead1", "type": "function",
                      "function": {"name": "echo", "arguments": "{}"}}],
     )
-    await loop.store.set_pending(sid, {
+    await store.set_pending(sid, {
         "assistant_seq": 1, "round_index": 0,
         "tool_call_ids": ["dead1"],
         "tool_calls": [{"id": "dead1", "type": "function",
@@ -190,30 +178,27 @@ async def _wedge_session(loop: StatefulAgentLoop, sid: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_interrupts_pending_and_proceeds(tmp_path):
+async def test_send_interrupts_pending_and_proceeds(tmp_path, runtime_agent):
     from power_loop import AgentLoopConfig
 
-    loop = StatefulAgentLoop(
-        llm=StrictModel(responses=[_resp("recovered", prompt=1, completion=1)]),
-        db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(system_prompt="t"),
-    )
-    sid = await loop.new_session()
-    await _wedge_session(loop, sid)
-    res = await loop.send("hello again", session_id=sid)
+    loop = await runtime_agent(model=StrictModel(responses=[_resp("recovered", prompt=1, completion=1)]), config=AgentLoopConfig(system_prompt="t"))
+    sid = loop.target.session_id
+    await _wedge_session(loop.runtime.store, sid)
+    res = await loop.send("hello again")
     assert res.status == "completed"
     assert res.final_text == "recovered"
     # The dead tool_call got a synthetic <aborted> tool message.
-    msgs = await loop.get_messages(sid)
-    aborted = [m for m in msgs if m.get("role") == "tool" and "执行中断，结果未知" in str(m.get("content"))]
+    msgs = await loop.runtime.store.load_all_messages(sid)
+    aborted = [m for m in msgs if m.role == "tool" and "执行中断，结果未知" in str(m.content)]
     assert len(aborted) == 1
     # A healthy send needs no repair.
-    res2 = await loop.send("again", session_id=sid)
+    res2 = await loop.send("again")
     assert res2.status == "completed"
-    loop.close()
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_send_interrupts_stale_pending(registry_store):  # noqa: F811
+async def test_task_runtime_send_interrupts_stale_pending(registry_store, runtime_agent):  # noqa: F811
     from power_loop import AgentLoopConfig
     from power_loop.runtime.jobs import JobManager
     from power_loop.runtime.task_runtime import TaskRuntime
@@ -222,16 +207,15 @@ async def test_task_runtime_send_interrupts_stale_pending(registry_store):  # no
     runtime = TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host",
                           executor_id="heal", boot_id="boot")
     model = StrictModel()
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-                             config=AgentLoopConfig(compactor=None, delegation_policy="single_level"))
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, config=AgentLoopConfig(compactor=None, delegation_policy="single_level"))
     try:
-        sid = await loop.new_session()
-        await _wedge_session(loop, sid)
-        assert (await loop.send("continue", sid)).status == "completed"
-        assert await loop.get_pending(sid) is None
+        sid = loop.target.session_id
+        await _wedge_session(loop.runtime.store, sid)
+        assert (await loop.send("continue")).status == "completed"
+        assert (await store.get_state(sid)).pending is None
         tools = [m for m in model.requests[0] if m["role"] == "tool"]
         assert len(tools) == 1 and "执行中断，结果未知" in tools[0]["content"]
-        assert (await loop.send("continue again", sid)).status == "completed"
+        assert (await loop.send("continue again")).status == "completed"
         rows = await store.load_active_messages(sid)
         assert len([r for r in rows if r.role == "tool"]) == 1
     finally:

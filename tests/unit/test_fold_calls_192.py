@@ -1,12 +1,11 @@
 """History-fold model calls inside a task-managed send: booked, refused or cancelled, never unmanaged."""
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, CancellationToken, LLMRequest, StatefulAgentLoop
+from power_loop import AgentEventBus, AgentLoopConfig, CancellationToken, LLMRequest
 from power_loop._vendor.llm_client.interface import LLMResponse, LLMTokenUsage
 from power_loop.contracts.errors import CancellationRequested
 from power_loop.contracts.events import AgentEventType
@@ -43,9 +42,12 @@ class FoldHost(Host):
     def __init__(self):
         super().__init__()
         self.purposes = []
+        self.prepared = []
 
     async def prepare(self, context, logical_request, *, service, purpose=None):
         self.purposes.append(purpose)
+        self.prepared.append({"attempt_id": context["attempt_id"], "purpose": purpose,
+                              "model": service.capabilities.model})
         return await super().prepare(context, logical_request, service=service)
 
 
@@ -82,9 +84,7 @@ def _request():
 
 
 async def _prepared(c):
-    rows = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'")
-    return [json.loads(row["payload_json"]) for row in rows]
+    return c.host.prepared
 
 
 async def test_fold_call_is_booked_once_as_fold_under_the_send(fold_case):
@@ -140,9 +140,8 @@ async def test_failed_fold_call_is_unknown_and_never_retried_by_a_fallback(fold_
         _SEND.reset(token)
     assert model.calls == 1 and len(await _prepared(c)) == 1
     assert c.binding.resource_evidence["resource_state"] == "unknown"
-    [finished] = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_finished'")
-    assert json.loads(finished["payload_json"])["status"] == "unknown"
+    [submission] = c.host.applied.values()
+    assert submission.attempt_id == c.host.prepared[0]["attempt_id"]
 
 
 async def test_cancelled_send_cancels_the_fold_through_a_swallowing_strategy(fold_case):
@@ -211,41 +210,41 @@ class SendModel:
         pass
 
 
-async def test_task_send_end_of_send_fold_runs_inside_the_send(registry_store):
+async def test_task_send_end_of_send_fold_runs_inside_the_send(registry_store, runtime_agent):
     store, _ = registry_store
     runtime = TaskRuntime(JobManager(store), tenant_id="fold-loop", principal_id="host",
                           executor_id="executor", boot_id="boot", lease_ms=300000)
     model = SendModel()
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, config=AgentLoopConfig(
+    bus, events = AgentEventBus(), []
+    bus.subscribe(AgentEventType.LLM_CALL_STARTED, events.append)
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, event_bus=bus, config=AgentLoopConfig(
         delegation_policy="single_level", system_prompt="S", max_rounds=2, max_tokens=10,
         representation=ProjectedRepresentation(), fold_strategy=LLMSummaryFold(keep_last_sends=2)))
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     for i in range(1, 4):
-        assert (await loop.send(f"m{i}", session_id=sid)).status == "completed"
+        assert (await loop.send(f"m{i}")).status == "completed"
     compact = await store.latest_project_compact(sid)
     assert compact is not None and compact.content["summary"] == "FOLD-1"
-    rows = await runtime.manager.db.fetchall(
-        f"SELECT payload_json FROM {runtime.manager.events} WHERE event_type='model_attempt_prepared'")
-    purposes = [json.loads(r["payload_json"]).get("purpose") for r in rows]
+    purposes = [event.data.purpose for event in events]
     assert purposes.count("fold") == 1 and purposes.count(None) == 3
     assert len(model.requests) == 4
 
 
-async def test_task_send_verbatim_compaction_is_booked_as_fold(registry_store, monkeypatch):
+async def test_task_send_verbatim_compaction_is_booked_as_fold(registry_store, monkeypatch, runtime_agent):
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     store, _ = registry_store
     runtime = TaskRuntime(JobManager(store), tenant_id="fold-verbatim", principal_id="host",
                           executor_id="executor", boot_id="boot", lease_ms=300000)
     model = SendModel()
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, config=AgentLoopConfig(
+    bus, events = AgentEventBus(), []
+    bus.subscribe(AgentEventType.LLM_CALL_STARTED, events.append)
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, event_bus=bus, config=AgentLoopConfig(
         delegation_policy="single_level", system_prompt="S", max_rounds=2, max_tokens=10,
         representation=VerbatimRepresentation(), fold_strategy=LLMSummaryFold(keep_last_sends=1, trigger_ratio=0.5)))
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     for i in range(1, 5):
-        assert (await loop.send(f"m{i}", session_id=sid)).status == "completed"
+        assert (await loop.send(f"m{i}")).status == "completed"
     assert await store.list_compactions(sid)
-    rows = await runtime.manager.db.fetchall(
-        f"SELECT payload_json FROM {runtime.manager.events} WHERE event_type='model_attempt_prepared'")
-    purposes = [json.loads(r["payload_json"]).get("purpose") for r in rows]
+    purposes = [event.data.purpose for event in events]
     folds = sum("transcript" in str(r.messages) for r in model.requests)
     assert folds >= 1 and purposes.count("fold") == folds and purposes.count(None) == len(model.requests) - folds

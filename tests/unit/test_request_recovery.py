@@ -8,13 +8,10 @@ import pytest
 
 from power_loop import (
     AgentLoopConfig,
-    CancellationToken,
     LLMResponse,
     LLMRetryPolicy,
     LLMTokenUsage,
-    StatefulAgentLoop,
 )
-from power_loop.contracts.errors import CompactionFailed
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.history_sanitize import sanitize_request_messages
 from power_loop.runtime.jobs import JobManager
@@ -64,7 +61,7 @@ class RepairModel(StrictModel):
      ["initial", "summary", "retry"]),
 ], ids=["format-retry", "context-summary", "context-retry", "shared-budget"])
 async def test_recovery_stops_within_original_budget(managed, ending, kind, delays, expected,
-                                                     record_property):
+                                                     record_property, runtime_agent):
     phases, stopped = [], []
     reached = asyncio.Event()
     started = None
@@ -91,22 +88,24 @@ async def test_recovery_stops_within_original_budget(managed, ending, kind, dela
     runtime = (TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host",
         executor_id="repair", boot_id="boot", boot_contract_hash="a" * 64) if managed else None)
     timeout = (1 if ending == "cancel" else .15 if len(delays) == 3 else .05)
-    loop = StatefulAgentLoop(llm=SlowRepair(kind), store=store, task_runtime=runtime,
+    loop = await runtime_agent(model=SlowRepair(kind), store=store, task_runtime=runtime,
         config=AgentLoopConfig(compactor=None, delegation_policy="single_level",
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, total_timeout=timeout)))
-    token = CancellationToken()
     try:
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         await store.append_message(sid, role="user", content="old details " * 200)
         await store.append_message(sid, role="assistant", content="done")
-        task = asyncio.create_task(loop.send("continue", sid, stop_event=token))
+        from power_loop.agent.runtime_store import now_ms
+        receipt = await loop.runtime.client.send(loop.target, "continue", message_id="repair", actor=loop.actor)
+        task = asyncio.create_task(loop.runtime.client.wait(receipt.input_ref, actor=loop.actor,
+                                                           deadline_ms=now_ms()+10000))
         if ending == "cancel":
             await asyncio.wait_for(reached.wait(), .5)
-            token.cancel("stop during repair")
+            await loop.runtime.client.cancel(receipt.input_ref, actor=loop.actor, reason="stop during repair")
         result = await asyncio.wait_for(task, .5)
         elapsed = time.monotonic() - started
         record_property("elapsed_seconds", round(elapsed, 4))
-        assert result.status == ("degraded" if ending == "timeout" else "cancelled")
+        assert result.status == ("failed" if ending == "timeout" else "cancelled")
         if ending == "timeout":
             assert "LLM timeout" in result.final_text
             assert elapsed < timeout + .1
@@ -120,11 +119,17 @@ async def test_recovery_stops_within_original_budget(managed, ending, kind, dela
 @pytest.mark.parametrize("kind", ["format", "context"])
 @pytest.mark.parametrize("fails_twice", [False, True])
 @pytest.mark.parametrize("mode", ["plain", "managed", "budgeted"])
-async def test_rejected_history_recovers_once(registry_store, kind, fails_twice, mode):  # noqa: F811
+async def test_rejected_history_recovers_once(registry_store, kind, fails_twice, mode, runtime_agent):  # noqa: F811
     store, _ = registry_store
     model = RepairModel(kind, fails_twice=fails_twice)
     host = FoldHost()
     host.service = model
+    observations = []
+    original_usage = host.prepare_usage
+    async def prepare_usage(context, grant, observation):
+        observations.append(observation)
+        return await original_usage(context, grant, observation)
+    host.prepare_usage = prepare_usage
     original_prepare = host.prepare
 
     async def prepare(context, request, *, service, purpose=None):
@@ -139,20 +144,20 @@ async def test_rejected_history_recovers_once(registry_store, kind, fails_twice,
     runtime = (None if mode == "plain" else TaskRuntime(JobManager(store), tenant_id="eval",
         principal_id="host", executor_id="repair", boot_id="boot", boot_contract_hash="a" * 64,
         budget_config=budget if mode == "budgeted" else None))
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=_echo_registry(),
+    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, registry=_echo_registry(),
         config=AgentLoopConfig(compactor=None, delegation_policy="single_level", max_tokens=20,
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, give_up_on=None)))
     try:
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         for msg in [{"role": "user", "content": "old details " * 200}, assistant(call("old")),
                     {"role": "tool", "tool_call_id": "old", "content": "known"}]:
             await store.append_message(sid, **msg)
         before = await store.load_active_messages(sid)
+        result = await loop.send("continue")
         if fails_twice:
-            with pytest.raises(Rejection):
-                await loop.send("continue", sid)
+            assert result.status == "failed" and result.error == "Rejection", result
         else:
-            assert (await loop.send("continue", sid)).final_text == "recovered"
+            assert result.status == "completed" and result.final_text == "recovered"
         assert len(model.main_requests) == 2
         assert model.summaries == (1 if kind == "context" else 0)
         first, second = [r.messages for r in model.main_requests]
@@ -164,8 +169,6 @@ async def test_rejected_history_recovers_once(registry_store, kind, fails_twice,
         assert (await store.load_active_messages(sid))[:len(before)] == before
         if mode == "budgeted":
             assert host.reserve_calls == host.apply_calls == (3 if kind == "context" else 2)
-            rows = await store._db.fetchall(f"SELECT state_json FROM {store.table_prefix}task_budget_attempts")
-            observations = [json.loads(r['state_json'])['observation'] for r in rows]
             zero = [o for o in observations if o['usage']['total_tokens'] == 0]
             assert len(zero) == (2 if fails_twice else 1)
             assert all(not o['estimated'] and o['status'] == 'returned' for o in zero)
@@ -197,16 +200,16 @@ def test_request_rejection_classifier(status, detail, expected):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_history", [False, True])
-async def test_uncompressible_request_fails_without_identical_retry(tmp_path, old_history):
+async def test_uncompressible_request_fails_without_identical_retry(tmp_path, old_history, runtime_agent):
     model = RepairModel("context", summary_fails=True)
-    loop = StatefulAgentLoop(llm=model, db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(compactor=None))
+    loop = await runtime_agent(model=model, config=AgentLoopConfig(compactor=None))
     try:
-        sid = await loop.new_session()
+        sid = loop.target.session_id
         if old_history:
-            await loop.store.append_message(sid, role="user", content="old " * 200)
-            await loop.store.append_message(sid, role="assistant", content="done")
-        with pytest.raises(CompactionFailed, match="Context too long"):
-            await loop.send("new", sid)
+            await loop.runtime.store.append_message(sid, role="user", content="old " * 200)
+            await loop.runtime.store.append_message(sid, role="assistant", content="done")
+        result = await loop.send("new")
+        assert result.status == "failed" and result.error == "CompactionFailed", result
         assert len(model.main_requests) == 1
         assert model.summaries == int(old_history)
     finally:

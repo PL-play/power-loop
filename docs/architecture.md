@@ -1,228 +1,28 @@
-# 架构总览
+# Runtime 架构 · SDK 11
 
-[English](en/architecture.md) | [回到文档站](README.md)
-
-本文概览 power-loop 的内部协作：模块边界、`send()` 全链路、pipeline 阶段、pending 状态机、压缩、子代理、并发隔离和关键不变量。
-
-> 这些图使用保守 Mermaid 语法，适合 GitHub 原生渲染。
-
-## 1. 模块边界
-
-```mermaid
-flowchart TB
-    subgraph Public["Public API"]
-        SAL["StatefulAgentLoop"]
-        Config["AgentLoopConfig"]
-        Result["StatefulResult"]
-        Store["SessionStore"]
-        Registry["ToolRegistry"]
-        Hooks["AgentHooks"]
-        Bus["AgentEventBus"]
-    end
-
-    subgraph Core["Core internal"]
-        Pipeline["AgentPipeline"]
-        Runner["AgentRunner"]
-        Context["ContextManager"]
-    end
-
-    subgraph Runtime["Runtime internal"]
-        Compact["DefaultCompactor"]
-        Retry["LLMRetryPolicy"]
-        Cancel["CancellationToken"]
-        Memory["MemoryProvider"]
-        Structured["StructuredOutputSpec"]
-        Budget["trim_history"]
-    end
-
-    SAL --> Pipeline
-    SAL --> Runner
-    SAL --> Store
-    Config --> Compact
-    Config --> Retry
-    Config --> Memory
-    Pipeline --> Registry
-    Pipeline --> Hooks
-    Pipeline --> Bus
-    Pipeline --> Context
-```
-
-业务方主要依赖 `StatefulAgentLoop`、`AgentLoopConfig`、`SessionStore`、工具、hooks 和 events。`core` 与大部分 `runtime` 模块是内部实现细节。
-
-## 2. send 全链路
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant Agent as StatefulAgentLoop
-    participant Store as SessionStore
-    participant Pipeline as AgentPipeline
-    participant LLM
-    participant Tools as ToolRegistry
-
-    Caller->>Agent: new_session()
-    Agent->>Store: create_session()
-    Store-->>Agent: sid
-    Caller->>Agent: send(user_input, session_id=sid)
-    Agent->>Store: append user message
-    Agent->>Store: load active messages
-    Agent->>Pipeline: run(history)
-    Pipeline->>Pipeline: session.start hook
-    loop each round
-        Pipeline->>Pipeline: round.start hook
-        Pipeline->>Pipeline: maybe compact and recall memory
-        Pipeline->>LLM: complete(messages, tools)
-        LLM-->>Pipeline: response
-        Pipeline->>Store: append assistant message
-        alt response has tool calls
-            Pipeline->>Tools: invoke_async(name, args)
-            Tools-->>Pipeline: result
-            Pipeline->>Store: append tool message
-        else final answer
-            Pipeline->>Pipeline: session.end hook
-            Pipeline-->>Agent: AgentLoopResult
-        end
-    end
-    Agent-->>Caller: StatefulResult
-```
-
-## 3. Pipeline 单轮
-
-```mermaid
-flowchart TD
-    A["round.start"] --> B["prepare round"]
-    B --> C{"compaction needed"}
-    C -->|"yes"| D["compactor.maybe_compact"]
-    C -->|"no"| E["llm.before"]
-    D --> E
-    E --> F["LLM.complete"]
-    F --> G["llm.after"]
-    G --> H["append assistant message"]
-    H --> I{"has tool calls"}
-    I -->|"no"| J["round.end and session.end"]
-    I -->|"yes"| K["round.decide"]
-    K --> L["tools.batch.before"]
-    L --> M["tool.before, invoke, tool.after"]
-    M --> N["append tool message"]
-    N --> O{"more tools"}
-    O -->|"yes"| M
-    O -->|"no"| P["tools.batch.after"]
-    P --> Q["round.end"]
-    Q --> A
-```
-
-## 4. Sink 和 Store
+公开入口为 RuntimeClient。StatefulAgentLoop(runtime=runtime) 提供提交并等待的便捷调用。工厂在执行节点按不可变、版本化的描述符引用重建 ExecutionEnvironment；消息中不保存活的模型对象、资源连接或宿主密钥。
 
 ```mermaid
 flowchart LR
-    Pipeline["AgentPipeline"] --> Sink["MessageSink protocol"]
-    Sink --> SQLiteSink["SQLiteSink"]
-    Sink --> NullSink["NullSink"]
-    SQLiteSink --> Store["SessionStore"]
-    Store --> Sessions["sessions"]
-    Store --> Messages["messages"]
-    Store --> State["session_state"]
-    Store --> Compactions["compactions"]
-    Store --> Usage["usage_rounds"]
+  Host[已认证宿主] --> Client[RuntimeClient]
+  Client --> Inbox[持久输入与 Receipt]
+  Inbox --> Worker[所有权与容量控制]
+  Factory[工厂与启动预检] --> Worker
+  Worker --> Model[模型、工具与 hooks]
+  Model --> Result[持久结果与用量]
+  Result --> Query[查询与等待]
+  Model --> Children[独立子任务]
+  Children --> Inbox
 ```
 
-`SQLiteSink` 把 pipeline 的内存 history 映射回 SQLite seq，保证消息追加、pending 清理和 compaction 审计都落在同一个 `SessionStore`。
+Store ID、会话目标、输入 ID 和任务代次分别标识不同对象。权限取自可信 actor，输入受理时固定配置和描述符。Worker 条件领取输入，取得会话所有权后装配环境。已受理与已执行完成是两个状态。
 
-## 5. Pending 状态机
+模型执行使用有界 Runtime 容量；工作流驱动和子任务共享入队与任务体系。等待不占唯一模型槽位。父任务中断后，健康子任务仍可查询；取消指向原任务与原资源。已经结束的工作流节点保存晚到子结果，显式继续时沿用原归属和累计额度。
 
-```mermaid
-stateDiagram-v2
-    [*] --> Clean: session created
-    Clean --> Pending: assistant tool calls stored
-    Pending --> Pending: tool message stored, some remain
-    Pending --> Clean: last tool message stored
-    Pending --> Recovered: resume called
-    Pending --> Aborted: abort_pending called
-    Recovered --> Clean: remaining tools executed
-    Aborted --> Clean: aborted tool messages stored
-```
+默认组合使用内存传输、内存所有权和 store 启动独占锁，拒绝两个独立默认进程同时启动。纯 Client 不持有该锁。共享执行必须显式提供共享适配器，并在同能力 worker 组声明同一组 required_profiles。健康状态有界，不为每次请求额外查询健康数据库。
 
-如果进程在 assistant tool calls 已落库、tool 消息未全部落库时退出，下次 `send()` 自动为遗留调用补“执行中断，结果未知”并继续。调用方仍可显式使用 `resume()` 或 `abort_pending()`。
+默认定时后端使用 SDK 存储和 Runtime 管理的 driver；显式宿主后端必须提供就绪 driver。定时器按索引分批扫描、条件领取，使用稳定输入 ID 提交，只等待受理。StoreBlackboard 在数据库内原子读改写，首次建行同样受保护。DeepTalk 适配器继续通过 API 管理业务状态。
 
-## 6. 压缩流程
+未知外部动作只查询原结果或明确 unknown，不自动重放。恢复目标是格式正确、任务可见、流程可继续，不保证逐阶段精确恢复。当前结构可以重开，旧结构和协议直接拒绝，不保留兼容执行分支。
 
-```mermaid
-flowchart TD
-    A["round.start"] --> B{"tokens over threshold"}
-    B -->|"no"| Z["continue"]
-    B -->|"yes"| C["compact.before hook"]
-    C --> D{"hook skipped"}
-    D -->|"yes"| Z
-    D -->|"no"| E["find foldable span"]
-    E --> F["expand to atomic boundary"]
-    F --> G["LLM summary call"]
-    G --> H{"summary success"}
-    H -->|"yes"| I["replace span with compact_note"]
-    H -->|"no"| J["continue without compaction"]
-    I --> K["persist compaction audit"]
-    K --> Z
-    J --> Z
-```
-
-压缩不切开 `assistant(tool_calls)` 和对应 `tool` 消息，失败时软降级为未压缩 history。
-
-## 7. 子代理
-
-```mermaid
-sequenceDiagram
-    participant Parent as Parent Pipeline
-    participant Agent as StatefulAgentLoop
-    participant Store as SessionStore
-    participant Child as Child Pipeline
-
-    Parent->>Agent: spawn_agent(task, preset)
-    Agent->>Store: create child session
-    Store-->>Agent: child_sid
-    Agent->>Child: run(child_history)
-    Child-->>Agent: child result
-    Agent->>Store: close or keep child session
-    Agent-->>Parent: subagent result text
-```
-
-```mermaid
-flowchart TD
-    P["Parent Session sess_abc"] --> C1["Child researcher sess_def"]
-    P --> C2["Child reviewer sess_ghi"]
-    C1 --> GC1["Grandchild searcher sess_jkl"]
-```
-
-所有子代理共享父代理的 `SessionStore`。`close_session(parent_sid, cascade=True)` 会级联删除 `LINKED` 子树。
-
-## 8. 并发与隔离
-
-```mermaid
-flowchart LR
-    subgraph Loop["StatefulAgentLoop"]
-        L1["asyncio.Lock sid_1"]
-        L2["asyncio.Lock sid_2"]
-        L3["asyncio.Lock sid_3"]
-    end
-    subgraph Store["SessionStore"]
-        DB["SQLite WAL"]
-    end
-    L1 --> DB
-    L2 --> DB
-    L3 --> DB
-```
-
-一个 `StatefulAgentLoop` 可以并发驱动多个 session；每个 session 有独立 `asyncio.Lock`，底层 SQLite 连接由 `threading.RLock` 串行化写入。
-
-## 9. 关键不变量
-
-| 不变量 | 执行位置 |
-|---|---|
-| `assistant(tool_calls)` 落库后立即设置 pending | `SQLiteSink.on_assistant_tool_calls` |
-| 最后一个 `tool` 消息落库后清 pending | `SQLiteSink.on_message_appended` |
-| `(session_id, seq)` 单调唯一 | `SessionStore.append_message` |
-| compaction 不切开工具调用原子对 | `DefaultCompactor` |
-| compaction 失败软降级 | `DefaultCompactor.maybe_compact` |
-| 子代理深度不超过 `store.max_spawn_depth`（默认 `MAX_SPAWN_DEPTH=3`，可配） | `SessionStore.create_session` |
-| `SQLiteSink._history_seqs` 与 pipeline history 一一对应 | `SQLiteSink` |
-| 子代理共享父代理的 `SessionStore` | `run_agent_spec` |
-
-更多细节见 [Hooks](hooks.md)、[Events](events.md) 和对应单元测试。
+详见 [Runtime 契约](runtime-11.md)、[中文 API](zh/api/index.md) 和可执行编号示例。本文对应 SDK 11.0.0、任务结构 15、协议 42、描述符结构 1，不代表已经部署或启用。

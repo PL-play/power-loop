@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, SessionStore, ToolDefinition
 from power_loop._vendor.llm_client.interface import LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.hooks import HookPoint
 from power_loop.core.control import ControlledLoopStop
@@ -36,7 +36,7 @@ class Scripted(LLMService):
         pass
 
 
-async def test_entry_stop_makes_no_model_call_and_finalizes_once():
+async def test_entry_stop_makes_no_model_call_and_finalizes_once(runtime_agent):
     hooks = AgentHooks()
     ends = []
 
@@ -47,16 +47,17 @@ async def test_entry_stop_makes_no_model_call_and_finalizes_once():
     hooks.register(HookPoint.SESSION_END, lambda ctx: ends.append(ctx.reason))
     llm = Scripted()
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, hooks=hooks, config=AgentLoopConfig(system_prompt="test", compactor=None)
+    loop = await runtime_agent(
+        model=llm, store=store, hooks=hooks, config=AgentLoopConfig(system_prompt="test", compactor=None)
     )
-    result = await loop.send("go", session_id=await loop.new_session())
-    assert result.status == "budget_exceeded" and result.final_text == "stop"
+    result = await loop.send("go")
+    assert result.status == "interrupted" and result.error == "budget_exceeded" and result.final_text == "stop"
     assert llm.calls == 0 and ends == ["quota_exhausted"]
+    await loop.aclose()
     await store.close()
 
 
-async def test_current_round_tool_finishes_then_next_round_stops_without_summary():
+async def test_current_round_tool_finishes_then_next_round_stops_without_summary(runtime_agent):
     hooks = AgentHooks()
     completed = []
     ended = []
@@ -84,19 +85,20 @@ async def test_current_round_tool_finishes_then_next_round_stops_without_summary
     )
     llm = Scripted()
     store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
-        llm=llm,
+    loop = await runtime_agent(
+        model=llm,
         store=store,
-        tool_registry=reg,
+        registry=reg,
         hooks=hooks,
         config=AgentLoopConfig(system_prompt="test", max_rounds=4, compactor=None),
     )
-    sid = await loop.new_session()
-    result = await loop.send("go", session_id=sid)
-    assert result.status == "budget_exceeded" and result.rounds == 1
+    sid = loop.target.session_id
+    result = await loop.send("go")
+    assert result.status == "interrupted" and result.error == "budget_exceeded"
     assert llm.calls == 1 and completed == ["saved result and fee"]
     assert ended == ["quota_exhausted"]
-    assert any(m.get("role") == "tool" and m.get("content") == "done" for m in await loop.get_messages(sid))
+    assert [(m.role, m.content) for m in await store.load_all_messages(sid) if m.role == "tool"] == [("tool", "done")]
+    await loop.aclose()
     await store.close()
 
 

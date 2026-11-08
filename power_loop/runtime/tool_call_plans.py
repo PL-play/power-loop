@@ -315,16 +315,16 @@ async def finish_receipt(manager, actor, ref, call_id):
 
 
 @_verify_stored
-async def reconcile_pending(loop, actor, source_job_id):
+async def reconcile_pending(runtime, actor, source_job_id):
     """Original-main host stages known outcomes/negative proofs; never executes."""
     from .managed_completion import _host_only
-    from .managed_delivery import enqueue, resolved_review, result_event
+    from .managed_delivery import enqueue_runtime, resolved_review, result_event
     from .managed_effects import _never_claimed, terminate_unstarted
     from .pending_calls import SNAPSHOT, _verify, model
 
     _host_only()
-    runtime = getattr(loop, 'task_runtime', None)
-    if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
+    from .task_runtime import TaskRuntime
+    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
         raise JobError('task_runtime_required')
     manager = runtime.manager
     from .abort_outcomes import uses_batch_route
@@ -334,7 +334,7 @@ async def reconcile_pending(loop, actor, source_job_id):
         batch_route = await uses_batch_route(manager, tx, source, closed)
     if batch_route:
         from .abort_outcomes import reconcile
-        return await reconcile(loop, actor, source_job_id)
+        return await reconcile(runtime, actor, source_job_id)
     async with manager._write() as tx:
         source = await manager._authorize(tx, actor, source_job_id)
         closed = await model(manager, tx, source)
@@ -364,6 +364,6 @@ async def reconcile_pending(loop, actor, source_job_id):
     for job_id, generation in targets:
         if generation == 0:
             await terminate_unstarted(manager, actor, job_id)
-    notices = [await enqueue(loop, actor, job_id) for job_id, _generation in targets]
+    notices = [await enqueue_runtime(runtime, actor, job_id) for job_id, _generation in targets]
     return {'source_job_id': source_job_id, 'notices': notices, 'execution_authority': False,
             'acknowledgement_created': False, 'billing_settled': False}

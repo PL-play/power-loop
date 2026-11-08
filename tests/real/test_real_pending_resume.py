@@ -13,7 +13,6 @@ import pytest
 from power_loop import (
     AgentLoopConfig,
     SessionStore,
-    StatefulAgentLoop,
 )
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.pricing import Free
@@ -21,6 +20,8 @@ from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
 from .judge import assert_passes
+
+pytestmark = pytest.mark.real_llm
 
 
 def _noop_registry() -> ToolRegistry:
@@ -38,11 +39,11 @@ def _noop_registry() -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_pending_is_interrupted_then_send_works() -> None:
+async def test_pending_is_interrupted_then_send_works(runtime_agent) -> None:
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=2048, temperature=0.2),
+        loop = await runtime_agent(
+            model=make_llm(max_tokens=2048, temperature=0.2),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -53,10 +54,10 @@ async def test_pending_is_interrupted_then_send_works() -> None:
                 max_rounds=2, max_tokens=2048, temperature=0.2,
                 compactor=None,
             ),
-            tool_registry=_noop_registry(),
+            registry=_noop_registry(),
         )
 
-        sid = await store.create_session(system_prompt="S")
+        sid = loop.target.session_id
         await store.append_message(sid, role="user", content="initial prompt")
         seq = await store.append_message(
             sid,
@@ -77,9 +78,9 @@ async def test_pending_is_interrupted_then_send_works() -> None:
         })
 
         q = "In one short sentence, what does HTML stand for?"
-        r = await loop.send(q, session_id=sid)
+        r = await loop.send(q)
         assert r.status == "completed"
-        assert await loop.get_pending(sid) is None
+        assert (await store.get_state(sid)).pending is None
         rows = await store.load_active_messages(sid)
         assert any(row.role == "tool" and "结果未知" in row.content for row in rows)
         await assert_passes(
@@ -92,4 +93,5 @@ async def test_pending_is_interrupted_then_send_works() -> None:
             ),
         )
     finally:
+        await loop.aclose()
         await store.close()

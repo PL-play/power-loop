@@ -122,7 +122,7 @@ async def submit(client, target, spec, *, message_id, actor, descriptor=None, op
                 options=plain(options),
             ),
             actor,
-            descriptor=descriptor,
+            descriptor=descriptor, child_start=True,
         )
         run_id = registration.operation.operation_id[3:]
         if receipt.newly_accepted:
@@ -295,7 +295,7 @@ class DurableExecutor:
                         options=plain(options),
                     ),
                     self.actor,
-                    descriptor=descriptor,
+                    descriptor=descriptor, child_start=True,
                 )
                 await tx.execute(
                     f"UPDATE {self.port.q} SET delivered_job_id=?,delivered_job_generation=0 WHERE session_id=? AND item_id=?",
@@ -521,7 +521,7 @@ async def run(worker, ctx, record, env, runtime, *, recovery=False):
         driver_sid=ctx.session_id,
         allowed_tools=ctx.descriptor.config["workflow"]["allowed_tools"],
         stop_event=ctx.stop,
-        file_io=getattr(env.resources, "workflow_file_io", None),
+        file_io=env.workflow_file_io,
     )
     engine._usage_acc = dict(executor.plan.get("prior_usage", {}))
     # The scheduler holds ownership but no model slot while awaiting leaves.

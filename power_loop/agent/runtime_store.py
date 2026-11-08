@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from power_loop.runtime.jobs import JobActor, JobManager
+from power_loop.runtime.jobs import JobActor, JobError, JobManager
 
 from .runtime_types import (
     InputRef,
@@ -94,8 +94,11 @@ class RuntimeInputStore:
                 if actor.call_ref is None or actor.tool_call_id is None:
                     raise RuntimeRequestError("forbidden", "persisted tool call required")
                 manager = JobManager(self.store)
-                await manager._validate_call(reader, JobActor(actor.tenant_id, actor.principal_id, actor.session_id),
-                                             actor.call_ref, actor.tool_call_id)
+                try:
+                    await manager._validate_call(reader, JobActor(actor.tenant_id, actor.principal_id, actor.session_id),
+                                                 actor.call_ref, actor.tool_call_id)
+                except JobError as exc:
+                    raise RuntimeRequestError(exc.code, str(exc)) from exc
         return metadata
 
     @staticmethod
@@ -129,9 +132,11 @@ class RuntimeInputStore:
                        "accepted" if row["status"] in {"pending", "claimed"} else row["status"],
                        "not_needed", reason or stored_reason)
 
-    async def accept_input(self, tx, command, actor, *, descriptor=None):
+    async def accept_input(self, tx, command, actor, *, descriptor=None, child_start=False):
         """A: conditionally gate intake, freeze once, insert/dedupe the original row."""
         defaults = await self.authorize(tx, command.target, actor)
+        if command.operation == "send" and not child_start and defaults.get("execution_role", "main") != "main":
+            raise RuntimeRequestError("invalid_options", "child sessions require resume with their original JobRef")
         waiting_gate = (f" AND NOT EXISTS (SELECT 1 FROM {self.jobs} j WHERE j.session_id=? AND j.status='waiting')"
                         if command.operation == "send" else "")
         changed = await tx.execute(
@@ -268,11 +273,11 @@ class RuntimeInputStore:
         if not changed:
             raise RuntimeRequestError("input_not_startable")
 
-    async def void_unbound(self, tx, ref, *, reason, status=None):
+    async def void_unbound(self, tx, ref, *, reason, status=None, error_code=None):
         record = await self.input(tx, ref)
         if record is None:
             raise RuntimeRequestError("not_found")
-        meta = dict(record.meta, reason={"status": status or ("cancelled" if reason == "cancelled" else "failed"), "detail": reason})
+        meta = dict(record.meta, reason={"status": status or ("cancelled" if reason == "cancelled" else "failed"), "detail": reason, "error_code": error_code})
         changed = await tx.execute(
             f"UPDATE {self.q} SET status='void',meta_json=?,claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
             "WHERE session_id=? AND item_id=? AND status IN ('pending','claimed') AND delivered_job_id IS NULL",
@@ -331,7 +336,7 @@ class RuntimeInputStore:
                     state = reason["status"] if terminal else "accepted"
                     detail = reason["detail"] if terminal else None
                     return (Status(ref, None, state, detail, terminal, state == "cancelled", "not_started"),
-                            Result(None, ref, state, error=detail) if terminal else None, ref)
+                            Result(None, ref, state, error=detail, error_code=reason.get("error_code")) if terminal else None, ref)
                 job_ref = JobRef(ref.store_id, row["delivered_job_id"], row["delivered_job_generation"])
                 job = await reader.fetchone(f"SELECT j.*,e.payload_json AS original_result FROM {self.jobs} j "
                     f"LEFT JOIN {self.events} e ON e.event_id=? AND e.event_type='result' WHERE j.job_id=?",
@@ -361,7 +366,7 @@ class RuntimeInputStore:
                     raise RuntimeRequestError("not_found")
                 value = payload["result"]
                 result = Result(actual, input_ref, value["status"], value["final_text"], value["usage"],
-                                value["structured_output"], value["error"])
+                                value["structured_output"], value["error"], value.get("error_code"))
                 return (Status(input_ref, actual, result.status, result.error, True,
                                result.status == "cancelled", payload["resource_state"]), result, fixed)
             if selected < job["generation"] or job["supervision_status"] == "closed":
@@ -430,12 +435,12 @@ class RuntimeInputStore:
             parent = row["parent_job_id"]
         return False
 
-    async def fail_start(self, ref, reason, ownership):
+    async def fail_start(self, ref, reason, ownership, *, error_code=None):
         manager = JobManager(self.store)
         async with manager.joined_write() as tx:
             record = await self.input(tx, ref)
             if record.row["delivered_job_id"] is None:
-                await self.void_unbound(tx, ref, reason=reason)
+                await self.void_unbound(tx, ref, reason=reason, error_code=error_code)
                 return None
             job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], 0)
             route = await self._lock_result_sessions(tx, job_ref)
@@ -452,7 +457,7 @@ class RuntimeInputStore:
             await tx.execute(f"UPDATE {self.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
                 "WHERE session_id=? AND delivered_job_id=? AND delivered_job_generation=0 AND status IN ('pending','claimed')",
                 (ref.session_id, row["job_id"]))
-            return await self._commit_result(tx, job_ref, Result(job_ref, ref, "failed", error=reason), ownership, route)
+            return await self._commit_result(tx, job_ref, Result(job_ref, ref, "failed", error=reason, error_code=error_code), ownership, route)
 
     async def commit_result_and_parent_ref(self, tx, job_ref, result, ownership):
         """F: one original result; a queued failure never invents an execution."""

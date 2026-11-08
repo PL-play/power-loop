@@ -1,167 +1,80 @@
-"""TimerRunner host delivery seam, independent of workflow dispatch."""
-
-from __future__ import annotations
-
-import time
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
-from typing import Any
+"""Timer driver routes through RuntimeClient; host policy lives in the backend/driver."""
+import asyncio
 
 import pytest
 
-from power_loop import (
-    AgentLoopConfig,
-    HookDirective,
-    HookPoint,
-    StatefulAgentLoop,
-    TimerFireCtx,
-    TimerRunner,
-)
-from power_loop._vendor.llm_client.interface import (
-    LLMRequest,
-    LLMResponse,
-    LLMService,
-    LLMStreamChunk,
-)
+from power_loop import AgentHooks, HookDirective, HookPoint, InputRef, TimerRunner
+from power_loop.agent.runtime_store import now_ms
 
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, timers
+
+__all__ = ['registry_store']
 pytestmark = pytest.mark.asyncio
 
 
-@dataclass
-class _Scripted(LLMService):
-    responses: list[LLMResponse] = field(default_factory=list)
-    calls: int = 0
-    _idx: int = 0
-
-    async def complete(
-        self,
-        request: LLMRequest,
-        *,
-        on_chunk_delta_text: Callable[[str], Any] | None = None,
-        on_chunk_think: Callable[[str], Any] | None = None,
-        on_stream_end: Callable[[LLMResponse], Any] | None = None,
-    ) -> LLMResponse:
-        self.calls += 1
-        if self._idx >= len(self.responses):
-            return LLMResponse(raw_text="done")
-        r = self.responses[self._idx]
-        self._idx += 1
-        return r
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-
-        return _empty()
-
-    async def close(self) -> None:
-        return None
+async def test_delivery_waits_for_acceptance_without_holding_model(registry_store):
+    store, _ = registry_store
+    started, release = asyncio.Event(), asyncio.Event()
+    class BlockedModel(_Scripted):
+        async def complete(self, request, **kwargs):
+            started.set()
+            await release.wait()
+            return await super().complete(request, **kwargs)
+    async with timers(store, BlockedModel()) as (runtime, target, actor, source):
+        timer = await runtime.timer_backend.create(source, delay_s=-1, note='route me')
+        try:
+            assert await asyncio.wait_for(runtime.timer_driver.scan_once(), 3) == 1
+            await asyncio.wait_for(started.wait(), 3)
+            assert (await store.get_timer(target.session_id, timer.timer_id)).status == 'fired'
+            ref = InputRef(store.store_id, target.session_id, f'timer-{timer.timer_id}-{timer.created_at}-0')
+            assert not (await runtime.client.inspect(ref, actor=actor)).result_available
+            release.set()
+            assert (await runtime.client.wait(ref, actor=actor, deadline_ms=now_ms()+10000)).status == 'completed'
+        finally:
+            release.set()
 
 
-def _loop(tmp_path, hooks=None) -> tuple[StatefulAgentLoop, _Scripted]:
-    llm = _Scripted()
-    return StatefulAgentLoop(
-        llm=llm,
-        db_path=str(tmp_path / "s.db"),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=3),
-        hooks=hooks,
-    ), llm
+@pytest.mark.parametrize('skip', [False, True])
+async def test_hook_rewrite_or_skip_applies_before_client_acceptance(registry_store, skip):
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        hooks = AgentHooks()
+        def policy(ctx):
+            ctx.message = 'REWRITTEN: ' + ctx.note
+            if skip:
+                ctx.directive = HookDirective.SKIP
+        hooks.register(HookPoint.TIMER_FIRE, policy)
+        driver = TimerRunner(store=store, client=runtime.client, hooks=hooks)
+        timer = await runtime.timer_backend.create(source, delay_s=-1, note='original')
+        assert await driver.scan_once() == 1
+        assert (await store.get_timer(target.session_id, timer.timer_id)).status == 'fired'
+        if skip:
+            assert await store.load_all_messages(target.session_id) == []
+        else:
+            ref = InputRef(store.store_id, target.session_id, f'timer-{timer.timer_id}-{timer.created_at}-0')
+            await runtime.client.wait(ref, actor=actor, deadline_ms=now_ms()+10000)
+            assert any(row.content == 'REWRITTEN: original' for row in await store.load_all_messages(target.session_id))
 
 
-async def _arm_due_timer(loop: StatefulAgentLoop, sid: str, note: str = "poke") -> None:
-    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note=note)
-
-
-async def test_custom_delivery_replaces_follow_up(tmp_path) -> None:
-    loop, llm = _loop(tmp_path)
-    sid = await loop.new_session()
-    await _arm_due_timer(loop, sid, note="route me")
-    delivered: list[TimerFireCtx] = []
-
-    async def delivery(ctx: TimerFireCtx) -> None:
-        delivered.append(ctx)
-
-    runner = TimerRunner(loop, delivery=delivery)
-    assert await runner.scan_once() == 1
-    assert len(delivered) == 1
-    ctx = delivered[0]
-    assert ctx.session_id == sid and "route me" in ctx.message
-    # The host took delivery: no follow_up happened (LLM never called) and the
-    # one-shot row is done.
-    assert llm.calls == 0
-    assert (await loop.store.get_timer(sid, 1)).status == "fired"
-    await loop.aclose()
-
-
-async def test_custom_delivery_sees_hook_rewritten_message(tmp_path) -> None:
-    from power_loop.core.hooks import AgentHooks
-
-    hooks = AgentHooks()
-
-    def rewrite(ctx: TimerFireCtx) -> None:
-        ctx.message = "REWRITTEN: " + ctx.note
-
-    hooks.register(HookPoint.TIMER_FIRE, rewrite)
-    loop, _llm = _loop(tmp_path, hooks=hooks)
-    sid = await loop.new_session()
-    await _arm_due_timer(loop, sid, note="original")
-    delivered: list[str] = []
-
-    async def delivery(ctx: TimerFireCtx) -> None:
-        delivered.append(ctx.message)
-
-    await TimerRunner(loop, delivery=delivery).scan_once()
-    assert delivered == ["REWRITTEN: original"]
-    await loop.aclose()
-
-
-async def test_hook_skip_suppresses_custom_delivery(tmp_path) -> None:
-    from power_loop.core.hooks import AgentHooks
-
-    hooks = AgentHooks()
-
-    def veto(ctx: TimerFireCtx) -> None:
-        ctx.directive = HookDirective.SKIP
-
-    hooks.register(HookPoint.TIMER_FIRE, veto)
-    loop, _llm = _loop(tmp_path, hooks=hooks)
-    sid = await loop.new_session()
-    await _arm_due_timer(loop, sid)
-    delivered: list[Any] = []
-
-    async def delivery(ctx: TimerFireCtx) -> None:
-        delivered.append(ctx)
-
-    await TimerRunner(loop, delivery=delivery).scan_once()
-    assert delivered == []  # veto point runs BEFORE the host delivery
-    assert (await loop.store.get_timer(sid, 1)).status == "fired"  # skipped → done
-    await loop.aclose()
-
-
-async def test_failing_delivery_rearms_and_refires(tmp_path) -> None:
-    loop, _llm = _loop(tmp_path)
-    sid = await loop.new_session()
-    await _arm_due_timer(loop, sid)
-    attempts = {"n": 0}
-
-    async def delivery(ctx: TimerFireCtx) -> None:
-        attempts["n"] += 1
-        raise RuntimeError("host pipeline down")
-
-    runner = TimerRunner(loop, delivery=delivery)
-    await runner.scan_once()
-    assert attempts["n"] == 1
-    row = await loop.store.get_timer(sid, 1)
-    assert row.status == "armed"  # re-armed (+30s) → re-fires: at-least-once
-    assert row.due_at > int(time.time() * 1000)
-    await loop.aclose()
-
-
-async def test_default_delivery_unchanged(tmp_path) -> None:
-    loop, llm = _loop(tmp_path)
-    sid = await loop.new_session()
-    await _arm_due_timer(loop, sid, note="classic")
-    assert await TimerRunner(loop).scan_once() == 1
-    assert llm.calls == 1  # built-in follow_up path ran the session
-    await loop.aclose()
+async def test_unknown_acceptance_is_not_replayed_and_next_timer_can_fire(registry_store, monkeypatch):
+    store, _ = registry_store
+    async with timers(store) as (runtime, target, actor, source):
+        original = runtime.client.append
+        calls = []
+        async def lose_reply(*args, **kwargs):
+            calls.append(kwargs['message_id'])
+            await original(*args, **kwargs)
+            raise ConnectionError('acceptance reply lost')
+        monkeypatch.setattr(runtime.client, 'append', lose_reply)
+        timer = await runtime.timer_backend.create(source, delay_s=-1, note='unknown original')
+        with pytest.raises(ConnectionError, match='reply lost'):
+            await runtime.timer_driver.scan_once()
+        assert (await store.get_timer(target.session_id, timer.timer_id)).status == 'fired'
+        assert await runtime.timer_driver.scan_once() == 0
+        assert len(calls) == 1
+        monkeypatch.setattr(runtime.client, 'append', original)
+        next_timer = await runtime.timer_backend.create(source, delay_s=-1, note='new invocation')
+        assert await runtime.timer_driver.scan_once() == 1
+        ref = InputRef(store.store_id, target.session_id, f'timer-{next_timer.timer_id}-{next_timer.created_at}-0')
+        assert (await runtime.client.wait(ref, actor=actor, deadline_ms=now_ms()+10000)).status == 'completed'

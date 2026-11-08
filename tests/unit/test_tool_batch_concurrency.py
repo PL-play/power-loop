@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, HookDirective, HookPoint, StatefulAgentLoop
+from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, HookDirective, HookPoint
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -94,18 +94,15 @@ def _tool_rows(msgs: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 
 @pytest.mark.asyncio
-async def test_async_capable_calls_in_one_round_run_concurrently_and_keep_order(tmp_path):
+async def test_async_capable_calls_in_one_round_run_concurrently_and_keep_order(tmp_path, runtime_agent):
     log: list[str] = []
     llm = _Scripted(responses=[
         _batch(("c1", "gen_image", {"tag": "a"}), ("c2", "gen_image", {"tag": "b"}), ("c3", "gen_image", {"tag": "c"})),
         _resp("done"),
     ])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-                             tool_registry=_registry(log))
-    sid = await loop.new_session()
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry(log))
     t0 = time.monotonic()
-    res = await loop.send("go", session_id=sid)
+    res = await loop.send("go")
     elapsed = time.monotonic() - t0
     assert res.status == "completed"
     assert elapsed < 0.6, f"3×0.25s ran serially? {elapsed:.2f}s"
@@ -115,18 +112,15 @@ async def test_async_capable_calls_in_one_round_run_concurrently_and_keep_order(
 
 
 @pytest.mark.asyncio
-async def test_non_async_tools_stay_serial_and_mixed_batch_keeps_order(tmp_path):
+async def test_non_async_tools_stay_serial_and_mixed_batch_keeps_order(tmp_path, runtime_agent):
     log: list[str] = []
     llm = _Scripted(responses=[
         _batch(("c1", "save_note", {"tag": "f1"}), ("c2", "gen_image", {"tag": "a"}),
                ("c3", "save_note", {"tag": "f2"}), ("c4", "gen_image", {"tag": "b"})),
         _resp("done"),
     ])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-                             tool_registry=_registry(log))
-    sid = await loop.new_session()
-    await loop.send("go", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry(log))
+    await loop.send("go")
     # f1 串行先完成；a 与 b 一起起（在 f1 之后）；f2 串行
     assert log[0:2] == ["start:f1", "end:f1"]
     assert set(log[2:4]) == {"start:a", "start:b"}
@@ -135,16 +129,14 @@ async def test_non_async_tools_stay_serial_and_mixed_batch_keeps_order(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_tool_before_skip_still_wins_for_hoisted_calls(tmp_path):
+async def test_tool_before_skip_still_wins_for_hoisted_calls(tmp_path, runtime_agent):
     """闸类 hook 的语义不变：被 hoist 的调用也先过 TOOL_BEFORE，判 SKIP 就不执行。"""
     log: list[str] = []
     llm = _Scripted(responses=[
         _batch(("c1", "gen_image", {"tag": "a"}), ("c2", "gen_image", {"tag": "blocked"}), ("c3", "gen_image", {"tag": "c"})),
         _resp("done"),
     ])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-                             tool_registry=_registry(log))
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry(log))
 
     def gate(ctx):
         if ctx.tool_args.get("tag") == "blocked":
@@ -153,25 +145,21 @@ async def test_tool_before_skip_still_wins_for_hoisted_calls(tmp_path):
         return None
 
     loop.hooks.register(HookPoint.TOOL_BEFORE, gate, name="gate")
-    sid = await loop.new_session()
-    await loop.send("go", session_id=sid)
+    await loop.send("go")
     assert "start:blocked" not in log
     assert _tool_rows(llm.seen[1]) == [("c1", "img:a"), ("c2", "Error: gated"), ("c3", "img:c")]
     await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_one_failing_member_does_not_poison_the_batch(tmp_path):
+async def test_one_failing_member_does_not_poison_the_batch(tmp_path, runtime_agent):
     log: list[str] = []
     llm = _Scripted(responses=[
         _batch(("c1", "gen_image", {"tag": "a"}), ("c2", "gen_image", {"tag": "boom"}), ("c3", "gen_image", {"tag": "c"})),
         _resp("done"),
     ])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-                             tool_registry=_registry(log))
-    sid = await loop.new_session()
-    res = await loop.send("go", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry(log))
+    res = await loop.send("go")
     assert res.status == "completed"
     rows = _tool_rows(llm.seen[1])
     assert rows[0] == ("c1", "img:a") and rows[2] == ("c3", "img:c")
@@ -180,23 +168,20 @@ async def test_one_failing_member_does_not_poison_the_batch(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_concurrency_off_runs_serially(tmp_path):
+async def test_concurrency_off_runs_serially(tmp_path, runtime_agent):
     log: list[str] = []
     llm = _Scripted(responses=[
         _batch(("c1", "gen_image", {"tag": "a"}), ("c2", "gen_image", {"tag": "b"})),
         _resp("done"),
     ])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=4, tool_batch_concurrency=0),
-                             tool_registry=_registry(log, delay=0.05))
-    sid = await loop.new_session()
-    await loop.send("go", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4, tool_batch_concurrency=0), registry=_registry(log, delay=0.05))
+    await loop.send("go")
     assert log == ["start:a", "end:a", "start:b", "end:b"]
     await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_started_events_fire_for_every_member_up_front(tmp_path):
+async def test_started_events_fire_for_every_member_up_front(tmp_path, runtime_agent):
     log: list[str] = []
     events: list = []
     bus = AgentEventBus(suppress_subscriber_errors=True)
@@ -205,11 +190,8 @@ async def test_started_events_fire_for_every_member_up_front(tmp_path):
         _batch(("c1", "gen_image", {"tag": "a"}), ("c2", "gen_image", {"tag": "b"})),
         _resp("done"),
     ])
-    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=4),
-                             tool_registry=_registry(log, delay=0.05), event_bus=bus)
-    sid = await loop.new_session()
-    await loop.send("go", session_id=sid)
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=4), registry=_registry(log, delay=0.05), event_bus=bus)
+    await loop.send("go")
     ids = [(e.payload or {}).get("tool_call_id") for e in events]
     assert ids == ["c1", "c2"]
     await loop.aclose()

@@ -1,4 +1,6 @@
-"""Resumable, lightweight StatefulAgentLoop + the per-session active-window cache.
+"""Reconstructable runtime executions and the internal active-window cache.
+
+Resumable, lightweight StatefulAgentLoop + the per-session active-window cache.
 
 The crown-jewel invariant: the cache is a *rebuildable accelerator*, never a source of
 truth — so a loop WITH caching feeds the LLM byte-for-byte the same prompts as a loop with
@@ -11,7 +13,6 @@ comparing the recorded LLM requests of a cache-on run and a cache-off run on sep
 from __future__ import annotations
 
 import copy
-import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,8 +21,9 @@ import pytest
 
 from power_loop import (
     AgentLoopConfig,
+    RequestOptions,
+    RuntimeRequestError,
     SchemaPolicy,
-    StatefulAgentLoop,
     StoreSchemaError,
 )
 from power_loop._vendor.llm_client.interface import (
@@ -30,11 +32,20 @@ from power_loop._vendor.llm_client.interface import (
     LLMService,
     LLMStreamChunk,
 )
+from power_loop.agent.stateful_loop import _ExecutionLoop
 from power_loop.runtime.compact import CompactionPlan
+from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.memory import MemoryProvider
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
+from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
+
+from .test_job_registry_192 import registry_store
+
+__all__ = ["registry_store"]
+
 
 pytestmark = pytest.mark.unit
 
@@ -158,519 +169,213 @@ class _EveryRoundCompactor:
                               summary_text="folded", before_tokens=100, after_tokens=10)
 
 
-# ── the warm-vs-cold equivalence harness ─────────────────────────────────────
+def _cache_loop(store, *, size=256):
+    # Pure cache units do not execute inputs or use a removed public constructor.
+    return _ExecutionLoop(llm=_SeqLLM(), store=store, session_cache_size=size, config=AgentLoopConfig(delegation_policy="single_level"),
+        task_runtime=TaskRuntime(JobManager(store), tenant_id="test", principal_id="host",
+                                 executor_id="fixture", boot_id="boot"))
 
 
-async def _run(cache_size: int, llm: LLMService, scenario, *, config: AgentLoopConfig,
-               registry: ToolRegistry | None = None, tools=None):
-    """Run ``scenario(loop, sid)`` on a fresh in-memory store with the given cache size.
-    Returns (recorded llm.calls, the loop's final active messages, cache_stats)."""
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(llm=llm, store=store, config=config, tool_registry=registry,
-                             session_cache_size=cache_size)
-    sid = await loop.new_session()
-    await scenario(loop, sid, tools)
-    msgs = await loop.get_messages(sid)
-    stats = dict(loop.cache_stats)
-    await loop.aclose()
-    return llm.calls, msgs, stats
-
-
-async def _assert_warm_equals_cold(make_llm, scenario, *, config_factory, registry_factory=None,
-                                   tools=None, expect_hits=True):
-    """Run the identical scenario with caching ON (256) and OFF (0) on separate stores and
-    assert the LLM saw byte-identical prompts (system_prompt + messages) at every call."""
-    warm_calls, warm_msgs, warm_stats = await _run(
-        256, make_llm(), scenario, config=config_factory(),
-        registry=registry_factory() if registry_factory else None, tools=tools,
-    )
-    cold_calls, cold_msgs, _ = await _run(
-        0, make_llm(), scenario, config=config_factory(),
-        registry=registry_factory() if registry_factory else None, tools=tools,
-    )
-    assert warm_calls == cold_calls, "cache changed the prompts the LLM saw"
-
-    # final active history (role+content+name) must also match
-    def norm(ms):
-        return [(m.get("role"), m.get("content"), m.get("name")) for m in ms]
-
-    assert norm(warm_msgs) == norm(cold_msgs)
-    if expect_hits:
-        assert warm_stats["hits"] > 0, f"cache never engaged: {warm_stats}"
-    return warm_stats
-
-
-# ── scenarios ────────────────────────────────────────────────────────────────
-
-
-async def _three_plain_sends(loop, sid, tools):
-    await loop.send("one", session_id=sid)
-    await loop.send("two", session_id=sid)
-    await loop.send("three", session_id=sid)
-
-
-async def _two_sends_with_tool(loop, sid, tools):
-    await loop.send("first", session_id=sid, tools=tools)
-    await loop.send("second", session_id=sid, tools=tools)
-
-
-async def _multiround_then_send(loop, sid, tools):
-    await loop.send("go", session_id=sid, tools=["blob"])
-    await loop.send("again", session_id=sid, tools=["blob"])
-
-
-# ── tests: warm == cold under each regime ────────────────────────────────────
-
-
-async def test_plain_multisend_warm_equals_cold():
-    stats = await _assert_warm_equals_cold(
-        lambda: _SeqLLM(responses=[LLMResponse(raw_text=f"r{i}") for i in range(5)]),
-        _three_plain_sends,
-        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=2, compactor=None),
-    )
-    # 1st send loads+populates (miss); 2nd & 3rd reuse (hit)
-    assert stats["hits"] >= 2
-
-
-async def test_recall_warm_equals_cold():
-    """A MemoryProvider injects a non-persisted memory_* message every send; the cache must
-    not double-inject or cache the placeholder — warm prompts must equal cold."""
-    await _assert_warm_equals_cold(
-        lambda: _SeqLLM(responses=[LLMResponse(raw_text=f"r{i}") for i in range(5)]),
-        _three_plain_sends,
-        config_factory=lambda: AgentLoopConfig(
-            system_prompt="S", max_rounds=2, compactor=None, memory=_FixedMemory()),
-    )
-
-
-async def test_tool_round_warm_equals_cold():
-    await _assert_warm_equals_cold(
-        lambda: _SeqLLM(responses=[
-            _tool_resp("c1", "echo", '{"x":"hi"}'), LLMResponse(raw_text="done1"),
-            _tool_resp("c2", "echo", '{"x":"yo"}'), LLMResponse(raw_text="done2"),
-        ]),
-        _two_sends_with_tool,
-        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
-        registry_factory=_echo_registry,
-        tools=["echo"],
-    )
-
-
-async def test_compaction_warm_equals_cold(monkeypatch):
-    """A send that folds (repeatedly) must invalidate the cache; the next send reloads — warm
-    prompts must equal cold even across the double-fold regression regime."""
+@pytest.mark.parametrize("mode", ["plain", "recall", "tool", "fold", "microcompact", "fold_once"])
+async def test_rebuilt_worker_preserves_prompts_and_history(mode, tmp_path, monkeypatch):
+    from power_loop.runtime.env import RuntimeEnv
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")
-    await _assert_warm_equals_cold(
-        lambda: _FoldLLM(tool_rounds=3),
-        _multiround_then_send,
-        config_factory=lambda: AgentLoopConfig(
-            system_prompt="S", max_rounds=8, max_tokens=4000, compactor=_EveryRoundCompactor()),
-        registry_factory=_blob_registry,
-        tools=["blob"],
-        expect_hits=False,  # every send folds → cache invalidated each time
-    )
-
-
-async def test_microcompact_warm_equals_cold(tmp_path, monkeypatch):
-    """Microcompaction rewrites large tool-message content in-place in the WORKING history
-    (never the store). The cache holds only the durable projection, so warm == cold."""
     monkeypatch.setenv("CONTEXT_MICRO_HOT_TAIL", "0")
     monkeypatch.setenv("CONTEXT_MICRO_SIZE_LIMIT", "100")
-    from power_loop.runtime.env import RuntimeEnv, runtime_env_context
-
-    def cfg():
-        return AgentLoopConfig(system_prompt="S", max_rounds=6, compactor=None,
-                               microcompact_enabled=True)
-
-    async def scenario(loop, sid, tools):
-        await loop.send("a", session_id=sid, tools=["blob"])
-        await loop.send("b", session_id=sid, tools=["blob"])
-
-    # microcompact needs a runtime home (it spills cold tool outputs to home/.cache); the
-    # blob tool returns a fat (>limit) output so microcompact fires each round.
-    with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, home_dir=tmp_path)):
-        await _assert_warm_equals_cold(
-            lambda: _SeqLLM(responses=[
-                _tool_resp("c1", "blob"), LLMResponse(raw_text="d1"),
-                _tool_resp("c2", "blob"), LLMResponse(raw_text="d2"),
-            ]),
-            scenario,
-            config_factory=cfg,
-            registry_factory=_blob_registry,
-            tools=["blob"],
-        )
-
-
-# ── tests: statelessness — a fresh cold loop resumes identically ─────────────
-
-
-async def test_fresh_loop_resumes_identically():
-    """A loop is freely re-creatable: after a warm loop runs, a brand-new loop (empty cache)
-    bound to the same store sees the identical active history and can continue the session."""
-    store = await SessionStore.open(":memory:")
-
-    def cfg():
-        return AgentLoopConfig(system_prompt="S", max_rounds=2, compactor=None, memory=_FixedMemory())
-
-    warm = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="a"), LLMResponse(raw_text="b")]),
-                             store=store, config=cfg())
-    sid = await warm.new_session()
-    await warm.send("hi", session_id=sid)
-    await warm.send("again", session_id=sid)
-    warm_hist = [(m.get("role"), m.get("content")) for m in await warm.get_messages(sid)]
-
-    # brand-new loop, SAME store, empty cache → identical view + can continue
-    fresh = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="c")]), store=store, config=cfg())
-    assert fresh.cache_stats["entries"] == 0
-    fresh_hist = [(m.get("role"), m.get("content")) for m in await fresh.get_messages(sid)]
-    assert fresh_hist == warm_hist
-    r = await fresh.send("continue", session_id=sid)
-    assert r.status == "completed"
-
-
-async def test_prewarm_makes_first_send_a_hit():
-    store = await SessionStore.open(":memory:")
-    seed = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="x")]), store=store,
-                             config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    sid = await seed.new_session()
-    await seed.send("seed", session_id=sid)
-
-    fresh = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="y")]), store=store,
-                              config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    assert await fresh.prewarm(sid) is True
-    assert await fresh.prewarm("sess_nope") is False
-    await fresh.send("after prewarm", session_id=sid)
-    assert fresh.cache_stats["hits"] >= 1  # prewarm primed the window → first send hits
-
-
-# ── tests: out-of-band durable appends must NOT serve a stale cached window ──
-# (regression for the review's confirmed blocker: resume/submit_input/abort/heal and other
-#  store writers append rows the cache never saw; the next plain send must reload, not HIT a
-#  stale window — guaranteed by the _cache_append contiguity guard.)
-
-
-async def _pending_then_resume_then_send(loop, sid, tools):
-    # send 1: model emits a tool_call but the loop has NO registry → goes pending (warms cache
-    # with user + assistant(tool_calls)); resume() then appends an error-tool + assistant
-    # OUT-OF-BAND of the cache; send 2 must see those rows.
-    await loop.send("u1", session_id=sid)
-    await loop.resume(sid)
-    await loop.send("u2", session_id=sid)
-
-
-async def test_resume_after_warm_send_warm_equals_cold():
-    await _assert_warm_equals_cold(
-        lambda: _SeqLLM(responses=[
-            _tool_resp("c1", "echo"), LLMResponse(raw_text="after-resume"), LLMResponse(raw_text="fin"),
-        ]),
-        _pending_then_resume_then_send,
-        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
-        expect_hits=False,  # resume invalidates → send 2 reloads (the correct, non-stale path)
-    )
-
-
-async def _pending_then_abort_then_send(loop, sid, tools):
-    await loop.send("u1", session_id=sid)                       # tool_call, no registry → pending (warms)
-    await loop.abort_pending(sid)                               # <aborted> tool row, out-of-band
-    await loop.send("u2", session_id=sid)    # must reload
-
-
-async def test_abort_after_warm_send_warm_equals_cold():
-    await _assert_warm_equals_cold(
-        lambda: _SeqLLM(responses=[_tool_resp("c1", "echo"), LLMResponse(raw_text="fin")]),
-        _pending_then_abort_then_send,
-        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
-        expect_hits=False,
-    )
-
-
-async def test_cross_writer_shared_store_forces_reload():
-    """Two loops share one store (the supported shared-store path). When loop B appends to a
-    session, loop A's cached window is stale; A's next send must reload (contiguity guard), not
-    serve a window missing B's rows — the cross-process data-safety guarantee."""
-    store = await SessionStore.open(":memory:")
-
-    def cfg():
-        return AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None)
-
-    a_llm = _SeqLLM(responses=[LLMResponse(raw_text="a1"), LLMResponse(raw_text="a2")])
-    a = StatefulAgentLoop(llm=a_llm, store=store, config=cfg())
-    b = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="b1")]), store=store, config=cfg())
-    sid = await a.new_session()
-    await a.send("u1", session_id=sid)          # loop A warms its window
-    await b.send("u2", session_id=sid)          # loop B appends out-of-band of A's cache
-    await a.send("u3", session_id=sid)          # A's window is stale → must reload
-    # The bug shows in the PROMPT A's third send fed the LLM (its final stored history is always
-    # correct since get_messages reads the store): a stale-cache HIT would omit B's u2/b1.
-    last_prompt = [(m.get("role"), m.get("content")) for m in a_llm.calls[-1]["messages"]]
-    assert last_prompt == [("user", "u1"), ("assistant", "a1"), ("user", "u2"),
-                           ("assistant", "b1"), ("user", "u3")], last_prompt
-
-
-async def test_fold_then_recache_then_reuse(monkeypatch):
-    """After a fold invalidates the window, a later plain send must reload+recache and a
-    further send must REUSE — proving the post-fold recache token is correct (warm == cold AND
-    a real cache hit, which the always-fold regime can't show)."""
-    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")
-
-    class _OneShot:
-        def __init__(self):
-            self._done = False
-
-        async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
-            if self._done or len(messages) < 4:
+    results = []
+    class OneShot(_EveryRoundCompactor):
+        done = False
+        async def maybe_compact(self, messages, **kwargs):
+            if self.done:
                 return None
-            self._done = True
-            return CompactionPlan(fold_start_idx=0, fold_end_idx=len(messages) - 3,
-                                  summary_text="folded", before_tokens=100, after_tokens=10)
-
-    async def scenario(loop, sid, tools):
-        await loop.send("s1", session_id=sid, tools=["blob"])   # multi-round → folds once → invalidate
-        await loop.send("s2", session_id=sid, tools=["blob"])   # reload + recache
-        await loop.send("s3", session_id=sid, tools=["blob"])   # reuse → HIT
-
-    await _assert_warm_equals_cold(
-        lambda: _FoldLLM(tool_rounds=2),
-        scenario,
-        config_factory=lambda: AgentLoopConfig(
-            system_prompt="S", max_rounds=8, max_tokens=4000, compactor=_OneShot()),
-        registry_factory=_blob_registry,
-        tools=["blob"],
-        expect_hits=True,  # s3 reuses the post-fold recached window
-    )
-
-
-async def test_followup_drain_warm_equals_cold():
-    """A follow-up drained mid-run appends an extra user row; the post-run delta must fold it
-    into the warm window so the NEXT send's prompt equals a cold reload."""
-    from power_loop.agent.follow_up import FollowUpQueued
-
-    async def scenario(loop, sid, tools):
-        # queue a follow-up while a send holds the session lock, so it drains mid-run
-        async def _send_with_followup():
-            return await loop.send("first", session_id=sid)
-        import asyncio as _aio
-        task = _aio.create_task(_send_with_followup())
-        await _aio.sleep(0)  # let the send acquire the lock + start
-        # best-effort: if the lock is held, this enqueues; if not, it sends (either way the
-        # next send below validates warm==cold)
-        res = await loop.follow_up("steer", session_id=sid)
-        await task
-        if not isinstance(res, FollowUpQueued):
-            # it ran as a plain send; that's fine — still a multi-send warm/cold comparison
-            pass
-        await loop.send("second", session_id=sid)
-
-    await _assert_warm_equals_cold(
-        lambda: _SeqLLM(responses=[LLMResponse(raw_text=f"r{i}") for i in range(6)]),
-        scenario,
-        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=2, compactor=None),
-        expect_hits=False,
-    )
+            result = await super().maybe_compact(messages, **kwargs)
+            self.done = result is not None
+            return result
+    for rebuild in (False, True):
+        store = await SessionStore.open(str(tmp_path / f"{rebuild}.db"))
+        config = AgentLoopConfig(system_prompt="S", max_rounds=8, compactor=None)
+        registry, options = None, None
+        if mode in {"fold", "fold_once"}:
+            model = _FoldLLM(tool_rounds=3)
+            config.compactor = _EveryRoundCompactor() if mode == "fold" else OneShot()
+            registry, options = _blob_registry(), RequestOptions(tools=["blob"])
+        elif mode in {"tool", "microcompact"}:
+            name = "echo" if mode == "tool" else "blob"
+            model = _SeqLLM(responses=[_tool_resp("c1", name), LLMResponse(raw_text="d1"),
+                                     _tool_resp("c2", name), LLMResponse(raw_text="d2")])
+            registry = _echo_registry() if mode == "tool" else _blob_registry()
+            options = RequestOptions(tools=[name])
+            config.microcompact_enabled = mode == "microcompact"
+        else:
+            model = _SeqLLM(responses=[LLMResponse(raw_text=f"r{i}") for i in range(3)])
+            if mode == "recall":
+                config.memory = _FixedMemory()
+        # Resource ports are reconstructed by the current factory each time.
+        env = RuntimeEnv(workspace_dir=tmp_path, home_dir=tmp_path)
+        agent = await RunningAgent(store, model, registry, config, runtime_env=env).start()
+        try:
+            for i, body in enumerate(("one", "two", "three")):
+                if rebuild and i:
+                    target = agent.target
+                    await agent.aclose()
+                    agent = await RunningAgent(store, model, registry, config, runtime_env=env).start(target=target)
+                result = await agent.send(body, options=options, message_id=f"input-{i}")
+                assert result.status == "completed"
+            rows = await store.load_active_messages(agent.target.session_id)
+            results.append((model.calls, [(row.role, row.content, row.name) for row in rows]))
+            assert not agent.runtime.worker._tasks
+        finally:
+            await agent.aclose()
+            await store.close()
+    assert results[0] == results[1]
 
 
-# ── tests: cache disabled ────────────────────────────────────────────────────
-
-
-async def test_cache_size_zero_disables():
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="a"), LLMResponse(raw_text="b")]),
-                             store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
-                             session_cache_size=0)
-    sid = await loop.new_session()
-    await loop.send("one", session_id=sid)
-    await loop.send("two", session_id=sid)
-    assert loop.cache_stats == {"hits": 0, "misses": 0, "evictions": 0, "entries": 0}
-
-
-async def test_lru_eviction_bounds_entries():
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="x")] * 50),
-                             store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
-                             session_cache_size=2)
-    sids = [await loop.new_session() for _ in range(4)]
-    for s in sids:
-        await loop.send("hi", session_id=s)
-    assert loop.cache_stats["entries"] <= 2
-    assert loop.cache_stats["evictions"] >= 2
-
-
-# ── tests: store binding / construction ──────────────────────────────────────
-
-
-async def test_store_and_config_kwargs_conflict_raises():
-    store = await SessionStore.open(":memory:")
-    with pytest.raises(ValueError, match="not both"):
-        StatefulAgentLoop(llm=_SeqLLM(), store=store, dsn=":memory:")
-    with pytest.raises(ValueError, match="not both"):
-        StatefulAgentLoop(llm=_SeqLLM(), store=store, table_prefix="x_")
-    with pytest.raises(ValueError, match="not both"):
-        StatefulAgentLoop(llm=_SeqLLM(), store=store, schema=SchemaPolicy.VERIFY)
-    await store.close()
-
-
-async def test_loop_opens_owned_store_via_dsn(tmp_path):
-    db = str(tmp_path / "owned.db")
-    loop = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="hi")]),
-                             dsn=f"sqlite:///{db}",
-                             config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    sid = await loop.new_session()
-    r = await loop.send("hello", session_id=sid)
-    assert r.status == "completed"
-    await loop.aclose()
-    # reopen with VERIFY (schema now exists) on a fresh loop → resumes
-    loop2 = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="again")]),
-                              dsn=f"sqlite:///{db}", schema=SchemaPolicy.VERIFY,
-                              config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    hist = await loop2.get_messages(sid)
-    assert [m.get("content") for m in hist] == ["hello", "hi"]
-    await loop2.aclose()
-
-
-async def test_loop_table_prefix_isolation(tmp_path):
-    db = str(tmp_path / "prefixed.db")
-    a = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="A")]),
-                          dsn=f"sqlite:///{db}", table_prefix="alpha_",
-                          config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    b = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="B")]),
-                          dsn=f"sqlite:///{db}", table_prefix="beta_",
-                          config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    sa = await a.new_session()
-    await a.send("in alpha", session_id=sa)
-    # the beta-prefixed loop shares the FILE but not the tables → session unknown there
-    from power_loop.contracts.errors import SessionNotFoundError
-    with pytest.raises(SessionNotFoundError):
-        await b.send("x", session_id=sa)
-    await a.aclose()
-    await b.aclose()
-
-
-async def test_owned_store_schema_verify_on_fresh_db_raises_with_ddl(tmp_path):
-    db = str(tmp_path / "fresh.db")
-    loop = StatefulAgentLoop(llm=_SeqLLM(), dsn=f"sqlite:///{db}", schema=SchemaPolicy.VERIFY,
-                             config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
-    with pytest.raises(StoreSchemaError) as ei:
-        await loop.new_session()
-    assert "not initialized" in str(ei.value)
-    assert ei.value.ddl  # carries the provisioning script
-
-
-# ── gated: the loop binds to real server backends via dsn (Step A end-to-end) ─
-
-import socket  # noqa: E402
-from urllib.parse import urlparse  # noqa: E402
-
-
-def _reachable(dsn: str, default_port: int) -> bool:
-    u = urlparse(dsn)
+async def test_fresh_worker_and_other_writer_preserve_full_history(registry_store):
+    store, connect = registry_store
+    model = _SeqLLM(responses=[LLMResponse(raw_text="a1"), LLMResponse(raw_text="a2")])
+    config = AgentLoopConfig(compactor=None)
+    first = await RunningAgent(store, model, config=config).start()
+    target = first.target
+    await first.send("u1", message_id="first")
+    await first.aclose()
+    other = await connect(schema=SchemaPolicy.VERIFY)
+    second = await RunningAgent(other, _SeqLLM(responses=[LLMResponse(raw_text="b1")]), config=config).start(target=target)
+    await second.send("u2", message_id="other")
+    await second.aclose()
+    last = await RunningAgent(store, model, config=config).start(target=target)
     try:
-        with socket.create_connection((u.hostname or "localhost", u.port or default_port), timeout=2):
-            return True
-    except OSError:
-        return False
+        assert (await last.send("u3", message_id="last")).status == "completed"
+        assert [(m["role"], m["content"]) for m in model.calls[-1]["messages"]] == [
+            ("user", "u1"), ("assistant", "a1"), ("user", "u2"), ("assistant", "b1"), ("user", "u3")]
+    finally:
+        await last.aclose()
 
 
-_PG_DSN = os.environ.get("POWER_LOOP_TEST_PG_DSN", f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test")
-_MYSQL_DSN = os.environ.get("POWER_LOOP_TEST_MYSQL_DSN", "mysql://deeptalk:deeptalk@localhost:3307/power_loop_test")
+async def test_unknown_pending_tool_alignment_survives_worker_rebuild(runtime_agent):
+    first = await runtime_agent(model=_SeqLLM(), config=AgentLoopConfig(compactor=None))
+    store, target = first.runtime.store, first.target
+    await store.append_message(target.session_id, role="user", content="prior")
+    await store.append_message(target.session_id, role="assistant", content="", tool_calls=[{
+        "id":"old-call", "type":"function", "function":{"name":"echo", "arguments":"{}"}}])
+    await first.aclose()
+    called = []
+    registry = _echo_registry()
+    registry.register(registry.get("echo").definition, lambda **kw: called.append(kw), overwrite=True)
+    model = _SeqLLM(responses=[LLMResponse(raw_text="continued")])
+    fresh = await runtime_agent(model=model, store=store, registry=registry,
+                                config=AgentLoopConfig(compactor=None), target=target)
+    assert (await fresh.send("new input")).final_text == "continued"
+    assert not called
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "old-call" and
+               "结果未知" in m["content"] for m in model.calls[0]["messages"])
 
 
-async def _loop_binds_and_resumes(dsn: str) -> None:
-    """A loop opens an owned store at ``dsn`` (its own table_prefix), runs sends with the
-    window cache, and a fresh loop resumes the same session from the same DSN."""
-    prefix = "plrc_"
+async def test_appended_input_is_visible_after_worker_rebuild(runtime_agent):
+    import asyncio
 
-    def cfg():
-        return AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None)
-
-    loop = StatefulAgentLoop(
-        llm=_SeqLLM(responses=[LLMResponse(raw_text="hi"), LLMResponse(raw_text="again")]),
-        dsn=dsn, table_prefix=prefix, config=cfg(),
-    )
-    sid = await loop.new_session()
-    await loop.send("hello", session_id=sid)
-    await loop.send("more", session_id=sid)
-    assert loop.cache_stats["hits"] >= 1  # 2nd send reused the window
-    await loop.aclose()
-
-    # fresh loop, same DSN+prefix, VERIFY (schema already provisioned) → resumes identically
-    fresh = StatefulAgentLoop(
-        llm=_SeqLLM(responses=[LLMResponse(raw_text="z")]),
-        dsn=dsn, table_prefix=prefix, schema=SchemaPolicy.VERIFY, config=cfg(),
-    )
-    hist = [m.get("content") for m in await fresh.get_messages(sid)]
-    assert hist[:2] == ["hello", "hi"]
-    r = await fresh.send("continue", session_id=sid)
-    assert r.status == "completed"
-    await fresh.aclose()
+    from power_loop.agent.runtime_store import now_ms
+    entered, release = asyncio.Event(), asyncio.Event()
+    class Blocked(_SeqLLM):
+        async def complete(self, request, **kwargs):
+            if not self.calls:
+                entered.set()
+                await release.wait()
+            return await super().complete(request, **kwargs)
+    model = Blocked(responses=[LLMResponse(raw_text="r1"), LLMResponse(raw_text="r2")])
+    agent = await runtime_agent(model=model, config=AgentLoopConfig(compactor=None))
+    task = asyncio.create_task(agent.send("first"))
+    await asyncio.wait_for(entered.wait(), 5)
+    appended = await agent.runtime.client.append(agent.target, "steer", message_id="steer", actor=agent.actor)
+    release.set()
+    await task
+    await agent.runtime.client.wait(appended.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
+    await agent.drain()
+    await agent.aclose()
+    next_model = _SeqLLM(responses=[LLMResponse(raw_text="done")])
+    fresh = await runtime_agent(model=next_model, store=agent.runtime.store, target=agent.target,
+                                config=AgentLoopConfig(compactor=None))
+    await fresh.send("second", message_id="second")
+    assert any(m["role"] == "user" and "steer" in m["content"] for m in next_model.calls[0]["messages"])
 
 
-@pytest.mark.skipif(not _reachable(_PG_DSN, 5432), reason=f"Postgres not reachable at {_PG_DSN}")
-async def test_loop_binds_postgres_via_dsn():
-    pytest.importorskip("asyncpg")
-    await _loop_binds_and_resumes(_PG_DSN)
-
-
-@pytest.mark.skipif(not _reachable(_MYSQL_DSN, 3306), reason=f"MySQL not reachable at {_MYSQL_DSN}")
-async def test_loop_binds_mysql_via_dsn():
-    pytest.importorskip("aiomysql")
-    await _loop_binds_and_resumes(_MYSQL_DSN)
-
-
-# ── G8: an out-of-band fold must invalidate the window cache (never serve folded-out rows) ──
-# A fold reshuffles the OLDER active set into compacted_out while only bumping next_seq by the
-# note. Pre-fix, the post-send maintenance only invalidated on THIS send's compactions, so a
-# fold by another writer/process left the entry delta-extended past the fold — a later send
-# then HIT a window mixing folded-out rows with the note. The validity token now pairs in
-# last_compact_seq, so ANY fold invalidates.
-
-
-async def test_window_cache_token_includes_last_compact_seq():
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
-        llm=_SeqLLM(), store=store, config=AgentLoopConfig(system_prompt="S"), session_cache_size=8
-    )
+@pytest.mark.parametrize("size", [0, 2])
+async def test_internal_cache_remains_bounded_and_prewarm_handles_missing_session(tmp_path, size):
+    store = await SessionStore.open(str(tmp_path / "cache.db"))
+    loop = _cache_loop(store, size=size)
     try:
-        sid = await loop.new_session()
-        for i in range(3):
-            await store.append_message(sid, role="user", content=f"m{i}")
-        assert await loop.prewarm(sid)
-        st = await store.get_state(sid)
-        # exact token → HIT
-        assert loop._cache_get(sid, st.next_seq, st.last_compact_seq) is not None
-        # same next_seq but a fold advanced last_compact_seq → MISS (the G8 guarantee)
-        assert loop._cache_get(sid, st.next_seq, st.last_compact_seq + 1) is None
+        assert not await loop.prewarm("missing")
+        for i in range(4):
+            sid = await store.create_session()
+            await store.append_message(sid, role="user", content=str(i))
+            await loop.prewarm(sid)
+        assert loop.cache_stats["entries"] <= size
+        if size:
+            assert loop.cache_stats["evictions"] >= 2
+        else:
+            assert loop.cache_stats == {"hits": 0, "misses": 0, "evictions": 0, "entries": 0}
     finally:
         await loop.aclose()
+        await store.close()
 
 
-async def test_out_of_band_fold_invalidates_window_not_delta_extend():
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(
-        llm=_SeqLLM(), store=store, config=AgentLoopConfig(system_prompt="S"), session_cache_size=8
-    )
+async def test_internal_cache_invalidates_folded_rows(tmp_path):
+    store = await SessionStore.open(str(tmp_path / "cache.db"))
+    loop = _cache_loop(store)
     try:
-        sid = await loop.new_session()
+        sid = await store.create_session()
         for i in range(4):
             await store.append_message(sid, role="user", content=f"m{i}")
-        assert await loop.prewarm(sid)  # window built at last_compact_seq=0, rows m0..m3
-
-        # Another writer/process folds m1,m2 out-of-band (advances last_compact_seq + next_seq).
-        await store.record_compaction(
-            sid, from_seq=2, to_seq=3, note_content="sum", before_tokens=9, after_tokens=1,
-            round_index=0, fold_seqs=[2, 3], order_key=2,
-        )
-
-        # Post-send maintenance must DROP the entry (fold reshuffled the older set) — NOT
-        # delta-extend it (which would keep folded-out m1/m2 and front a corrupt window).
+        assert await loop.prewarm(sid)
+        state = await store.get_state(sid)
+        assert loop._cache_get(sid, state.next_seq, state.last_compact_seq) is not None
+        assert loop._cache_get(sid, state.next_seq, state.last_compact_seq+1) is None
+        await loop.prewarm(sid)
+        await store.record_compaction(sid, from_seq=2, to_seq=3, note_content="sum", before_tokens=9,
+            after_tokens=1, round_index=0, fold_seqs=[2,3], order_key=2)
         await loop._refresh_window_cache_after_send(sid, store)
-        # The entry must be DROPPED (not delta-extended past the fold): assert removal directly,
-        # since the _cache_get token would also mask a buggy delta-extend.
         assert sid not in loop._session_cache
-        st = await store.get_state(sid)
-        assert loop._cache_get(sid, st.next_seq, st.last_compact_seq) is None
-
-        # Durable truth after the fold: m1/m2 are folded out, the note is active.
         active = [m.content for m in await store.load_active_messages(sid)]
         assert "m1" not in active and "m2" not in active and "sum" in active
     finally:
         await loop.aclose()
+        await store.close()
+
+
+async def test_store_schema_verify_and_reopen_through_current_runtime(tmp_path):
+    path = str(tmp_path / "store.db")
+    with pytest.raises(StoreSchemaError) as error:
+        await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
+    assert "not initialized" in str(error.value) and error.value.ddl
+    store = await SessionStore.open(path)
+    agent = await RunningAgent(store, _SeqLLM(responses=[LLMResponse(raw_text="hi")])).start()
+    target = agent.target
+    await agent.send("hello", message_id="first")
+    await agent.aclose()
+    await store.close()
+    reopened = await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
+    agent = await RunningAgent(reopened, _SeqLLM(responses=[LLMResponse(raw_text="again")])).start(target=target)
+    try:
+        assert [m.content for m in await reopened.load_active_messages(target.session_id)] == ["hello", "hi"]
+        assert (await agent.send("next", message_id="second")).status == "completed"
+    finally:
+        await agent.aclose()
+        await reopened.close()
+
+
+async def test_store_table_prefix_isolation_and_wrong_store_target(tmp_path):
+    path = str(tmp_path / "namespaces.db")
+    a, b = await SessionStore.open(path, table_prefix="alpha_"), await SessionStore.open(path, table_prefix="beta_")
+    first = await RunningAgent(a, _SeqLLM()).start()
+    target = first.target
+    await first.send("alpha")
+    await first.aclose()
+    second = await RunningAgent(b, _SeqLLM()).start()
+    try:
+        with pytest.raises(RuntimeRequestError) as error:
+            await second.runtime.client.send(target, "wrong store", message_id="wrong", actor=second.actor)
+        assert error.value.code == "wrong_store"
+        assert await b.get_session(target.session_id) is None
+    finally:
+        await second.aclose()
+        await a.close()
+        await b.close()

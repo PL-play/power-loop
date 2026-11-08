@@ -2,6 +2,24 @@
 
 ## 11.0.0 — Design 203 (source delivery; not published)
 
+- Finite child reviews use persisted interactions, the configured timer port,
+  and public `WaitPolicy` / `register_wait_handoff_tool`. The required-timer
+  proof protocol is removed. Known ManagedTool notices use original runtime
+  descriptors and budgets; external action execution is unchanged.
+
+- Public results are `Receipt` / `Result`; retired `FollowUpQueued`, direct-loop `StatefulResult` exports and child-run guard callbacks are removed.
+
+- P7A source changes: one TimerBackend tool contract, trusted TimerContext and
+  Runtime-owned TimerRunner input delivery. Explicit external drivers require readiness.
+- Public StoreBlackboard uses database-atomic edits on all three backends; remove
+  SqliteBlackboard and TimerDelivery without compatibility aliases.
+- Factories declare profiles/preflight; execution resources and original process
+  control are explicit. Runtime result error_code persists and health stays local.
+- Default process-local coordination holds a native store startup lock, released
+  on exit; loss stops admission. Pure clients remain independent.
+- No additional schema/protocol/version upgrade, package release or deployment.
+
+
 - Breaking: all execution uses `RuntimeClient` → durable input → `RuntimeWorker`.
   `StatefulAgentLoop(runtime=...)` is a convenience facade over those ports.
   Callers supply authenticated actors, stable targets and request IDs; old direct

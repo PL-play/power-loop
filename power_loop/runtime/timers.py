@@ -1,316 +1,129 @@
-"""Durable per-session timers: "wake this session at T with this note".
-
-Design (one store file = one process, like everything else here):
-
-* **The ``timers`` table is the source of truth.** A timer is data, not an
-  in-memory task — it survives restarts. The in-process scan loop is only an
-  accelerator over the table; resolution = ``scan_interval``.
-* **Firing = a normal send.** Delivery goes through ``loop.follow_up``: an
-  idle session gets a regular ``send``; a session mid-run gets the note
-  injected at the next round boundary (``FollowUpQueued``). There is exactly
-  one path into a conversation.
-* **Recurrence is declared at creation** (``interval_s`` on the row /
-  ``every_seconds`` on the tool): NULL = one-shot (``firing -> fired``);
-  set = the firing re-arms at fire-time + interval (fixed-delay) until
-  cancelled. Cancelling is the only way a recurring timer ends.
-* **At-least-once.** A claim is a compare-and-set ``armed -> firing``; rows
-  stuck in ``firing`` (process died mid-fire) are re-armed on the next
-  :meth:`TimerRunner.start` / periodic recovery sweep and may deliver twice.
-* **The TIMER_FIRE hook is the orchestrator's veto point.** Before delivery
-  every firing runs :pyattr:`HookPoint.TIMER_FIRE` with a
-  :class:`TimerFireCtx`: CONTINUE delivers, SKIP drops this firing, BREAK
-  cancels the timer, ``postpone_s`` re-arms it later. No hook registered =
-  deliver. Use it to dedupe after re-fires, hold off a busy system, audit.
-
-Timers are created by the agent itself (the ``schedule_wakeup`` default tool,
-``action=schedule|list|cancel``) or externally via
-``StatefulAgentLoop.schedule_timer`` — both write the same rows.
-"""
-
+"""Bounded timer scanning. A driver only waits for RuntimeClient acceptance."""
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import time
-from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from dataclasses import replace
 
+from power_loop.agent.runtime_types import TargetRef, TrustedActor
 from power_loop.contracts.event_payloads import TimerFiredPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import TimerFireCtx
 from power_loop.contracts.hooks import HookDirective, HookPoint
-from power_loop.runtime.cancellation import CancellationToken
-from power_loop.runtime.store.types import TimerRow
 
-if TYPE_CHECKING:  # pragma: no cover
-    from power_loop.agent.stateful_loop import StatefulAgentLoop
-
-logger = logging.getLogger(__name__)
+from .timer_backend import TimerDriverStatus
 
 DEFAULT_SCAN_INTERVAL_S = 2.0
-DEFAULT_STALE_FIRING_S = 120.0
-
-#: HOST delivery seam (PROVISIONAL, 3.14): replaces ONLY the final "inject into
-#: the session" step of a firing — the scan / claim / heartbeat / stale-recovery
-#: machinery and the TIMER_FIRE hook (veto/dedupe point) all run unchanged
-#: before it. Receives the post-hook :class:`TimerFireCtx` (``session_id`` /
-#: ``timer_id`` / ``note`` / ``due_at`` / ``message`` — a hook may have
-#: rewritten ``message``). A normal return marks the firing done (one-shot →
-#: fired; recurring → re-armed); an exception re-arms the row +30s and it
-#: re-fires, so deliveries must tolerate at-least-once. Use it to route wakes
-#: into the host's own run pipeline instead of ``loop.follow_up``.
-TimerDelivery = Callable[[TimerFireCtx], Awaitable[None]]
 
 
-def format_timer_message(timer: TimerRow) -> str:
-    """The user-role text a fired timer injects into its session."""
-    return (
-        f"<timer id={timer.timer_id}>\n"
-        f"Your scheduled wake-up has fired. Your note to yourself was:\n"
-        f"{timer.note}\n"
-        f"</timer>"
-    )
+def format_timer_message(timer):
+    return (f'<timer id={timer.timer_id}>\nYour scheduled wake-up has fired. '
+            f'Your note to yourself was:\n{timer.note}\n</timer>')
 
 
 class TimerRunner:
-    """Scans the store for due timers and fires them into their sessions.
+    def __init__(self, *, store, client, hooks=None, event_bus=None,
+                 scan_interval_s=DEFAULT_SCAN_INTERVAL_S, batch_size=50, acceptance_timeout_s=10):
+        if scan_interval_s <= 0 or not 1 <= batch_size <= 1000 or acceptance_timeout_s <= 0:
+            raise ValueError('invalid timer driver limits')
+        self.store, self.client, self.hooks, self.event_bus = store, client, hooks, event_bus
+        self.scan_interval_s, self.batch_size = scan_interval_s, batch_size
+        self.acceptance_timeout_s = acceptance_timeout_s
+        self._task = None
+        self._last_recovery = 0.0
+        self._status = TimerDriverStatus('store', False)
 
-    One runner per :class:`StatefulAgentLoop` (per store/process)::
+    def status(self):
+        return self._status
 
-        runner = TimerRunner(loop)
-        await runner.start()      # re-arms stale 'firing' rows, begins scanning
-        ...
-        await runner.stop()
-
-    Not started automatically: timers only fire while a runner is running —
-    callers who poll ``loop.store.due_timers()`` from their own scheduler
-    don't need it at all.
-    """
-
-    def __init__(
-        self,
-        loop: StatefulAgentLoop,
-        *,
-        scan_interval_s: float = DEFAULT_SCAN_INTERVAL_S,
-        stale_firing_s: float = DEFAULT_STALE_FIRING_S,
-        heartbeat_interval_s: float | None = None,
-        delivery: TimerDelivery | None = None,
-    ) -> None:
-        self._loop = loop
-        # None → the built-in loop.follow_up delivery; see TimerDelivery.
-        self._delivery = delivery
-        self._scan_interval = float(scan_interval_s)
-        self._stale_firing_ms = int(stale_firing_s * 1000)
-        # While a claimed 'firing' row is being delivered we re-stamp it on this
-        # cadence so a slow-but-live delivery stays comfortably fresh before the
-        # stale cutoff. A quarter of the stale window by default (floored at 1s to
-        # avoid hammering sqlite); overridable for tests / unusual configs.
-        # Floor the override at a small positive value (async-control-4): heartbeat_interval_s=0
-        # would make _heartbeat_firing spin a busy re-stamp loop (sleep(0)) on the firing row.
-        self._heartbeat_interval_s = (
-            max(0.01, float(heartbeat_interval_s)) if heartbeat_interval_s is not None
-            else max(1.0, stale_firing_s / 4.0)
-        )
-        self._task: asyncio.Task[None] | None = None
-        self._stop = asyncio.Event()
-        # Owned cancellation token threaded into the timer-fired follow_up/send so stop() can
-        # abort an in-flight (idle-session → full agent run) delivery at its next checkpoint,
-        # rather than blocking for the whole run to finish (M-async-control-2).
-        self._cancel = CancellationToken()
-
-    async def start(self) -> None:
-        if getattr(self._loop, "timer_backend", None) is not None:
-            raise ValueError("A host timer backend requires its own delivery driver")
-        store = await self._loop._ensure_store()
-        recovered = await store.recover_stale_firing_timers(
-            older_than_ms=self._stale_firing_ms
-        )
-        if recovered:
-            logger.warning("timers: re-armed %d stale 'firing' row(s)", recovered)
-        self._stop.clear()
-        self._cancel = CancellationToken()  # fresh token (a prior stop() cancelled the old one)
+    async def start(self):
         if self._task is None:
-            self._task = asyncio.create_task(self._scan_loop(), name="power-loop-timers")
+            self._status = replace(self._status, ready=True, last_error=None)
+            self._task = asyncio.create_task(self._run(), name='power-loop-timers')
 
-    async def stop(self) -> None:
-        self._stop.set()
-        # Cancel an in-flight timer-fired delivery so awaiting the scan task returns promptly
-        # instead of blocking for a full agent run to complete. An aborted delivery leaves the
-        # row re-armed (scan_once's handler), so it re-fires when a runner restarts.
-        self._cancel.cancel("timer runner stopped")
+    async def stop(self):
         if self._task is not None:
-            await self._task
-            self._task = None
-
-    async def scan_once(self) -> int:
-        """Fire everything currently due. Returns the number fired (any
-        outcome). Exposed for tests and external schedulers."""
-        fired = 0
-        from power_loop.contracts.errors import SessionBusy
-        store = await self._loop._ensure_store()
-        for timer in await store.due_timers():
-            try:
-                await self._fire(timer)
-                fired += 1
-            except SessionBusy:
-                continue  # Leave the wake-up for the owning container.
-            except Exception:
-                logger.exception(
-                    "timers: firing %s/%d failed; postponing 30s",
-                    timer.session_id, timer.timer_id,
-                )
-                await store.transition_timer(
-                    timer.session_id, timer.timer_id,
-                    from_status="firing", to_status="armed",
-                    due_at=int(time.time() * 1000) + 30_000,
-                )
-                self._emit(timer, "error")
-        return fired
-
-    # ── internals ─────────────────────────────────────────────────────────
-
-    async def _scan_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._scan_interval)
-                return
-            except asyncio.TimeoutError:
-                pass
-            try:
-                # Periodic recovery so a crashed *other* runner's rows are
-                # also picked up eventually, not only at start().
-                store = await self._loop._ensure_store()
-                await store.recover_stale_firing_timers(
-                    older_than_ms=self._stale_firing_ms
-                )
-                await self.scan_once()
-            except Exception:
-                logger.exception("timers: scan failed (continuing)")
-
-    async def _fire(self, timer: TimerRow) -> None:
-        async with self._loop._session_lease(timer.session_id):
-            await self._fire_owned(timer)
-
-    async def _fire_owned(self, timer: TimerRow) -> None:
-        store = await self._loop._ensure_store()
-        # Claim (CAS): lost claims mean another runner took it.
-        if not await store.transition_timer(
-            timer.session_id, timer.timer_id, from_status="armed", to_status="firing"
-        ):
-            return
-        # Heartbeat the 'firing' row while the (possibly slow) hook + delivery run,
-        # so a live delivery longer than stale_firing_s is NOT reclaimed as stale
-        # and double-fired. Cancelled in finally once the row leaves 'firing'.
-        hb = asyncio.create_task(self._heartbeat_firing(timer), name="power-loop-timer-hb")
-        try:
-            await self._deliver_claimed(timer)
-        finally:
-            hb.cancel()
+            self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await hb
+                await self._task
+            self._task = None
+        self._status = replace(self._status, ready=False)
 
-    async def _heartbeat_firing(self, timer: TimerRow) -> None:
-        """Re-stamp the claimed 'firing' row every quarter-of-the-stale-window so
-        a slow-but-live delivery stays fresh and is never re-armed by the recovery
-        sweep. Stops itself if the claim is lost (row no longer 'firing')."""
-        interval = self._heartbeat_interval_s
-        store = await self._loop._ensure_store()
+    async def _run(self):
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(self.scan_interval_s)
             try:
-                if not await store.heartbeat_firing_timer(
-                    timer.session_id, timer.timer_id
-                ):
-                    return  # row left 'firing' — nothing left to keep alive
-            except Exception:
-                logger.exception(
-                    "timers: heartbeat failed for %s/%d (continuing)",
-                    timer.session_id, timer.timer_id,
-                )
+                await self.scan_once()
+            except Exception as exc:
+                self._status = replace(self._status, last_error=str(exc)[:500], ready=False)
 
-    async def _deliver_claimed(self, timer: TimerRow) -> None:
-        store = await self._loop._ensure_store()
-        if await store.get_session(timer.session_id) is None:
-            await store.transition_timer(
-                timer.session_id, timer.timer_id,
-                from_status="firing", to_status="cancelled",
-            )
-            self._emit(timer, "cancelled")
+    async def scan_once(self):
+        if time.monotonic() - self._last_recovery >= 120:
+            await self.store.recover_stale_firing_timers(
+                older_than_ms=max(120000, int(self.acceptance_timeout_s*2000)), limit=self.batch_size)
+            self._last_recovery = time.monotonic()
+        timers = await self.store.due_timers(limit=self.batch_size)
+        self._status = replace(self._status, pending=len(timers),
+            oldest_due_ms=timers[0].due_at if timers else None)
+        count = 0
+        for timer in timers:
+            if not await self.store.transition_timer(timer.session_id, timer.timer_id,
+                    from_status='armed', to_status='firing', expected_due_at=timer.due_at,
+                    expected_fire_count=timer.fire_count):
+                continue
+            try:
+                async with asyncio.timeout(self.acceptance_timeout_s):
+                    await self._deliver(timer)
+                count += 1
+            except BaseException as exc:
+                # Never automatically replay an unknown accepted input. End this
+                # occurrence, allowing a recurring timer's next occurrence.
+                await self.store.finish_firing_timer(timer.session_id, timer.timer_id)
+                self._status = replace(self._status, last_error=str(exc)[:500], ready=False)
+                self._emit(timer, 'unknown')
+                raise
+        self._status = replace(self._status, ready=True, last_scan_ms=int(time.time()*1000), last_error=None)
+        return count
+
+    async def _deliver(self, timer):
+        session = await self.store.get_session(timer.session_id)
+        if session is None:
+            await self.store.transition_timer(timer.session_id, timer.timer_id,
+                from_status='firing', to_status='cancelled')
+            self._emit(timer, 'cancelled')
             return
-
-        from .execution_roles import require_timer_creation
-
-        # Old finite child timers also lack a durable owner/wait binding. Keep
-        # their original rows for explicit reconciliation/cancellation instead
-        # of executing them, invoking host delivery, or marking them delivered.
-        await require_timer_creation(self._loop, sid=timer.session_id)
-
-        # ── Orchestrator veto point ──
-        ctx = TimerFireCtx(
-            session_id=timer.session_id,
-            timer_id=timer.timer_id,
-            note=timer.note,
-            due_at=timer.due_at,
-            message=format_timer_message(timer),
-        )
-        await self._loop.hooks.run_typed_async(HookPoint.TIMER_FIRE, ctx)
-
+        metadata = session.metadata or {}
+        if session.parent_session_id is not None or metadata.get('execution_role', 'main') != 'main':
+            await self.store.transition_timer(timer.session_id, timer.timer_id,
+                from_status='firing', to_status='cancelled')
+            self._emit(timer, 'forbidden')
+            return
+        ctx = TimerFireCtx(session_id=timer.session_id, timer_id=timer.timer_id,
+            note=timer.note, due_at=timer.due_at, message=format_timer_message(timer))
+        if self.hooks is not None:
+            await self.hooks.run_typed_async(HookPoint.TIMER_FIRE, ctx)
+        outcome = 'accepted'
         if ctx.directive == HookDirective.BREAK:
-            await store.transition_timer(
-                timer.session_id, timer.timer_id,
-                from_status="firing", to_status="cancelled",
-            )
-            self._emit(timer, "cancelled")
-            return
-        if ctx.directive == HookDirective.SKIP:
-            # Skip THIS firing only: a recurring timer still re-arms for the
-            # next period; a one-shot is done.
-            await store.finish_firing_timer(timer.session_id, timer.timer_id)
-            self._emit(timer, "skipped")
-            return
-        if ctx.postpone_s and ctx.postpone_s > 0:
-            await store.transition_timer(
-                timer.session_id, timer.timer_id,
-                from_status="firing", to_status="armed",
-                due_at=int(time.time() * 1000) + int(ctx.postpone_s * 1000),
-            )
-            self._emit(timer, "postponed")
-            return
-
-        # ── Deliver ──
-        if self._delivery is not None:
-            # Host delivery seam: the host routes the wake itself (e.g. into its
-            # own dispatch pipeline). A raise falls through to scan_once's
-            # handler → the row re-arms +30s and re-fires (at-least-once).
-            await self._delivery(ctx)
-            outcome = "delivered"
+            await self.store.transition_timer(timer.session_id, timer.timer_id,
+                from_status='firing', to_status='cancelled')
+            outcome = 'cancelled'
+        elif ctx.directive == HookDirective.SKIP:
+            await self.store.finish_firing_timer(timer.session_id, timer.timer_id)
+            outcome = 'skipped'
+        elif ctx.postpone_s and ctx.postpone_s > 0:
+            await self.store.transition_timer(timer.session_id, timer.timer_id,
+                from_status='firing', to_status='armed', due_at=int(time.time()*1000+ctx.postpone_s*1000))
+            outcome = 'postponed'
         else:
-            # Built-in: follow_up = queued when mid-run, plain send when idle.
-            from power_loop.agent.follow_up import FollowUpQueued
-
-            result = await self._loop.follow_up(
-                ctx.message, timer.session_id, stop_event=self._cancel
-            )
-            outcome = "queued" if isinstance(result, FollowUpQueued) else "delivered"
-        # One-shot -> fired; recurring -> re-armed at fire-time + interval
-        # (fixed-delay: periods missed while the process was down collapse).
-        await store.finish_firing_timer(timer.session_id, timer.timer_id)
+            await self.client.append(TargetRef(self.store.store_id, timer.session_id), ctx.message,
+                message_id=f'timer-{timer.timer_id}-{timer.created_at}-{timer.fire_count}',
+                actor=TrustedActor(metadata['tenant_id'], metadata['principal_id'], None))
+            await self.store.finish_firing_timer(timer.session_id, timer.timer_id)
         self._emit(timer, outcome)
-        logger.info(
-            "timers: %s/%d %s (note=%r)",
-            timer.session_id, timer.timer_id, outcome, timer.note[:80],
-        )
 
-    def _emit(self, timer: TimerRow, outcome: str) -> None:
-        try:
-            self._loop.event_bus.publish(AgentEvent(
-                type=AgentEventType.TIMER_FIRED,
-                data=TimerFiredPayload(
-                    timer_id=timer.timer_id, note=timer.note,
-                    due_at=timer.due_at, outcome=outcome,
-                ),
-                session_id=timer.session_id,
-            ))
-        except Exception:
-            logger.exception("timers: event publish failed")
+    def _emit(self, timer, outcome):
+        if self.event_bus is not None:
+            self.event_bus.publish(AgentEvent(type=AgentEventType.TIMER_FIRED,
+                data=TimerFiredPayload(timer_id=timer.timer_id, note=timer.note,
+                    due_at=timer.due_at, outcome=outcome), session_id=timer.session_id))

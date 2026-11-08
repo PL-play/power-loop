@@ -19,10 +19,11 @@ Run / 运行
 from __future__ import annotations
 
 import asyncio
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop, ToolDefinition, ToolRegistry
+from power_loop import LLMResponse, LLMService, ToolDefinition, ToolRegistry
 from power_loop.runtime.pricing import Free
 
 # A tiny in-memory "knowledge base". In a real app this is your vector store / DB.
@@ -66,24 +67,23 @@ def _registry() -> ToolRegistry:
     return reg
 
 
-async def main() -> str:
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=128),
-        tool_registry=_registry(),
-        config=AgentLoopConfig(
-            system_prompt=(
-                "Answer ONLY from the knowledge base. Call search_docs first, then answer "
-                "concisely in English."
-            ),
-            max_rounds=4,
-        ),
-    )
-    sid = await loop.new_session()
-    result = await loop.send("How many runtime dependencies does the power-loop core have?",
-                             session_id=sid, tools=["search_docs"])
-    print(result.final_text)
-    return result.final_text or ""
+class SearchModel(LLMService):
+    async def complete(self, request, **kwargs):
+        results = [m['content'] for m in request.messages if m.get('role') == 'tool']
+        if results:
+            return LLMResponse(raw_text=results[-1])
+        return LLMResponse(raw_text='', tool_calls=[{'id':'search','type':'function','function':{
+            'name':'search_docs','arguments':'{"query":"MIT licensed"}'}}])
+    async def close(self):
+        pass
 
+async def main():
+    async with demo_runtime(SearchModel(), _registry()) as (runtime, loop, target, actor):
+        result = await loop.send(target, 'Find the license note', message_id='search', actor=actor,
+            deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and '[license]' in result.final_text
+        print(result.final_text)
+        return result.final_text
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())

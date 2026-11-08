@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import AgentEventBus, AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentEventBus, LLMResponse, LLMService
 from power_loop.contrib.jsonl_sink import attach_jsonl_sink, replay
 from power_loop.contrib.metrics_sink import attach_metrics_sink
 
@@ -48,6 +49,12 @@ class _CountingBackend:
         pass
 
 
+class ColorModel(LLMService):
+    async def complete(self, request, **kwargs):
+        return LLMResponse(raw_text='Blue')
+    async def close(self):
+        pass
+
 async def main() -> str:
     bus = AgentEventBus(suppress_subscriber_errors=True)
     tmp = Path(tempfile.mkdtemp(prefix="pl_obs_"))
@@ -57,14 +64,13 @@ async def main() -> str:
     metrics = _CountingBackend()
     attach_metrics_sink(bus, metrics)            # OBS-4: events → metrics
 
-    loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=64),
-        event_bus=bus,
-        config=AgentLoopConfig(system_prompt="Answer in one short sentence.", max_rounds=1),
-    )
-    sid = await loop.new_session()
-    result = await loop.send("Name a primary color.", session_id=sid)
-    sink.close()
+    try:
+        async with demo_runtime(ColorModel(), event_bus=bus) as (runtime, loop, target, actor):
+            result = await loop.send(target, 'Name a primary color', message_id='color', actor=actor,
+                deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed'
+    finally:
+        sink.close()
 
     # OBS-1: events persisted with their envelope survive the run and replay in seq order.
     events = list(replay(path))

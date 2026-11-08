@@ -186,86 +186,80 @@ class _RecLLM:
 
 
 async def _run(loop, text="hi"):
-    sid = await loop.new_session()
-    await loop.send(text, session_id=sid)
+    await loop.send(text)
 
 
 @pytest.mark.asyncio
-async def test_builtin_hook_auto_registered_when_memory_set() -> None:
-    from power_loop import SessionStore, StatefulAgentLoop
+async def test_builtin_hook_auto_registered_when_memory_set(runtime_agent) -> None:
+    from power_loop import SessionStore
 
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecLLM()
-        loop = StatefulAgentLoop(
-            llm=llm, store=store,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
                 max_rounds=1, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "fact"}]),
-            ),
-        )
-        assert loop.hooks.has(MemoryRecallHook.NAME)
+            ))
         await _run(loop)
-        assert any(str(m.get("name") or "").startswith("memory_") for m in llm.seen[0])
+        assert loop.hooks.has(MemoryRecallHook.NAME)
+        assert "fact" in str(llm.seen[0])
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_host_can_disable_builtin_hook_via_remove() -> None:
-    from power_loop import SessionStore, StatefulAgentLoop
+async def test_host_can_disable_memory_for_subsequent_executions(runtime_agent) -> None:
+    from power_loop import SessionStore
 
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecLLM()
-        loop = StatefulAgentLoop(
-            llm=llm, store=store,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
                 max_rounds=1, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "fact"}]),
-            ),
-        )
+            ))
+        await _run(loop)
+        assert "fact" in str(llm.seen[0])
+        loop.config.builtin_memory_hook = False
         loop.hooks.remove(MemoryRecallHook.NAME)
         await _run(loop)
-        assert not any(str(m.get("name") or "").startswith("memory_") for m in llm.seen[0])
+        assert "fact" not in str(llm.seen[-1])
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_builtin_memory_hook_flag_off_skips_registration() -> None:
-    from power_loop import SessionStore, StatefulAgentLoop
+async def test_builtin_memory_hook_flag_off_skips_registration(runtime_agent) -> None:
+    from power_loop import SessionStore
 
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=_RecLLM(), store=store,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(
                 max_rounds=1, compactor=None, builtin_memory_hook=False,
                 memory=_FakeProvider(to_recall=[{"content": "fact"}]),
-            ),
-        )
+            ))
+        await _run(loop)
         assert not loop.hooks.has(MemoryRecallHook.NAME)
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_builtin_memory_hook_runs_after_host_llm_before_hook() -> None:
+async def test_builtin_memory_hook_runs_after_host_llm_before_hook(runtime_agent) -> None:
     """P1: order=100 makes the builtin memory hook run AFTER a host's default-order
     LLM_BEFORE hook, so memory lands at the TRUE tail (after host-appended content)."""
-    from power_loop import HookPoint, SessionStore, StatefulAgentLoop
+    from power_loop import HookPoint, SessionStore
 
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecLLM()
-        loop = StatefulAgentLoop(
-            llm=llm, store=store,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
                 max_rounds=1, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "the-note"}]),
-            ),
-        )
+            ))
 
         def host_hook(ctx):  # default order 0 → runs before the builtin (order 100)
             ctx.messages.append({"role": "system", "name": "host_sentinel", "content": "HOST"})
@@ -274,18 +268,20 @@ async def test_builtin_memory_hook_runs_after_host_llm_before_hook() -> None:
         await _run(loop)
 
         sent = llm.seen[0]
-        host_idx = next(i for i, m in enumerate(sent) if m.get("name") == "host_sentinel")
-        mem_idx = next(i for i, m in enumerate(sent) if str(m.get("name") or "").startswith("memory_"))
+        content = str(sent)
+        host_idx = content.index("HOST")
+        mem_idx = content.index("the-note")
         assert host_idx < mem_idx  # memory appended AFTER the host hook's content
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_host_can_preregister_under_builtin_name_and_loop_does_not_clobber() -> None:
+async def test_host_can_preregister_under_builtin_name_and_loop_does_not_clobber(runtime_agent) -> None:
     """P1: if the host already registered a handler under MemoryRecallHook.NAME, the
     loop's has()-guard must NOT overwrite it — the host's override wins."""
-    from power_loop import AgentHooks, HookPoint, SessionStore, StatefulAgentLoop
+    from power_loop import AgentHooks, HookPoint, SessionStore
 
     store = await SessionStore.open(":memory:")
     try:
@@ -297,13 +293,10 @@ async def test_host_can_preregister_under_builtin_name_and_loop_does_not_clobber
         hooks.register(HookPoint.LLM_BEFORE, host_override, name=MemoryRecallHook.NAME)
 
         llm = _RecLLM()
-        loop = StatefulAgentLoop(
-            llm=llm, store=store, hooks=hooks,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=llm, store=store, hooks=hooks, config=AgentLoopConfig(
                 max_rounds=1, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "builtin-note"}]),
-            ),
-        )
+            ))
         # exactly one handler under the name (loop didn't add the builtin alongside)
         entries = [e for e in loop.hooks._handlers[str(HookPoint.LLM_BEFORE)]
                    if e.name == MemoryRecallHook.NAME]
@@ -311,7 +304,8 @@ async def test_host_can_preregister_under_builtin_name_and_loop_does_not_clobber
 
         await _run(loop)
         sent = llm.seen[0]
-        assert any(m.get("name") == "memory_host_override" for m in sent)  # host's ran
-        assert not any(m.get("content") == "builtin-note" for m in sent)  # builtin did NOT
+        assert "HOST-MEM" in str(sent)  # host's ran
+        assert "builtin-note" not in str(sent)  # builtin did NOT
     finally:
+        await loop.aclose()
         await store.close()

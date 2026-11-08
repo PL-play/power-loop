@@ -1,5 +1,4 @@
-"""Per-call ``max_rounds`` override on send()/follow_up() — run a bounded continuation with a
-different round budget than config.max_rounds (e.g. a short "finalize" turn)."""
+"""RequestOptions bound a new turn; append retains the configured execution limits."""
 
 from __future__ import annotations
 
@@ -7,7 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig, RequestOptions
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -68,46 +67,33 @@ def _echo_registry() -> ToolRegistry:
     return reg
 
 
-def _loop(db, max_rounds):
-    return StatefulAgentLoop(
-        llm=_AlwaysTool(),
-        db_path=str(db),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=max_rounds),
-        tool_registry=_echo_registry(),
-    )
+async def _run_rounds(runtime_agent, *, configured, override=None, append=False):
+    from power_loop.agent.runtime_store import now_ms
+    model = _AlwaysTool()
+    agent = await runtime_agent(model=model, registry=_echo_registry(),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=configured))
+    options = RequestOptions(max_rounds=override) if override is not None else None
+    if append:
+        receipt = await agent.runtime.client.append(agent.target, "finalize", message_id="append",
+            actor=agent.actor)
+        await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
+        await agent.drain()
+    else:
+        await agent.send("hi", options=options)
+    return model.calls
 
 
-async def _run_rounds(loop, *, override=None):
-    sid = await loop.new_session()
-    await loop.send("hi", sid, max_rounds=override)
-    return loop.llm.calls
+async def test_send_max_rounds_override_matches_that_config(runtime_agent):
+    assert await _run_rounds(runtime_agent, configured=10, override=2) == await _run_rounds(runtime_agent, configured=2)
 
 
-async def test_send_max_rounds_override_matches_that_config(tmp_path) -> None:
-    # send(max_rounds=2) on a config.max_rounds=10 loop runs as many rounds as a
-    # config.max_rounds=2 loop — i.e. the override, not the config, governs.
-    with_override = await _run_rounds(_loop(tmp_path / "a.db", 10), override=2)
-    as_config = await _run_rounds(_loop(tmp_path / "b.db", 2))
-    assert with_override == as_config
+async def test_override_caps_below_config(runtime_agent):
+    assert await _run_rounds(runtime_agent, configured=10, override=2) < await _run_rounds(runtime_agent, configured=10)
 
 
-async def test_override_caps_below_config(tmp_path) -> None:
-    small = await _run_rounds(_loop(tmp_path / "c.db", 10), override=2)
-    big = await _run_rounds(_loop(tmp_path / "d.db", 10))  # no override → config's 10
-    assert small < big
+async def test_no_override_uses_config(runtime_agent):
+    assert await _run_rounds(runtime_agent, configured=3) < await _run_rounds(runtime_agent, configured=5)
 
 
-async def test_no_override_uses_config(tmp_path) -> None:
-    three = await _run_rounds(_loop(tmp_path / "e.db", 3))
-    five = await _run_rounds(_loop(tmp_path / "f.db", 5))
-    assert three < five  # config governs when no override is passed
-
-
-async def test_follow_up_idle_honors_override(tmp_path) -> None:
-    loop = _loop(tmp_path / "g.db", 10)
-    sid = await loop.new_session()
-    await loop.follow_up("finalize", sid, max_rounds=1)  # idle → send fallback → override applies
-    ref = _loop(tmp_path / "h.db", 1)
-    ref_sid = await ref.new_session()
-    await ref.send("finalize", ref_sid)
-    assert loop.llm.calls == ref.llm.calls
+async def test_idle_append_uses_frozen_configuration(runtime_agent):
+    assert await _run_rounds(runtime_agent, configured=1, append=True) == await _run_rounds(runtime_agent, configured=1)

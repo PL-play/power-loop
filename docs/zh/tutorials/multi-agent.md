@@ -1,100 +1,58 @@
-# 教程：多 Agent 系统
+# 多 Agent 协作
 
-[English](../../en/tutorials/multi-agent.md) | [教程](../index.md)
+SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
 
-**目标**：构建一个将研究任务委托给子代理的父 Agent——80 行。
+在执行节点注册 spawn_agent。受理的子任务通过 Runtime 独立运行，按原 JobRef 查询控制。子任务继承允许的资源与有界配置，不继承父 Python 对象。工作流把任务组织到明确的归属和额度之下。
 
-**你会学到**：`spawn_agent`、`AgentSpec`、`run_agent_spec`、子代理生命周期、工具白名单。
+以下源码可在本源码目录运行，依赖同目录的 [examples/_runtime.py](../../../examples/_runtime.py)。该辅助文件启动并关闭实际 Runtime；独立应用装配见[快速开始](../user-guide/quickstart.md)。
 
-## 命令式：spawn_agent
-
-LLM 决定何时委托：
-
-```python
-from power_loop import register_spawn_agent
-
-register_spawn_agent(registry)
-
-loop = StatefulAgentLoop(
-    llm=llm, tool_registry=registry,
-    config=AgentLoopConfig(
-        system_prompt="你可以用 spawn_agent 委托研究任务。",
-        max_rounds=8,
-    ),
-)
-
-sid = await loop.new_session()
-result = await loop.send("找到项目中的认证逻辑代码。", session_id=sid)
-# LLM: spawn_agent(task="搜索认证代码", tools=["grep", "read_file", "glob"])
-# → 子代理用白名单工具集搜索 → 父代理拿到结果
+```bash
+.venv/bin/python examples/03_subagent_delegation.py
 ```
 
-## 声明式：AgentSpec
-
-你控制子代理配置：
-
 ```python
-from power_loop import AgentSpec, run_agent_spec
-
-spec = AgentSpec(
-    name="security-auditor",
-    system_prompt="你是安全审计员。只报告确认的问题。",
-    tools=["grep", "read", "glob"],  # 白名单
-    max_rounds=5,
-    lifecycle="ephemeral",
-)
-
-result = await run_agent_spec(spec, "审计认证模块的 SQL 注入漏洞。", parent_loop=loop)
-print(result["final_text"])
-```
-
-## 两种方式对比
-
-| | spawn_agent | AgentSpec + run_agent_spec |
-|---|---|---|
-| 谁决定 | LLM（可选 `system_prompt` / `tools` / `max_rounds` 覆盖） | 你（宿主代码） |
-| 工具白名单 | 可选 `tools` 参数 | 显式 `tools` 列表 |
-| 使用场景 | 动态委托 | 受控、可审计的子任务 |
-
-## 完整代码
-
-```python
+"""03 · Capacity-one parent accepts a child, finishes, and receives its result."""
 import asyncio
-from power_loop import (
-    StatefulAgentLoop, AgentLoopConfig, ToolRegistry, ToolDefinition,
-    AgentSpec, run_agent_spec, register_spawn_agent,
-    create_llm_service_from_env,
-)
+import json
+import time
 
-registry = ToolRegistry()
-registry.register(
-    ToolDefinition(name="read_file", description="读取文件。参数: path。",
-        input_schema={"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
-    lambda path: f"(内容: {path})",
-)
-register_spawn_agent(registry)
+from _runtime import demo_runtime
+
+from power_loop import JobRef, LLMResponse, LLMService, ToolRegistry, register_spawn_agent
+
+
+class DelegatingModel(LLMService):
+    async def complete(self, request, **kwargs):
+        if request.system_prompt.startswith('child'):
+            return LLMResponse(raw_text='Tokyo')
+        if not any(m.get('role') == 'tool' for m in request.messages):
+            return LLMResponse(raw_text='', tool_calls=[{'id':'spawn','type':'function','function':{
+                'name':'spawn_agent','arguments':json.dumps({'task':'Capital of Japan?',
+                    'system_prompt':'child', 'tools':[], 'max_rounds':1})}}])
+        return LLMResponse(raw_text='Parent accepted the task.')
+
+    async def close(self):
+        pass
+
 
 async def main():
-    llm = create_llm_service_from_env()
-    loop = StatefulAgentLoop(
-        llm=llm, tool_registry=registry,
-        config=AgentLoopConfig(system_prompt="用 spawn_agent 委托。简洁。", max_rounds=8),
-    )
-    try:
-        sid = await loop.new_session()
-        r1 = await loop.send("研究：read_file 返回什么？", session_id=sid)
-        print(f"命令式: {r1.final_text[:200]}")
+    registry = ToolRegistry()
+    register_spawn_agent(registry)
+    async with demo_runtime(DelegatingModel(), registry) as (runtime, loop, target, actor):
+        parent = await loop.send(target, 'Delegate the question', message_id='delegate', actor=actor,
+                                 deadline_ms=int(time.time()*1000)+10000)
+        assert parent.status == 'completed'
+        rows = await runtime.store.load_all_messages(target.session_id)
+        receipt = json.loads(next(row.content for row in rows if row.tool_call_id == 'spawn'))
+        result = await runtime.client.wait(JobRef(**receipt['job_ref']), actor=actor,
+                                            deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed' and result.final_text == 'Tokyo'
+        print(result.final_text)
+        return result.final_text
 
-        spec = AgentSpec(name="r", system_prompt="简洁回答。", tools=["read_file"], max_rounds=3)
-        r2 = await run_agent_spec(spec, "读 config.py", parent_loop=loop)
-        print(f"声明式: {r2['final_text'][:200]}")
-    finally:
-        loop.close()
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
 ```
 
-## 下一步
-
-- [子代理用户手册](../user-guide/subagents.md) — 完整参考
-- [Hooks 用户手册](../user-guide/hooks.md) — 拦截每个阶段
+[subagents](../user-guide/subagents.md) · [API](../api/index.md)

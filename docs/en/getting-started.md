@@ -1,115 +1,22 @@
-# Getting Started
+# Getting started with SDK 11
 
-[中文](../zh/getting-started.md) | [Back to docs](../README.md)
-
-Get power-loop running in 5 minutes — from `pip install` to your first agent reply.
-
-## 1. Install
+This checkout uses SDK 11.0.0, task schema 15, protocol 42 and descriptor schema 1. Install this source into an isolated environment; this delivery does not publish a package.
 
 ```bash
-pip install 'power-loop[openai]'      # any OpenAI-compatible endpoint
-# or 'power-loop[anthropic]' for the native Anthropic Messages API, or [all] for both
-# for development:
-pip install -e '../power-loop[openai]'
+python3 -m venv .venv
+.venv/bin/pip install -e '.[openai]'
+.venv/bin/python examples/design203_single_process.py
 ```
 
-The SDK-free core has zero runtime dependencies; the transport is pulled in by the extra
-you choose. To use the native Anthropic Messages API, install `'power-loop[anthropic]'`
-and set `POWER_LOOP_PROVIDER=anthropic`.
-
-Python 3.11+ required.
-
-## 2. Set up your LLM credentials
-
-Create a `.env` file in your project root:
-
-```bash
-# Primary (recommended)
-POWER_LOOP_BASE_URL=https://api.openai.com/v1
-POWER_LOOP_API_KEY=sk-…
-POWER_LOOP_MODEL=gpt-4o-mini
-
-# Legacy names also work (auto-fallback)
-# OPENAI_COMPAT_BASE_URL=…
-# OPENAI_COMPAT_API_KEY=…
-# OPENAI_COMPAT_MODEL=…
-```
-
-Any OpenAI-compatible provider works — DashScope, DeepSeek, OpenRouter, Together, Groq, local Ollama/vLLM. See [Providers](user-guide/providers.md) for more snippets.
-
-## 3. Write your first agent
-
-```python
-import asyncio
-from power_loop import (
-    StatefulAgentLoop,
-    AgentLoopConfig,
-    create_llm_service_from_env,
-)
-
-async def main():
-    llm = create_llm_service_from_env()
-
-    loop = StatefulAgentLoop(
-        llm=llm,
-        config=AgentLoopConfig(
-            system_prompt="You are a helpful assistant. Reply concisely.",
-            max_rounds=1,
-        ),
-    )
-
-    sid = await loop.new_session()
-    result = await loop.send("What does HTTP stand for?", session_id=sid)
-    print(result.final_text)
-
-asyncio.run(main())
-```
-
-Run it:
-
-```bash
-$ python hello.py
-HTTP stands for HyperText Transfer Protocol.
-```
-
-## 4. What just happened?
+The local example needs no model credentials or middleware. It creates a dedicated SQLite file, registers a factory, starts the worker, submits an input and waits for its result. Run it from a disposable test directory if you want to keep generated data separate. For live providers, install the provider extra, set POWER_LOOP_BASE_URL / POWER_LOOP_API_KEY / POWER_LOOP_MODEL and return the provider from the factory. Do not put secrets in RuntimeDescriptor.
 
 ```mermaid
 flowchart LR
-    A[new_session] --> B[send]
-    B --> C[load session history]
-    C --> D[LLM complete]
-    D --> E[append assistant msg]
-    E --> F[session.end]
-    F --> G[StatefulResult]
+  F[Factory + Store] --> W[Runtime worker]
+  C[Client send] --> R[Receipt + InputRef]
+  R --> W
+  W --> P[Persisted Result]
+  P --> Q[Client wait / inspect]
 ```
 
-1. `new_session()` creates an empty session and returns its `session_id`.
-2. `send(..., session_id=sid)` appends the user message and sends it to the LLM with your `system_prompt`.
-3. The LLM replies — no tools were called, so the round ends.
-4. `StatefulResult` carries `session_id`, `status="completed"`, `final_text`, and `rounds`.
-
-## 5. Keep talking — multi-turn
-
-```python
-sid = await loop.new_session()
-result1 = await loop.send("My name is Alan.", session_id=sid)
-print(result1.final_text)
-
-result2 = await loop.send(
-    "What is my name?",
-    session_id=sid,   # continue same session
-)
-print(result2.final_text)   # "Your name is Alan."
-```
-
-The library loads the full history from the store automatically. You never manage `messages` by hand. The default store is a single zero-infra SQLite file; point `dsn=` at PostgreSQL or MySQL when you outgrow it — see [Storage backends](user-guide/storage-backends.md). And because the loop itself holds no authoritative state, a fresh process resumes any session from the same `dsn` + `session_id`.
-
-## 6. Next steps
-
-| I want to… | Read this |
-|---|---|
-| Add tools (bash, search, …) | [Quickstart: Tool Calling](user-guide/quickstart.md#tool-calling) |
-| Stream tokens to a UI | [Streaming](user-guide/events.md#stream-delta) |
-| Understand the loop phases | [Architecture](architecture.md) |
-| See everything in one place | [Examples](../../examples/) — start with `00_hello_world.py` |
+[Quickstart](user-guide/quickstart.md) explains composition. [Sessions](user-guide/sessions.md) covers identity and retry. [API](api/index.md) lists public contracts. [Examples](../../examples/README.md) lists executable features and required host dependencies.

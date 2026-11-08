@@ -22,7 +22,7 @@ from power_loop import (
     AgentLoopConfig,
     MessageState,
     SessionStore,
-    StatefulAgentLoop,
+    TargetRef,
 )
 from power_loop.runtime.compact import DefaultCompactor
 
@@ -38,15 +38,11 @@ _SP = (
 )
 
 
-def _loop(db_path: str) -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=make_llm(max_tokens=256, temperature=0),
-        db_path=db_path,
-        config=AgentLoopConfig(
-            system_prompt=_SP, max_rounds=1, max_tokens=256, temperature=0,
-            compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1),
-        ),
-    )
+async def _loop(runtime_agent, db_path, *, target=None):
+    store = await SessionStore.open(db_path)
+    return await runtime_agent(model=make_llm(max_tokens=256, temperature=0), store=store, target=target,
+        config=AgentLoopConfig(system_prompt=_SP, max_rounds=1, max_tokens=256, temperature=0,
+                              compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)))
 
 
 async def _seed_fat_history(store: SessionStore, sid: str) -> None:
@@ -58,56 +54,60 @@ async def _seed_fat_history(store: SessionStore, sid: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_durability_lifecycle_with_real_llm(tmp_path: Path, monkeypatch) -> None:
+async def test_durability_lifecycle_with_real_llm(tmp_path: Path, monkeypatch, runtime_agent) -> None:
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "500")  # force compaction on the fat seed
     db = str(tmp_path / "dur.db")
 
     # ── phase 1: real send → compaction → prune + vacuum (file store) ──────────
-    loop = _loop(db)
-    sid = await loop.new_session()
-    await _seed_fat_history(loop.store, sid)
+    loop = await _loop(runtime_agent, db)
+    sid = loop.target.session_id
+    await _seed_fat_history(loop.runtime.store, sid)
 
-    r1 = await loop.send("Name the largest planet in our solar system.", session_id=sid)
+    r1 = await loop.send("Name the largest planet in our solar system.")
     assert r1.status == "completed"
     assert "jupiter" in (r1.final_text or "").lower(), r1.final_text
-    assert await loop.store.list_compactions(sid), "compaction should have fired on the fat seed"
+    assert await loop.runtime.store.list_compactions(sid), "compaction should have fired on the fat seed"
     assert any(
-        m.state is MessageState.COMPACTED_OUT for m in await loop.store.load_all_messages(sid)
+        m.state is MessageState.COMPACTED_OUT for m in await loop.runtime.store.load_all_messages(sid)
     )
 
     active_before = [
-        (m.role, m.name, m.content) for m in await loop.store.load_active_messages(sid)
+        (m.role, m.name, m.content) for m in await loop.runtime.store.load_active_messages(sid)
     ]
-    await loop.store.checkpoint(mode="TRUNCATE")
+    await loop.runtime.store.checkpoint(mode="TRUNCATE")
     size_before = Path(db).stat().st_size
-    pruned = await loop.store.prune_compacted_messages(sid)
+    pruned = await loop.runtime.store.prune_compacted_messages(sid)
     assert pruned > 0
-    await loop.store.vacuum(incremental=False)
+    await loop.runtime.store.vacuum(incremental=False)
     # active window (compact_note + kept tail) is untouched by pruning the originals
     assert [
-        (m.role, m.name, m.content) for m in await loop.store.load_active_messages(sid)
+        (m.role, m.name, m.content) for m in await loop.runtime.store.load_active_messages(sid)
     ] == active_before
     assert Path(db).stat().st_size <= size_before  # reclaimed (or at worst unchanged)
 
-    blob = await loop.store.export_session(sid)  # OPS-4 export before shutdown
-    await loop.aclose()                          # OPS-5 graceful shutdown of the owned store
+    blob = await loop.runtime.store.export_session(sid)  # OPS-4 export before shutdown
+    await loop.aclose()
+    await loop.runtime.store.close()
 
     # ── phase 2: REOPEN the file (migration gate) + a real follow-up ──────────
-    loop2 = _loop(db)
-    store2 = await loop2._ensure_store()
+    loop2 = await _loop(runtime_agent, db, target=loop.target)
+    store2 = loop2.runtime.store
     assert store2.schema_version == CURRENT_SCHEMA_VERSION
     assert await store2.get_session(sid) is not None  # survived reopen
-    r2 = await loop2.send("Which planet is known as the Red Planet?", session_id=sid)
+    r2 = await loop2.send("Which planet is known as the Red Planet?", message_id="after-reopen")
     assert r2.status == "completed"
     assert "mars" in (r2.final_text or "").lower(), r2.final_text
     await loop2.aclose()
+    await store2.close()
 
     # ── phase 3: import the export into a fresh store + a real send ───────────
-    other = _loop(str(tmp_path / "restored.db"))
-    other_store = await other._ensure_store()
+    other_store = await SessionStore.open(str(tmp_path / "restored.db"))
     new_sid = await other_store.import_session(blob, new_session_id="restored")
+    other = await runtime_agent(model=make_llm(max_tokens=256, temperature=0), store=other_store,
+        target=TargetRef(other_store.store_id, new_sid), config=AgentLoopConfig(system_prompt=_SP, max_tokens=256))
     assert (await other_store.load_active_messages(new_sid))[0].name == "compact_note"  # ordering
-    r3 = await other.send("In one word, what is the largest planet in the solar system?", session_id=new_sid)
+    r3 = await other.send("In one word, what is the largest planet in the solar system?")
     assert r3.status == "completed"
     assert "jupiter" in (r3.final_text or "").lower(), r3.final_text
     await other.aclose()
+    await other_store.close()

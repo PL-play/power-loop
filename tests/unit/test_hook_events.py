@@ -12,9 +12,10 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.core.pipeline import AgentPipeline
+from tests.runtime_fixture import RunningAgent
 
 _summarize = AgentPipeline._summarize_hook_injection
 
@@ -208,16 +209,17 @@ class _FakeProvider:
 async def _run_with(record_mode: str, *, recall_text="the-secret-memory"):
     store = await SessionStore.open(":memory:")
     llm = _RecLLM()
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
+    loop = await RunningAgent(
+        model=llm, store=store,
         config=AgentLoopConfig(
             max_rounds=1, compactor=None,
             memory=_FakeProvider(to_recall=[{"content": recall_text}]),
             record_hook_events=record_mode,
         ),
-    )
-    sid = await loop.new_session()
-    await loop.send("hi", session_id=sid)
+    ).start()
+    sid = loop.target.session_id
+    await loop.send("hi")
+    await loop.aclose()
     return store, llm, sid
 
 
@@ -226,7 +228,7 @@ async def test_loop_off_by_default_records_nothing() -> None:
     store, llm, sid = await _run_with("off")
     try:
         # memory WAS injected into the LLM request...
-        assert any(str(m.get("name") or "").startswith("memory_") for m in llm.seen[0])
+        assert "the-secret-memory" in str(llm.seen[0])
         # ...but with auditing off, no event was recorded.
         assert await store.list_hook_events(sid) == []
     finally:
@@ -261,7 +263,7 @@ async def test_loop_metadata_mode_omits_content() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_records_one_event_per_round_in_multi_round_send() -> None:
+async def test_loop_records_one_event_per_round_in_multi_round_send(runtime_agent) -> None:
     """A multi-round send (tool call on round 0 → text on round 1) records ONE audit row per round,
     each linked to its own assistant message, with monotonic event_ids — and a 2nd send keeps
     counting forward (no mislink/double-count)."""
@@ -273,16 +275,13 @@ async def test_loop_records_one_event_per_round_in_multi_round_send() -> None:
             _tool_resp("c1", "echo", '{"text": "hi"}'),  # round 0 → tool call
             LLMResponse(raw_text="done"),                # round 1 → finish
         ])
-        loop = StatefulAgentLoop(
-            llm=llm, store=store, tool_registry=_echo_registry(),
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(), config=AgentLoopConfig(
                 max_rounds=4, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "M"}]),
                 record_hook_events="full",
-            ),
-        )
-        sid = await loop.new_session()
-        await loop.send("go", session_id=sid)
+            ))
+        sid = loop.target.session_id
+        await loop.send("go")
         evs = await store.list_hook_events(sid)
         assert len(evs) == 2  # one per round
         assert [e.event_id for e in evs] == [1, 2]  # monotonic
@@ -291,16 +290,17 @@ async def test_loop_records_one_event_per_round_in_multi_round_send() -> None:
         assert all(e.message_seq in asst_seqs for e in evs)
 
         # a SECOND send continues the id sequence (no reattach/double-count of prior events)
-        await loop.send("again", session_id=sid)
+        await loop.send("again")
         evs2 = await store.list_hook_events(sid)
         assert [e.event_id for e in evs2][:2] == [1, 2]
         assert len(evs2) > 2 and evs2[-1].event_id == len(evs2)
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_degraded_round_records_the_injection_that_fed_the_failed_call() -> None:
+async def test_degraded_round_records_the_injection_that_fed_the_failed_call(runtime_agent) -> None:
     """The injection fed a real (failed) LLM call, so the degraded assistant row must carry its
     audit (pins the commit-claimed behavior)."""
     from power_loop import LLMTimeout
@@ -317,17 +317,14 @@ async def test_degraded_round_records_the_injection_that_fed_the_failed_call() -
 
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=_RaisingLLM(), store=store,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=_RaisingLLM(), store=store, config=AgentLoopConfig(
                 max_rounds=1, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "M"}]),
                 record_hook_events="full",
-            ),
-        )
-        sid = await loop.new_session()
-        r = await loop.send("hi", session_id=sid)
-        assert r.status == "degraded"
+            ))
+        sid = loop.target.session_id
+        r = await loop.send("hi")
+        assert r.status == "failed" and "degraded" in r.error and "LLMTimeout" in r.error
         evs = await store.list_hook_events(sid)
         assert len(evs) == 1
         # linked to the degraded assistant row
@@ -336,49 +333,45 @@ async def test_degraded_round_records_the_injection_that_fed_the_failed_call() -
         assert evs[0].message_seq == asst.seq
         assert evs[0].payload["items"][0]["content"] == "M"
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_llm_after_break_round_records_the_injection() -> None:
+async def test_llm_after_break_round_records_the_injection(runtime_agent) -> None:
     from power_loop import HookPoint
     from power_loop.contracts.hooks import HookDirective
 
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=_RecLLM(), store=store,
-            config=AgentLoopConfig(
+        loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(
                 max_rounds=2, compactor=None,
                 memory=_FakeProvider(to_recall=[{"content": "M"}]),
                 record_hook_events="full",
-            ),
-        )
+            ))
 
         def _brk(ctx):
             ctx.directive = HookDirective.BREAK
 
         loop.hooks.register(HookPoint.LLM_AFTER, _brk, name="t.break")
-        sid = await loop.new_session()
-        await loop.send("hi", session_id=sid)
+        sid = loop.target.session_id
+        await loop.send("hi")
         evs = await store.list_hook_events(sid)
         assert len(evs) == 1 and evs[0].payload["items"][0]["content"] == "M"
     finally:
+        await loop.aclose()
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_loop_custom_hook_total_rebind_records_unresolved_marker() -> None:
+async def test_loop_custom_hook_total_rebind_records_unresolved_marker(runtime_agent) -> None:
     """End-to-end: a custom LLM_BEFORE hook that REPLACES ctx.messages with fresh copies must yield
     an inject_unresolved marker with NO conversation text captured (the privacy fail-safe)."""
     from power_loop import HookPoint
 
     store = await SessionStore.open(":memory:")
     try:
-        loop = StatefulAgentLoop(
-            llm=_RecLLM(), store=store,
-            config=AgentLoopConfig(max_rounds=1, compactor=None, record_hook_events="full"),
-        )
+        loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(max_rounds=1, compactor=None, record_hook_events="full"))
 
         def _rebind(ctx):
             ctx.messages = [{**m} for m in ctx.messages] + [
@@ -386,14 +379,15 @@ async def test_loop_custom_hook_total_rebind_records_unresolved_marker() -> None
             ]
 
         loop.hooks.register(HookPoint.LLM_BEFORE, _rebind, name="t.rebind")
-        sid = await loop.new_session()
-        await loop.send("SENSITIVE-USER-TEXT", session_id=sid)
+        sid = loop.target.session_id
+        await loop.send("SENSITIVE-USER-TEXT")
         evs = await store.list_hook_events(sid)
         assert len(evs) == 1 and evs[0].kind == "inject_unresolved"
         assert evs[0].payload["rebound"] is True and evs[0].payload["items"] == []
         # no conversation/injected text leaked into the audit
         assert "SENSITIVE" not in str(evs[0].payload)
     finally:
+        await loop.aclose()
         await store.close()
 
 
@@ -431,7 +425,7 @@ def test_config_rejects_invalid_record_hook_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_leak_guard_audit_never_enters_history_or_request() -> None:
+async def test_leak_guard_audit_never_enters_history_or_request(runtime_agent) -> None:
     """The load-bearing test: captured audit must NOT be on the persisted message row, must NOT
     appear when the row is converted into an LLM-request message, and must NOT accrete into the
     next request's history."""
@@ -439,17 +433,14 @@ async def test_leak_guard_audit_never_enters_history_or_request() -> None:
 
     store = await SessionStore.open(":memory:")
     llm = _RecLLM()
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(
+    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
             max_rounds=1, compactor=None,
             memory=_FakeProvider(to_recall=[{"content": "SECRET"}]),
             record_hook_events="full",
-        ),
-    )
+        ))
     try:
-        sid = await loop.new_session()
-        await loop.send("first", session_id=sid)
+        sid = loop.target.session_id
+        await loop.send("first")
         # (a) the audit row exists
         assert len(await store.list_hook_events(sid)) == 1
         # (b) the assistant MessageRow carries NO hook payload (no field, nothing in meta)
@@ -464,10 +455,12 @@ async def test_leak_guard_audit_never_enters_history_or_request() -> None:
         # (d) a SECOND send: the history portion (everything before the freshly re-injected memory)
         # must not contain the recorded audit/SECRET except as the live ephemeral re-injection.
         llm.seen.clear()
-        await loop.send("second", session_id=sid)
+        await loop.send("second")
         sent = llm.seen[0]
         secret_msgs = [m for m in sent if "SECRET" in str(m.get("content") or "")]
         # SECRET appears ONLY as the live memory_* re-injection, never as accreted history.
-        assert all(str(m.get("name") or "").startswith("memory_") for m in secret_msgs)
+        assert len(secret_msgs) == 1 and str(secret_msgs[0]["content"]).count("SECRET") == 1
+        assert "second" in secret_msgs[0]["content"]
     finally:
+        await loop.aclose()
         await store.close()

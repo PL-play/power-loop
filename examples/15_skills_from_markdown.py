@@ -1,47 +1,18 @@
-"""15 · Skills：从 SKILL.md 文件加载领域知识注入 system prompt
-     / Loading domain knowledge from SKILL.md files into system prompt
+"""15 · Parse skill instructions and supply the resulting config in the factory.
 
-## What you'll learn / 你将学到
-- 加载 ``SKILL.md`` 格式的 frontmatter 文件并解析出 name / description / instructions
-  / load ``SKILL.md`` formatted frontmatter files and parse name / description / instructions
-- 把 skill 内容拼接进 ``AgentLoopConfig.system_prompt`` 作为领域知识
-  / splice skill content into ``AgentLoopConfig.system_prompt`` as domain knowledge
-- Agent 能按照 skill 里定义的规则回答问题
-  / Agent answers questions following rules defined in the skill
-
-## Prerequisites / 前提
-- 需要 ``.env`` 配置 ``POWER_LOOP_*``（或 ``OPENAI_COMPAT_*``）
-  / requires ``.env`` with ``POWER_LOOP_*`` (or ``OPENAI_COMPAT_*``)
-
-## Run / 运行
-    python examples/15_skills_from_markdown.py
-
-## Key concepts / 关键概念
-- **SKILL.md**: Markdown 文件，YAML frontmatter 声明 ``name`` / ``description``，
-  正文是给 Agent 的指令。这是 power-loop 里最轻量的「给 Agent 注入领域知识」的方式。
-  / Markdown file with YAML frontmatter declaring ``name`` / ``description``;
-  body contains instructions for the Agent. The lightest way to inject domain
-  knowledge into an Agent in power-loop.
-- **System prompt 组装 / System prompt assembly**: 多个 skill 可以拼接成一个 system prompt，业务方自由组合。
-  / multiple skills can be spliced into a single system prompt; freely composable by the application
-- 本例不依赖 ``runtime/skills.py``（那是内部实现），直接演示外部如何加载文件。
-  / this example does not depend on ``runtime/skills.py`` (internal implementation);
-  demonstrates external file loading directly
-
-## Next / 下一步
-看看 `16_custom_compactor.py` — 实现自定义压缩策略
-/ see `16_custom_compactor.py` — implement a custom compaction strategy
+This inline demonstration has no external resource dependency. File-backed
+skills need a stable, authorized resource profile resolved on every worker.
 """
-
 from __future__ import annotations
 
 import asyncio
 import re
 import textwrap
+import time
 
-from _helpers import make_llm
+from _runtime import demo_runtime
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMResponse, LLMService
 
 # ── 1. 两个简单的 SKILL.md 文件（inline，不写盘）───────────────────────
 #    Two simple SKILL.md files (inline, not written to disk)
@@ -109,38 +80,24 @@ def build_system_prompt(*skills: str) -> str:
 # ── 3. 跑两个场景 / Run two scenarios ────────────────────────────────────
 
 
-async def main() -> None:
-    llm = make_llm(max_tokens=200, temperature=0.0)
+class SkillsModel(LLMService):
+    async def complete(self, request, **kwargs):
+        assert 'Use type hints' in request.system_prompt
+        return LLMResponse(raw_text='def greet(name: str) -> str: return "Hello " + name')
 
-    # Scenario A: Python expert
-    prompt_a = build_system_prompt(SKILL_PYTHON)
-    loop_a = StatefulAgentLoop(
-        llm=llm,
-        config=AgentLoopConfig(system_prompt=prompt_a, max_rounds=1, compactor=None),
-    )
-    try:
-        sid = await loop_a.new_session()
-        r = await loop_a.send("How do I read a JSON file?", session_id=sid)
-        print(f"[Python Expert]\n{r.final_text}\n")
-    finally:
-        await loop_a.aclose()
-
-    # Scenario B: Python expert + Security reviewer
-    prompt_b = build_system_prompt(SKILL_PYTHON, SKILL_SECURITY)
-    loop_b = StatefulAgentLoop(
-        llm=llm,
-        config=AgentLoopConfig(system_prompt=prompt_b, max_rounds=1, compactor=None),
-    )
-    try:
-        sid = await loop_b.new_session()
-        r = await loop_b.send(
-            "Review this code: `query = f\"SELECT * FROM users WHERE name='{name}'\"`",
-            session_id=sid,
-        )
-        print(f"[Python Expert + Security]\n{r.final_text}")
-    finally:
-        await loop_b.aclose()
+    async def close(self):
+        pass
 
 
-if __name__ == "__main__":
+async def main():
+    for skills in [(SKILL_PYTHON,), (SKILL_PYTHON, SKILL_SECURITY)]:
+        config = AgentLoopConfig(system_prompt=build_system_prompt(*skills), max_rounds=1, compactor=None)
+        async with demo_runtime(SkillsModel(), config=config) as (runtime, loop, target, actor):
+            result = await loop.send(target, 'Write a typed greeting function', message_id='skill', actor=actor,
+                                     deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == 'completed'
+            print(result.final_text)
+
+
+if __name__ == '__main__':
     asyncio.run(main())

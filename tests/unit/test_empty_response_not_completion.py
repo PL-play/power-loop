@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -52,42 +52,39 @@ def _empty() -> LLMResponse:
     return LLMResponse(raw_text="", tool_calls=[])
 
 
-def _loop(db, llm, max_rounds=10):
-    return StatefulAgentLoop(
-        llm=llm, db_path=str(db),
+async def _loop(runtime_agent, llm, max_rounds=10):
+    return await runtime_agent(
+        model=llm,
         config=AgentLoopConfig(system_prompt="t", max_rounds=max_rounds),
-        tool_registry=ToolRegistry(),
+        registry=ToolRegistry(),
     )
 
 
-async def test_single_empty_response_is_not_completion(tmp_path) -> None:
+async def test_single_empty_response_is_not_completion(tmp_path, runtime_agent) -> None:
     # One empty turn, then a real answer. The empty turn must NOT end the send with "".
     llm = _ScriptedLLM(script=[_empty()])
-    loop = _loop(tmp_path / "a.db", llm)
-    sid = await loop.new_session()
-    result = await loop.send("investigate", sid)
+    loop = await _loop(runtime_agent, llm)
+    result = await loop.send("investigate")
     assert result.final_text == "done for real", (
         f"empty turn was treated as completion; got final_text={result.final_text!r}"
     )
     assert llm.calls >= 2, "loop stopped after the empty turn instead of retrying"
 
 
-async def test_non_empty_no_tool_still_completes(tmp_path) -> None:
+async def test_non_empty_no_tool_still_completes(tmp_path, runtime_agent) -> None:
     # A NORMAL completion (agent says something, no tool call) must be unaffected by the fix.
     llm = _ScriptedLLM(script=[LLMResponse(raw_text="here is my report", tool_calls=[])])
-    loop = _loop(tmp_path / "b.db", llm)
-    sid = await loop.new_session()
-    result = await loop.send("hi", sid)
+    loop = await _loop(runtime_agent, llm)
+    result = await loop.send("hi")
     assert result.final_text == "here is my report"
     assert llm.calls == 1, "a normal one-shot completion should not retry"
 
 
-async def test_persistent_empty_terminates_bounded(tmp_path) -> None:
+async def test_persistent_empty_terminates_bounded(tmp_path, runtime_agent) -> None:
     # If the provider keeps returning empty forever, the loop must still terminate (bounded),
     # not spin until the round cap silently. It should end degraded/completed, never hang.
     llm = _ScriptedLLM(script=[_empty()] * 50)
-    loop = _loop(tmp_path / "c.db", llm, max_rounds=6)
-    sid = await loop.new_session()
-    result = await loop.send("hi", sid)
+    loop = await _loop(runtime_agent, llm, max_rounds=6)
+    result = await loop.send("hi")
     assert result.status in ("degraded", "completed")
     assert llm.calls <= 8, f"unbounded empty-retry loop: {llm.calls} calls"

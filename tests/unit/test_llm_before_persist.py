@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from power_loop import AgentHooks, AgentLoopConfig, HookPoint, LlmBeforeCtx, StatefulAgentLoop
+from power_loop import AgentHooks, AgentLoopConfig, HookPoint, LlmBeforeCtx
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -45,16 +45,15 @@ class _Capturing(LLMService):
         return None
 
 
-def _loop(tmp_path, llm, hooks=None):
-    return StatefulAgentLoop(
-        llm=llm,
-        db_path=str(tmp_path / "s.db"),
+async def _loop(runtime_agent, llm, hooks=None):
+    return await runtime_agent(
+        model=llm,
         config=AgentLoopConfig(system_prompt="t", max_rounds=2),
         hooks=hooks,
     )
 
 
-async def test_persist_message_is_durable_and_joins_request(tmp_path) -> None:
+async def test_persist_message_is_durable_and_joins_request(tmp_path, runtime_agent) -> None:
     hooks = AgentHooks()
 
     def inject(ctx: LlmBeforeCtx) -> None:
@@ -63,12 +62,12 @@ async def test_persist_message_is_durable_and_joins_request(tmp_path) -> None:
 
     hooks.register(HookPoint.LLM_BEFORE, inject, name="test.persist")
     llm = _Capturing()
-    loop = _loop(tmp_path, llm, hooks)
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
+    loop = await _loop(runtime_agent, llm, hooks)
+    sid = loop.target.session_id
+    await loop.send("hi")
 
     # (1) durable: the reminder is a REAL persisted turn (not ephemeral)
-    rows = await loop.get_messages(sid)
+    rows = [dict(role=r.role, content=r.content) for r in await loop.runtime.store.load_active_messages(sid)]
     reminders = [m for m in rows if m["role"] == "user" and "REMINDER" in (m.get("content") or "")]
     assert len(reminders) == 1, rows
 
@@ -83,10 +82,10 @@ async def test_persist_message_is_durable_and_joins_request(tmp_path) -> None:
     assert any(m["role"] == "assistant" for m in rows[idx + 1:])
 
 
-async def test_empty_persist_messages_is_noop(tmp_path) -> None:
+async def test_empty_persist_messages_is_noop(tmp_path, runtime_agent) -> None:
     llm = _Capturing()
-    loop = _loop(tmp_path, llm)  # no hook
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
-    rows = await loop.get_messages(sid)
+    loop = await _loop(runtime_agent, llm)  # no hook
+    sid = loop.target.session_id
+    await loop.send("hi")
+    rows = [dict(role=r.role, content=r.content) for r in await loop.runtime.store.load_active_messages(sid)]
     assert not [m for m in rows if "REMINDER" in (m.get("content") or "")]

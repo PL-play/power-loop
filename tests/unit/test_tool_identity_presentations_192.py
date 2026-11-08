@@ -2,19 +2,17 @@
 
 import json
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, ToolDefinition, validate_tool_args
+from power_loop import ToolDefinition, validate_tool_args
 from power_loop.contracts.context_policy import ToolContextPolicy
-from power_loop.runtime.delegation import _completion_cap, completion_view
-from power_loop.runtime.invocation import invocation_context
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.types import MessageRow, MessageState
-from power_loop.runtime.tool_context import ToolContextConfig
+from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.tools.registry import ToolRegistry
+from power_loop.tools.spawn_agent import register_spawn_agent
 
 from .test_job_registry_192 import registry_store
 
@@ -27,19 +25,19 @@ async def test_completion_uses_aliased_original_definition_and_explicit_override
     store, _ = registry_store
     sid = await store.create_session()
     registry = ToolRegistry()
-    registry.register(ToolDefinition('delegate_notes', '', context_policy=ToolContextPolicy(result_max_chars=1700), pricing=Free("test_fixture")), lambda **kw: '')
-    config = AgentLoopConfig(tool_context=ToolContextConfig(overrides={'spawn_agent': {'result_max_chars':20}, 'delegate_notes': {'result_max_chars':1300}}))
-    loop = SimpleNamespace(config=config, tool_registry=registry)
-    seq = await store.append_message(sid, role='assistant', tool_calls=[{'id':'original', 'type':'function',
-        'function':{'name':'delegate_notes','arguments':'{}'}}])
-    with invocation_context(sid, seq, 'original'):
-        cap = await _completion_cap(loop, store, sid)
-    assert cap == 1300
-    output = completion_view(loop, {'status':'completed','session_id':'original-child','run_id':'original-run','final_text':'A'*3000}, max_chars=cap)
-    assert json.loads(output)['final_text'] == 'A'*1300 + '…[truncated]'
-    with invocation_context(sid, seq, 'unrelated'):
-        assert await _completion_cap(loop, store, sid) is None
-    assert len(completion_view(loop, {'status':'completed','session_id':'original-child','run_id':'original-run','final_text':'A'*3000})) > 20
+    register_spawn_agent(registry)
+    original = registry.get('spawn_agent')
+    registry.register(replace(original.definition, name='delegate_notes',
+        context_policy=ToolContextPolicy(result_max_chars=1700)), original.handler)
+    config = ToolContextConfig(overrides={'spawn_agent':{'result_max_chars':20},'delegate_notes':{'result_max_chars':1300}})
+    engine = ToolContextEngine(config=config,store=store,owner_session_id=sid,owner_send_index=1,
+        registry=registry,llm=None,model='unused')
+    result = {'status':'completed','session_id':'original-child','run_id':'original-run','final_text':'A'*3000}
+    source = ToolSource(sid,1,2,'original','delegate_notes',{},json.dumps(result))
+    assert engine.policy(source).result_max_chars == 1300
+    output = json.loads(await engine.distill(source,'general'))
+    assert output == {**result,'final_text':'A'*1300+'…[truncated]'}
+    assert json.loads(source.result) == result
 
 
 def test_timeline_projection_uses_metadata_and_does_not_infer_from_a_tool_name():

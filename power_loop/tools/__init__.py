@@ -118,10 +118,15 @@ def _bind_handler(handler: Any, runtime_env: RuntimeEnv) -> Any:
     def _merged() -> RuntimeEnv:
         outer = get_runtime_env()
         return replace(
-            runtime_env,
+            outer,
+            workspace_dir=runtime_env.workspace_dir or outer.workspace_dir,
+            home_dir=runtime_env.home_dir or outer.home_dir,
+            skills_dir=runtime_env.skills_dir or outer.skills_dir,
             shell_backend=runtime_env.shell_backend or outer.shell_backend,
             blackboard=runtime_env.blackboard or outer.blackboard,
             blackboard_id=runtime_env.blackboard_id or outer.blackboard_id,
+            process_control=runtime_env.process_control or outer.process_control,
+            background_timeout_s=outer.background_timeout_s,
         )
 
     # An async handler returns a coroutine — the env context MUST be held across its

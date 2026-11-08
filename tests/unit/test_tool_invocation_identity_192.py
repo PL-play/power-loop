@@ -11,7 +11,6 @@ from power_loop import (
     LLMResponse,
     LLMService,
     SessionStore,
-    StatefulAgentLoop,
     ToolDefinition,
     get_tool_runtime_context,
 )
@@ -46,7 +45,7 @@ class Model(LLMService):
 
 
 @pytest.mark.parametrize("concurrency", [1, 2])
-async def test_real_persisted_seq_and_call_ids_are_isolated_per_invocation(tmp_path, concurrency):
+async def test_real_persisted_seq_and_call_ids_are_isolated_per_invocation(tmp_path, concurrency, runtime_agent):
     store = await SessionStore.open(str(tmp_path / "invocation.db"), schema="tasks")
     registry = ToolRegistry()
     contexts = []
@@ -63,14 +62,14 @@ async def test_real_persisted_seq_and_call_ids_are_isolated_per_invocation(tmp_p
 
     registry.register(ToolDefinition(name="inspect", description="Inspect invocation", async_capable=True,
         input_schema={"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}, pricing=Free("test_fixture")), inspect)
-    loop = StatefulAgentLoop(llm=Model(), store=store, tool_registry=registry,
+    loop = await runtime_agent(model=Model(), store=store, registry=registry,
         config=AgentLoopConfig(max_rounds=4, tool_batch_concurrency=concurrency))
-    sid = await loop.new_session()
+    sid = loop.target.session_id
     try:
         # Existing rows make DB seq differ from a fresh send's in-memory indices.
         for _ in range(3):
             await store.append_message(sid, role="user", content="earlier")
-        result = await asyncio.wait_for(loop.send("inspect", sid), 5)
+        result = await asyncio.wait_for(loop.send("inspect"), 5)
         assert result.status == "completed"
         assert sorted((n, call_id) for n, call_id, _, _ in contexts) == [(1, "call-1"), (2, "call-2")]
         assert len({seq for _, _, seq, _ in contexts}) == 1
@@ -79,10 +78,11 @@ async def test_real_persisted_seq_and_call_ids_are_isolated_per_invocation(tmp_p
         outside = get_tool_runtime_context()
         assert outside.assistant_seq is None and outside.tool_call_id is None
     finally:
+        await loop.aclose()
         await store.close()
 
 
-async def test_resume_replays_the_original_persisted_call_identity(tmp_path):
+async def test_unknown_original_call_is_not_replayed_and_keeps_identity(tmp_path, runtime_agent):
     store = await SessionStore.open(str(tmp_path / "resume.db"), schema="tasks")
     registry = ToolRegistry()
     observed = []
@@ -95,16 +95,22 @@ async def test_resume_replays_the_original_persisted_call_identity(tmp_path):
     registry.register(ToolDefinition(name="inspect", description="Resume inspector", pricing=Free("test_fixture")), inspect)
     model = Model()
     model.calls = 1  # The resumed provider round only returns its final text.
-    loop = StatefulAgentLoop(llm=model, store=store, tool_registry=registry, config=AgentLoopConfig(max_rounds=2))
-    sid = await loop.new_session()
+    loop = await runtime_agent(model=model, store=store, registry=registry, config=AgentLoopConfig(max_rounds=2))
+    sid = loop.target.session_id
     calls = [{"id": "original-call", "type": "function", "function": {"name": "inspect", "arguments": '{"number":1}'}}]
     seq = await store.append_message(sid, role="assistant", tool_calls=calls)
     await store.set_pending(sid, {"assistant_seq": seq, "round_index": 0, "tool_call_ids": ["original-call"], "tool_calls": calls})
     try:
-        result = await loop.resume(sid)
-        assert result.status == "completed" and observed == [(seq, "original-call")]
+        result = await loop.send("continue with unknown result")
+        assert result.status == "completed" and observed == []
+        original = await store.get_message(sid, seq)
+        assert original.tool_calls[0]["id"] == "original-call"
+        rows = await store.load_all_messages(sid)
+        outcomes = [row for row in rows if row.tool_call_id == "original-call"]
+        assert len(outcomes) == 1 and "结果未知" in outcomes[0].content
         assert get_tool_runtime_context().tool_call_id is None
     finally:
+        await loop.aclose()
         await store.close()
 
 

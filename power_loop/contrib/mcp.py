@@ -190,9 +190,13 @@ class StdioMCPClient:
 
     async def aclose(self) -> None:
         if self._stack is not None:
-            await self._stack.aclose()
-            self._stack = None
-            self._session = None
+            try:
+                await self._stack.aclose()
+            finally:
+                # AsyncExitStack has unwound its callbacks even when a nested
+                # cancel scope re-raises cancellation after closing the process.
+                self._stack = None
+                self._session = None
 
 
 def _content_to_text(content: Any) -> str:

@@ -74,7 +74,7 @@ async def _atomic_pending_case(registry_store, stage, *, warm=False):
         await store.append_message(sid, role='assistant', tool_calls=CALLS, round_index=4, send_index=3, pending_tool_calls=True)
     assert fired
     store._db.transaction = original
-    reader = await connect(schema='compatible')
+    reader = await connect(schema="verify")
     rows = await reader.load_all_messages(sid)
     state = await reader.get_state(sid)
     if stage != 'commit_ack':
@@ -128,7 +128,7 @@ async def test_tool_result_and_remaining_interactions_commit_together(registry_s
             await sink.on_message_appended(message, round_index=4)
     finally:
         store._db.transaction = original
-    reader = await connect(schema='compatible')
+    reader = await connect(schema="verify")
     state = await reader.get_state(sid)
     if stage == 'commit':
         assert state.pending == pending and state.next_seq == 2

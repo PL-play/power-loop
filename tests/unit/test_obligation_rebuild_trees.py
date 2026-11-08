@@ -12,7 +12,6 @@ import pytest
 
 from power_loop.runtime import session_obligations as obligations
 from power_loop.runtime.jobs import JobActor, JobManager
-from power_loop.runtime.session_controls import ControlTransaction
 
 from .test_job_registry_192 import registry_store, runtime
 
@@ -26,7 +25,7 @@ async def _result(manager, actor, key, *, parent=None):
             system_key="rebuild-root-"+key)
         parent = await manager.claim_job(actor, root.job.job_id,
             executor_id="rebuild-root", boot_id="boot", expected_version=1)
-    child = await manager.register_job(actor, kind="subagent", parent=parent, independent=True,
+    child = await manager.register_job(actor, kind="subagent", session_id=actor.session_id, parent=parent, independent=True,
         system_key="rebuild-result-"+key)
     lease = await manager.claim_job(actor, child.job.job_id,
         executor_id="child", boot_id="boot", expected_version=1)
@@ -43,18 +42,14 @@ async def _originals(manager):
         for table in (manager.jobs, manager.events, manager.store.t.messages)}
 
 
-async def test_rebuild_computes_outside_writer_and_repairs_only_one_tree_at_a_time(runtime, monkeypatch):
+async def test_rebuild_preserves_originals_and_repairs_only_one_tree_at_a_time(runtime, monkeypatch):
     _, manager, actor, _, parent, _, _ = runtime
     await _result(manager, actor, "one", parent=parent)
     await _result(manager, actor, "two")
     expected, originals = await _rows(manager), await _originals(manager)
     await manager.db.execute(f"DELETE FROM {manager.prefix}session_obligations")
-    desired, entries, write = obligations._desired, obligations._write_entries, manager._write
+    entries, write = obligations._write_entries, manager._write
     footprints = []
-
-    async def outside(owner, reader, row, **kwargs):
-        assert owner._control_intents.get() is None, "original validation/calculation belongs outside writer"
-        return await desired(owner, reader, row, **kwargs)
 
     @asynccontextmanager
     async def recorded():
@@ -68,15 +63,9 @@ async def test_rebuild_computes_outside_writer_and_repairs_only_one_tree_at_a_ti
         tx._test_rebuild_roots.add(row["root_job_id"])
         return await entries(owner, tx, row, pending)
 
-    async def forbidden_read(*args, **kwargs):
-        raise AssertionError("rebuild writer must only publish its prepared conditional writes")
-
     with monkeypatch.context() as patch:
-        patch.setattr(obligations, "_desired", outside)
         patch.setattr(obligations, "_write_entries", target)
         patch.setattr(manager, "_write", recorded)
-        patch.setattr(ControlTransaction, "fetchone", forbidden_read)
-        patch.setattr(ControlTransaction, "fetchall", forbidden_read)
         await obligations.rebuild(manager)
     assert len(footprints) == 2 and all(len(roots) == 1 for roots in footprints)
     assert len(set.union(*footprints)) == 2
@@ -104,7 +93,7 @@ async def test_rebuild_does_not_erase_new_roots_or_children_admitted_after_disco
     with monkeypatch.context() as patch:
         patch.setattr(obligations, "_rebuild_tree", admitted_before_publish)
         await obligations.rebuild(manager)
-    assert len(attempts) == 2
+    assert attempts  # New admissions are indexed by their own writer.
     assert {row["job_id"] for row in await _rows(manager)} == {first, *added}
     await obligations.verify(manager, actor)
 
@@ -163,43 +152,6 @@ async def test_committed_first_tree_survives_failure_of_the_second_and_retry_is_
     await obligations.verify(manager, actor)
 
 
-async def test_new_original_notice_without_job_version_change_invalidates_the_rebuild_plan(registry_store, monkeypatch):
-    from power_loop.runtime.managed_delivery import enqueue
-    from power_loop.runtime.managed_effects import terminate_unstarted
-
-    from .test_aborted_call_outcomes_192 import pending_batch
-    from .test_tool_call_plans_192 import controller
-
-    c, _ = await pending_batch(registry_store, stage="commit_ack")
-    loop, model = await controller(c)
-    try:
-        [child, *_] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool' ORDER BY job_id")
-        await terminate_unstarted(c.manager, c.actor, child["job_id"])
-        before = await c.manager._row(c.manager.db, child["job_id"])
-        await c.manager.db.execute(c.manager.db.dialect.insert_ignore(c.manager.prefix+"session_obligations", obligations.COLUMNS),
-            (c.sid, "managed", "stale-derived-notice", child["job_id"], 1))
-        publish, attempts = obligations._rebuild_tree, []
-
-        async def delivered_before_publish(owner, root_id, plan):
-            attempts.append(root_id)
-            if len(attempts) == 1:
-                await enqueue(loop, c.actor, child["job_id"])
-                after = await c.manager._row(c.manager.db, child["job_id"])
-                assert after["version"] == before["version"], "this real notice does not bump the execution version"
-            return await publish(owner, root_id, plan)
-
-        with monkeypatch.context() as patch:
-            patch.setattr(obligations, "_rebuild_tree", delivered_before_publish)
-            await obligations.rebuild(c.manager)
-        # The concurrent producer already removed the stale derived entry and
-        # published its actual notice. A stale repair must not delete that row.
-        assert len(attempts) == 1
-        current = [row for row in await _rows(c.manager) if row["job_id"] == child["job_id"]]
-        assert len(current) == 1 and current[0]["kind"] == "managed" and current[0]["source_id"] != "stale-derived-notice"
-        await obligations.verify(c.manager, c.actor)
-        assert model.calls == c.state.dispatched == 0
-    finally:
-        await loop.aclose(drain_timeout_s=.1)
 
 
 async def test_lost_rebuild_commit_ack_keeps_the_committed_tree_and_retries_only_remaining_drift(runtime, monkeypatch):

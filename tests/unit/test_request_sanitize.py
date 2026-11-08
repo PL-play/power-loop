@@ -4,7 +4,8 @@ from copy import deepcopy
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop
+from power_loop import AgentLoopConfig, JobRef, LLMResponse, LLMService
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.history_sanitize import sanitize_request_messages
 from tests.unit.test_stateful_loop import _echo_registry
 
@@ -95,22 +96,54 @@ class StrictModel(LLMService):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("messages", CASES)
-@pytest.mark.parametrize("action", ["send", "resume"])
-async def test_bad_stored_history_can_continue(tmp_path, messages, action):
-    model = StrictModel([LLMResponse(raw_text="", tool_calls=[call("new", '{"text":"ok"}')])])
-    loop = StatefulAgentLoop(llm=model, db_path=str(tmp_path / "history.db"),
-        tool_registry=_echo_registry(), config=AgentLoopConfig(system_prompt="system", compactor=None))
-    try:
-        sid = await loop.new_session()
-        for message in messages:
-            await loop.store.append_message(sid, **message)
-        before = await loop.store.load_active_messages(sid)
-        result = await loop.send("continue", sid) if action == "send" else await loop.resume(sid)
-        assert result.status == "completed" and len(model.requests) == 2
-        after = await loop.store.load_active_messages(sid)
-        assert after[:len(before)] == before
-    finally:
-        await loop.aclose()
+@pytest.mark.parametrize("action", ["send", "child_resume"])
+async def test_bad_stored_history_can_continue(tmp_path, messages, action, runtime_agent):
+    registry = _echo_registry()
+    if action == 'child_resume':
+        from power_loop.tools.spawn_agent import register_spawn_agent
+        register_spawn_agent(registry)
+        class Model(StrictModel):
+            spawned = False
+            async def complete(self, request, **kwargs):
+                if request.system_prompt.startswith('CHILD'):
+                    return await super().complete(request, **kwargs)
+                if not self.spawned:
+                    self.spawned = True
+                    return LLMResponse(raw_text='', tool_calls=[{'id':'spawn','type':'function','function':{
+                        'name':'spawn_agent','arguments':'{"task":"initial","system_prompt":"CHILD","tools":["echo"]}'}}])
+                return LLMResponse(raw_text='parent done')
+        model = Model([LLMResponse(raw_text='initial child result')])
+    else:
+        model = StrictModel()
+    loop = await runtime_agent(model=model, registry=registry,
+        config=AgentLoopConfig(system_prompt='system', compactor=None))
+    store = loop.runtime.store
+    if action == 'child_resume':
+        await loop.send('delegate')
+        rows = await store.load_all_messages(loop.target.session_id)
+        created = json.loads(next(r.content for r in rows if r.tool_call_id == 'spawn'))
+        ref = JobRef(**created['job_ref'])
+        original = await loop.runtime.client.wait(ref, actor=loop.actor, deadline_ms=now_ms()+10000)
+        assert original.status == 'completed' and original.final_text == 'initial child result'
+        ref = original.job_ref
+        await loop.drain()
+        sid = created['session_id']
+    else:
+        sid = loop.target.session_id
+    model.requests.clear()
+    model.responses[:] = [LLMResponse(raw_text='', tool_calls=[call('new', '{"text":"ok"}')])]
+    for message in messages:
+        await store.append_message(sid, **message)
+    before = await store.load_active_messages(sid)
+    if action == 'send':
+        result = await loop.send('continue')
+    else:
+        receipt = await loop.runtime.client.resume(ref, message_id='resume', actor=loop.actor, body='continue')
+        result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
+        await loop.drain()
+    assert result.status == 'completed' and len(model.requests) == 2
+    after = await store.load_active_messages(sid)
+    assert after[:len(before)] == before
 
 
 def test_merging_preserves_multimodal_content_and_known_results():

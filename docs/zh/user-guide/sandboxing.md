@@ -1,102 +1,27 @@
-# 沙箱与隔离
+# 沙箱与进程资源
 
-[English](../../en/user-guide/sandboxing.md) | [用户手册](../index.md)
+SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
 
-默认情况下，power-loop 在**进程内、宿主机上**运行模型编写的 shell，并带有你的完整环境（包括各类密钥）。**任何执行不可信、由模型编写的命令的宿主，都必须对其进行沙箱隔离。** power-loop 保持与具体沙箱无关，不绑死某一种运行时，而是给你两个注入接缝：
+[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
 
-| 接缝 | 包裹对象 | 作用范围 | 示例 |
-|---|---|---|---|
-| `ShellBackend` | `bash` 工具背后那个持久化的 **shell** | 每个 workspace 一个 shell | [28](../../../examples/28_docker_shell_backend.py) |
+执行工厂返回 ExecutionEnvironment(runtime_env=..., process_control=..., workflow_file_io=...)。RuntimeEnv 在实际执行节点提供 workspace、skills 和 ShellBackend。模型生成的命令拥有该后端的权限；产品需要隔离时由宿主管理隔离容器。
 
-两者都遵循与 power-loop 其他接缝相同的模式：一个极小的 `Protocol`、一个安全的默认实现，以及按运行注入。它们都不改动任何工具或引擎代码。
+ShellBackend 定义 launch_argv、launch_cwd、launch_env 和 session_key。Docker 适配器把稳定资源引用映射到指定容器和 workspace。创建 shell 时绑定原目标，之后取消操作仍指向该目标，不能按可复用的容器名重新找一个替代资源。
 
-## ShellBackend — sandbox the `bash` tool
+ShellProcessControl.stop_tagged 返回严格的 confirmed 布尔值。能力缺失或无法确认原进程时保留 unconfirmed，不能改成成功或暗中换资源。输出排空和取消有时限。后台命令使用 Runtime 任务，父任务退出后仍可查询控制，并保留原资源保护。
 
-`bash` / `background_run` 工具把 *shell 进程如何启动* 这件事委托给 `ShellBackend`。`BashSession` 中的 pty / sentinel / 输出抽取（output-drain）机制保持不变，因此对运行时的其余部分来说，进程内 bash 和 `docker exec -i <container> bash` 看起来完全一致。
+Runtime 与工作流文件 IO 显式装配。共享节点核验共享引用及内容，不能只检查目录存在。Docker 示例需要可用 daemon 和指定镜像；Python 进程控制器需要目标环境提供相应支持。依赖缺失应明确失败。
 
-```python
-from power_loop.runtime.exec_backend import ShellBackend  # Protocol
+## 可执行示例
+
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+
+| 示例 | 行为 |
+|---|---|
+| [28_docker_shell_backend.py](../../../examples/28_docker_shell_backend.py) | Docker shell |
+| [20_default_tools.py](../../../examples/20_default_tools.py) | 工作区工具 |
+| [27_dynamic_workflow.py](../../../examples/27_dynamic_workflow.py) | 工作流 IO |
+
+```bash
+.venv/bin/python examples/28_docker_shell_backend.py
 ```
-
-默认的 `LocalShellBackend` 在 workspace 目录下运行 `/bin/bash`，继承宿主环境。要做沙箱，实现这个四方法协议：
-
-```python
-from collections.abc import Hashable
-from pathlib import Path
-
-class DockerShellBackend:
-    def __init__(self, container: str, workdir: str = "/workspace") -> None:
-        self._container, self._workdir = container, workdir
-
-    def launch_argv(self, workspace_dir: Path) -> list[str]:
-        return ["docker", "exec", "-i", "-w", self._workdir,
-                self._container, "bash", "--norc", "--noprofile"]
-
-    def launch_cwd(self, workspace_dir: Path) -> str | None:
-        return None  # host-side cwd of the `docker` CLI is irrelevant
-
-    def launch_env(self, workspace_dir: Path) -> dict[str, str]:
-        import os
-        return {**os.environ, "TERM": "dumb", "NO_COLOR": "1"}  # the docker CLIENT's env
-
-    def session_key(self, workspace_dir: Path) -> Hashable:
-        return ("docker", self._container, self._workdir)  # same target → reuse one shell
-```
-
-`launch_env` 返回的是 **docker 客户端**的环境（这样才能在 PATH 上找到 `docker`），*而不是*沙箱内部的环境——容器自己的环境在 `docker run` 时就已固定，因此没有任何宿主密钥会越过边界。`session_key` 标识 shell *在哪里* 运行：键相等则复用同一个持久化 `BashSession`；键不同则得到各自独立的 shell。
-
-### 注入它
-
-backend 挂在 `RuntimeEnv.shell_backend` 上，按运行注入，和 workspace 完全一样。用 `bind=False` 构建工具注册表，让 handler 在调用时解析当前的 `RuntimeEnv`：
-
-```python
-from power_loop import (
-    RuntimeEnv, StatefulAgentLoop, create_default_tool_registry, runtime_env_context,
-)
-
-registry = create_default_tool_registry(include=["bash"], bind=False)
-loop = StatefulAgentLoop(llm=..., db_path=":memory:", tool_registry=registry)
-
-env = RuntimeEnv(workspace_dir=host_ws, shell_backend=DockerShellBackend("my-sandbox"))
-with runtime_env_context(env):
-    await loop.send("Run the tests with bash.", session_id=sid)
-```
-
-> **0.14.0 起**不一定非用 `bind=False`：带 workspace 的 bound 注册表仍会尊重外层
-> `runtime_env_context(...)` 注入的 `ShellBackend`（bind 不再把它重置掉）。也可以直接传：
-> `create_default_tool_registry(include=["bash"], workspace_dir=ws, shell_backend=DockerShellBackend("my-sandbox"))`。
-> 当一个注册表要跨多个 workspace/沙箱复用时，`bind=False` 仍是正确选择。
-
-完整可运行的版本见 [示例 28](../../../examples/28_docker_shell_backend.py)（它证明了隔离的有效性：shell 会报告容器的操作系统，并读取一个 bind-mount 进来的宿主文件）。DeepTalk 正是用这个接缝，配合一个按会话隔离的 gVisor（`runsc`）容器。
-
-## Runtime worker 隔离
-
-workflow 调度器和叶子统一由 Runtime worker 执行。宿主部署隔离进程或容器，按冻结的
-RuntimeDescriptor 提供工具和资源。跨进程执行必须配置共享协调器和消息传输；默认内存
-适配器只用于单进程。SDK 不再逐叶子拉起进程或创建独立数据库。见 [工作流](workflows.md)。
-
-## 另见
-
-- [Tools](tools.md) — `bash` 工具与工具预设
-- [Workflows](workflows.md) — 进程内与进程外执行器
-- [Configuration](configuration.md) — `RuntimeEnv` 与按 send 注入
-
-### 原执行目标的进程控制
-
-SDK在创建shell时绑定原argv、cwd和环境。停止时使用该绑定，不再调用launch_argv寻找或
-创建替换目标。宿主可实现 `bind_process_control(workspace_dir, *, argv, cwd, env)`，
-返回继承 `power_loop.runtime.process_control.ShellProcessControl` 的控制器。
-`stop_tagged(tag, *, variable, grace_s)` 返回 `ShellControlResult`，包含严格布尔值
-confirmed及可选错误文本。原身份、连接或实际退出不确定时必须返回未确认；不得在停止
-方法里按可复用名称寻找替换资源。
-
-默认控制器在原目标中执行随SDK提供的Python 3脚本，用Linux pidfd控制匹配原命令标签的
-进程，避免扫描PID后数字复用造成误杀。目标缺少Python、pidfd或所需权限时保留未知，
-不退回数字PID强杀。标签用于追踪配合的命令，不是对抗清除标签、远端工作等恶意行为的
-安全隔离边界；这些资源需要宿主更强的生命周期适配器。
-
-后台命令还由本地监督进程持有原组，通过专用管道取消。创建期间的取消不会丢失，停止后
-读取输出有时间上限。未确认停止继续显示在jobs中并阻止完成；重启后找不到原控制器不再
-伪报已停止。此扩展本身不放宽native受管任务的准入条件。
-
-默认控制器在提交命令前探测pidfd支持，记录原目标boot ID和探测进程的启动时间。更早的进程不可能是该命令的子进程；boot变化或无法读取的新同用户进程仍保持未确认。延迟状态回写与后续停止确认串行，旧未知结果不会覆盖新的已确认停止。

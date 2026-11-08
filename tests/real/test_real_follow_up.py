@@ -1,96 +1,55 @@
-"""Real-LLM companion for the follow-up / steering unit tests (test_follow_up.py).
-
-A follow-up message must reach the live model and steer the reply. We exercise both the
-idle-delivery path (follow_up on an idle session falls through to a send) and the in-flight
-queue+merge path (follow_up while a tool-using send is mid-run drains at the next round).
-"""
-
-from __future__ import annotations
-
+"""Live provider coverage for idle wakeup and busy input append."""
 import asyncio
 
 import pytest
 
-from power_loop import (
-    AgentLoopConfig,
-    FollowUpQueued,
-    SessionStore,
-    StatefulAgentLoop,
-)
-from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME
-from power_loop.contracts.tools import ToolDefinition
+from power_loop import AgentLoopConfig, ToolDefinition, ToolRegistry
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.pricing import Free
-from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
 from .judge import assert_passes
 
+pytestmark = pytest.mark.asyncio
 
-@pytest.mark.asyncio
-async def test_idle_follow_up_steers_the_reply() -> None:
-    store = await SessionStore.open(":memory:")
+
+async def test_idle_follow_up_steers_the_reply(runtime_agent):
+    agent = await runtime_agent(model=make_llm(max_tokens=256, temperature=0),
+        config=AgentLoopConfig(system_prompt='Answer briefly in English.',
+            max_rounds=1, max_tokens=256, temperature=0, compactor=None))
+    await agent.send('Name a primary color.')
+    steer = "Forget the previous color. Reply with exactly one word — the color 'teal'."
+    receipt = await agent.runtime.client.append(agent.target, steer, message_id='idle-followup', actor=agent.actor)
+    result = await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+60000)
+    assert result.status == 'completed'
+    await assert_passes(question=steer, answer=result.final_text,
+                        rubric="The reply contains the word 'teal' (case-insensitive).")
+
+
+async def test_inflight_follow_up_is_queued_merged_and_steers(runtime_agent):
+    entered, release = asyncio.Event(), asyncio.Event()
+    registry = ToolRegistry()
+    async def wait_tool():
+        entered.set()
+        await release.wait()
+        return 'waited'
+    registry.register(ToolDefinition('wait', 'Wait briefly before continuing.',
+        input_schema={'type':'object', 'properties':{}}, pricing=Free('test')), wait_tool)
+    agent = await runtime_agent(model=make_llm(max_tokens=384, temperature=0), registry=registry,
+        config=AgentLoopConfig(system_prompt='First call the wait tool exactly once, then answer the user.',
+            max_rounds=4, max_tokens=384, temperature=0, compactor=None))
+    first = await agent.runtime.client.send(agent.target, 'Name a fruit.', message_id='fruit', actor=agent.actor)
     try:
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
-            store=store,
-            config=AgentLoopConfig(system_prompt="Answer briefly in English.",
-                                   max_rounds=1, max_tokens=256, temperature=0, compactor=None),
-        )
-        sid = await loop.new_session()
-        await loop.send("Name a primary color.", session_id=sid)
-        # follow_up on an idle session delivers as a send; the steering must reach the model.
-        steer = "Forget the previous color. Reply with exactly one word — the color 'teal'."
-        r2 = await loop.follow_up(steer, session_id=sid)
-        assert not isinstance(r2, FollowUpQueued)  # idle → delivered, not queued
-        await assert_passes(question=steer, answer=r2.final_text,
-                            rubric="The reply contains the word 'teal' (case-insensitive).")
+        await asyncio.wait_for(entered.wait(), 60)
+        extra = await agent.runtime.client.append(agent.target, "Make sure the fruit you name is specifically 'mango'.",
+            message_id='fruit-followup', actor=agent.actor)
+        assert extra.newly_accepted
+        release.set()
+        result = await agent.runtime.client.wait(first.input_ref, actor=agent.actor, deadline_ms=now_ms()+60000)
+        assert result.status == 'completed'
+        rows = await agent.runtime.store.load_active_messages(agent.target.session_id)
+        assert any(row.role == 'user' and 'mango' in str(row.content) for row in rows)
+        await assert_passes(question='Name a fruit, steered to mango.', answer=result.final_text,
+            rubric="The reply names the fruit 'mango' (case-insensitive), not another fruit.")
     finally:
-        await store.close()
-
-
-@pytest.mark.asyncio
-async def test_inflight_follow_up_is_queued_merged_and_steers() -> None:
-    # While a tool-using send is mid-run, a follow_up is QUEUED and merged into the next round so
-    # the live model sees it. Uses a slow tool to keep the send in-flight long enough to enqueue.
-    store = await SessionStore.open(":memory:")
-    try:
-        reg = ToolRegistry()
-
-        async def wait_tool(**kwargs):
-            await asyncio.sleep(1.5)
-            return "waited"
-
-        reg.register(ToolDefinition(
-            name="wait", description="Wait briefly before continuing.",
-            input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), wait_tool)
-
-        loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=384, temperature=0), store=store, tool_registry=reg,
-            config=AgentLoopConfig(
-                system_prompt="First call the `wait` tool exactly once, then answer the user.",
-                max_rounds=4, max_tokens=384, temperature=0, compactor=None),
-        )
-        sid = await loop.new_session()
-        send_task = asyncio.create_task(loop.send("Name a fruit.", session_id=sid))
-        # Wait for the send to be in-flight (lock held), then steer.
-        for _ in range(400):
-            if loop._lock_for(sid).locked():
-                break
-            await asyncio.sleep(0.01)
-        queued = await loop.follow_up("Make sure the fruit you name is specifically 'mango'.", session_id=sid)
-        result = await send_task
-
-        assert result.status == "completed"
-        rows = await store.load_active_messages(sid)
-        # Either it was genuinely queued (merged follow_up row present), or it raced to idle and was
-        # delivered — both paths must get the steering text in front of the model.
-        if isinstance(queued, FollowUpQueued):
-            assert any(r.name == FOLLOW_UP_MESSAGE_NAME for r in rows)
-        await assert_passes(
-            question="Name a fruit (steered to mango via a follow-up).",
-            answer=result.final_text or "",
-            rubric="The reply names the fruit 'mango' (case-insensitive). If it named a different "
-                   "fruit, FAIL — the follow-up steering was not applied.",
-        )
-    finally:
-        await store.close()
+        release.set()
