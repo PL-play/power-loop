@@ -74,9 +74,14 @@ async def test_provisioning_ddl_stamp_is_idempotent_sqlite():
     db = SqliteDatabase.open(":memory:")
     ddl = provisioning_ddl(db, "pl_")
     assert "ON CONFLICT" in ddl[-1].upper()  # not a plain INSERT
-    for _ in range(2):  # re-applying the whole script must not raise
-        for stmt in ddl:
+    for stmt in ddl:
+        await db.execute(stmt)
+    identity = await db.fetchone("SELECT store_id FROM pl_task_store WHERE id=1")
+    for _ in range(2):
+        for stmt in ddl[-2:]:  # Identity/version stamps are idempotent.
             await db.execute(stmt)
+        await ensure_schema(db, "pl_", policy=SchemaPolicy.VERIFY)
+    assert await db.fetchone("SELECT store_id FROM pl_task_store WHERE id=1") == identity
     row = await db.fetchone("SELECT COUNT(*) AS c FROM pl_schema_migrations")
     assert row["c"] == 1
     await db.close()
@@ -119,7 +124,7 @@ async def test_verify_detects_dropped_data_table(tmp_path):
     with pytest.raises(StoreSchemaError) as ei:
         await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
     msg = str(ei.value)
-    assert "pl_timers" in msg and "incomplete" in msg
+    assert "timers" in msg and "incomplete" in msg
 
 
 # ── G15: VERIFY surfaces a real read error instead of 'not initialized' ──────
@@ -129,14 +134,19 @@ async def test_verify_propagates_real_read_error(monkeypatch):
     db = SqliteDatabase.open(":memory:")
     await ensure_schema(db, "pl_", policy=SchemaPolicy.AUTO_CREATE)  # provision fully
 
-    orig = db.fetchone
-
-    async def boom(sql, params=()):
-        if sql.strip().upper().startswith("SELECT VERSION"):
-            raise RuntimeError("connection reset by peer")
-        return await orig(sql, params)
-
-    monkeypatch.setattr(db, "fetchone", boom)
+    from contextlib import asynccontextmanager
+    original = db.transaction
+    @asynccontextmanager
+    async def broken_read():
+        async with original() as tx:
+            read = tx.fetchone
+            async def boom(sql, params=()):
+                if sql.strip().upper().startswith("SELECT VERSION"):
+                    raise RuntimeError("connection reset by peer")
+                return await read(sql, params)
+            monkeypatch.setattr(tx, "fetchone", boom)
+            yield tx
+    monkeypatch.setattr(db, "transaction", broken_read)
     # The version table exists, so a failure READING it is a real fault and must propagate
     # as itself — not be swallowed and reported as 'schema not initialized'.
     with pytest.raises(RuntimeError, match="connection reset"):

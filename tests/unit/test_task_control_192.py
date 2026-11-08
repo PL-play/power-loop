@@ -69,13 +69,12 @@ async def test_stopping_actual_or_unknown_execution_never_fabricates_stopped(con
     assert op.result["response"]["resource_state"] == state and not op.result["response"]["resource_stop_confirmed"]
 
 
-async def test_stop_remains_available_after_actual_source_lease_expiry(control):
+async def test_elapsed_time_does_not_expire_a_control_execution(control):
     c = control
     c.now[0] += 30001
     op, _ = await c.stop()
     assert op.result["response"]["cancel_requested"]
-    with pytest.raises(JobError, match="expired"):
-        await c.manager.check_execution(c.actor, c.caller)
+    await c.manager.check_execution(c.actor, c.caller)
 
 
 async def test_closed_source_can_recall_committed_receipt_but_cannot_issue_a_new_stop(control):
@@ -191,8 +190,8 @@ async def test_two_managers_replay_one_stop_and_repaired_receipt_corruption_is_r
 async def test_local_cancel_deduplicates_nested_task_and_never_recancels_cleanup(control):
     c = control
     runtime = TaskRuntime(c.manager, tenant_id=c.actor.tenant_id, principal_id=c.actor.principal_id, executor_id="worker", boot_id="boot", lease_ms=300)
-    child_sid = await c.store.create_session(parent_session_id=c.actor.session_id, metadata={"execution_role": "subagent"})
-    bound = await c.manager.bind_session(c.actor, c.child.job.job_id, child_sid)
+    child_sid = c.child.job.session_id
+    bound = c.child.job
     lease = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=bound.version)
     binding = Execution(runtime, c.actor, lease)
     subactor = runtime.actor(child_sid)

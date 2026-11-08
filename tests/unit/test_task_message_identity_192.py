@@ -22,7 +22,7 @@ async def task_store(tmp_path):
         await store.close()
 
 
-@pytest.mark.parametrize("mode", ["tasks", "compatible"])
+@pytest.mark.parametrize("mode", ["tasks", "verify"])
 async def test_old_experimental_task_protocol_is_not_implicitly_upgraded(tmp_path, mode):
     path = str(tmp_path / "old-experimental.db")
     s = await SessionStore.open(path, schema="tasks")
@@ -39,7 +39,8 @@ async def test_old_experimental_task_protocol_is_not_implicitly_upgraded(tmp_pat
 async def test_partial_control_owner_schema_is_rejected_on_open(tmp_path):
     path = str(tmp_path / "partial-owner.db")
     s = await SessionStore.open(path, schema="tasks")
-    await s._db.execute("ALTER TABLE pl_jobs DROP COLUMN control_owner_boot_id")
+    await s._db.execute("DROP INDEX pl_idx_jobs_control_owner")
+    await s._db.execute("ALTER TABLE pl_jobs DROP COLUMN control_owner_job_id")
     await s.close()
     with pytest.raises(StoreSchemaError, match="control owner schema incomplete"):
         await SessionStore.open(path, schema="verify")
@@ -72,38 +73,33 @@ async def test_ids_not_reused_after_deletion_or_import(task_store):
     assert await s.message_by_id(sid, old.id) is None
 
 
-async def test_identity_survives_reopen_and_both_bridge_modes(tmp_path):
+async def test_identity_survives_reopen_in_current_schema_modes(tmp_path):
     path = str(tmp_path / "reopen.db")
     s = await SessionStore.open(path, schema="tasks")
     sid = await s.create_session()
     await s.append_message(sid, role="assistant", tool_calls=[{"id": "call-1"}])
     ref = await s.message_ref(sid, 1)
     await s.close()
-    for policy in ("tasks", "compatible"):
-        s = await SessionStore.open(path, schema=policy)
+    for policy in ("tasks", "verify", None):
+        s = await SessionStore.open(path, **({"schema": policy} if policy else {}))
         assert await s.message_ref(sid, 1) == ref
         await s.close()
-    # The old default entry remains unable to start a legacy writer on v10.
-    for policy in (None, "verify"):
-        with pytest.raises(StoreSchemaError):
-            await SessionStore.open(path, schema=policy)
+    with pytest.raises(ValueError):
+        await SessionStore.open(path, schema="compatible")
 
 
-async def test_legacy_mode_degrades_and_never_automatically_migrates(tmp_path):
-    path = str(tmp_path / "legacy.db")
-    s = await SessionStore.open(path)
-    sid = await s.create_session()
-    await s.append_message(sid, role="user", content="legacy")
-    assert (await s.message_ref(sid, 1)).to_dict()["id_status"] == "unsupported"
-    with pytest.raises(ValueError, match="unsupported"):
-        await s.message_by_id(sid, "1")
-    await s.close()
-    with pytest.raises(StoreSchemaError, match="maintenance migration"):
-        await SessionStore.open(path, schema="tasks")
-    s = await SessionStore.open(path, schema="verify")
-    assert s.schema_version == CURRENT_SCHEMA_VERSION and (await s.load_all_messages(sid))[0].content == "legacy"
-    await s.close()
-
+async def test_default_store_has_current_message_identity(tmp_path):
+    path = str(tmp_path / "current.db")
+    store = await SessionStore.open(path)
+    sid = await store.create_session()
+    await store.append_message(sid, role="user", content="current")
+    ref = await store.message_ref(sid, 1)
+    assert ref.id > 0 and ref.store_id == store.store_id
+    await store.close()
+    reopened = await SessionStore.open(path, schema="verify")
+    assert reopened.schema_version == CURRENT_SCHEMA_VERSION
+    assert await reopened.message_ref(sid, 1) == ref
+    await reopened.close()
 
 
 

@@ -212,15 +212,33 @@ async def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> N
     skill = await registry.invoke_async("load_skill", {"name": "missing-skill-for-test"})
     assert "Unknown skill" in str(skill)
 
-    started = await registry.invoke_async(
-        "background_run", {"action": "run", "command": "printf 'background-ok\\n'"}
-    )
-    assert "Background task" in str(started)
-    task_id = str(started).split()[2]
-    checked = await registry.invoke_async("background_run", {"action": "check", "task_id": task_id})
-    assert task_id or checked
+    import json
 
+    from power_loop import JobRef
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.runtime.store.factory import open_store
+    from tests.runtime_fixture import RunningAgent
+
+    from .test_timers import _Scripted, _tool_resp
+    store = await open_store(str(tmp_path / "tools.sqlite"), schema="tasks")
+    model = _Scripted([_tool_resp("background", "background_run", json.dumps({
+        "action": "run", "command": "printf 'background-ok\\n'"}))])
+    agent = await RunningAgent(store, model, registry).start()
+    try:
+        assert (await agent.send("run shell")).status == "completed"
+        started = json.loads(next(row.content for row in await store.load_all_messages(agent.target.session_id)
+                                 if row.role == "tool" and row.tool_call_id == "background"))
+        checked = await agent.runtime.client.wait(JobRef(**started["job_ref"]), actor=agent.actor,
+                                                  deadline_ms=now_ms()+10000)
+        assert checked.status == "completed" and "background-ok" in checked.final_text
+        await agent.drain()
+    finally:
+        await agent.aclose()
+        await store.close()
+    registry.invoke("write_file", {"path": "read-state.txt", "content": "tracked"})
+    registry.invoke("read_file", {"path": "read-state.txt"})
     assert FILE_READ_STATE
+
 
 
 def test_looks_binary_accepts_utf8_cjk_and_flags_real_binary():

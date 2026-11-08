@@ -62,8 +62,8 @@ async def test_changed_original_preparation_cannot_authorize_dispatch_or_late_ob
 async def test_new_physical_send_cannot_evade_same_owner_unknown_request(attempt_case):
     c=attempt_case
     sid=await c.store.create_session(parent_session_id=c.sid,metadata={"execution_role":"subagent"})
-    child=await c.manager.register_job(c.actor,kind="subagent",parent=c.binding.lease,system_key="original-owner",independent=True)
-    bound=await c.manager.bind_session(c.actor,child.job.job_id,sid)
+    child=await c.manager.register_job(c.actor,kind="subagent",parent=c.binding.lease,system_key="original-owner",independent=True, session_id=sid)
+    bound=child.job
     lease=await c.manager.claim_job(c.actor,child.job.job_id,executor_id="executor",boot_id="boot",expected_version=bound.version)
     actor=c.runtime.actor(sid)
     first=await c.manager.register_job(actor,kind="send",parent=lease,session_id=sid,system_key="first",request={"model_attempt_protocol":1,"send_index":1})

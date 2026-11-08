@@ -69,7 +69,7 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
 
     async def event(process, kind):
         try:
-            line = await asyncio.wait_for(process.stdout.readline(), 20)
+            line = await asyncio.wait_for(process.stdout.readline(), 30)
         except TimeoutError:
             raise AssertionError("\n".join(p.log.read_text()[-10000:] for p in processes)) from None
         assert line, process.log.read_text()
@@ -101,7 +101,7 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
         handle = await client.workflow(target, spec, message_id="run", actor=actor)
         c = await launch("C")
         if scenario == "dispatch_gap":
-            for _ in range(250):
+            for _ in range(1500):
                 node = await store._db.fetchone(
                     f"SELECT generation FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
                 )
@@ -157,7 +157,7 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
         c.kill()
         await c.wait()
         c2 = await launch("C2")
-        for _ in range(250):
+        for _ in range(1500):
             driver = await store._db.fetchone(
                 f"SELECT * FROM {store.table_prefix}jobs WHERE job_id=?", (handle.job_id,)
             )

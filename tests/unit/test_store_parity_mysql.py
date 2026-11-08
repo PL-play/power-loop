@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 
 import pytest
 
+from power_loop.runtime.store.schema import _STORE_TABLES
+from power_loop.runtime.store.task_schema import TASK_TABLES
+
 pytest.importorskip("aiomysql")
 
 from power_loop.runtime.store.factory import open_store  # noqa: E402
@@ -40,19 +43,17 @@ pytestmark = [
     pytest.mark.skipif(not _reachable(MYSQL_DSN), reason=f"MySQL not reachable at {MYSQL_DSN}"),
 ]
 
-_DATA_TABLES = (
-    "sessions", "messages", "compactions", "usage_observations", "session_state",
-    "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes", "project_messages", "hook_events",
-)
+
+_DATA_TABLES = tuple(dict.fromkeys((*_STORE_TABLES, *(n for n in TASK_TABLES if n != 'task_store'))))
 
 
 @pytest.fixture
 async def mysql_store():
+    assert urlparse(MYSQL_DSN).path.endswith("_test")
     store = await open_store(MYSQL_DSN)
     # TRUNCATE each pl_ table for a clean slate per scenario (FK-free schema → order-agnostic).
     for n in _DATA_TABLES:
-        await store._db.execute(f"TRUNCATE TABLE {getattr(store.t, n)}")
+        await store._db.execute(f"TRUNCATE TABLE {store.table_prefix + n}")
     try:
         yield store
     finally:
@@ -117,7 +118,7 @@ async def test_mysql_old_format_is_refused_without_implicit_widening() -> None:
         before = await store._db.fetchall(f"SELECT * FROM {prefix}messages")
         await store._db.execute(f"ALTER TABLE {prefix}messages MODIFY content TEXT")
         await store._db.execute(f"UPDATE {prefix}schema_migrations SET version=3 WHERE id=1")
-        with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+        with pytest.raises(StoreSchemaError, match="create a fresh store for task schema v15"):
             await open_store(MYSQL_DSN, table_prefix=prefix)
         assert await _content_data_type(store._db, prefix+'messages') == 'text'
         assert await store._db.fetchall(f"SELECT * FROM {prefix}messages") == before

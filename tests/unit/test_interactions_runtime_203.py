@@ -84,7 +84,7 @@ async def test_answer_after_worker_change_is_exactly_one_tool_response(registry_
         interaction = waiting["pending_interactions"][0]
         status = await first.runtime.client.inspect(receipt.input_ref, actor=first.actor)
         assert status.state == "waiting_input" and not status.result_available
-        with pytest.raises(RuntimeRequestError, match="waiting_input"):
+        with pytest.raises(RuntimeRequestError, match="child sessions require resume" if mode == "child" else "waiting_input"):
             await first.runtime.client.send(target, "ordinary message", message_id="not-answer", actor=first.actor)
         await first.runtime.worker.shutdown(timeout_s=2)
         second = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()

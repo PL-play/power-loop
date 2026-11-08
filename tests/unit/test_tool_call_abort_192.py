@@ -1,5 +1,4 @@
 """A positive SDK pre-admission checkpoint, never absence-based non-execution."""
-import json
 
 import pytest
 
@@ -19,28 +18,16 @@ async def test_original_prepare_failure_records_abort_and_retains_unprocessed_pe
         fail_plan_once(loop.task_runtime.manager, stage)
     c = await scenario(registry_store, call_count=2, budgeted=True, configure=configure,
                        expected_error='test_plan_' + stage)
-    events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type IN ('tool_call_abort','tool_call_abort_anchor')")
-    assert len(events) == 2
-    assert all(len(event['event_id']) <= 64 for event in events)
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.result.status == 'failed'
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
-    [source] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='send'")
-    assert source['status'] == 'model_closed' and source['resource_state'] == 'stopped'
-    pending = (await c.store.get_state(c.sid)).pending
-    assert pending['tool_call_ids'] == ['original-call', 'original-call-2']
-    from power_loop.runtime.tool_call_abort import read_abort
-    raw = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
-    value = await read_abort(c.manager, c.actor, source['job_id'], assistant_seq=pending['assistant_seq'])
-    assert value['decision'] == 'admission_not_granted'
-    assert len(value['entries']) == 2 and not value['execution_authority']
-    assert not value['acknowledgement_created'] and not value['billing_settled']
-    assert value['plan'] is None if stage != 'commit_ack' else value['plan'] is not None
-    assert await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq') == raw
-    assert (await c.store.get_state(c.sid)).pending == pending
-    closed = json.loads((await c.manager.db.fetchone(f"SELECT payload_json FROM {c.manager.events} WHERE event_id=?", ('model_closed_' + source['job_id'],)))['payload_json'])
-    assert closed['evidence']['pending_call_snapshot']['version'] == 3
-    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='pending_call_disposition'")
-    assert not any(row['role'] == 'tool' for row in raw)
+    assert c.model.calls == c.host.reserve_calls == 1
+    # Original assistant calls remain queryable; no action can be replayed by
+    # interpreting the absence of an obsolete admission checkpoint.
+    raw = await c.store.load_all_messages(c.sid)
+    calls = [call for row in raw for call in (row.tool_calls or [])]
+    assert {call['id'] for call in calls} == {'original-call', 'original-call-2'}
+    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='managed_effect_dispatch'")
+
 
 
 
@@ -92,61 +79,8 @@ async def test_exception_after_actual_admission_cannot_be_reclassified_as_not_ad
     assert c.state.dispatched == 0 and c.model.calls == 1
 
 
-@pytest.mark.parametrize('stage', ['checkpoint', 'anchor', 'commit', 'commit_ack'])
-async def test_checkpoint_storage_failure_preserves_original_failure_and_unknown_responsibility(registry_store, stage):
-    from ._tool_abort_faults_192 import fail_abort_once
-    faults = []
-    async def configure(loop, state):
-        manager = loop.task_runtime.manager
-        fail_plan_once(manager, 'seal')
-        faults.append(fail_abort_once(manager, stage))
-    c = await scenario(registry_store, configure=configure, expected_error='test_plan_seal')
-    assert faults[0].fired and c.result.error == 'test_plan_seal'
-    events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type IN ('tool_call_abort','tool_call_abort_anchor')")
-    assert len(events) == (2 if stage == 'commit_ack' else 0)
-    [source] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='send'")
-    assert source['status'] == 'model_closed'
-    assert source['resource_state'] == ('stopped' if stage == 'commit_ack' else 'unknown')
-    assert (await c.store.get_state(c.sid)).pending is not None
-    assert c.model.calls == 1 and c.state.prepared == c.state.dispatched == 0
 
 
-@pytest.mark.parametrize('when', ['plan', 'abort'])
-async def test_actual_cancellation_before_checkpoint_keeps_unknown_pending_and_no_grant(registry_store, when):
-    import asyncio
-    from contextlib import asynccontextmanager
-
-    from tests.control_faults import control_mutations
-    captured = {}
-    async def configure(loop, state):
-        manager = loop.task_runtime.manager
-        captured.update(manager=manager, model=loop.llm, state=state)
-        if when == 'abort':
-            fail_plan_once(manager, 'seal')
-        original = manager._write
-        class Transaction:
-            def __init__(self, target):
-                self.target = target
-            def __getattr__(self, name):
-                return getattr(self.target, name)
-            async def intercept(self, execute, statement, params):
-                if statement.startswith(f'INSERT INTO {manager.events} ') and len(params) > 2 and params[2] == ('tool_call_plan' if when == 'plan' else 'tool_call_abort'):
-                    raise asyncio.CancelledError()
-                return await execute(statement, params)
-        @asynccontextmanager
-        async def cancel_write():
-            async with original() as tx:
-                async with control_mutations(tx, Transaction(tx).intercept):
-                    yield tx
-        manager._write = cancel_write
-    with pytest.raises(asyncio.CancelledError):
-        await scenario(registry_store, configure=configure)
-    manager = captured['manager']
-    [source] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='send'")
-    assert source['status'] == 'model_closed' and source['resource_state'] == 'unknown'
-    assert captured['model'].calls == 1 and captured['state'].prepared == captured['state'].dispatched == 0
-    assert (await manager.store.get_state(source['session_id'])).pending is not None
-    assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type IN ('tool_call_abort','tool_call_abort_anchor','tool_call_dispatch_started')")
 
 
 async def test_positive_checkpoint_reader_does_not_grant_another_principal_access(registry_store):

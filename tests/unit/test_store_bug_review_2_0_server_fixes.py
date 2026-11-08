@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 
 import pytest
 
+from power_loop.runtime.store.schema import _STORE_TABLES
+from power_loop.runtime.store.task_schema import TASK_TABLES
+
 pytestmark = pytest.mark.unit
 
 PG_DSN = os.environ.get(
@@ -25,11 +28,8 @@ MYSQL_DSN = os.environ.get(
     "mysql://deeptalk:deeptalk@localhost:3307/power_loop_test",
 )
 
-_ALL_TABLES = (
-    "schema_migrations", "sessions", "messages", "compactions", "usage_observations",
-    "session_state", "session_runtime_state", "shared_state", "background_tasks",
-    "session_stats", "timers", "notes",
-)
+
+_ALL_TABLES = tuple(dict.fromkeys((*_STORE_TABLES, *(n for n in TASK_TABLES if n != 'task_store'))))
 
 
 def _reachable(dsn: str, default_port: int) -> bool:
@@ -55,7 +55,7 @@ async def test_pg_concurrent_create_timer_no_pk_collision():
 
     store = await open_store(PG_DSN)
     try:
-        tables = ",".join(getattr(store.t, n) for n in _ALL_TABLES if n != "schema_migrations")
+        tables = ",".join(store.table_prefix + n for n in _ALL_TABLES if n != "schema_migrations")
         await store._db.execute(f"TRUNCATE {tables}")
         sid = await store.create_session(session_id="race_timers")
         # Without the session_state FOR UPDATE lock, concurrent allocators read the same
@@ -77,7 +77,7 @@ async def test_pg_concurrent_add_note_no_pk_collision():
 
     store = await open_store(PG_DSN)
     try:
-        tables = ",".join(getattr(store.t, n) for n in _ALL_TABLES if n != "schema_migrations")
+        tables = ",".join(store.table_prefix + n for n in _ALL_TABLES if n != "schema_migrations")
         await store._db.execute(f"TRUNCATE {tables}")
         sid = await store.create_session(session_id="race_notes")
         n = 12
@@ -94,28 +94,23 @@ async def test_pg_concurrent_add_note_no_pk_collision():
 @_pg
 async def test_pg_concurrent_first_boot_provisioning_converges():
     pytest.importorskip("asyncpg")
+    import secrets
+
     from power_loop.runtime.store.factory import open_store
-
-    # Drop the whole pl_ schema so every concurrent open hits the first-boot path.
-    admin = await open_store(PG_DSN)
-    prefix = admin.table_prefix
-    from power_loop.runtime.store.schema import _STORE_TABLES
-    await admin._db.execute(f"DROP VIEW IF EXISTS {prefix}usage_rounds")
-    drop = [f"{prefix}schema_migrations", *(prefix+name for name in _STORE_TABLES)]
-    for table in drop:
-        await admin._db.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    await admin.close()
-
-    # 8 instances racing on a fresh DB: the advisory lock serializes provisioning, so ALL
-    # succeed instead of all-but-one crashing with a UniqueViolation on pg_type.
-    stores = await asyncio.gather(*(open_store(PG_DSN) for _ in range(8)))
+    assert urlparse(PG_DSN).path.endswith('_test')
+    prefix = 'firstboot_' + secrets.token_hex(6) + '_'
+    stores = await asyncio.gather(*(open_store(PG_DSN, table_prefix=prefix) for _ in range(8)))
     try:
-        assert all(s.schema_version >= 1 for s in stores)
+        assert all(s.schema_version == 15 for s in stores)
+        assert len({s.store_id for s in stores}) == 1
         # The schema is usable and stamped exactly once (idempotent stamp).
         vtable = f"{stores[0].table_prefix}schema_migrations"
         row = await stores[0]._db.fetchone(f"SELECT COUNT(*) AS c FROM {vtable}")
         assert row["c"] == 1
     finally:
+        await stores[0]._db.execute(f"DROP VIEW IF EXISTS {prefix}usage_rounds")
+        for name in (*TASK_TABLES, *_STORE_TABLES, 'schema_migrations'):
+            await stores[0]._db.execute(f'DROP TABLE IF EXISTS {prefix}{name}')
         await asyncio.gather(*(s.close() for s in stores))
 
 

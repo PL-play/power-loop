@@ -164,7 +164,10 @@ async def main():
         capacity=2,
         coordinator=Coordinator(coord),
         transport=DatabasePollingTransport(RuntimeInputStore(store), interval_s=0.03, control_interval_s=0.03),
-        session_lease_ttl_s=1,
+        # The normal live-leaf assertions must not inject an accidental lease
+        # loss when the three database suites contend for the same host.
+        # The parent test still kills the driver explicitly to test takeover.
+        session_lease_ttl_s=5,
         recovery_interval_s=0.15,
         shared_execution=True,
     )

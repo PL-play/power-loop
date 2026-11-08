@@ -7,8 +7,9 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-def test_replayable_ids_deeply_nested_parallel_sequence_foreach_branch() -> None:
-    from power_loop.workflow import WorkflowSpec, replayable_node_ids
+def test_continuation_of_deeply_nested_parallel_sequence_foreach_branch() -> None:
+    from power_loop.workflow import WorkflowSpec
+    from power_loop.workflow.continuation import plan_continuation
 
     # s1 runs first (sequence), THEN a parallel of {foreach, branch} that both reference it — so the
     # references are reachable (s1 completes before the parallel). (Referencing s1 from one parallel
@@ -32,6 +33,8 @@ def test_replayable_ids_deeply_nested_parallel_sequence_foreach_branch() -> None
             ]},
         ]},
     })
-    # s1 + foreach aggregate 'fe' + branch case 'ca' + default 'cd' replayable;
-    # 'deep' (inside the foreach body) is NOT individually replayable.
-    assert replayable_node_ids(spec) == {"s1", "fe", "ca", "cd"}
+    assert plan_continuation(spec, "s1").invalidated == {"s1", "fe", "deep", "ca", "cd"}
+    assert "s1" not in plan_continuation(spec, "ca").invalidated
+    from power_loop.workflow import WorkflowRunError
+    with pytest.raises(WorkflowRunError, match="iteration-specific"):
+        plan_continuation(spec, "deep")

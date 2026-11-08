@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 async def test_verification_has_no_control_writer_or_original_mutation(runtime, monkeypatch):
     _, manager, actor, _, parent, _, _ = runtime
     child = await manager.register_job(actor, kind="subagent", parent=parent, independent=True,
-        system_key="snapshot-child")
+        system_key="snapshot-child", session_id=actor.session_id)
     lease = await manager.claim_job(actor, child.job.job_id, executor_id="child", boot_id="boot", expected_version=1)
     await manager.record_execution_result(actor, lease, outcome="succeeded", result={"value": 1}, resource_state="stopped")
     before = {table: await manager.db.fetchall(f"SELECT * FROM {table} ORDER BY 1")
@@ -37,7 +37,7 @@ async def test_verification_has_no_control_writer_or_original_mutation(runtime, 
 async def test_verification_keeps_one_snapshot_while_a_concurrent_result_commits(runtime, monkeypatch):
     _, manager, actor, _, parent, connect, _ = runtime
     child = await manager.register_job(actor, kind="subagent", parent=parent, independent=True,
-        system_key="concurrent-snapshot-child")
+        system_key="concurrent-snapshot-child", session_id=actor.session_id)
     lease = await manager.claim_job(actor, child.job.job_id, executor_id="child", boot_id="boot", expected_version=1)
     writer = JobManager(await connect(), now_ms=manager.now)
     entered, release = asyncio.Event(), asyncio.Event()

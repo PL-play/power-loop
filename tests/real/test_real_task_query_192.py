@@ -35,7 +35,7 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
     root = await manager.register_job(actor, kind="send", session_id=sid, system_key="original-send")
     root_lease = await manager.claim_job(actor, root.job.job_id, executor_id="old-executor", boot_id="old-boot", expected_version=1)
     saved = await manager.register_job(actor, kind="background_command", parent=root_lease, independent=True,
-        title="Completed library inventory", system_key="original-inventory")
+        title="Completed library inventory", system_key="original-inventory", session_id=actor.session_id)
     child_lease = await manager.claim_job(actor, saved.job.job_id, executor_id="old-executor", boot_id="old-boot", expected_version=1)
     await manager.record_execution_result(actor, child_lease, outcome="succeeded", result={"final_text": "Inventory contains 47 books."}, resource_state="stopped")
     await manager.close_model_execution(actor, root_lease)

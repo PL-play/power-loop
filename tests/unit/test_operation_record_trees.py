@@ -133,20 +133,20 @@ async def test_accepted_metadata_permission_can_finish_after_its_caller_exits(op
     assert not await cold.db.fetchall(f"SELECT * FROM {cold.prefix}session_obligations WHERE kind='control_request'")
 
 
-async def test_expired_target_gets_one_refusal_and_closes_the_source_obligation(operation_case, monkeypatch):
+async def test_closed_target_gets_one_refusal_and_closes_the_source_obligation(operation_case, monkeypatch):
     c = operation_case
     apply = operation_records._apply
     async def expired(*args, **kwargs):
-        c.now[0] += 30001
+        await c.manager.record_execution_result(c.actor, c.target, outcome="succeeded", result={"status":"completed"}, resource_state="stopped")
         return await apply(*args, **kwargs)
     with monkeypatch.context() as patch:
         patch.setattr(operation_records, '_apply', expired)
-        with pytest.raises(JobError, match='execution_lease_expired'):
+        with pytest.raises(JobError, match='job_intake_closed'):
             await record(c)
     before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
     [request] = [row for row in before if row['event_type'] == 'task_control_request' and json.loads(row['payload_json'])['phase'] == 'accepted']
     cold = JobManager(await c.connect(), now_ms=c.manager.now)
-    with pytest.raises(JobError, match='execution_lease_expired'):
+    with pytest.raises(JobError, match='job_intake_closed'):
         await operation_records.reconcile_request(cold, c.actor, request['event_id'])
     assert await cold.db.fetchall(f'SELECT * FROM {cold.events} ORDER BY event_id') == before
     assert not await cold.db.fetchall(f"SELECT * FROM {cold.prefix}session_obligations WHERE kind='control_request'")

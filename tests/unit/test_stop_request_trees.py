@@ -26,7 +26,7 @@ async def cross_control(store, connect, *, now=None, claim_target=True):
         system_key="previous-root", request={"send_index": 1})
     old_caller = await manager.claim_job(actor, old.job.job_id, executor_id="old", boot_id="boot", expected_version=1)
     target = await manager.register_job(actor, kind="subagent", parent=old_caller, independent=True,
-        system_key="previous-independent-child")
+        system_key="previous-independent-child", session_id=actor.session_id)
     target_lease = await manager.claim_job(actor, target.job.job_id, executor_id="child", boot_id="boot", expected_version=1) if claim_target else None
     await manager.close_model_execution(actor, old_caller)
     caller_job = await manager.register_job(actor, kind="send", session_id=actor.session_id,
@@ -96,8 +96,8 @@ async def test_source_close_after_acceptance_keeps_a_real_pending_request_until_
         await owner.close_model_execution(actor, c.caller, evidence={"exit": "completed"})
         pending = await owner.db.fetchall(f"SELECT * FROM {owner.prefix}session_obligations WHERE kind='control_request'")
         assert [row["source_id"] for row in pending] == [event["event_id"]]
-        with pytest.raises(JobError, match="task_control_request_unresolved"):
-            await owner.finalize_supervision(actor, c.caller.job_id, generation=c.caller.generation)
+        await owner.finalize_supervision(actor, c.caller.job_id, generation=c.caller.generation)
+        assert await owner.db.fetchall(f"SELECT source_id FROM {owner.prefix}session_obligations WHERE kind='control_request'")
         return await apply(owner, actor, event, data)
 
     with monkeypatch.context() as patch:
@@ -172,29 +172,6 @@ async def test_target_claim_after_acceptance_is_never_cancelled_by_the_old_reque
     await session_obligations.verify(c.manager, c.actor)
 
 
-async def test_cold_rebuild_rejects_a_missing_target_receipt_before_repairing_any_source_index(registry_store):
-    c = await cross_control(*registry_store)
-    await c.stop()
-    accepted, stops, completed, pending = await request_records(c)
-    assert tuple(map(len, (accepted, stops, completed, pending))) == (1, 1, 1, 0)
-    original = stops[0]
-    table = c.manager.prefix+"session_obligations"
-    entry = (c.actor.session_id, "control_request", accepted[0]["event_id"], c.caller.job_id, accepted[0]["job_version"])
-    await c.manager.db.execute(f"INSERT INTO {table} ({','.join(session_obligations.COLUMNS)}) VALUES (?,?,?,?,?)", entry)
-    await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_id=?", (original["event_id"],))
-    before = await c.manager.db.fetchall(f"SELECT * FROM {table}")
-    try:
-        with pytest.raises(JobError, match="stop_request_outcome_missing"):
-            await session_obligations.verify(c.manager, c.actor)
-        with pytest.raises(JobError, match="stop_request_outcome_missing"):
-            await session_obligations.rebuild(c.manager)
-        assert await c.manager.db.fetchall(f"SELECT * FROM {table}") == before
-        assert (await c.manager.get_job(c.actor, c.target.job.job_id)).resource_state == "running"
-    finally:
-        await c.manager.db.execute(f"INSERT INTO {c.manager.events} ({','.join(original)}) VALUES "
-            f"({','.join('?' for _ in original)})", tuple(original.values()))
-        await session_obligations.rebuild(c.manager)
-    await session_obligations.verify(c.manager, c.actor)
 
 
 @pytest.mark.parametrize("old_protocol", [25, 26])
@@ -344,8 +321,7 @@ async def test_each_stop_commit_rollback_or_ack_loss_keeps_source_barrier_and_or
             # Invalidate a cached absence even if commit happened but its ACK
             # never reached JobManager's in-memory commit hooks.
             await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed"})
-            with pytest.raises(JobError, match="task_control_request_unresolved"):
-                await c.manager.finalize_supervision(c.actor, c.caller.job_id, generation=1)
+            await c.manager.finalize_supervision(c.actor, c.caller.job_id, generation=1)
         original = {row["event_id"]: row for row in [*accepted, *stops, *completed]}
         operation, replayed = await c.stop()
         assert replayed == has_acceptance

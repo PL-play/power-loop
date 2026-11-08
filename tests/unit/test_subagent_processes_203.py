@@ -81,11 +81,13 @@ async def test_parent_a_child_b_parent_c_with_original_budget(registry_store, tm
         result = await client.wait(JobRef(**one['job_ref']),actor=actor,deadline_ms=now_ms()+15000)
         assert result.status=='completed' and 'new direction' in result.final_text
         for _ in range(500):
-            rows = await store._db.fetchall(f'SELECT result_status,supervision_status FROM {store.table_prefix}jobs WHERE job_id IN (?,?)',(one['job_id'],two['job_id']))
-            if all(row['result_status']=='handled' for row in rows):
+            rows = await store._db.fetchall(f'SELECT job_id,result_status,supervision_status FROM {store.table_prefix}jobs WHERE job_id IN (?,?)',(one['job_id'],two['job_id']))
+            if all(row['result_status']==('handled' if row['job_id']==one['job_id'] else 'suppressed')
+                   and row['supervision_status']=='closed' for row in rows):
                 break
             await asyncio.sleep(.02)
-        assert all(row['result_status']=='handled' for row in rows),rows
+        assert {row['job_id']:row['result_status'] for row in rows} == {one['job_id']:'handled',two['job_id']:'suppressed'},rows
+        assert all(row['supervision_status']=='closed' for row in rows)
         scopes = await store._db.fetchall(f'SELECT limits_json,counters_json FROM {store.table_prefix}task_budget_scopes')
         child_scopes = [(json.loads(s['limits_json']),json.loads(s['counters_json'])) for s in scopes if json.loads(s['limits_json']).get('subject_kind')=='subagent']
         assert len(child_scopes)==2

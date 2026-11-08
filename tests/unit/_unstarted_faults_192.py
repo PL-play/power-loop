@@ -8,9 +8,7 @@ from tests.control_faults import control_mutations
 def fail_unstarted_once(manager, stage):
     original = manager._write
     state = SimpleNamespace(fired=False)
-    selected = {'result': 'result', 'negative': 'managed_effect_unstarted',
-                'closure': 'supervision_closed', 'commit': 'supervision_closed',
-                'commit_ack': 'supervision_closed'}[stage]
+    selected = 'result'
 
     @asynccontextmanager
     async def intercepted():

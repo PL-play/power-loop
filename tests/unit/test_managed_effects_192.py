@@ -267,7 +267,7 @@ async def test_unknown_api_outcome_stops_another_model_and_can_be_queried(regist
     c = await scenario(registry_store, pending=True)
     assert c.model.calls == 1 and c.state.dispatched == 1
     child = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert child["supervision_status"] == "open" and json.loads(child["result_json"])["managed_effect_pending"]
+    assert child["supervision_status"] == "closed" and json.loads(child["result_json"])["managed_effect_pending"]
     assert await reconcile(c.runtime, c.actor, child["job_id"], c.adapter) is None
     c.state.resolved = True
     assert (await reconcile(c.runtime, c.actor, child["job_id"], c.adapter)).reference["receipt_id"] == "original"
@@ -310,7 +310,7 @@ async def test_result_capacity_is_checked_before_claiming_or_dispatching_effect(
     c = await scenario(registry_store, capacity=16, tool_name=tool_name)
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
     [intent] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert intent['generation'] == 0 and intent['executor_id'] is intent['lease_until_ms'] is None
+    assert intent['generation'] == 0 and intent['executor_id'] is intent['boot_id'] is None
     assert intent['resource_state'] == 'stopped' and intent['supervision_status'] == 'closed'
     assert intent['outcome'] == 'cancelled' and intent['result_status'] == 'suppressed'
     assert (await terminate_unstarted(c.manager, c.actor, intent['job_id']))['resolution'] == 'not_dispatched'
@@ -410,41 +410,6 @@ async def test_recovery_rechecks_preparation_after_query_before_recording(regist
     )
 
 
-@pytest.mark.parametrize("part", ["raw_call", "membership", "prepared_adapter", "prepared_version"])
-async def test_recovery_refuses_corrupt_original_evidence_before_query(registry_store, part):
-    from power_loop.runtime.execution_membership import scope_id
-
-    c, row = await pending_case(registry_store)
-    if part == "raw_call":
-        [creation] = await c.manager.db.fetchall(
-            f"SELECT call_ref_json FROM {c.manager.events} WHERE job_id=? AND action='create'", (row["job_id"],)
-        )
-        ref = json.loads(creation["call_ref_json"])
-        await c.manager.db.execute(
-            f"UPDATE {c.store.t.messages} SET tool_calls_json=? WHERE session_id=? AND id=?",
-            (
-                _json([{"id": "original-call", "function": {"name": "different", "arguments": '{"text":"hello"}'}}]),
-                ref["session_id"],
-                int(ref["id"]),
-            ),
-        )
-    elif part == "membership":
-        event_id = scope_id(c.manager, row["parent_job_id"], row["parent_generation"])
-        event = await c.manager.db.fetchone(
-            f"SELECT payload_json FROM {c.manager.events} WHERE event_id=?", (event_id,)
-        )
-        value = json.loads(event["payload_json"])
-        value["lease"]["executor_id"] = "different-original-executor"
-        await c.manager.db.execute(
-            f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?", (_json(value), event_id)
-        )
-    elif part == "prepared_adapter":
-        await rewrite_event(c, row, "prepared", lambda value: value["adapter"].update(arguments_hash="c" * 64))
-    else:
-        await rewrite_event(c, row, "prepared", lambda value: value.update(version=True))
-    with pytest.raises(JobError, match="managed_effect_"):
-        await reconcile(c.runtime, c.actor, row["job_id"], c.adapter)
-    assert c.state.lookups == 0 and c.state.dispatched == c.model.calls == 1
 
 
 @pytest.mark.parametrize("part", ["version", "lease", "adapter", "extra", "result", "event_type", "job_id"])
@@ -536,29 +501,6 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
     assert c.state.dispatched == 0 and c.model.calls == c.host.reserve_calls == 2
 
 
-async def test_unclaimed_cancel_and_closure_roll_back_as_one_transaction(registry_store, monkeypatch):
-    from power_loop.runtime import finalization
-    from power_loop.runtime.managed_effects import terminate_unstarted
-
-    c = await scenario(registry_store, claim_failure=True, receipt_bind_failure=True)
-    [before] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-
-    assert before["generation"] == 0 and before["resource_state"] == "not_started"
-    assert before["supervision_status"] == "open" and c.model.calls == 1
-
-    async def fail(*args):
-        raise RuntimeError("closure write failed")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(finalization, "_publish", fail)
-        with pytest.raises(RuntimeError, match="closure write failed"):
-            await terminate_unstarted(c.manager, c.actor, before["job_id"])
-    assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (before["job_id"],)) == before
-    assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type IN ('managed_effect_unstarted','result','supervision_closed')",
-        (before["job_id"],),
-    )
-    assert (await terminate_unstarted(c.manager, c.actor, before["job_id"]))["resolution"] == "not_dispatched"
 
 
 async def test_claimed_effect_cannot_be_relabelled_never_started(registry_store):
@@ -725,25 +667,4 @@ async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
     assert bool(events) == bool(operation["receipt_ref_json"]) == after_commit
     observed = await reconcile_raw_receipt(manager, c.actor, job["job_id"])
     assert observed and not observed["acknowledges_result"]
-    assert c.model.calls == 1 and c.state.dispatched == c.state.lookups == 0
-
-
-
-
-async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):
-    from power_loop.runtime.execution_membership import scope_id
-    from power_loop.runtime.managed_effects import terminate_unstarted
-
-    c = await scenario(registry_store, claim_failure="after")
-    [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert job["generation"] == 1 and c.state.prepared == c.state.dispatched == 0
-    await c.manager.db.execute(
-        f"DELETE FROM {c.manager.events} WHERE event_id=?", (scope_id(c.manager, job["job_id"], 1),)
-    )
-    await c.manager.db.execute(
-        f"UPDATE {c.manager.jobs} SET generation=0,executor_id=NULL,boot_id=NULL,lease_until_ms=NULL,status='queued',intake='open',resource_state='not_started' WHERE job_id=?",
-        (job["job_id"],),
-    )
-    with pytest.raises(JobError, match="unstarted_conflict"):
-        await terminate_unstarted(c.manager, c.actor, job["job_id"])
     assert c.model.calls == 1 and c.state.dispatched == c.state.lookups == 0

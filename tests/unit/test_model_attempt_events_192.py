@@ -111,7 +111,7 @@ async def event_case(registry_store, request):
     ).start()
     try:
         yield SimpleNamespace(
-            store=store, manager=manager, runtime=runtime, model=model, host=host, loop=loop, events=events, mode=mode
+            store=store, manager=manager, runtime=runtime, model=model, host=host, loop=loop, bus=bus, events=events, mode=mode
         )
     finally:
         model.release.set()

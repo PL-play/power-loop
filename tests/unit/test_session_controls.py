@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import pytest
 
-from power_loop.runtime import session_controls
 from power_loop.runtime.jobs import JobActor, JobManager
 
 from .test_job_registry_192 import registry_store
@@ -13,13 +12,12 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize("rollback", [False, True])
-async def test_notice_recipient_version_changes_only_with_its_transaction(registry_store, rollback):
+async def test_notice_recipient_changes_only_with_its_transaction(registry_store, rollback):
     store, connect = registry_store
     manager = JobManager(store)
     sender, recipient = await store.create_session(), await store.create_session()
     registered = await manager.register_job(JobActor("tenant", "host", sender), kind="send",
                                             session_id=sender, system_key="source")
-    before = await session_controls.version(manager, manager.db, recipient)
 
     async def route_notice():
         async with manager._write() as tx:
@@ -36,5 +34,5 @@ async def test_notice_recipient_version_changes_only_with_its_transaction(regist
     else:
         await route_notice()
     observer = JobManager(await connect(schema="verify"))
-    after = await session_controls.version(observer, observer.db, recipient)
-    assert after == (before[0] + (0 if rollback else 1), before[1])
+    event = await observer.db.fetchone(f"SELECT caller_session_id FROM {observer.events} WHERE event_id=?", ("notice",))
+    assert event is None if rollback else event["caller_session_id"] == recipient

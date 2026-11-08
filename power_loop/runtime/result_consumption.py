@@ -33,6 +33,7 @@ async def observe(binding, messages, *, round_index, send_index):
             reference = meta.get("result_ref")
             key = reference["result_id"] if reference else inbox["item_id"].removeprefix("nudge:")
             event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
+            negative_review = False
             binding.observed_inputs.add(inbox["item_id"])
             if event is None:
                 continue  # Ordinary append/steer input has no task result to consume.
@@ -42,7 +43,12 @@ async def observe(binding, messages, *, round_index, send_index):
                     raise JobError("access_denied")
                 notice = json.loads(event["payload_json"])
                 original_id = notice["result_id"] if event["event_type"] == "managed_effect_delivery" else notice["result"]["event_id"]
+                managed_notice = event["event_type"] == "managed_effect_delivery"
                 event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (original_id,))
+                # A generation-zero negative stays suppressed as an execution
+                # result, but its explicit review notice still needs consumption.
+                negative_review = (managed_notice and target["generation"] == 0
+                    and target["result_status"] == "suppressed")
             if event["event_type"] == "operation" and event["action"] == "nudge":
                 from .node_inputs import input_target
                 target = await input_target(manager, tx, actor, source, event)
@@ -58,11 +64,11 @@ async def observe(binding, messages, *, round_index, send_index):
                     raise JobError("result_binding_mismatch")
             else:
                 continue
-            if event["delivery_status"] not in {"handled", "suppressed"}:
+            if event["delivery_status"] != "handled" and (negative_review or event["delivery_status"] != "suppressed"):
                 if len(binding.consumed_inputs) >= 1000 and event["event_id"] not in binding.consumed_inputs:
                     raise JobError("consumed_input_limit")
                 binding.consumed_inputs[event["event_id"]] = (target["job_id"], target["root_job_id"], generation,
-                    event["event_type"])
+                    "managed_review" if negative_review else event["event_type"])
 
 
 async def finish(binding):
@@ -78,16 +84,18 @@ async def finish(binding):
     for entries in roots.values():
         async with manager._write() as tx:
             for event_id, job_id, generation, kind in entries:
+                excluded = "('handled')" if kind == "managed_review" else "('handled','suppressed')"
                 changed = await tx.update_event(job_id,
                     f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=? AND job_id=? "
-                    "AND delivery_status NOT IN ('handled','suppressed')", (event_id, job_id), obligations=False)
+                    f"AND delivery_status NOT IN {excluded}", (event_id, job_id), obligations=False)
                 if changed:
                     if kind == "result":
                         await tx.write_job(job_id, f"UPDATE {manager.jobs} SET result_status='handled',version=version+1 "
                             "WHERE job_id=? AND generation=?", (job_id, generation))
-                    await tx.execute(f"DELETE FROM {manager.prefix}session_obligations WHERE job_id=? AND source_id=?",
-                        (job_id, event_id))
-                    if kind == "result":
+                    if kind != "managed_review":
+                        await tx.execute(f"DELETE FROM {manager.prefix}session_obligations WHERE job_id=? AND source_id=?",
+                            (job_id, event_id))
+                    if kind in {"result", "managed_review"}:
                         await tx.execute(f"DELETE FROM {manager.prefix}session_obligations WHERE job_id=? "
                             "AND kind IN ('managed','abort','controller','disposition') "
                             f"AND EXISTS (SELECT 1 FROM {manager.jobs} WHERE job_id=? AND generation=?)",

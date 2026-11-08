@@ -11,7 +11,7 @@ def _published_markdown_files() -> list[Path]:
     return [
         path
         for path in sorted(ROOT.rglob("*.md"))
-        if ".skills" not in path.parts
+        if not any(part.startswith(".") for part in path.relative_to(ROOT).parts)
     ]
 
 

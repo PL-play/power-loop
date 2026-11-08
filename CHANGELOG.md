@@ -2,6 +2,10 @@
 
 ## 11.0.0 — Design 203 (source delivery; not published)
 
+- P7B: consuming an unstarted ManagedTool outcome closes its review notification
+  while preserving the original suppressed result; hidden or failed reviews stay pending.
+  Background rejection messages identify the capability and permitted alternatives.
+
 - Finite child reviews use persisted interactions, the configured timer port,
   and public `WaitPolicy` / `register_wait_handoff_tool`. The required-timer
   proof protocol is removed. Known ManagedTool notices use original runtime

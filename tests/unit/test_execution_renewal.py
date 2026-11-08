@@ -136,8 +136,8 @@ async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_sto
                                      pricing=Free('test')), lose)
     agent = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None), hooks=hooks).start()
     try:
-        with pytest.raises(SessionLeaseLost):
-            await agent.send('go')
+        result = await agent.send('go')
+        assert result.status == 'failed' and result.error == 'SessionLeaseLost', result
         assert calls == ['tool'] and not invoked and model.calls == 1
     finally:
         await agent.aclose()

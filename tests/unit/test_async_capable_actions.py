@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -70,14 +70,13 @@ def test_openai_description_names_the_allowed_actions():
 
 
 @pytest.mark.asyncio
-async def test_background_run_refuses_side_effecting_tools_with_the_way_out(monkeypatch):
+async def test_background_run_refuses_side_effecting_tools_with_the_way_out(tmp_path):
     """报错即出路：说清「为什么不行」「哪些行」「这件事该怎么做」，三样都给。
 
     明确**不兜底同步执行**：模型调 background_run 的语义是「别阻塞我，给我一个 task_id」。
     兜底改成阻塞执行，它拿到的是同步结果，接下来很可能去 check 一个不存在的 task_id，
     或者以为自己已经并行了而其实没有——一个「成功」的错误回执比一个说清楚的报错更贵。
     """
-    from power_loop.tools import default_tools as dt
 
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="write_file", description="w", pricing=Free("test_fixture")), lambda **kw: "")
@@ -86,14 +85,24 @@ async def test_background_run_refuses_side_effecting_tools_with_the_way_out(monk
                  lambda **kw: "")
     from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
     reg.register(ToolDefinition(name="background_run", description="bg", pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS["background_run"])
-    # run_tool 里是**局部导入**，所以要 patch 源模块而不是 default_tools
-    from power_loop.core import agent_context
-    monkeypatch.setattr(agent_context, "get_current_loop",
-                        lambda: SimpleNamespace(tool_registry=reg))
+    from power_loop.runtime.store.factory import open_store
+    from tests.runtime_fixture import RunningAgent
 
-    with pytest.raises(ValueError) as exc:
-        await dt.BG.run_tool("write_file", {"path": "a", "content": "b"})
-    msg = str(exc.value)
+    from .test_timers import _Scripted, _tool_resp
+    store = await open_store(str(tmp_path / "background.sqlite"), schema="tasks")
+    model = _Scripted([_tool_resp("refused", "background_run", json.dumps({
+        "action": "tool", "tool": "write_file", "args": {"path": "a", "content": "b"}}))])
+    agent = await RunningAgent(store, model, reg).start()
+    try:
+        result = await agent.send("run a write in the background")
+        assert result.status == "completed"
+        msg = next(m.content for m in await store.load_all_messages(agent.target.session_id)
+                   if m.role == "tool" and m.tool_call_id == "refused")
+        assert not await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='background_tool'")
+    finally:
+        await agent.aclose()
+        await store.close()
+
     assert "不能后台跑" in msg and "副作用" in msg          # 为什么不行
     assert "没有声明可以后台跑" in msg                       # 说的是「没标」，不是断定它有副作用
     assert "直接调用 write_file 就行" in msg                # 这件事该怎么做

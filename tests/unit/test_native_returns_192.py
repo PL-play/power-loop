@@ -27,14 +27,17 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 async def test_actual_spawn_acceptance_does_not_close_running_child_or_parent_supervision(managed, monkeypatch):
     store, manager, runtime, loop, model, sid, _ = managed
     append = store.append_message
+    failed = False
     async def fail_receipt(session_id, **kwargs):
-        if session_id == sid and kwargs.get('role') == 'tool':
+        nonlocal failed
+        if not failed and session_id == sid and kwargs.get('role') == 'tool':
+            failed = True
             raise OSError('original spawn receipt write failed')
         return await append(session_id, **kwargs)
     monkeypatch.setattr(store, 'append_message', fail_receipt)
     try:
-        with pytest.raises(OSError, match='receipt write failed'):
-            await loop.send('delegate', sid)
+        result = await loop.send('delegate')
+        assert result.status == 'failed' and result.error == 'OSError'
         await asyncio.wait_for(model.entered.wait(), 5)
         records = await jobs(managed)
         root = next(j for j in records if j.kind == 'send' and j.session_id == sid)
@@ -48,4 +51,5 @@ async def test_actual_spawn_acceptance_does_not_close_running_child_or_parent_su
         assert model.child_calls == 1 and (await manager.get_job(actor, child.job_id)).result_status == 'none'
         assert not [r for r in await store.load_all_messages(sid) if r.role == 'tool']
     finally:
+        monkeypatch.setattr(store, 'append_message', append)
         await finish(managed)

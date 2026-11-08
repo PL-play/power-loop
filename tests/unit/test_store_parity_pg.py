@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 
 import pytest
 
+from power_loop.runtime.store.schema import _STORE_TABLES
+from power_loop.runtime.store.task_schema import TASK_TABLES
+
 pytest.importorskip("asyncpg")
 
 from power_loop.runtime.store.factory import open_store  # noqa: E402
@@ -40,19 +43,16 @@ pytestmark = [
     pytest.mark.skipif(not _reachable(PG_DSN), reason=f"Postgres not reachable at {PG_DSN}"),
 ]
 
-_DATA_TABLES = (
-    "sessions", "messages", "compactions", "usage_observations", "session_state",
-    "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes", "project_messages", "hook_events",
-    "session_leases", "follow_up_queue",
-)
+
+_DATA_TABLES = tuple(dict.fromkeys((*_STORE_TABLES, *(n for n in TASK_TABLES if n != 'task_store'))))
 
 
 @pytest.fixture
 async def pg_store():
+    assert urlparse(PG_DSN).path.endswith("_test")
     store = await open_store(PG_DSN)
-    tables = ",".join(getattr(store.t, n) for n in _DATA_TABLES)
-    await store._db.execute(f"TRUNCATE {tables}")  # clean slate per scenario
+    tables = ",".join(store.table_prefix + n for n in _DATA_TABLES)
+    await store._db.execute(f"TRUNCATE {tables} RESTART IDENTITY")  # clean slate per scenario
     try:
         yield store
     finally:

@@ -61,19 +61,24 @@ def test_render_shows_where_the_work_went():
 
 
 @pytest.mark.asyncio
-async def test_background_run_list_is_an_explicit_alias_for_check_all(monkeypatch):
-    """「列出全部」原来藏在「check 不带 task_id」这个隐式约定里——模型要先知道才用得上。
-    同一件事该只有一个名字（design/96 §6.4）。"""
-    from power_loop.tools import default_tools as dt
+async def test_background_run_lists_all_and_check_requires_an_explicit_task():
+    import json
 
-    seen: list = []
+    from power_loop import SessionStore, create_default_tool_registry
+    from tests.runtime_fixture import RunningAgent
 
-    async def _check(task_id=None):
-        seen.append(task_id)
-        return "ok"
-
-    monkeypatch.setattr(dt.BG, "check", _check)
-    assert await dt.run_background("list") == "ok"
-    assert seen == [None]
-    await dt.run_background("check", task_id="t1")
-    assert seen[-1] == "t1"
+    from .test_timers import _Scripted, _tool_resp
+    store = await SessionStore.open(":memory:")
+    runner = await RunningAgent(store, _Scripted([
+        _tool_resp("list", "background_run", '{"action":"list"}'),
+        _tool_resp("check", "background_run", '{"action":"check"}'),
+    ]), create_default_tool_registry(bind=False)).start()
+    try:
+        await runner.send("List all background work")
+        outputs = [row.content for row in await store.load_all_messages(runner.target.session_id) if row.role == "tool"]
+        assert len(outputs) == 2
+        assert json.loads(outputs[0].split("\n", 1)[1])["tasks"] == []
+        assert "task_id is required" in outputs[1]
+    finally:
+        await runner.aclose()
+        await store.close()

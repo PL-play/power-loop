@@ -120,7 +120,7 @@ async def test_paused_receipt_source_proof_allows_another_root_to_stop(receipt_c
     if close_source:
         assert (await other.get_job(c.actor,c.caller.job_id)).status=='model_closed'
         with pytest.raises(JobError,match='closed|not_running'):
-            await other.register_job(c.actor,kind='background_tool',parent=c.caller,system_key='receipt-is-not-permission')
+            await other.register_job(c.actor,kind='background_tool',parent=c.caller,system_key='receipt-is-not-permission', session_id=c.actor.session_id)
 
 
 async def test_stale_live_source_fails_before_a_target_writer(receipt_case,monkeypatch):

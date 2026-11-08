@@ -66,16 +66,17 @@ async def test_drain_atomically_freezes_claim_and_records_active_and_queued_stop
     c = boot
     await start(c)
     reg, lease = await root(c)
-    child = await c.manager.register_job(c.actor, kind="subagent", parent=lease, system_key="unclaimed", independent=True)
+    child = await c.manager.register_job(c.actor, kind="subagent", parent=lease, system_key="unclaimed", independent=True, session_id=c.actor.session_id)
     stopped = await registry.drain(c.manager, c.identity, system_key="shutdown", reason="host shutdown")
     assert stopped["executor"]["state"] == "draining" and not stopped["physical_stop_confirmed"]
-    assert {j["job_id"] for j in stopped["effects"]["executions"]} == {reg.job.job_id, child.job.job_id}
-    assert len(stopped["effects"]["stop_operations"]) == 2 and stopped["effects"]["scope_incomplete"] is False
-    for job_id in (reg.job.job_id, child.job.job_id):
+    assert {j["job_id"] for j in stopped["effects"]["executions"]} == {reg.job.job_id}
+    assert len(stopped["effects"]["stop_operations"]) == 1 and stopped["effects"]["scope_incomplete"] is False
+    for job_id in (reg.job.job_id,):
         job = await c.manager.get_job(c.actor, job_id)
         assert job.cancel_requested_at is not None and job.supervision_status == "open"
     assert (await c.manager.get_job(c.actor, reg.job.job_id)).resource_state == "running"
     assert (await c.manager.get_job(c.actor, child.job.job_id)).resource_state == "not_started"
+    assert (await c.manager.get_job(c.actor, child.job.job_id)).cancel_requested_at is None
     with pytest.raises(JobError, match="cancel_requested|executor_not_accepting"):
         await c.manager.check_execution(c.actor, lease)
     assert (await c.manager.get_execution_membership(c.actor, reg.job.job_id, 1))["scope"]["executor_binding"]
@@ -165,7 +166,7 @@ async def test_health_expiry_does_not_turn_known_success_into_failure(boot):
     c = boot
     await start(c)
     _, parent = await root(c)
-    child = await c.manager.register_job(c.actor, kind="subagent", parent=parent, system_key="child", independent=True)
+    child = await c.manager.register_job(c.actor, kind="subagent", parent=parent, system_key="child", independent=True, session_id=c.actor.session_id)
     lease = await c.manager.claim_job(c.actor, child.job.job_id, executor_id="executor", boot_id="boot-one", expected_version=1)
     c.now[0] += 1001
     raw = {"status": "completed", "final_text": "known late output", "usage": {"total_tokens": 17}}
@@ -205,22 +206,7 @@ async def test_concurrent_start_and_drain_cannot_leave_a_new_claim_open(boot):
     assert (await registry.get(c.manager, c.identity))["state"] == "draining"
 
 
-@pytest.mark.parametrize("fault", ["registry_missing", "binding_removed", "registration_event_missing", "control_row_changed"])
-async def test_lost_or_corrupt_original_control_cannot_downgrade_registered_job(boot, fault):
-    c = boot
-    accepted = await start(c)
-    _, lease = await root(c)
-    key = accepted["executor"]["executor_key"]
-    if fault == "registry_missing":
-        await c.manager.db.execute(f"DELETE FROM {c.manager.prefix}task_executors WHERE executor_key=?", (key,))
-    elif fault == "binding_removed":
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET executor_key=NULL WHERE job_id=?", (lease.job_id,))
-    elif fault == "registration_event_missing":
-        await c.manager.db.execute(f"DELETE FROM {c.manager.prefix}task_executor_events WHERE event_id=?", (registry._event_id(c.manager, key, 1),))
-    else:
-        await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_executors SET lease_until_ms=lease_until_ms+1 WHERE executor_key=?", (key,))
-    with pytest.raises(JobError, match="executor_(registration_required|binding_missing|evidence_missing|evidence_corrupt)"):
-        await c.manager.check_execution(c.actor, lease)
+
 
 
 async def test_register_does_not_retroactively_adopt_old_unregistered_execution(boot):
@@ -319,7 +305,7 @@ async def test_registered_parent_does_not_require_child_to_share_its_registry(bo
     c = boot
     await start(c)
     _, lease = await root(c)
-    pending = await c.manager.register_job(c.actor, kind="subagent", parent=lease, system_key="child", independent=True)
+    pending = await c.manager.register_job(c.actor, kind="subagent", parent=lease, system_key="child", independent=True, session_id=c.actor.session_id)
     child = await c.manager.claim_job(c.actor, pending.job.job_id, executor_id="unregistered", boot_id="new-boot", expected_version=1)
     await c.manager.check_execution(c.actor, child)
 

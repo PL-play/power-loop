@@ -925,7 +925,9 @@ async def unstarted_references(manager, tx, row):
         or result is None
         or result["job_id"] != row["job_id"]
         or result["event_type"] != "result"
-        or result["delivery_status"] != "suppressed"
+        # Handling the separate review notice does not execute this action or
+        # change the canonical suppressed disposition on the job.
+        or result["delivery_status"] not in ("suppressed", "handled")
         or _hash(json.loads(result["payload_json"])) != _hash(payload)
         or terminal[0]["job_id"] != row["job_id"]
         or terminal[0]["event_type"] != "managed_effect_unstarted"

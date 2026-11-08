@@ -91,38 +91,23 @@ async def test_first_tree_commit_survives_failure_and_reuses_the_frozen_scope(bo
     assert not final["physical_stop_confirmed"]
 
 
-async def test_frozen_queued_scope_cannot_cancel_a_new_executor_claim(boot, monkeypatch):
+async def test_unclaimed_child_is_not_owned_or_cancelled_by_creator_executor_drain(boot):
     c = boot
     await start(c)
     _, parent = await root(c)
     reg = await c.manager.register_job(c.actor, kind="subagent", parent=parent,
-                                     system_key="queued-independent", independent=True)
+        system_key="queued-independent", independent=True, session_id=c.actor.session_id)
     await c.manager.close_model_execution(c.actor, parent)
+    final = await registry.drain(c.manager, c.identity, system_key="stop", reason="shutdown")
+    assert reg.job.job_id not in {r["job_id"] for r in final["effects"]["executions"]}
     future = JobManager(await c.connect(), now_ms=c.manager.now)
     identity = replace(c.identity, executor_id="successor", boot_id="next-boot")
-    await registry.register(future, identity, contract_hash="a" * 64)
+    await registry.register(future, identity, contract_hash="a"*64)
     await registry.activate(future, identity, expected_version=1, system_key="startup", lease_ms=300000)
-    tree = registry._drain_tree
-    claimed = []
-
-    async def take_over_before_stop(*args, **kwargs):
-        claimed.append(await future.claim_job(c.actor, reg.job.job_id, executor_id=identity.executor_id,
-            boot_id=identity.boot_id, expected_version=1))
-        return await tree(*args, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(registry, "_drain_tree", take_over_before_stop)
-        final = await registry.drain(c.manager, c.identity, system_key="stop", reason="shutdown")
-    [new] = claimed
-    assert new.generation == 1
-    saved = await future.get_job(c.actor, reg.job.job_id)
-    assert saved.generation == new.generation
-    assert await future.db.fetchone(f"SELECT executor_id,boot_id FROM {future.jobs} WHERE job_id=?",
-        (reg.job.job_id,)) == {"executor_id": identity.executor_id, "boot_id": identity.boot_id}
-    assert saved.cancel_requested_at is None and saved.status == "running"
-    await future.check_execution(c.actor, new)
-    assert final["effects"]["scope_incomplete"] and not final["physical_stop_confirmed"]
-    assert final["effects"]["executions"][0]["generation"] == 0
+    lease = await future.claim_job(c.actor, reg.job.job_id, executor_id=identity.executor_id,
+        boot_id=identity.boot_id, expected_version=1)
+    await future.check_execution(c.actor,lease)
+    assert (await future.get_job(c.actor,reg.job.job_id)).cancel_requested_at is None
 
 
 async def spawn_worker(c, tmp_path, mode, *, sid=None, identity=None):
@@ -282,7 +267,8 @@ async def test_original_model_exit_between_scope_freeze_and_stop_keeps_its_close
     completed = []
 
     async def exit_before_stop(*args, **kwargs):
-        await c.manager.close_and_finalize(c.actor, lease, evidence={"exit": "completed"})
+        await c.manager.close_model_execution(c.actor, lease, evidence={"exit": "completed"})
+        await c.manager.finalize_supervision(c.actor, lease.job_id, generation=lease.generation)
         completed.append(await c.manager.get_job(c.actor, reg.job.job_id))
         return await tree(*args, **kwargs)
 
@@ -348,7 +334,7 @@ async def test_real_opposite_tree_drains_commit_each_tree_before_waiting_for_the
     for key in ("first", "second"):
         reg, lease = await root(c, key=key)
         child = await c.manager.register_job(c.actor, kind="subagent", parent=lease,
-                                             system_key="independent-" + key, independent=True)
+                                             system_key="independent-" + key, independent=True, session_id=c.actor.session_id)
         await c.manager.claim_job(c.actor, child.job.job_id, executor_id=other.executor_id,
                                  boot_id=other.boot_id, expected_version=1)
         roots.append(reg.job.job_id)

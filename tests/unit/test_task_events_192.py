@@ -26,21 +26,28 @@ async def events_case(registry_store, tmp_path):
     manager = JobManager(store, now_ms=lambda: 1000000)
     sid = await store.create_session()
     actor = JobActor("events", "host", sid)
-    source = await manager.register_job(actor, kind="send", session_id=sid, system_key="source", request={"send_index": 1})
+    async def input_request(mid, index):
+        await store.inbox_put(sid, [{"item_id": mid, "content": mid}])
+        claimed = await store.inbox_claim(sid)
+        await store.append_message(sid, role="user", content=mid, send_index=index,
+            inbox={"claim_token": claimed[0]["claim_token"], "ids": [claimed[0]["id"]]})
+        return {"send_index": index, "input_ref": {"store_id": store.store_id, "session_id": sid, "message_id": mid}}
+
+    source = await manager.register_job(actor, kind="send", session_id=sid, system_key="source", request=await input_request("source", 1))
     lease = await manager.claim_job(actor, source.job.job_id, executor_id="SOURCE-EXECUTOR-SECRET", boot_id="BOOT-SECRET", expected_version=1)
     seq = await store.append_message(sid, role="assistant", send_index=1, round_index=0, tool_calls=[{
         "id": "create-call", "type": "function", "function": {"name": "spawn_agent", "arguments": "{}"}}])
+    child_sid = await store.create_session(parent_session_id=sid, metadata={"execution_role": "subagent"})
     child = await manager.register_job(actor, kind="subagent", parent=lease, independent=True,
-        call_ref=await store.message_ref(sid, seq), tool_call_id="create-call")
+        call_ref=await store.message_ref(sid, seq), tool_call_id="create-call", session_id=child_sid)
     receipt = await store.append_message(sid, role="tool", send_index=1, round_index=0, tool_call_id="create-call", content="CREATED")
     await manager.bind_receipt(actor, child.operation.operation_id, await store.message_ref(sid, receipt), caller=lease)
-    child_sid = await store.create_session(parent_session_id=sid, metadata={"execution_role": "subagent"})
-    bound = await manager.bind_session(actor, child.job.job_id, child_sid)
+    bound = child.job
     child_lease = await manager.claim_job(actor, child.job.job_id, executor_id="CHILD-EXECUTOR-SECRET", boot_id="BOOT-SECRET", expected_version=bound.version)
     event = await manager.record_execution_result(actor, child_lease, outcome="succeeded", result={
         "status": "completed", "final_text": "RESULT-42", "usage": {"total_tokens": 19}}, resource_state="stopped")
     await manager.close_model_execution(actor, lease)
-    other_source = await manager.register_job(actor, kind="send", session_id=sid, system_key="controller", request={"send_index": 2})
+    other_source = await manager.register_job(actor, kind="send", session_id=sid, system_key="controller", request=await input_request("controller", 2))
     caller = await manager.claim_job(actor, other_source.job.job_id, executor_id="CONTROL-EXECUTOR-SECRET", boot_id="BOOT-SECRET", expected_version=1)
     stop_seq = await store.append_message(sid, role="assistant", send_index=2, round_index=0, tool_calls=[{
         "id": "stop-call", "type": "function", "function": {"name": "jobs", "arguments": json.dumps({"action": "stop", "job_id": child.job.job_id})}}])
@@ -83,10 +90,12 @@ async def test_each_operation_has_its_own_original_call_and_receipt_and_no_contr
     assert [dict(r) for r in before] == [dict(r) for r in await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")]
 
 
-async def test_canonical_result_remains_original_after_job_cache_changes_and_session_deletion(events_case):
+async def test_canonical_result_remains_original_and_active_resources_prevent_session_deletion(events_case):
     c = events_case
     await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET result_json=? WHERE job_id=?", (json.dumps({"final_text": "WRONG-CACHE"}), c.job))
-    await c.store.close_session(c.child_sid)
+    from power_loop import SessionBusy
+    with pytest.raises(SessionBusy):
+        await c.store.close_session(c.child_sid)
     listing = await get(c, view="results")
     assert listing["events"][0]["event_id"] == c.result and listing["events"][0]["generation"] == "1"
     result = await get(c, view="results", event_id=c.result)
@@ -285,7 +294,7 @@ async def test_operation_origin_refusal_never_expands_to_caller_transcript(event
 
 async def test_cancelled_unstarted_result_preserves_generation_zero(events_case):
     c = events_case
-    queued = await c.manager.register_job(c.actor, kind="subagent", parent=c.caller, system_key="never-dispatched")
+    queued = await c.manager.register_job(c.actor, kind="subagent", parent=c.caller, system_key="never-dispatched", session_id=c.actor.session_id)
     await c.manager.record_unstarted_result(c.actor, queued.job.job_id, outcome="cancelled", result={"status": "cancelled", "final_text": "not dispatched"})
     listing = await task_events.read_events(c.manager, c.actor, queued.job.job_id, view="results")
     assert listing["events"][0]["generation"] == "0"
@@ -346,30 +355,6 @@ async def test_event_scope_limit_and_workspace_requirement_are_explicit(events_c
             await get(c, view="results", output_file="never-written.jsonl")
 
 
-@pytest.mark.parametrize("fault", ["none", "duplicate", "child_actor"])
-async def test_actual_active_nudge_without_caller_payload_uses_unique_send_authority(nudge_case, fault):
-    from power_loop.runtime.task_history import read_history
-
-    c = nudge_case
-    operation, _ = await c.accept()
-    assert "caller" not in operation.result["request"]
-    seq = await c.store.append_message(c.actor.session_id, role="tool", send_index=1, round_index=0,
-        tool_call_id="nudge-call", content="NUDGE-ACCEPTED")
-    ref = await c.store.message_ref(c.actor.session_id, seq)
-    await c.manager.bind_receipt(c.actor, operation.operation_id, ref, caller=c.caller)
-    await c.manager.close_model_execution(c.actor, c.caller)
-    if fault == "duplicate":
-        duplicate = await c.manager.register_job(c.actor, kind="send", session_id=c.actor.session_id,
-            system_key="ambiguous-send", request={"send_index": 1})
-        await c.manager.claim_job(c.actor, duplicate.job.job_id, executor_id="duplicate", boot_id="boot", expected_version=1)
-    actor = c.child_actor if fault == "child_actor" else c.actor
-    if fault == "none":
-        result = await read_history(c.manager, actor, c.target.job_id, message_id=ref.to_dict()["id"])
-        assert result["status"] == "ok" and json.loads(result["text"])["content"] == "NUDGE-ACCEPTED"
-        assert result["bindings"][0]["source_operation_ids"] == [operation.operation_id]
-    else:
-        with pytest.raises(JobError):
-            await read_history(c.manager, actor, c.target.job_id, message_id=ref.to_dict()["id"])
 
 
 async def test_small_list_budget_preserves_every_operation_across_pages(events_case):

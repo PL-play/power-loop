@@ -25,4 +25,8 @@ async def test_concurrent_drains_deliver_each_item_exactly_once(stores) -> None:
     assert len(seen) == len(set(seen)), "an item was delivered to more than one drain"
     assert sorted(seen) == sorted(f"m{i}" for i in range(50)), "items lost or duplicated"
 
+    for batch in batches:
+        if batch:
+            await stores[0].append_message(sid,role="user",content="delivered",inbox={
+                "claim_token":batch[0]['claim_token'],"ids":[row['id'] for row in batch]})
     await stores[0].close_session(sid)

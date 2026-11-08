@@ -94,14 +94,14 @@ async def call(store, actor, call_id="call-1"):
     return await store.message_ref(actor.session_id, seq)
 
 
-async def child(runtime, *, key="child", kind="subagent", independent=False):
+async def child(runtime, *, key="child", kind="subagent", independent=False, session_id=None):
     _, manager, actor, _, lease, _, _ = runtime
     return await manager.register_job(actor, kind=kind, parent=lease,
-                                      system_key=key, independent=independent)
+                                      system_key=key, independent=independent, session_id=session_id or actor.session_id)
 
 
 async def claimed(m, actor, kind, parent, key, **kwargs):
-    reg = await m.register_job(actor, kind=kind, parent=parent, system_key=key, **kwargs)
+    reg = await m.register_job(actor, kind=kind, parent=parent, system_key=key, session_id=actor.session_id, **kwargs)
     proof = await m.claim_job(actor, reg.job.job_id, executor_id=key, boot_id="boot", expected_version=1)
     return reg, proof
 
@@ -114,24 +114,19 @@ async def node_tree(runtime):
     return workflow, wp, node, np, send, sp
 
 
-async def test_session_binding_is_direct_child_role_checked_immutable_and_survives_caller_close(runtime):
-    store, m, actor, _, caller, _, _ = runtime
-    reg = await child(runtime, independent=True)
-    wrong = await store.create_session(parent_session_id=actor.session_id, metadata={"execution_role": "main"})
-    with pytest.raises(JobError, match="ownership"):
-        await m.bind_session(actor, reg.job.job_id, wrong)
-    sid = await store.create_session(parent_session_id=actor.session_id, metadata={"execution_role": "subagent"})
-    other = await store.create_session(parent_session_id=actor.session_id, metadata={"execution_role": "subagent"})
-    await m.close_model_execution(actor, caller)
-    bound = await m.bind_session(actor, reg.job.job_id, sid)
-    assert bound.session_id == sid and bound.version == 2
-    assert (await m.bind_session(actor, reg.job.job_id, sid)) == bound
-    with pytest.raises(JobError, match="already_bound"):
-        await m.bind_session(actor, reg.job.job_id, other)
-    proof = await m.claim_job(actor, bound.job_id, executor_id="executor", boot_id="boot", expected_version=2)
-    child_actor = JobActor(actor.tenant_id, actor.principal_id, sid)
-    sub_send = await m.register_job(child_actor, kind="send", session_id=sid, parent=proof, system_key="child-send")
-    assert sub_send.job.execution_role == "subagent"
+async def test_session_is_fixed_at_admission_and_child_survives_creator_close(runtime):
+    store, manager, actor, _, caller, _, _ = runtime
+    sid = await store.create_session(parent_session_id=actor.session_id, metadata={"execution_role":"subagent"})
+    other = await store.create_session(parent_session_id=actor.session_id, metadata={"execution_role":"subagent"})
+    args = dict(kind="subagent",parent=caller,system_key="fixed-session",independent=True,session_id=sid)
+    registered = await manager.register_job(actor,**args)
+    assert (await manager.register_job(actor,**args)).job == registered.job
+    with pytest.raises(JobError,match="conflict"):
+        await manager.register_job(actor,**(args|{"session_id":other}))
+    await manager.close_model_execution(actor,caller)
+    proof = await manager.claim_job(actor,registered.job.job_id,executor_id="child",boot_id="boot",expected_version=1)
+    await manager.check_execution(actor,proof)
+    assert (await manager.get_job(actor,proof.job_id)).session_id == sid
 
 
 async def test_cancellation_blocks_dispatch_but_model_exit_evidence_is_saved(runtime):
@@ -142,7 +137,7 @@ async def test_cancellation_blocks_dispatch_but_model_exit_evidence_is_saved(run
     closed = await m.close_model_execution(actor, proof, evidence={"usage": {"total_tokens": 17}})
     assert closed.status == "model_closed" and closed.resource_state == "stopped"
     assert (await m.close_model_execution(actor, proof)).version == closed.version
-    event = await m.db.fetchone(f"SELECT payload_json FROM {m.events} WHERE event_id=?", ("model_closed_" + root.job.job_id,))
+    event = await m.db.fetchone(f"SELECT payload_json FROM {m.events} WHERE event_id=?", ("result_" + root.job.job_id,))
     assert json.loads(event["payload_json"])["evidence"]["usage"]["total_tokens"] == 17
     with pytest.raises(JobError, match="cancel|closed|not_running"):
         await m.check_execution(actor, proof)
@@ -167,14 +162,14 @@ async def test_result_evidence_keeps_usage_after_stop_without_claiming_final_suc
     if barrier != "elapsed-time":
         assert result.result["execution_status"] == "completed" and result.result["status"] == "cancelled"
     with pytest.raises(JobError, match="cancel|closed|not_running"):
-        await m.register_job(actor, kind="background_tool", parent=proof, system_key="after-result-must-not-run")
+        await m.register_job(actor, kind="background_tool", parent=proof, system_key="after-result-must-not-run", session_id=actor.session_id)
 
 
 async def test_actual_receipt_can_be_reconciled_after_caller_closes_without_reopening_execution(runtime):
     store, m, actor, _, caller, _, _ = runtime
     origin = await call(store, actor)
     reg = await m.register_job(actor, kind="subagent", parent=caller, call_ref=origin,
-                               tool_call_id="call-1", independent=True)
+                               tool_call_id="call-1", independent=True, session_id=actor.session_id)
     assert (await m.operation_for_call(actor, origin, "call-1")).operation_id == reg.operation.operation_id
     seq = await store.append_message(actor.session_id, role="tool", tool_call_id="call-1", content="accepted")
     receipt = await store.message_ref(actor.session_id, seq)
@@ -195,20 +190,20 @@ async def test_async_workflow_outlives_closed_creator_and_survives_reopen(runtim
     now[0] += 31_000  # Original model execution lease has expired.
     recovered = JobManager(await connect(), now_ms=m.now)
     proof = await recovered.claim_job(actor, reg.job.job_id, executor_id="engine", boot_id="boot", expected_version=1)
-    node = await recovered.register_job(actor, kind="workflow_node", parent=proof, system_key="new-node")
+    node = await recovered.register_job(actor, kind="workflow_node", parent=proof, system_key="new-node", session_id=actor.session_id)
     saved = await recovered.get_job(actor, reg.job.job_id)
     assert saved.parent_job_id == root.job.job_id and not saved.blocks_completion
     assert saved.control_owner_job_id is None and node.job.control_owner_job_id == saved.job_id
     assert (await recovered.get_job(actor, root.job.job_id)).status == "model_closed"
     with pytest.raises(JobError, match="closed|not_running"):
-        await recovered.register_job(actor, kind="workflow", parent=caller, system_key="stale-caller", independent=True)
+        await recovered.register_job(actor, kind="workflow", parent=caller, system_key="stale-caller", independent=True, session_id=actor.session_id)
     assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {m.jobs}"))["n"] == 3
 
 
 async def test_node_subagent_depends_on_node_scope_instead_of_creator_model_send(runtime):
     store, m, actor, _, caller, connect, now = runtime
     _, wp, node, np, send, sp = await node_tree(runtime)
-    reg = await m.register_job(actor, kind="subagent", parent=sp, system_key="audit")
+    reg = await m.register_job(actor, kind="subagent", parent=sp, system_key="audit", session_id=actor.session_id)
     assert reg.job.control_owner_job_id == node.job.job_id
     assert reg.job.completion_scope_job_id == node.job.job_id and reg.job.blocks_completion
     await m.close_model_execution(actor, sp)
@@ -217,7 +212,7 @@ async def test_node_subagent_depends_on_node_scope_instead_of_creator_model_send
                             (send.job.job_id,))
     recovered = JobManager(await connect(), now_ms=m.now)
     ap = await recovered.claim_job(actor, reg.job.job_id, executor_id="audit", boot_id="boot", expected_version=1)
-    bg = await recovered.register_job(actor, kind="background_tool", parent=ap, system_key="ordinary-tool")
+    bg = await recovered.register_job(actor, kind="background_tool", parent=ap, system_key="ordinary-tool", session_id=actor.session_id)
     assert bg.job.execution_role == "subagent" and bg.job.control_owner_job_id == reg.job.job_id
     assert wp.job_id != np.job_id
 
@@ -260,18 +255,18 @@ async def test_subagent_cannot_delegate_recursively_even_through_another_send(ru
     if through_send:
         _, ap = await claimed(m, actor, "send", ap, "child-send")
     with pytest.raises(JobError, match="role_forbids"):
-        await m.register_job(actor, kind=kind, parent=ap, system_key="recursive", independent=True)
+        await m.register_job(actor, kind=kind, parent=ap, system_key="recursive", independent=True, session_id=actor.session_id)
 
 
 async def test_workflow_node_can_spawn_child_but_cannot_spawn_workflow(runtime):
     _, m, actor, _, _, _, _ = runtime
     _, _, _, _, _, sp = await node_tree(runtime)
-    audit = await m.register_job(actor, kind="subagent", parent=sp, system_key="allowed-audit")
+    audit = await m.register_job(actor, kind="subagent", parent=sp, system_key="allowed-audit", session_id=actor.session_id)
     assert audit.job.execution_role == "subagent"
     with pytest.raises(JobError, match="role_forbids"):
-        await m.register_job(actor, kind="workflow", parent=sp, system_key="nested-workflow")
+        await m.register_job(actor, kind="workflow", parent=sp, system_key="nested-workflow", session_id=actor.session_id)
     with pytest.raises(JobError, match="required_child"):
-        await m.register_job(actor, kind="subagent", parent=sp, system_key="escape-node", independent=True)
+        await m.register_job(actor, kind="subagent", parent=sp, system_key="escape-node", independent=True, session_id=actor.session_id)
 
 
 async def test_close_model_execution_is_idempotent_and_is_not_tree_completion(runtime):
@@ -283,7 +278,7 @@ async def test_close_model_execution_is_idempotent_and_is_not_tree_completion(ru
     assert closed.status == "model_closed" and closed.resource_state == "stopped"
     assert closed.supervision_status == "open" and closed.outcome is None
     with pytest.raises(JobError, match="closed|not_running"):
-        await m.register_job(actor, kind="background_tool", parent=proof, system_key="old-send")
+        await m.register_job(actor, kind="background_tool", parent=proof, system_key="old-send", session_id=actor.session_id)
 
 
 async def test_only_model_send_can_use_model_close_and_stale_proof_is_rejected(runtime):
@@ -317,16 +312,16 @@ async def test_concurrent_replayed_call_creates_only_one_job_and_operation(runti
     ref = await call(store, actor)
     other = JobManager(await connect(), now_ms=m.now)
     results = await asyncio.gather(*(manager.register_job(actor, kind="subagent", parent=lease,
-        call_ref=ref, tool_call_id="call-1", request={"task": "audit"}) for manager in [m, other] * 4))
+        call_ref=ref, tool_call_id="call-1", request={"task": "audit"}, session_id=actor.session_id) for manager in [m, other] * 4))
     assert len({r.job.job_id for r in results}) == 1 and sum(not r.replayed for r in results) == 1
     assert len({r.operation.operation_id for r in results}) == 1
     assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {m.jobs}"))["n"] == 2
     with pytest.raises(JobError, match="operation_conflict"):
         await m.register_job(actor, kind="subagent", parent=lease,
-            call_ref=ref, tool_call_id="call-1", request={"task": "different task"})
+            call_ref=ref, tool_call_id="call-1", request={"task": "different task"}, session_id=actor.session_id)
     with pytest.raises(JobError, match="operation_conflict"):
         await m.register_job(actor, kind="subagent", parent=lease,
-            call_ref=replace(ref, id=ref.id + 99), tool_call_id="call-1", request={"task": "audit"})
+            call_ref=replace(ref, id=ref.id + 99), tool_call_id="call-1", request={"task": "audit"}, session_id=actor.session_id)
 
 
 async def test_claim_has_one_winner_across_connections(runtime):
@@ -343,7 +338,7 @@ async def test_claim_has_one_winner_across_connections(runtime):
 async def test_call_and_receipt_are_bound_by_actual_message_ids(runtime):
     store, m, actor, _, lease, _, _ = runtime
     ref = await call(store, actor)
-    reg = await m.register_job(actor, kind="background_tool", parent=lease, call_ref=ref, tool_call_id="call-1")
+    reg = await m.register_job(actor, kind="background_tool", parent=lease, call_ref=ref, tool_call_id="call-1", session_id=actor.session_id)
     seq = await store.append_message(actor.session_id, role="tool", tool_call_id="call-1", content="accepted")
     receipt = await store.message_ref(actor.session_id, seq)
     op = await m.bind_receipt(actor, reg.operation.operation_id, receipt, caller=lease)
@@ -372,7 +367,7 @@ async def test_tool_call_id_reuse_does_not_merge_different_messages_or_steering(
 async def test_receipt_rejects_wrong_origin_without_overwriting_operation(runtime, case):
     store, m, actor, _, lease, _, _ = runtime
     ref = await call(store, actor)
-    reg = await m.register_job(actor, kind="subagent", parent=lease, call_ref=ref, tool_call_id="call-1")
+    reg = await m.register_job(actor, kind="subagent", parent=lease, call_ref=ref, tool_call_id="call-1", session_id=actor.session_id)
     sid, role, tool_call = actor.session_id, "tool", "call-1"
     if case == "other-session":
         sid = await store.create_session()
@@ -392,13 +387,13 @@ async def test_scope_boundaries_and_independent_edges_remain_distinct_from_tree(
     _, m, actor, root, _, _, _ = runtime
     outer = await child(runtime)
     proof = await m.claim_job(actor, outer.job.job_id, executor_id="outer", boot_id="boot", expected_version=1)
-    inner = await m.register_job(actor, kind="background_tool", parent=proof, system_key="inner")
+    inner = await m.register_job(actor, kind="background_tool", parent=proof, system_key="inner", session_id=actor.session_id)
     assert inner.job.root_job_id == root.job.job_id
     assert inner.job.completion_scope_job_id == outer.job.job_id
     service = await child(runtime, key="service", kind="background_tool", independent=True)
     assert not service.job.blocks_completion and service.job.completion_scope_job_id == service.job.job_id
     service_proof = await m.claim_job(actor, service.job.job_id, executor_id="service", boot_id="boot", expected_version=1)
-    follower = await m.register_job(actor, kind="background_tool", parent=service_proof, system_key="follower")
+    follower = await m.register_job(actor, kind="background_tool", parent=service_proof, system_key="follower", session_id=actor.session_id)
     assert follower.job.completion_scope_job_id == service.job.job_id and follower.job.blocks_completion
 
 
@@ -419,11 +414,11 @@ async def test_cancelled_ancestor_blocks_new_admission_and_queued_child_claim(ru
     assert stop.result["status"] == "cancelling" and stop.result["resource_state"] == "running"
     assert await m.request_cancel(actor, root.job.job_id, system_key="stop-1", reason="user stopped") == stop
     with pytest.raises(JobError, match="cancel_requested"):
-        await m.register_job(actor, kind="subagent", parent=lease, system_key="new-after-stop")
+        await m.register_job(actor, kind="subagent", parent=lease, system_key="new-after-stop", session_id=actor.session_id)
     with pytest.raises(JobError, match="cancel_requested"):
         await m.claim_job(actor, reg.job.job_id, executor_id="late", boot_id="boot", expected_version=1)
     # Receipt replay returns the old admission, never starts replacement work.
-    assert (await m.register_job(actor, kind="subagent", parent=lease, system_key="child")).replayed
+    assert (await m.register_job(actor, kind="subagent", parent=lease, system_key="child", session_id=actor.session_id)).replayed
 
 
 async def test_queued_cancel_is_persistent_and_cannot_later_start(runtime):
@@ -462,19 +457,42 @@ async def test_registration_and_operation_rollback_together(runtime, monkeypatch
         raise RuntimeError("injected operation persistence failure")
     monkeypatch.setattr(m, "_insert_operation", broken)
     with pytest.raises(RuntimeError, match="persistence failure"):
-        await m.register_job(actor, kind="subagent", parent=lease, system_key="atomic-child")
+        await m.register_job(actor, kind="subagent", parent=lease, system_key="atomic-child", session_id=actor.session_id)
     assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {m.jobs}"))["n"] == 1
 
 
-async def test_session_deletion_removes_its_root_task_tree(runtime):
-    store, m, actor, root, _, _, _ = runtime
-    await child(runtime)
-    await store.close_session(actor.session_id)
-    assert not await store._db.fetchall(f'SELECT job_id FROM {m.jobs}')
-    assert not await store._db.fetchall(f'SELECT event_id FROM {m.events}')
+async def test_session_deletion_preserves_running_child_then_removes_completed_tree(registry_store):
+    import asyncio
 
+    from power_loop import JobRef, SessionBusy
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.tools.registry import ToolRegistry
+    from power_loop.tools.spawn_agent import register_spawn_agent
+    from tests.runtime_fixture import RunningAgent
 
-
+    from .test_subagent_runtime_203 import ParentAndChild
+    store, _ = registry_store
+    model, registry = ParentAndChild(), ToolRegistry()
+    model.child_gate = asyncio.Event()
+    register_spawn_agent(registry)
+    runner = await RunningAgent(store,model,registry).start()
+    try:
+        await runner.send("delegate")
+        await asyncio.wait_for(model.child_started.wait(),5)
+        with pytest.raises(SessionBusy):
+            await store.close_session_tree(runner.target.session_id)
+        messages = await store.load_all_messages(runner.target.session_id)
+        child = json.loads(next(m.content for m in messages if m.tool_call_id == "spawn"))
+        model.child_gate.set()
+        result = await runner.runtime.client.wait(JobRef(**child["job_ref"]),actor=runner.actor,deadline_ms=now_ms()+10000)
+        assert result.status == "completed"
+        await runner.drain()
+        await store.close_session_tree(runner.target.session_id)
+        assert not await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs")
+        assert not await store._db.fetchall(f"SELECT event_id FROM {store.table_prefix}job_events")
+    finally:
+        model.child_gate.set()
+        await runner.aclose()
 
 
 async def test_unknown_resource_keeps_supervision_and_blocks_more_work(runtime):
@@ -485,7 +503,7 @@ async def test_unknown_resource_keeps_supervision_and_blocks_more_work(runtime):
     row = await m.get_job(actor, reg.job.job_id)
     assert row.outcome == "interrupted" and row.resource_state == "unknown" and row.supervision_status == "open"
     with pytest.raises(JobError, match="unresolved_prior_attempt"):
-        await m.register_job(actor, kind="background_tool", parent=proof, system_key="do-not-repeat")
+        await m.register_job(actor, kind="background_tool", parent=proof, system_key="do-not-repeat", session_id=actor.session_id)
     stop = await m.request_cancel(actor, reg.job.job_id, system_key="stop-unknown", reason="query/cancel needed")
     assert stop.result["status"] == "cancelling" and stop.result["resource_state"] == "unknown"
 
@@ -493,7 +511,7 @@ async def test_unknown_resource_keeps_supervision_and_blocks_more_work(runtime):
 async def test_stale_caller_cannot_attach_receipt_or_steer_with_valid_target_lease(runtime):
     store, m, actor, _, lease, _, _ = runtime
     ref = await call(store, actor)
-    reg = await m.register_job(actor, kind="subagent", parent=lease, call_ref=ref, tool_call_id="call-1")
+    reg = await m.register_job(actor, kind="subagent", parent=lease, call_ref=ref, tool_call_id="call-1", session_id=actor.session_id)
     target = await m.claim_job(actor, reg.job.job_id, executor_id="target", boot_id="boot", expected_version=1)
     seq = await store.append_message(actor.session_id, role="tool", tool_call_id="call-1", content="accepted")
     receipt = await store.message_ref(actor.session_id, seq)
@@ -509,8 +527,8 @@ async def test_model_origin_must_reference_an_actual_assistant_tool_call(runtime
     store, m, actor, _, lease, _, _ = runtime
     ref = await call(store, actor)
     with pytest.raises(JobError, match="tool_call_not_found"):
-        await m.register_job(actor, kind="subagent", parent=lease, call_ref=ref, tool_call_id="not-in-row")
+        await m.register_job(actor, kind="subagent", parent=lease, call_ref=ref, tool_call_id="not-in-row", session_id=actor.session_id)
     with pytest.raises(JobError, match="message_ref_mismatch"):
-        await m.register_job(actor, kind="subagent", parent=lease, call_ref=replace(ref, id=ref.id + 99), tool_call_id="call-1")
+        await m.register_job(actor, kind="subagent", parent=lease, call_ref=replace(ref, id=ref.id + 99), tool_call_id="call-1", session_id=actor.session_id)
     with pytest.raises(JobError, match="persistent_system_key_required"):
-        await m.register_job(actor, kind="subagent", parent=lease)
+        await m.register_job(actor, kind="subagent", parent=lease, session_id=actor.session_id)

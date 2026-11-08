@@ -55,16 +55,19 @@ async def test_inbox_same_item_id_is_accepted_once_ever(store: SessionStore) -> 
 
 
 @pytest.mark.asyncio
-async def test_inbox_release_and_stale_claim_return_to_pending(store: SessionStore) -> None:
+async def test_inbox_release_returns_pending_but_age_never_steals_a_claim(store: SessionStore, monkeypatch) -> None:
     sid = await store.create_session(system_prompt="S")
     await store.inbox_put(sid, _items("a", "b"))
     c1 = await store.inbox_claim(sid)
     assert await store.inbox_release(sid, c1[0]["claim_token"]) == 2
     c2 = await store.inbox_claim(sid)
     assert [r["item_id"] for r in c2] == ["a", "b"]
-    # a claim whose claimer died (never delivered) comes back after the stale window
-    assert await store.inbox_claim(sid, stale_after_ms=60_000) == []
-    c3 = await store.inbox_claim(sid, stale_after_ms=-1)
+    # Session ownership controls recovery; elapsed time alone is not authority.
+    from power_loop.runtime.store import store as module
+    monkeypatch.setattr(module, '_now_ms', lambda: 2**60)
+    assert await store.inbox_claim(sid) == []
+    assert await store.inbox_release(sid,c2[0]['claim_token']) == 2
+    c3 = await store.inbox_claim(sid)
     assert [r["item_id"] for r in c3] == ["a", "b"]
 
 
@@ -102,5 +105,9 @@ async def test_close_session_clears_queue(store: SessionStore) -> None:
     sid = await store.create_session(system_prompt="S")
     await store.inbox_put(sid, _items("steer"))
 
+    from power_loop import SessionBusy
+    with pytest.raises(SessionBusy):
+        await store.close_session(sid)
+    assert await store.inbox_void(sid,["steer"]) == 1
     await store.close_session(sid)
     assert (await store.inbox_counts(sid))["pending"] == 0

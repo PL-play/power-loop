@@ -41,7 +41,7 @@ async def test_directory_persists_across_store_reopen_and_never_dispatches(runti
 async def test_result_get_returns_saved_excerpt_and_distinct_call_receipt_ids(runtime):
     store, m, actor, _, proof, _, _ = runtime
     ref = await call(store, actor)
-    reg = await m.register_job(actor, kind="background_tool", parent=proof, call_ref=ref, tool_call_id="call-1")
+    reg = await m.register_job(actor, kind="background_tool", parent=proof, call_ref=ref, tool_call_id="call-1", session_id=actor.session_id)
     seq = await store.append_message(actor.session_id, role="tool", tool_call_id="call-1", content="accepted")
     receipt = await store.message_ref(actor.session_id, seq)
     await m.bind_receipt(actor, reg.operation.operation_id, receipt, caller=proof)
@@ -115,9 +115,8 @@ async def test_unrelated_actor_cannot_read_get_or_root(runtime, bad):
 
 async def test_child_actor_cannot_expand_to_ancestor_or_sibling(runtime):
     store, m, actor, root, _, _, _ = runtime
-    reg = await child(runtime)
     sid = await store.create_session(parent_session_id=actor.session_id, metadata={"execution_role": "subagent"})
-    await m.bind_session(actor, reg.job.job_id, sid)
+    reg = await child(runtime, session_id=sid)
     sibling = await child(runtime, key="sibling")
     leaf = JobActor(actor.tenant_id, actor.principal_id, sid)
     assert (await task_query.list_jobs(m, leaf))["nodes"][0]["job_id"] == reg.job.job_id
@@ -211,7 +210,7 @@ async def test_same_timestamp_insert_below_upper_requires_snapshot_restart(runti
 async def test_message_pointers_cannot_leak_unvalidated_payload_or_cross_store(runtime, fault):
     store, m, actor, _, proof, _, _ = runtime
     ref = await call(store, actor)
-    reg = await m.register_job(actor, kind="background_tool", parent=proof, call_ref=ref, tool_call_id="call-1")
+    reg = await m.register_job(actor, kind="background_tool", parent=proof, call_ref=ref, tool_call_id="call-1", session_id=actor.session_id)
     data = ref.to_dict()
     if fault == "store":
         data["store_id"] = "other-store"

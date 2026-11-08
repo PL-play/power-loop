@@ -144,18 +144,6 @@ def test_scope_default_deny_blocks_unlisted_verbs_touching_home(command: str) ->
         assert err is not None and "POWER_LOOP_HOME" in err
 
 
-def test_background_manager_prunes_terminal_tasks() -> None:
-    # default-tools-2: the in-memory task cache evicts oldest TERMINAL records beyond the cap so it
-    # (and the store/event_loop refs each pins) can't grow without bound; running tasks are kept.
-    from power_loop.tools.default_tools import _MAX_BG_TASKS, BackgroundManager
-
-    mgr = BackgroundManager()
-    with mgr._lock:
-        mgr.tasks["run-1"] = {"status": "running"}  # oldest, but running → never evicted
-        for i in range(_MAX_BG_TASKS + 50):
-            mgr.tasks[f"done-{i}"] = {"status": "completed"}
-        mgr._prune_locked()
-    assert len(mgr.tasks) <= _MAX_BG_TASKS
-    assert "run-1" in mgr.tasks                       # running task preserved
-    assert f"done-{_MAX_BG_TASKS + 49}" in mgr.tasks  # newest terminal preserved
-    assert "done-0" not in mgr.tasks                  # oldest terminal evicted
+# BackgroundManager's process-local cache was removed. Normal bounded retention
+# is covered by test_background_tool_queue (no retained completed workers/waiters)
+# and the store retention tests; bash permission checks above remain unchanged.

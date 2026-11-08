@@ -82,7 +82,7 @@ async def test_foreign_task_ownership_rejected_before_admission(registry_store, 
                 if operation == "claim":
                     await b.claim(actor, second)
                 else:
-                    async with b.model_send(None, sid, 1):
+                    async with b.model_send(None, sid, 1, input_start=None):
                         pytest.fail("foreign model body entered")
         assert b._lifecycle._start_task is None
         assert (await manager.get_job(actor, second.job.job_id)).generation == 0

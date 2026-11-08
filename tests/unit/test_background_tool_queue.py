@@ -1,122 +1,75 @@
-
+"""Worker capacity, queued cancellation and waiting through the current client."""
 import asyncio
-from contextvars import ContextVar
-from types import SimpleNamespace
+import json
 
-import pytest
-
-from power_loop.contracts.tools import ToolDefinition
-from power_loop.core import agent_context
+from power_loop import AgentLoopConfig, JobRef, ToolDefinition, create_default_tool_registry
+from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.pricing import Free
-from power_loop.tools import default_tools as dt
-from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
+
+from .test_job_registry_192 import registry_store
+from .test_timers import _Scripted, _tool_resp
+
+__all__ = ['registry_store']
 
 
-@pytest.mark.asyncio
-async def test_queue_is_fifo_per_session_and_cancel_does_not_invoke(monkeypatch):
-    sid = ContextVar('queue_sid', default='a')
-    events = {i: asyncio.Event() for i in range(24)}
-    started = []
-    active = {}
-    peaks = {}
-    rows = {}
-    transitions = []
-
-    class Store:
-        async def upsert_background_task(self, session, **kw):
-            rows[session, kw['task_id']] = SimpleNamespace(**kw)
-            transitions.append((session, kw['task_id'], kw['status']))
-
-        async def list_background_tasks(self, session):
-            return [v for (s, _), v in rows.items() if s == session]
-
-        async def get_background_task(self, session, tid):
-            return rows.get((session, tid))
-
-    store = Store()
-
-    async def invoke(**args):
-        session, i = sid.get(), args['i']
+async def test_queue_releases_capacity_on_failure_and_cancelled_work_never_invokes(registry_store, tmp_path):
+    store, _ = registry_store
+    gates = [asyncio.Event(), asyncio.Event()]
+    started, active, peak = [], 0, 0
+    async def read(i):
+        nonlocal active, peak
         started.append(i)
-        active[session] = active.get(session, 0) + 1
-        peaks[session] = max(peaks.get(session, 0), active[session])
+        active += 1
+        peak = max(peak, active)
         try:
-            await events[i].wait()
+            await gates[i].wait()
             if i == 0:
                 raise ValueError('test failure releases slot')
-            return str(i)
+            return 'image ready'
         finally:
-            active[session] -= 1
-
-
-    registry = ToolRegistry()
-    registry.register(ToolDefinition("image", "test", async_capable=True, pricing=Free("test_fixture")), invoke)
-
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
-    monkeypatch.setattr(dt, '_current_store_and_session', lambda: (store, sid.get()))
-    manager = dt.BackgroundManager()
-    notifications = []
-
-    async def notified(session, tid, status):
-        notifications.append((session, tid, status))
-
-    monkeypatch.setattr(dt, '_TOOL_TASK_ON_COMPLETE', notified)
-
-    async def submit(i):
-        receipt = await manager.run_tool('image', {'i': i})
-        return receipt.split('task_id=')[1].split('（')[0]
-
+            active -= 1
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    registry.register(ToolDefinition('image', 'local read', input_schema={
+        'type':'object','properties':{'i':{'type':'integer'}},'required':['i']},
+        async_capable=True, pricing=Free('test')), read)
+    calls = [_tool_resp(str(i),'background_run',json.dumps({'action':'tool','tool':'image','args':{'i':i}}))
+             for i in range(3)]
+    model = _Scripted(calls)
+    agent = await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None),capacity=1).start()
+    waiter = None
     try:
-        ids = await asyncio.gather(*(submit(i) for i in range(12)))
-        assert started == list(range(8))
-        assert [rows['a', tid].status for tid in ids] == ['running'] * 8 + ['queued'] * 4
-        assert await manager.cancel_task(ids[9]) == 'stopped'
-        assert rows['a', ids[9]].status == 'cancelled'
-        assert not notifications
-        # A second sid has its own eight slots even in the same manager/store.
-        token = sid.set('b')
-        more = await asyncio.gather(*(submit(i) for i in range(12, 21)))
-        sid.reset(token)
-        assert started == list(range(8)) + list(range(12, 20))
-        assert rows['b', more[-1]].status == 'queued'
-        # Failure releases capacity without any check or completion collection.
-        events[0].set()
-        for _ in range(20):
-            await asyncio.sleep(0)
-        assert started[-1] == 8
-        assert rows['a', ids[0]].status == 'failed'
-        assert rows['a', ids[10]].status == 'queued'
-        for event in events.values():
-            event.set()
-        await asyncio.gather(*list(manager._workers.values()), return_exceptions=True)
-        await asyncio.sleep(0)
-        assert peaks == {'a': 8, 'b': 8}
-        assert 9 not in started
-        assert [i for i in started if i < 12][-3:] == [8, 10, 11]
-        assert not manager._tool_slots
-        assert not manager._stop_tokens
-        assert ('a', ids[10], 'queued') in transitions
-        assert ('a', ids[10], 'running') in transitions
-        assert ('a', ids[10], 'completed') in transitions
+        assert (await agent.send('start three readers')).status == 'completed'
+        messages = await store.load_all_messages(agent.target.session_id)
+        refs = [JobRef(**json.loads(next(m.content for m in messages if m.role=='tool' and m.tool_call_id==str(i)))['job_ref'])
+                for i in range(3)]
+        async with asyncio.timeout(5):
+            while not started:
+                await asyncio.sleep(.01)
+        assert started == [0] and peak == 1
+        await agent.runtime.client.cancel(refs[2],actor=agent.actor)
+        waiter = asyncio.create_task(agent.runtime.client.wait(refs[1],actor=agent.actor,deadline_ms=now_ms()+10000))
+        await asyncio.sleep(.02)
+        assert not waiter.done()  # A queued task is included in wait.
+        gates[0].set()
+        first = await agent.runtime.client.wait(refs[0],actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert first.status == 'failed'
+        async with asyncio.timeout(5):
+            while len(started)<2:
+                await asyncio.sleep(.01)
+        assert started == [0,1] and peak == 1
+        gates[1].set()
+        result = await waiter
+        assert result.status == 'completed' and 'image ready' in result.final_text
+        cancelled = await agent.runtime.client.wait(refs[2],actor=agent.actor,deadline_ms=now_ms()+10000)
+        assert cancelled.status == 'cancelled' and 2 not in started
+        await agent.drain()
+        assert not agent.runtime.worker._tasks and not agent.runtime.worker._pending
+        assert not agent.runtime.client._waiters
     finally:
-        for worker in list(manager._workers.values()):
-            worker.cancel()
-        await asyncio.gather(*list(manager._workers.values()), return_exceptions=True)
-
-
-@pytest.mark.asyncio
-async def test_wait_includes_queued_tasks_without_a_store(monkeypatch):
-    manager = dt.BackgroundManager()
-    manager.tasks['queued'] = {'status': 'queued', 'command': 'tool:image'}
-    monkeypatch.setattr(dt, '_current_store_and_session', lambda: (None, None))
-
-    async def finish():
-        await asyncio.sleep(0.03)
-        manager.tasks['queued'].update(status='completed', result='image ready')
-
-    worker = asyncio.create_task(finish())
-    manager._workers['queued'] = worker
-    output = await manager.wait(timeout_s=1)
-    assert worker.done()
-    assert '[completed] image ready' in output
-    assert '都做完了' in output
+        for gate in gates:
+            gate.set()
+        if waiter and not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter,return_exceptions=True)
+        await agent.aclose()

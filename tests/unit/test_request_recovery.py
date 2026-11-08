@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,8 @@ class Rejection(Exception):
 
 
 class RepairModel(StrictModel):
+    capabilities = SimpleNamespace(model="repair-model")
+
     def __init__(self, kind, *, fails_twice=False, summary_fails=False):
         super().__init__()
         self.kind, self.fails_twice, self.summary_fails = kind, fails_twice, summary_fails

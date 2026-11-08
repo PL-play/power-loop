@@ -8,7 +8,6 @@ import pytest
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.runtime.budget import estimate_tokens
-from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.runtime.tool_truncation import truncate_pair
@@ -103,34 +102,44 @@ async def test_off_on_keep_idempotence_and_recount(trigger):
         await store.close()
 
 
-async def test_background_uses_target_limits_and_keep():
-    from power_loop.contracts.tools import ToolDefinition
-    from power_loop.runtime.background import encode_results, record_key
+@pytest.mark.parametrize("keep", [False, True])
+async def test_background_uses_target_limits_and_keep(keep, tmp_path):
+    from power_loop import JobRef, RuntimeEnv
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.runtime.background import encode_results, load_record
     from power_loop.tools.registry import ToolRegistry
+
+    from .test_tool_background_contracts_192 import start_background
     store = await SessionStore.open(':memory:')
+    registry = ToolRegistry()
+    bash = create_default_tool_registry(bind=False).get('bash')
+    registry.register(replace(bash.definition, name='work', async_capable=True), bash.handler)
+    arguments = {'command':"python3 -c 'print(chr(121)*3000,end=chr(10))' #"+'x' * 2000, 'description':'background check'}
+    if keep:
+        arguments['context_policy'] = 'keep'
+    runner, row = await start_background(store, registry, 'work', arguments, runtime_env=RuntimeEnv(workspace_dir=tmp_path))
     try:
-        sid = await store.create_session()
-        registry = ToolRegistry()
-        registry.register(ToolDefinition('bash', '', pricing=Free("test_fixture")), create_default_tool_registry(bind=False).get('bash').handler)
-        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-        registry.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS['background_run'])
-        config = ToolContextConfig(overrides={'bash': {'insend_fuse': 'truncate',
+        ref = JobRef(**json.loads(row.content)['job_ref'])
+        result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+10000)
+        assert result.status == 'completed', result
+        sid = runner.target.session_id
+        record = await load_record(store, sid, ref.job_id)
+        config = ToolContextConfig(overrides={'work': {'insend_fuse': 'truncate',
             'general': 'truncate', 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
-                                   owner_send_index=1, llm=None, model='test', registry=registry)
+            owner_send_index=1, llm=None, model='test', registry=registry)
         await engine.start()
-        record = {'task_id': 'job', 'tool': 'bash', 'args': {'command': 'x' * 2000,
-                  'description': 'background check'}, 'result': 'y' * 3000, 'status': 'completed'}
-        await store.set_runtime_state(sid, record_key('job'), record)
-        wrapped = ToolSource(sid, 1, 5, 'check', 'background_run', {'action': 'check'}, encode_results([record]))
+        wrapped = ToolSource(sid,1,row.seq,'background','defer_work',{},encode_results([record]))
         text = await engine.distill(wrapped, 'insend_fuse')
-        assert 'background check' in text and 'recall_send' in text
-        assert 'x' * 201 not in text and 'y' * 301 not in text
-        record['args']['context_policy'] = 'keep'
-        await store.set_runtime_state(sid, record_key('job'), record)
-        assert await engine.distill(wrapped, 'insend_fuse') is None
+        if keep:
+            assert text is None
+        else:
+            assert text is not None and 'recall_send' in text
+            assert 'x' * 201 not in text and 'y' * 301 not in text
         assert await engine.distill(wrapped, 'general') is not None
+        assert 'y' * 3000 in (await load_record(store,sid,ref.job_id))['result']
     finally:
+        await runner.aclose()
         await store.close()
 
 

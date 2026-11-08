@@ -29,7 +29,7 @@ from .tool_contracts import background_allowed, validate_registration
 
 
 async def create(loop, name, arguments, *, command=False, automatic=False):
-    from power_loop.tools.registry import async_capable_for
+    from power_loop.tools.registry import async_capable_actions, async_capable_for
 
     from .tool_call_plans import registration_value
     binding, actor = await tool_actor(loop)
@@ -39,7 +39,20 @@ async def create(loop, name, arguments, *, command=False, automatic=False):
     if registered is None or allowed is not None and name not in allowed:
         raise RuntimeRequestError("forbidden", "background target is outside the tool grant")
     if not background_allowed(registered) or (not command and not automatic and not async_capable_for(registered.definition, arguments)):
-        raise RuntimeRequestError("invalid_options", "tool does not allow background execution")
+        choices = []
+        for definition in registry.definitions():
+            candidate = registry.get(definition.name)
+            if definition.name == "background_run" or not background_allowed(candidate):
+                continue
+            if allowed is not None and definition.name not in allowed:
+                continue
+            actions = async_capable_actions(definition)
+            if actions:
+                choices.append(definition.name + "(" + "/".join(sorted(actions)) + ")")
+            elif async_capable_for(definition, {}):
+                choices.append(definition.name)
+        raise RuntimeRequestError("invalid_options", f"tool does not allow background execution: {name} 不能后台跑：没有声明可以后台跑（可能有副作用）。"
+            f"直接调用 {name} 就行。可以后台跑的是：" + ", ".join(sorted(choices)))
     registry._raise_if_invalid(name, arguments)
     validate_registration(registry, name, registered)
     descriptor = loop._runtime_worker_context.descriptor

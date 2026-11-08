@@ -5,7 +5,6 @@ from dataclasses import asdict, replace
 import pytest
 
 from power_loop import AgentEvent, AgentEventType, LlmResponseReceivedPayload
-from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.jobs import JobError
 from power_loop.runtime.response_capture import ModelResponseCapture, ResponseCaptureReceipt, record
@@ -28,7 +27,7 @@ async def test_capture_precedes_observation_and_is_bound_before_dispatch(budget_
     c = budget_case
     seen = []
     async def capture(packet):
-        assert await attempts._read(c.manager, c.manager.db, 'finished', packet.grant.attempt_id, required=False) is None
+        assert c.host.apply_calls == 0
         state = await budgets.get_budget(c.manager, c.actor, packet.grant.attempt_id)
         assert state['phase'] == 'dispatch_authorized' and state['observation'] is None
         assert packet.context == state['context'] and asdict(packet.grant) == state['grant']
@@ -175,13 +174,12 @@ async def test_new_event_precedes_capture_and_cannot_change_actual_observation(e
             raise failure('observer is not authority')
     async def capture(packet):
         order.append('capture')
-        assert await attempts._read(c.manager, c.manager.db, 'finished', packet.grant.attempt_id, required=False) is None
+        assert c.host.apply_calls == 0
         assert packet.usage['total_tokens'] == 10
         return receipt(packet)
     c.host.capture_response = capture
-    c.loop.event_bus.subscribe(AgentEventType.LLM_RESPONSE_RECEIVED, observer)
-    sid = await c.loop.new_session()
-    await c.loop.send('Reply 42', sid)
+    c.bus.subscribe(AgentEventType.LLM_RESPONSE_RECEIVED, observer)
+    await c.loop.send('Reply 42')
     assert order == ['event', 'capture'] and c.model.calls == c.host.apply_calls == 1
     [done] = [e for e in c.events if e.type == AgentEventType.LLM_CALL_COMPLETED]
     assert done.data.total_tokens == 10 and done.data.model_attempt_id
@@ -193,13 +191,12 @@ async def test_no_response_event_or_capture_on_supplier_error(event_case):
     async def forbidden(_):
         pytest.fail('No complete response was received')
     c.host.capture_response = forbidden
-    sid = await c.loop.new_session()
-    await c.loop.send('Reply 42', sid)
+    await c.loop.send('Reply 42')
     assert not [e for e in c.events if e.type == AgentEventType.LLM_RESPONSE_RECEIVED]
     assert c.model.calls == 1
 
 
-@pytest.mark.parametrize('event_case', ['legacy', 'tracked', 'budget'], indirect=True)
+@pytest.mark.parametrize('event_case', ['tracked', 'budget'], indirect=True)
 @pytest.mark.parametrize('kind', [AgentEventType.LLM_CALL_COMPLETED, AgentEventType.STREAM_COMPLETED])
 async def test_post_response_subscriber_failure_never_retries_physical_call(event_case, kind):
     from power_loop.runtime.retry import LLMRetryPolicy
@@ -207,8 +204,8 @@ async def test_post_response_subscriber_failure_never_retries_physical_call(even
     c.loop.config.retry_policy = LLMRetryPolicy(max_attempts=3)
     def broken(event):
         raise RuntimeError('post-response telemetry failed')
-    c.loop.event_bus.subscribe(kind, broken)
-    await c.loop.send('Reply 42', await c.loop.new_session())
+    c.bus.subscribe(kind, broken)
+    await c.loop.send('Reply 42')
     assert c.model.calls == 1
 
 
@@ -261,7 +258,7 @@ async def test_pipeline_event_and_capture_keep_missing_provider_usage_unknown(ev
         return receipt(packet)
     monkeypatch.setattr(c.model, 'complete', missing)
     c.host.capture_response = capture
-    await c.loop.send('Reply 42', await c.loop.new_session())
+    await c.loop.send('Reply 42')
     [early] = [e for e in c.events if e.type == AgentEventType.LLM_RESPONSE_RECEIVED]
     [done] = [e for e in c.events if e.type == AgentEventType.LLM_CALL_COMPLETED]
     assert early.data.usage == seen[0].usage == {}

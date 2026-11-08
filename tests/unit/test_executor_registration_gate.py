@@ -187,7 +187,7 @@ async def test_a_later_registered_boot_revokes_unregistered_admission_without_a_
     with pytest.raises(JobError, match='executor_prior_execution_unsettled'):
         await registry.activate(c.manager, fresh, expected_version=1, system_key='startup')
     with pytest.raises(JobError, match='executor_registration_required'):
-        await c.manager.renew_execution(c.actor, lease)
+        await c.manager.check_execution(c.actor, lease)
     await c.manager.close_model_execution(c.actor, lease, evidence={'exit':'cancelled'}, resource_state='stopped')
     accepted = await registry.activate(c.manager, fresh, expected_version=1, system_key='startup')
     assert accepted['executor']['state'] == 'accepting'

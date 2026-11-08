@@ -31,15 +31,19 @@ async def audit(registry_store, tmp_path):
     store, connect = registry_store
     sid = await store.create_session()
     manager, actor = JobManager(store), JobActor("history", "host", sid)
-    reg = await manager.register_job(actor, kind="send", session_id=sid, system_key="original-send", request={"send_index": 1})
-    await manager.claim_job(actor, reg.job.job_id, executor_id="executor", boot_id="boot", expected_version=1)
-    await store.append_message(sid, role="user", content="原请求", send_index=1)
+    reg = await manager.register_job(actor, kind="send", session_id=sid, system_key="original-send", request={"input_ref": {"store_id": store.store_id, "session_id": sid, "message_id": "history-input"}})
+    lease = await manager.claim_job(actor, reg.job.job_id, executor_id="executor", boot_id="boot", expected_version=1)
+    await store.inbox_put(sid, [{"item_id": "history-input", "content": "原请求"}])
+    claimed = await store.inbox_claim(sid)
+    await store.append_message(sid, role="user", content="原请求", send_index=1, inbox={"claim_token": claimed[0]["claim_token"], "ids": [claimed[0]["id"]]})
     await store.append_message(sid, role="assistant", content="ORIGINAL-42", send_index=1)
     await store.append_message(sid, role="tool", name="saved", content="SAVED-RESULT", tool_call_id="saved-call", send_index=1)
     await store.append_message(sid, role="user", content="FUTURE-PRIVATE", send_index=2)
     await store.upsert_project_message(sid, send_index=1, kind="user", content={"text": "原请求"})
     await store.upsert_project_message(sid, send_index=1, kind="project", content={"text": "SUMMARY-42"}, source_seq_lo=1, source_seq_hi=3)
     await store.upsert_project_message(sid, send_index=1, kind="compact", content={"text": "COMPACT-PRIVATE"}, compact_from_send=1, compact_to_send=2)
+    await manager.close_model_execution(actor, lease)
+    await manager.finalize_supervision(actor, reg.job.job_id, generation=lease.generation)
     other = await store.create_session()
     await store.append_message(other, role="user", content="OTHER-PRIVATE", send_index=1)
     return SimpleNamespace(store=store, manager=manager, actor=actor, job=reg.job.job_id, sid=sid, other=other,
@@ -267,11 +271,13 @@ async def test_deleted_session_is_unavailable_not_an_empty_successful_export(aud
     c = audit
     page = await read(c, limit=1)
     await c.store.close_session(c.sid)
-    deleted = await read(c, cursor=page["next_cursor"])
-    assert deleted["status"] == "unavailable" and deleted["reason"] == "session_deleted"
+    with pytest.raises(JobError, match="access_denied"):
+        await read(c, cursor=page["next_cursor"])
     with runtime_env_context(RuntimeEnv(workspace_dir=c.workspace)):
-        result = await read(c, output_file="deleted.jsonl")
-    assert result["status"] == "unavailable" and not (c.workspace/"deleted.jsonl").exists()
+        with pytest.raises(JobError, match="access_denied"):
+            await read(c, output_file="deleted.jsonl")
+    assert not (c.workspace/"deleted.jsonl").exists()
+
 
 
 async def test_export_receipt_budget_is_checked_before_publishing_any_file(audit):

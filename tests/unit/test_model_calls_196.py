@@ -23,5 +23,5 @@ async def test_auxiliary_call_uses_normal_llm_accounting(fold_case):
         _SEND.reset(token)
     assert response.raw_text == '<summary>folded</summary>' and model.calls == 1
     prepared, = await _prepared(c)
-    assert 'purpose' not in prepared
+    assert prepared['purpose'] is None
     assert c.host.purposes == [None] and c.host.reserve_calls == c.host.apply_calls == 1

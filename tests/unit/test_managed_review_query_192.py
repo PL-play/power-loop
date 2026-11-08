@@ -6,6 +6,7 @@ from power_loop.runtime.pending_calls import retire_pending_runtime
 from power_loop.runtime.tool_call_plans import reconcile_pending
 
 from .test_job_registry_192 import registry_store
+from .test_managed_delivery_192 import consume_queued
 from .test_managed_effects_192 import scenario
 from .test_tool_call_plans_192 import controller
 
@@ -17,7 +18,7 @@ async def test_closed_unstarted_intent_is_not_a_permanent_active_job(registry_st
     c = await scenario(registry_store, claim_failure=True)
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     listing = await task_query.list_jobs(c.manager, c.actor, root_job_id=row['parent_job_id'], status='active')
-    assert listing['matched_count'] == 0
+    assert listing['matched_count'] == 0, str([(n['kind'], n.get('active_reason'), n.get('processing_obligation')) for n in listing['nodes']])
     details = await task_query.get_job(c.manager, c.actor, row['job_id'])
     assert details['node']['processing_obligation']['state'] == 'not_required'
     assert details['node']['active_reason'] == []
@@ -40,9 +41,10 @@ async def test_recovered_negative_review_is_visible_until_real_main_processing_a
         assert details['node']['processing_obligation']['notice_event_id']
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
         assert reviewer.calls == 0
-        await loop.send('Read both original outcomes without performing actions.', c.sid)
+        result = await consume_queued(loop)
+        assert result.status == 'completed'
         listing = await task_query.list_jobs(c.manager, c.actor, root_job_id=source_id, status='active')
-        assert listing['matched_count'] == 0
+        assert listing['matched_count'] == 0, str([(n['kind'], n.get('active_reason'), n.get('processing_obligation')) for n in listing['nodes']])
         details = await task_query.get_job(c.manager, c.actor, negative['job_id'])
         assert details['node']['processing_obligation']['state'] == 'handled' and details['node']['active_reason'] == []
         assert details['node']['result_status'] == 'suppressed'
@@ -57,4 +59,24 @@ async def test_recovered_negative_review_is_visible_until_real_main_processing_a
     finally:
         for row in deleted:
             await c.manager.db.execute(f"INSERT INTO {c.manager.events} ("+','.join(row)+") VALUES ("+','.join('?' for _ in row)+")", tuple(row.values()))
-        await loop.aclose(drain_timeout_s=.1)
+        await loop.aclose()
+
+
+@pytest.mark.parametrize('failure', ['hidden', 'model_error'])
+async def test_unprocessed_negative_notice_keeps_review_pending(registry_store, failure):
+    from .test_managed_delivery_192 import controller as review_controller
+    c = await scenario(registry_store, raw_receipt_failure=True, call_count=2, budgeted=True)
+    jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool' ORDER BY generation DESC")
+    negative, source_id = jobs[1], jobs[0]['parent_job_id']
+    await reconcile_pending(c.runtime, c.actor, source_id)
+    await retire_pending_runtime(c.runtime, c.actor, source_id)
+    loop, reviewer = await review_controller(c, sees=failure != 'hidden', fail=failure == 'model_error')
+    try:
+        result = await consume_queued(loop)
+        assert result.status == ('failed' if failure == 'model_error' else 'completed')
+        details = await task_query.get_job(c.manager, c.actor, negative['job_id'])
+        assert details['node']['processing_obligation']['state'] == 'pending'
+        assert details['node']['result_status'] == 'suppressed'
+        assert c.state.dispatched == 1 and reviewer.calls == 1
+    finally:
+        await loop.aclose()

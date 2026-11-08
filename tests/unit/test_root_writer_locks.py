@@ -57,7 +57,7 @@ async def test_actual_root_writer_blocks_its_tree_and_releases_unrelated_roots(r
     runtime = TaskRuntime(manager, tenant_id='root-lock', principal_id='host', executor_id='e', boot_id='b')
     binding = await runtime.claim(actors[0], roots[0])
     lease = binding.lease
-    child = await manager.register_job(actors[0], kind='subagent', parent=lease, system_key='child')
+    child = await manager.register_job(actors[0], kind='subagent', parent=lease, system_key='child', session_id=actors[0].session_id)
     if target == 'checkpoint':
         await model_attempts.enable(binding)
         control_runtime.current(binding).record('lifecycle', 'root-lock-proof', {'observed':True})
@@ -74,7 +74,7 @@ async def test_actual_root_writer_blocks_its_tree_and_releases_unrelated_roots(r
 
     async def mutate():
         if target == 'root':
-            await manager.renew_execution(actors[0], lease)
+            await manager.close_model_execution(actors[0], lease)
             return lease
         if target == 'checkpoint':
             await control_runtime.flush_binding(binding)

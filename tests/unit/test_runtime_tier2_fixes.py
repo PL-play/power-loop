@@ -1,7 +1,6 @@
 """Regression tests for Tier-2/3 runtime fixes:
 
-- C24: StoreBlackboard._locks is weak-valued, so per-board_id locks don't accumulate
-  forever in a long-lived process driving many distinct board ids.
+- C24: Independent blackboard objects atomically share and delete one board.
 - C16: LLMRetryPolicy.total_timeout bounds an IN-FLIGHT call, not just the gap between
   attempts — a hung call can't blow past the wall-clock budget.
 - C18: close_session(cascade) clears EVERY session-keyed table (guards against a future
@@ -11,14 +10,12 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import time
 
 import pytest
 
-from power_loop import CancellationToken, LLMRetryPolicy, SessionStore
+from power_loop import CancellationToken, LLMRetryPolicy, SessionStore, StoreBlackboard
 from power_loop.contracts.errors import LLMTimeout
-from power_loop.runtime.blackboard import StoreBlackboard
 from power_loop.runtime.retry import with_retry
 
 pytestmark = pytest.mark.unit
@@ -27,19 +24,18 @@ pytestmark = pytest.mark.unit
 # ── C24: blackboard locks are weakly bounded ─────────────────────────────────
 
 
-def test_blackboard_locks_do_not_accumulate() -> None:
-    bb = StoreBlackboard(store=None)  # _lock() does not touch the store
-
-    # same id returns the same lock while it is referenced (mutual exclusion holds)
-    held = bb._lock("x")
-    assert bb._lock("x") is held
-
-    # many distinct, unheld board ids must NOT pile up forever
-    for i in range(500):
-        bb._lock(f"board-{i}")  # result not retained → collectible
-    del held
-    gc.collect()
-    assert len(bb._locks) < 50  # was ~500 (an unbounded plain dict)
+async def test_blackboard_instances_share_atomic_updates_and_release_scope() -> None:
+    store = await SessionStore.open(":memory:")
+    try:
+        first, second = StoreBlackboard(store), StoreBlackboard(store)
+        entries = await asyncio.gather(*(board.post("shared", text=str(i))
+            for i, board in enumerate([first, second] * 10)))
+        assert len({e.id for e in entries}) == 20
+        assert {e.text for e in await second.read("shared")} == {str(i) for i in range(20)}
+        await first.delete("shared")
+        assert await second.read("shared") == []
+    finally:
+        await store.close()
 
 
 # ── C16: total_timeout bounds an in-flight call ──────────────────────────────
@@ -69,59 +65,19 @@ async def test_total_timeout_allows_a_fast_call() -> None:
 # ── C18: close_session clears every session-keyed table ──────────────────────
 
 
-def _dummy(coltype: str):
-    t = (coltype or "").upper()
-    if "INT" in t:
-        return 0
-    if "REAL" in t or "FLOA" in t or "DOUB" in t:
-        return 0.0
-    return "x"
-
-
-async def test_close_session_clears_every_session_keyed_table() -> None:
+async def test_close_session_clears_normal_descendant_resources() -> None:
     store = await SessionStore.open(":memory:")
     try:
-        db = store._db
-        messages_table = f"{store.table_prefix}messages"
-        all_tables = [r["name"] for r in await db.fetchall(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
-        session_tables = []
-        for t in all_tables:
-            cols = await db.fetchall(f"PRAGMA table_info({t})")  # noqa: S608 (schema names)
-            if any(c["name"] == "session_id" for c in cols):
-                session_tables.append((t, cols))
-        assert {t for t, _ in session_tables}  # sanity: there ARE session-keyed tables
-
-        sid = await store.create_session()  # also creates a session_state row
-        for t, cols in session_tables:
-            have = (await db.fetchone(f"SELECT COUNT(*) AS c FROM {t} WHERE session_id=?", (sid,)))["c"]  # noqa: S608
-            if have:
-                continue
-            if t == messages_table:
-                await store.append_message(sid, role="user", content="m", round_index=0)
-                continue
-            names, vals = ["session_id"], [sid]
-            for c in cols:
-                name, ctype, notnull, dflt = c["name"], c["type"], c["notnull"], c["dflt_value"]
-                if name == "session_id":
-                    continue
-                if notnull and dflt is None:
-                    names.append(name)
-                    vals.append(_dummy(ctype))
-            ph = ",".join("?" * len(names))
-            async with db.transaction() as tx:
-                await tx.execute(f"INSERT INTO {t} ({','.join(names)}) VALUES ({ph})", vals)  # noqa: S608
-
-        # every session-keyed table is seeded for sid
-        for t, _ in session_tables:
-            n = (await db.fetchone(f"SELECT COUNT(*) AS c FROM {t} WHERE session_id=?", (sid,)))["c"]  # noqa: S608
-            assert n > 0, f"failed to seed {t}"
-
+        sid = await store.create_session()
+        child = await store.create_session(parent_session_id=sid)
+        for target in (sid, child):
+            await store.append_message(target, role="user", content="retained history")
+            await store.add_note(target, "note")
+            await store.set_runtime_state(target, "resource", {"value": 1})
+            await store.create_timer(target, due_at=2**50, note="future")
         await store.close_session(sid, cascade=True)
-
-        # close_session must have cleared EVERY session-keyed table
-        for t, _ in session_tables:
-            n = (await db.fetchone(f"SELECT COUNT(*) AS c FROM {t} WHERE session_id=?", (sid,)))["c"]  # noqa: S608
-            assert n == 0, f"close_session left rows in {t} — add it to _delete_session_tree"
+        for table in (store.t.sessions, store.t.messages, store.t.notes,
+                      store.t.session_runtime_state, store.t.timers):
+            assert not await store._db.fetchall(f"SELECT * FROM {table} WHERE session_id IN (?,?)", (sid, child))
     finally:
         await store.close()
