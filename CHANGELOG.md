@@ -1,5 +1,26 @@
 # Changelog
 
+## [12.0.0] - 2026-11-09
+
+### Breaking Changes
+- **Removed `request_user_input` and waiting mechanism**: This feature had 0 definitions and 0 calls in production (design/93). The `request_user_input` tool, `HumanInputRequired` exception, `waiting` status, and `answer()` method have been removed. SQL #2 no longer includes the `waiting` NOT EXISTS subquery.
+- **Removed from STABLE_API**: `request_user_input`, `HumanInputRequired`, `answer`
+
+### Added
+- **`submit()` smart dispatch**: Automatically chooses `send` (no active job) or `append` (active job), eliminating manual operation判断
+- **`priority()` message primitive**: High-priority message delivery (replaces `steer` as pure message primitive without control side effects)
+- **Control primitives**: `stop(job_id)` and `cancel(job_id, clear_queue=True)` for task control independent of messages
+- **Status query interfaces**: `get_session_status()`, `get_job_status()`, `list_jobs()` - hosts no longer need raw SQL queries
+- **Host cleanup documentation**: README now includes `purge_expired()` usage example
+
+### Changed
+- **`steer()` deprecated**: Use `priority()` instead (steer remains as alias for backward compatibility)
+- **`jobs` tool now reuses host interface core**: Ensures semantic consistency between tool calls and direct API usage
+
+### Performance
+- **SQL #2 simplified**: Removed waiting NOT EXISTS subquery (-1 SQL per send, -52 characters, -1 parameter)
+- **submit() cost**: +1 SELECT to check owner_token (only when submit is called)
+
 ## 11.0.0 — Design 203 (source delivery; not published)
 
 - P7B: consuming an unstarted ManagedTool outcome closes its review notification

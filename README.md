@@ -1,4 +1,4 @@
-# power-loop 11.0.0
+# power-loop 12.0.0
 
 An embeddable agent runtime. Main agents, children, background work and workflows
 use one ID-addressed client/worker execution path. The default composition is
