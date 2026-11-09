@@ -22,7 +22,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -325,15 +325,22 @@ class SessionStore:
 
     # ── maintenance (optional capability; no-op on backends that lack it) ──────
     async def purge_expired(self, now: int, *, limit: int = 1000,
-                            retention_days: dict[str, float] | None = None) -> dict[str, int]:
-        """Trusted-host retention; UTC milliseconds, at most 1000 rows per delete.
+                            retention_days: dict[str, float] | None = None,
+                            session_id: str | None = None, job_id: str | None = None,
+                            categories: Iterable[str] | None = None) -> dict[str, int]:
+        """Trusted-host retention; UTC milliseconds, at most ``limit`` (1..1000) rows per call.
 
         Defaults in days: task_trees/runtime/hooks 30, executors 1,
-        follow_ups/timers 7, usage 90. Override individual categories by name.
+        follow_ups/timers 7, usage 90. Override individual categories by name;
+        ``categories`` restricts the call to those names. ``session_id`` keeps
+        only that session's rows and task trees rooted there; ``job_id`` keeps
+        only the task tree containing that job. A task tree (its jobs and job
+        events) is removed only after every job in it has finished.
         Messages and cumulative usage totals are retained.
         """
         from .retention import purge_expired
-        return await purge_expired(self, now, limit=limit, retention_days=retention_days)
+        return await purge_expired(self, now, limit=limit, retention_days=retention_days,
+                                   session_id=session_id, job_id=job_id, categories=categories)
 
     async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
         if isinstance(self._db, Maintenance):

@@ -168,41 +168,62 @@ async def delete_tree(store, tx, root_id, limit, counts):
     return True
 
 
-async def purge_expired(store, now, *, limit, retention_days):
+async def purge_expired(store, now, *, limit, retention_days, session_id=None, job_id=None, categories=None):
     remaining = batch_limit(limit)
     days = {**DEFAULT_DAYS, **(retention_days or {})}
     if days.keys() != DEFAULT_DAYS.keys() or any(type(v) not in (int, float) or v < 0 for v in days.values()):
         raise ValueError('invalid retention days')
+    wanted = set(DEFAULT_DAYS if categories is None else categories)
+    if not wanted <= DEFAULT_DAYS.keys():
+        raise ValueError('unknown retention category')
     cutoff = {key: int(now-value*DAY_MS) for key, value in days.items()}
     counts = {}
+    p = store.table_prefix
+    root_filter, root_params = '', ()
+    if job_id is not None:
+        # A job selects its whole tree; trees are only removed once fully finished.
+        row = await store._db.fetchone(f'SELECT root_job_id FROM {p}jobs WHERE job_id=?', (job_id,))
+        if row is None:
+            return counts
+        root_filter, root_params = ' AND job_id=?', (row['root_job_id'] or job_id,)
+        wanted &= {'task_trees'}
+    elif session_id is not None:
+        root_filter, root_params = ' AND session_id=?', (session_id,)
+        wanted -= {'executors', 'runtime'}
+    scope, scope_params = (' AND session_id=?', (session_id,)) if session_id is not None else ('', ())
     async with store._db.transaction() as tx:
         ordinary = (f' AND NOT EXISTS (SELECT 1 FROM {store.table_prefix}jobs j '
                     f'WHERE (j.job_id={store.t.follow_up_queue}.delivered_job_id '
                     f'OR j.job_id={store.t.follow_up_queue}.target_job_id) '
                     "AND (j.supervision_status<>'closed' OR j.resource_state<>'stopped'))") if store.has_message_ids else ''
-        for category, table, keys, where, params, order in (
-            ('follow_up_queue', store.t.follow_up_queue, ('id',),
+        for category, age, table, keys, where, params, order in (
+            ('follow_up_queue', 'follow_ups', store.t.follow_up_queue, ('id',),
              "status IN ('delivered','void') AND created_at<? AND (delivered_at IS NULL OR delivered_at<?)"+ordinary,
              (cutoff['follow_ups'], cutoff['follow_ups']), 'created_at,id'),
-            ('hook_events', store.t.hook_events, ('session_id','event_id'), 'created_at<?',
+            ('hook_events', 'hooks', store.t.hook_events, ('session_id','event_id'), 'created_at<?',
              (cutoff['hooks'],), 'created_at,session_id,event_id')):
-            counts[category] = await delete_batch(tx, table, keys, where, params, remaining, order=order)
-            remaining -= counts[category]
+            if age in wanted:
+                counts[category] = await delete_batch(tx, table, keys, where+scope, (*params, *scope_params),
+                                                      remaining, order=order)
+                remaining -= counts[category]
     for category, prune, age in (('timers', store.prune_timers, 'timers'),
                                  ('usage_rounds', store.prune_usage_rounds, 'usage')):
         if not remaining:
             return counts
-        counts[category] = await prune(None, older_than_ms=int(now-cutoff[age]), now=now, limit=remaining)
-        remaining -= counts[category]
+        if age in wanted:
+            counts[category] = await prune(session_id, older_than_ms=int(now-cutoff[age]), now=now, limit=remaining)
+            remaining -= counts[category]
     if not store.has_message_ids or not remaining:
         return counts
-    p = store.table_prefix
     runtime_ref = runtime_tree_condition(store).replace('j.root_job_id=?', 'j.root_job_id=root.job_id')
-    roots = await store._db.fetchall(f'SELECT job_id FROM {p}jobs root WHERE '
-        +ready_condition(p)+f' AND parent_job_id IS NULL AND updated_at<? AND NOT EXISTS ('
-        f'SELECT 1 FROM {store.t.session_runtime_state} WHERE updated_at>=? AND {runtime_ref}) '
-        'ORDER BY updated_at,job_id LIMIT ?',
-        (min(cutoff['task_trees'], cutoff['runtime']), cutoff['runtime'], remaining))
+    if 'task_trees' not in wanted:
+        roots = []
+    else:
+        roots = await store._db.fetchall(f'SELECT job_id FROM {p}jobs root WHERE '
+            +ready_condition(p)+f' AND parent_job_id IS NULL{root_filter} AND updated_at<? AND NOT EXISTS ('
+            f'SELECT 1 FROM {store.t.session_runtime_state} WHERE updated_at>=? AND {runtime_ref}) '
+            'ORDER BY updated_at,job_id LIMIT ?',
+            (*root_params, min(cutoff['task_trees'], cutoff['runtime']), cutoff['runtime'], remaining))
     for candidate in roots:
         if not remaining:
             return counts
@@ -219,30 +240,38 @@ async def purge_expired(store, now, *, limit, retention_days):
                 remaining -= sum(v for k, v in counts.items() if k != 'task_trees')-before
     if not remaining:
         return counts
-    unreferenced = f'NOT EXISTS (SELECT 1 FROM {p}jobs j WHERE j.executor_key={p}task_executors.executor_key)'
-    candidates = await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
-        f"WHERE state='draining' AND updated_at<? AND {unreferenced} ORDER BY updated_at LIMIT ?",
-        (cutoff['executors'], remaining))
-    candidates += await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
-        f'WHERE lease_until_ms<? AND {unreferenced} ORDER BY lease_until_ms LIMIT ?', (cutoff['executors'], remaining))
-    for key in sorted({row['executor_key'] for row in candidates}):
-        if not remaining:
-            break
-        async with store._db.transaction() as tx:
-            suffix = '' if store._db.dialect.name == 'sqlite' else ' FOR UPDATE'
-            row = await tx.fetchone(f'SELECT * FROM {p}task_executors WHERE executor_key=?'+suffix, (key,))
-            if row is None or not (row['lease_until_ms'] < cutoff['executors'] or
-                                  row['state'] == 'draining' and row['updated_at'] < cutoff['executors']):
-                continue
-            if await tx.fetchone(f'SELECT job_id FROM {p}jobs WHERE executor_key=? LIMIT 1', (key,)):
-                continue
-            deleted = await delete_batch(tx, p+'task_executor_events', ('event_id',), 'executor_key=?', (key,), remaining)
-            counts['task_executor_events'] = counts.get('task_executor_events', 0)+deleted
-            remaining -= deleted
-            if remaining:
-                deleted = await tx.execute(f'DELETE FROM {p}task_executors WHERE executor_key=?', (key,))
-                counts['task_executors'] = counts.get('task_executors', 0)+deleted
+    if 'executors' in wanted:
+        unreferenced = f'NOT EXISTS (SELECT 1 FROM {p}jobs j WHERE j.executor_key={p}task_executors.executor_key)'
+        candidates = await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
+            f"WHERE state='draining' AND updated_at<? AND {unreferenced} ORDER BY updated_at LIMIT ?",
+            (cutoff['executors'], remaining))
+        candidates += await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
+            f'WHERE lease_until_ms<? AND {unreferenced} ORDER BY lease_until_ms LIMIT ?', (cutoff['executors'], remaining))
+        for key in sorted({row['executor_key'] for row in candidates}):
+            if not remaining:
+                break
+            async with store._db.transaction() as tx:
+                suffix = '' if store._db.dialect.name == 'sqlite' else ' FOR UPDATE'
+                row = await tx.fetchone(f'SELECT * FROM {p}task_executors WHERE executor_key=?'+suffix, (key,))
+                if row is None or not (row['lease_until_ms'] < cutoff['executors'] or
+                                      row['state'] == 'draining' and row['updated_at'] < cutoff['executors']):
+                    continue
+                if await tx.fetchone(f'SELECT job_id FROM {p}jobs WHERE executor_key=? LIMIT 1', (key,)):
+                    continue
+                deleted = await delete_batch(tx, p+'task_executor_events', ('event_id',), 'executor_key=?', (key,), remaining)
+                counts['task_executor_events'] = counts.get('task_executor_events', 0)+deleted
                 remaining -= deleted
+                if remaining:
+                    deleted = await tx.execute(f'DELETE FROM {p}task_executors WHERE executor_key=?', (key,))
+                    counts['task_executors'] = counts.get('task_executors', 0)+deleted
+                    remaining -= deleted
+    if 'runtime' in wanted:
+        await _descriptors(store, cutoff, remaining, counts)
+    return counts
+
+
+async def _descriptors(store, cutoff, remaining, counts):
+    p = store.table_prefix
     if remaining >= 2:
         table = store.t.sessions
         present = ("CAST(metadata_json AS jsonb)->'runtime_descriptor'" if store._db.dialect.name == 'postgres'
@@ -267,4 +296,3 @@ async def purge_expired(store, now, *, limit, retention_days):
                 count += await tx.execute(f'UPDATE {table} SET metadata_json={removed} WHERE session_id=?', (sid,))
                 counts['descriptor_rows'] = counts.get('descriptor_rows', 0)+count
                 remaining -= count
-    return counts

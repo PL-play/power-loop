@@ -226,6 +226,35 @@ async def test_batch_bound_and_session_delete_preserve_parent_tree(registry_stor
         await store.purge_expired(NOW, limit=1001)
 
 
+async def test_session_job_and_category_filters_limit_what_is_purged(registry_store):
+    store, _ = registry_store
+    db, p = store._db, store.table_prefix
+    a, a_sid, _ = await root(store, 'a')
+    b, b_sid, _ = await root(store, 'b')
+    c, _, _ = await root(store, 'c')
+    running, run_sid, _ = await root(store, 'running', ended=False)
+    for sid in (a_sid, b_sid):
+        await insert(db, store.t.follow_up_queue, session_id=sid, item_id='void', content='old',
+                     kind='user', mode='queue', status='void', created_at=OLD)
+
+    def trees():
+        return db.fetchall(f'SELECT job_id FROM {p}jobs WHERE parent_job_id IS NULL ORDER BY job_id')
+
+
+    assert (await store.purge_expired(NOW, job_id=running)) == {}
+    assert (await store.purge_expired(NOW, session_id=a_sid, categories=['follow_ups'])) == {'follow_up_queue': 1}
+    assert len(await trees()) == 4
+    assert (await store.purge_expired(NOW, job_id=b))['task_trees'] == 1
+    assert {r['job_id'] for r in await trees()} == {a, c, running}
+    assert await db.fetchone(f'SELECT id FROM {store.t.follow_up_queue} WHERE session_id=?', (b_sid,))
+    assert (await store.purge_expired(NOW, session_id=a_sid))['task_trees'] == 1
+    assert {r['job_id'] for r in await trees()} == {c, running}
+    assert not await db.fetchone(f'SELECT event_id FROM {p}job_events WHERE job_id IN (?,?)', (a, b))
+    assert (await store.purge_expired(NOW, job_id='missing')) == {}
+    with pytest.raises(ValueError, match='unknown retention category'):
+        await store.purge_expired(NOW, categories=['events'])
+
+
 async def test_purged_task_trees_do_not_reset_budget_policy_or_balances(registry_store):
     store, connect = registry_store
     await _measure(store, 1, True)

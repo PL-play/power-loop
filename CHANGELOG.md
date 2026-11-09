@@ -16,6 +16,8 @@
 - A stopped child reports to its parent by default; `cancel(..., notify_parent=False)`
   stops quietly. A workflow node stopped from outside (while the workflow keeps running)
   immediately sends a `[workflow_node_cancelled]` notice to the owning agent.
+- `SessionStore.purge_expired` accepts `session_id`, `job_id` and `categories` filters;
+  task trees (jobs and job events) are still removed only after the whole tree has finished.
 
 - P7B: consuming an unstarted ManagedTool outcome closes its review notification
   while preserving the original suppressed result; hidden or failed reviews stay pending.
