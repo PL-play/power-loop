@@ -1896,6 +1896,22 @@ class _ExecutionLoop:
         if pending.get("tool_call_ids") or pending.get("tool_calls"):
             await store.set_pending(sid, pending)
 
+    async def _waiting_result_if_needed(self, sid: str) -> StatefulResult | None:
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
+        if state is None or not state.pending:
+            return None
+        pending = state.pending
+        interactions = list(pending.get("pending_interactions") or [])
+        if not interactions:
+            return None
+        return StatefulResult(
+            session_id=sid,
+            status="waiting_for_input",
+            pending_tool_calls=list(pending.get("tool_calls") or []),
+            pending_interactions=interactions,
+        )
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
 

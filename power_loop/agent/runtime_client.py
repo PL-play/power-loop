@@ -53,37 +53,14 @@ class RuntimeClient:
             options=plain(options or RequestOptions()), expires_at_ms=deadline_ms), actor=actor, descriptor=descriptor)
 
     async def append(self, target, body, *, message_id, actor, deadline_ms=None):
-        return await self._submit_internal(Command(message_id, target, "append", {"body": body}, "append",
+        return await self.submit(Command(message_id, target, "append", {"body": body}, "append",
                                          expires_at_ms=deadline_ms), actor=actor)
-
-    async def submit(self, target, body, *, message_id, actor, options=None, deadline_ms=None):
-        """Smart dispatch: automatically chooses send (no active job) or append (active job).
-
-        Host does not need to judge operation type manually.
-        send and append semantics remain unchanged, submit just encapsulates the judgment logic.
-
-        Note: target must be TargetRef (session level), not JobRef.
-        """
-        if target.job_id is not None:
-            raise RuntimeRequestError("invalid_options", "submit targets a session")
-
-        state = await self.inputs.db.fetchone(
-            f"SELECT owner_token FROM {self.inputs.state} WHERE session_id=?",
-            (target.session_id,))
-        has_active = state is not None and state["owner_token"] is not None
-
-        if has_active:
-            return await self.append(target, body, message_id=message_id, actor=actor,
-                                     deadline_ms=deadline_ms)
-        else:
-            return await self.send(target, body, message_id=message_id, actor=actor,
-                                   options=options, deadline_ms=deadline_ms)
 
     async def _job_input(self, ref, operation, body, *, message_id, actor, deadline_ms=None):
         job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
         if ref.generation is None:
             raise RuntimeRequestError("stale_generation")
-        return await self._submit_internal(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
+        return await self.submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
             operation, {"body": body}, "control" if operation == "steer" else "append",
             expires_at_ms=deadline_ms, expected_job_generation=ref.generation), actor=actor)
 
@@ -91,50 +68,13 @@ class RuntimeClient:
         return await self._job_input(ref, "nudge", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
     async def steer(self, ref, body, *, message_id, actor, deadline_ms=None):
-        """Deprecated: use priority() instead.
-
-        High-priority message delivery. This is a message primitive without control side effects.
-        """
         return await self._job_input(ref, "steer", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
     async def answer(self, ref, *, interaction_id, wait_round, value, message_id, actor):
-        """Internal API for answering wait_review interactions. Not exposed in STABLE_API."""
         self._require_open()
         from power_loop.runtime.interactions import answer
         return await answer(self, ref, interaction_id=interaction_id, wait_round=wait_round,
                             value=value, message_id=message_id, actor=actor)
-
-    async def priority(self, target, body, *, message_id, actor, deadline_ms=None):
-        """High-priority message: arrives faster than append, can interrupt rounds waiting for tool results.
-
-        Pure message primitive, no control side effects. Does not stop any tasks or clear queues.
-        If you need to stop or cancel, use control primitives stop() or cancel().
-
-        Note: target can be TargetRef (session level) or JobRef (job level).
-        """
-        if target.job_id is not None:
-            # JobRef: delegate to steer (job-level steering)
-            return await self.steer(target, body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
-        else:
-            # TargetRef: need to get active job first
-            state = await self.inputs.db.fetchone(
-                f"SELECT owner_token FROM {self.inputs.state} WHERE session_id=?",
-                (target.session_id,))
-            if state is None or state["owner_token"] is None:
-                raise RuntimeRequestError("no_active_job", "priority requires an active job")
-
-            # Get the active job to create JobRef for steer
-            job = await self.inputs.db.fetchone(
-                f"SELECT job_id, generation FROM {self.inputs.jobs} "
-                "WHERE session_id=? AND status IN ('running','settling','model_closed') "
-                "ORDER BY created_at DESC LIMIT 1",
-                (target.session_id,))
-            if job is None:
-                raise RuntimeRequestError("no_active_job", "priority requires an active job")
-
-            from power_loop.agent.runtime_types import JobRef
-            job_ref = JobRef(target.store_id, job["job_id"], job["generation"])
-            return await self.steer(job_ref, body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
     async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None, options=None):
         if ref.generation is None or ref.generation == 0:
@@ -168,111 +108,12 @@ class RuntimeClient:
             expected_job_generation=ref.generation), actor=actor,
             descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
 
-    async def stop(self, job_id, *, actor, reason="Stopped by host", expected_generation=None):
-        """Stop task: request persistent cancellation of job and its supervised subtree.
-
-        Note: stop is a request, not immediate physical stop. acceptance != physical stop.
-        Can target main agent's job or subagent's job.
-        """
-        from power_loop.runtime import task_control
-        manager = self.inputs.store._task_manager
-        return await task_control.request_cancel(
-            manager, actor, job_id,
-            reason=reason, expected_generation=expected_generation,
-        )
-
-    async def cancel(self, job_id, *, actor, reason="Cancelled by host", clear_queue=False):
-        """Cancel task, optionally clearing pending messages in input_queue.
-
-        clear_queue=True: set status='void' for status='pending' AND mode='queue' messages
-        in the session, preventing stopped task from processing queued messages.
-
-        Use case: user clicks "stop" button and wants to completely stop, not process backlog.
-        """
-        result = await self.stop(job_id, actor=actor, reason=reason)
-        if clear_queue:
-            job = await self.inputs.db.fetchone(
-                f"SELECT session_id FROM {self.inputs.jobs} WHERE job_id=?",
-                (job_id,))
-            if job:
-                await self.inputs.db.execute(
-                    f"UPDATE {self.inputs.q} SET status='void' "
-                    "WHERE session_id=? AND status='pending' AND mode='queue'",
-                    (job["session_id"],))
-        return result
-
-    async def _query_session_core(self, session_id):
-        """Internal status query, shared by jobs tool and host interface."""
-        state = await self.inputs.db.fetchone(
-            f"SELECT lifecycle, owner_token, next_seq FROM {self.inputs.state} "
-            "WHERE session_id=?", (session_id,))
-        if state is None:
-            raise RuntimeRequestError("not_found")
-        active_job = await self.inputs.db.fetchone(
-            f"SELECT job_id, kind, status FROM {self.inputs.jobs} "
-            "WHERE session_id=? AND status IN ('running','settling','model_closed') "
-            "ORDER BY created_at DESC LIMIT 1", (session_id,))
-        pending_count = await self.inputs.db.fetchone(
-            f"SELECT COUNT(*) AS n FROM {self.inputs.q} "
-            "WHERE session_id=? AND status='pending'", (session_id,))
-        return {
-            "lifecycle": state["lifecycle"],
-            "has_active_job": active_job is not None,
-            "active_job_id": active_job["job_id"] if active_job else None,
-            "active_job_kind": active_job["kind"] if active_job else None,
-            "pending_count": int(pending_count["n"]) if pending_count else 0,
-        }
-
-    async def get_session_status(self, session_id, *, actor):
-        """Get session status. Host no longer needs raw SQL queries.
-
-        Returns:
-          lifecycle: open / closing / closed
-          has_active_job: bool
-          active_job_id: str | None
-          active_job_kind: send / subagent / workflow_node / ...
-          pending_count: int  # status='pending' in input_queue
-        """
-        await self.inputs.authorize(self.inputs.db, TargetRef(self.store.store_id, session_id), actor)
-        return await self._query_session_core(session_id)
-
-    async def get_job_status(self, job_id, *, actor):
-        """Get job status.
-
-        Returns:
-          job_id, kind, status, outcome, generation
-          cancel_requested: bool
-        """
-        from power_loop.agent.runtime_types import JobRef
-        job = await self.inputs.resolve_job(self.inputs.db, JobRef(self.store.store_id, job_id, None), actor)
-        return {
-            "job_id": job["job_id"],
-            "kind": job["kind"],
-            "status": job["status"],
-            "outcome": job["outcome"],
-            "generation": job["generation"],
-            "cancel_requested": job["cancel_requested_at"] is not None,
-        }
-
-    async def list_jobs(self, session_id, *, actor, status="active", kinds=None, limit=20):
-        """List jobs under the session.
-
-        status: active (running/settling/model_closed) / terminal (completed/cancelled) / all
-        kinds: filter by job types (send/subagent/workflow_node/...)
-        """
-        from power_loop.runtime import task_query
-        manager = self.inputs.store._task_manager
-        return await task_query.list_jobs(
-            manager, self.inputs._actor(actor, session_id),
-            status=status, kinds=kinds, limit=limit,
-        )
-
     async def workflow(self, target, spec, *, message_id, actor, descriptor=None, options=None):
         from power_loop.workflow.runner import submit
         return await submit(self, target, spec, message_id=message_id, actor=actor,
                             descriptor=descriptor, options=options)
 
-    async def _submit_internal(self, command, *, actor):
+    async def submit(self, command, *, actor):
         if command.operation in {"answer", "resume"}:
             raise RuntimeRequestError("invalid_options", command.operation + " requires its dedicated control port")
         if command.operation == "cancel":

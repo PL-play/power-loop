@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "12.0.0"
+__version__ = "11.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -206,7 +206,7 @@ from power_loop.runtime.fold import (
     LLMSummaryFold,
     NoteOp,
 )
-from power_loop.runtime.human_input import HumanInputRequired
+from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import (
     MemoryProvider,
     MemoryRecallHook,
@@ -489,6 +489,8 @@ __all__ = [
 	"StoreBlackboard",
 	"render_entries",
 	"register_blackboard_tools",
+	"HumanInputRequired",
+	"request_user_input",
 	"LlmCallStartedPayload",
 	"LlmCallCompletedPayload",
 	"LlmResponseReceivedPayload",
