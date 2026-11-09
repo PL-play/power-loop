@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from power_loop.runtime.jobs import JobManager
 
-from .runtime_store import RuntimeInputStore, now_ms
+from .runtime_store import RuntimeInputStore, now_ms, quiet_cancel_event
 from .runtime_transport import SubscriptionSpec, TransportPacket
 from .runtime_types import (
     CapacityError,
@@ -173,10 +173,15 @@ class RuntimeClient:
                 success = False
         return success
 
-    async def cancel(self, ref, *, actor, scope="self", reason="cancelled"):
-        return await self._cancel(ref, actor=actor, scope=scope, reason=reason)
+    async def cancel(self, ref, *, actor, scope="self", reason="cancelled", notify_parent=True):
+        """Stop a job (or void an undelivered input).
 
-    async def _cancel(self, ref, *, actor, scope, reason, target=None):
+        A stopped child reports its cancelled result to its parent like a completion;
+        ``notify_parent=False`` suppresses that report for the job addressed here.
+        """
+        return await self._cancel(ref, actor=actor, scope=scope, reason=reason, notify_parent=notify_parent)
+
+    async def _cancel(self, ref, *, actor, scope, reason, target=None, notify_parent=True):
         self._require_open()
         if scope not in {"self", "subtree"}:
             raise RuntimeRequestError("invalid_options")
@@ -222,6 +227,10 @@ class RuntimeClient:
                         f"UPDATE {manager.jobs} SET cancel_requested_at=?,cancel_reason=?,intake='closed',version=version+1 "
                         "WHERE job_id=? AND generation=? AND version=?",
                         (now_ms(), reason, job_ref.job_id, job_ref.generation, row["version"]))
+                    if not notify_parent:
+                        await tx.append_event(("event_id", "job_id", "event_type", "job_version", "payload_json",
+                            "delivery_status", "created_at"), (quiet_cancel_event(job_ref.job_id), job_ref.job_id,
+                            "cancel_quiet", row["version"] + 1, "{}", "none", now_ms()), ignore=True)
                     if job_ref.generation == 0:
                         await tx.write_job(job_ref.job_id,
                             f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',resource_state='stopped',"

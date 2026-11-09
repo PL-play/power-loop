@@ -390,6 +390,12 @@ class DurableExecutor:
                 (reference["job_id"], reference["generation"]),
                 obligations=True,
             )
+            owner = (await self._node_stopped_notice(tx, request.node_path, result)
+                     if result.status == "cancelled" else None)
+        if owner is not None:
+            from power_loop.runtime.result_notices import notify
+
+            await notify(self.worker.runtime.client, *owner)
         from power_loop.runtime.finalization import try_finalize
 
         await try_finalize(self.manager, origin, result.job_ref.job_id, result.job_ref.generation)
@@ -408,6 +414,26 @@ class DurableExecutor:
                 else raw["usage"]
             ),
         }
+
+    async def _node_stopped_notice(self, tx, node, result):
+        """Tell the workflow's owner at once that a node was stopped from outside the graph."""
+        from power_loop.agent.runtime_store import quiet_cancel_event
+        from power_loop.runtime.result_notices import accept
+
+        workflow = await self.manager._row(tx, self.binding.lease.job_id)
+        if workflow["cancel_requested_at"] is not None or workflow["parent_job_id"] is None:
+            return None
+        if await tx.fetchone(f"SELECT 1 AS quiet FROM {self.port.events} WHERE event_id=?",
+                             (quiet_cancel_event(result.job_ref.job_id),)):
+            return None
+        stopped = await self.manager._row(tx, result.job_ref.job_id)
+        main = await self.manager._row(tx, workflow["parent_job_id"])
+        actor = JobActor(main["tenant_id"], main["principal_id"], main["session_id"])
+        key = f"node_stopped_{result.job_ref.job_id}_{result.job_ref.generation}"
+        body = "[workflow_node_cancelled]\n" + canonical({"workflow_run_id": self.run_id, "node": node,
+            "job_id": result.job_ref.job_id, "reason": stopped["cancel_reason"]})
+        await accept(self.manager, tx, actor, main["job_id"], key, "task_notice", body)
+        return actor, key
 
     async def todo_remaining(self, sid):
         state = await self.port.store.get_runtime_state(sid, "todo") or {}

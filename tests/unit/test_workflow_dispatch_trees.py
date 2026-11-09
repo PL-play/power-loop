@@ -109,3 +109,58 @@ async def test_timeout_closes_dispatch_and_cannot_be_reset_by_resume(registry_st
         assert all(n["title"] == "A" for n in nodes)
     finally:
         await runner.aclose()
+
+
+@pytest.mark.parametrize("notify", [True, False])
+async def test_stopped_node_of_agent_workflow_notifies_owner_at_once(registry_store, tmp_path, notify):
+    import asyncio
+    import json
+
+    from power_loop import LLMResponse
+    from power_loop.agent.runtime_types import JobRef
+    from power_loop.tools import create_default_tool_registry
+    from power_loop.workflow import register_workflow_tool
+
+    store, _ = registry_store
+    entered, finish_b = asyncio.Event(), asyncio.Event()
+
+    class Parent(Model):
+        async def complete(self, request, **kwargs):
+            if request.system_prompt.startswith("A"):
+                entered.set()
+                await asyncio.Event().wait()
+            if request.system_prompt.startswith("B"):
+                await finish_b.wait()
+                return LLMResponse(raw_text="B done")
+            if not any(m.get("role") == "tool" for m in request.messages):
+                return LLMResponse(raw_text="", tool_calls=[{"id": "wf", "type": "function", "function": {
+                    "name": "workflow", "arguments": json.dumps({"action": "create", "spec": {
+                        "name": "stop", "root": {"type": "parallel", "on_error": "continue",
+                                                 "branches": [leaf("A"), leaf("B")]}}})}}])
+            return LLMResponse(raw_text="parent done")
+
+    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
+    register_workflow_tool(registry)
+    runner = await RunningAgent(store, Parent(), registry, AgentLoopConfig(compactor=None), capacity=3).start()
+    try:
+        await runner.send("start")
+        await asyncio.wait_for(entered.wait(), 5)
+        node = await store._db.fetchone(
+            f"SELECT job_id,generation FROM {store.table_prefix}jobs WHERE kind='workflow_node' AND title='A'")
+        await runner.runtime.client.cancel(JobRef(store.store_id, node["job_id"], node["generation"]),
+                                           actor=runner.actor, reason="user stopped A", notify_parent=notify)
+        async def notices():
+            rows = await store.load_all_messages(runner.target.session_id)
+            return [r.content for r in rows if r.role == "user" and "workflow_node_cancelled" in str(r.content)]
+        if notify:
+            async with asyncio.timeout(10):
+                while not await notices():
+                    await asyncio.sleep(.02)
+            [notice] = await notices()
+            assert "user stopped A" in notice and node["job_id"] in notice
+        else:
+            await asyncio.sleep(.3)
+            assert await notices() == []
+    finally:
+        finish_b.set()
+        await runner.aclose()

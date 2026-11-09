@@ -17,7 +17,7 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize('control', ['cancel', 'send', 'foreign'])
+@pytest.mark.parametrize('control', ['cancel', 'cancel_quiet', 'send', 'foreign'])
 async def test_two_children_keep_separate_control_inputs_results_and_usage(registry_store, runtime_agent, control):
     store, _ = registry_store
     entered = {key: asyncio.Event() for key in 'AB'}
@@ -53,8 +53,9 @@ async def test_two_children_keep_separate_control_inputs_results_and_usage(regis
         refs = {key:JobRef(**item['job_ref']) for key,item in accepted.items()}
         current = {key:(await agent.runtime.client.inspect(ref,actor=agent.actor)).job_ref for key,ref in refs.items()}
         client = agent.runtime.client
-        if control=='cancel':
-            await client.cancel(current['A'], actor=agent.actor, reason='stop only A')
+        if control.startswith('cancel'):
+            await client.cancel(current['A'], actor=agent.actor, reason='stop only A',
+                                notify_parent=control == 'cancel')
         elif control=='send':
             await client.send(current['A'], 'ONLY-A-NOTE', message_id='note-A', actor=agent.actor)
         else:
@@ -67,15 +68,15 @@ async def test_two_children_keep_separate_control_inputs_results_and_usage(regis
         await agent.drain()
         assert results['B'].status=='completed' and results['B'].final_text=='RESULT-B'
         assert results['B'].usage['total_tokens']==10 and calls['B']==1
-        assert results['A'].status==('cancelled' if control=='cancel' else 'completed')
+        assert results['A'].status==('cancelled' if control.startswith('cancel') else 'completed')
         a_rows = await store.load_all_messages(accepted['A']['session_id'])
         b_rows = await store.load_all_messages(accepted['B']['session_id'])
         if control=='send':
             assert any('ONLY-A-NOTE' in str(row.content) for row in a_rows)
-        if control=='cancel':
+        if control.startswith('cancel'):
             main_rows = await store.load_all_messages(model.root)
             notices = [str(row.content) for row in main_rows if row.role == 'user' and '"cancelled"' in str(row.content)]
-            assert len(notices) == 1 and '"status":"cancelled"' in notices[0], notices
+            assert len(notices) == (control == 'cancel'), notices
         assert not any('ONLY-A-NOTE' in str(row.content) or 'FORBIDDEN' in str(row.content) for row in b_rows)
         await client.cancel(current['B'], actor=agent.actor, reason='already finished')
         assert await client.wait(refs['B'], actor=agent.actor, deadline_ms=now_ms()+1000)==results['B']

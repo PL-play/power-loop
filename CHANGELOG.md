@@ -13,6 +13,9 @@
 - Latest-messages reads: `jobs get view=messages`, `workflow logs` and
   `RuntimeClient.messages(job_ref)` list the newest 20 records (at most 50), each
   shortened to 500 characters; `source=projection` lists the projected history.
+- A stopped child reports to its parent by default; `cancel(..., notify_parent=False)`
+  stops quietly. A workflow node stopped from outside (while the workflow keeps running)
+  immediately sends a `[workflow_node_cancelled]` notice to the owning agent.
 
 - P7B: consuming an unstarted ManagedTool outcome closes its review notification
   while preserving the original suppressed result; hidden or failed reviews stay pending.

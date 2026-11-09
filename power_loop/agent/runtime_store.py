@@ -28,6 +28,10 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def quiet_cancel_event(job_id):
+    return "cancel_quiet:" + job_id
+
+
 @dataclass(frozen=True)
 class InputRecord:
     ref: InputRef
@@ -412,13 +416,16 @@ class RuntimeInputStore:
     async def discard_cancelled_result(self, tx, record):
         """An explicitly cancelled originating scope must not wake a new send.
 
-        The result's own job is not its origin: a stopped child still reports to its parent.
+        The result's own job is not its origin: a stopped child still reports to its parent,
+        unless it was stopped with ``notify_parent=False``.
         """
-        row = await tx.fetchone(f"SELECT p.parent_job_id,p.cancel_requested_at FROM {self.jobs} j "
-                               f"JOIN {self.jobs} p ON p.job_id=j.parent_job_id WHERE j.job_id=?",
-                               (record.meta["result_ref"]["job_id"],))
+        job_id = record.meta["result_ref"]["job_id"]
+        row = await tx.fetchone(f"SELECT p.parent_job_id,p.cancel_requested_at,e.event_id AS quiet FROM {self.jobs} j "
+                               f"LEFT JOIN {self.jobs} p ON p.job_id=j.parent_job_id "
+                               f"LEFT JOIN {self.events} e ON e.event_id=? WHERE j.job_id=?",
+                               (quiet_cancel_event(job_id), job_id))
         while row:
-            if row["cancel_requested_at"] is not None:
+            if row["cancel_requested_at"] is not None or row.get("quiet"):
                 await self.void_unbound(tx, record.ref, reason="origin_cancelled", status="cancelled")
                 ref = record.meta["result_ref"]
                 await tx.update_event(ref["job_id"], f"UPDATE {self.events} SET delivery_status='suppressed' WHERE event_id=?",
