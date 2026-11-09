@@ -53,14 +53,37 @@ class RuntimeClient:
             options=plain(options or RequestOptions()), expires_at_ms=deadline_ms), actor=actor, descriptor=descriptor)
 
     async def append(self, target, body, *, message_id, actor, deadline_ms=None):
-        return await self.submit(Command(message_id, target, "append", {"body": body}, "append",
+        return await self._submit_internal(Command(message_id, target, "append", {"body": body}, "append",
                                          expires_at_ms=deadline_ms), actor=actor)
+
+    async def submit(self, target, body, *, message_id, actor, options=None, deadline_ms=None):
+        """Smart dispatch: automatically chooses send (no active job) or append (active job).
+
+        Host does not need to judge operation type manually.
+        send and append semantics remain unchanged, submit just encapsulates the judgment logic.
+
+        Note: target must be TargetRef (session level), not JobRef.
+        """
+        if target.job_id is not None:
+            raise RuntimeRequestError("invalid_options", "submit targets a session")
+
+        state = await self.inputs.db.fetchone(
+            f"SELECT owner_token FROM {self.inputs.state} WHERE session_id=?",
+            (target.session_id,))
+        has_active = state is not None and state["owner_token"] is not None
+
+        if has_active:
+            return await self.append(target, body, message_id=message_id, actor=actor,
+                                     deadline_ms=deadline_ms)
+        else:
+            return await self.send(target, body, message_id=message_id, actor=actor,
+                                   options=options, deadline_ms=deadline_ms)
 
     async def _job_input(self, ref, operation, body, *, message_id, actor, deadline_ms=None):
         job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
         if ref.generation is None:
             raise RuntimeRequestError("stale_generation")
-        return await self.submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
+        return await self._submit_internal(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
             operation, {"body": body}, "control" if operation == "steer" else "append",
             expires_at_ms=deadline_ms, expected_job_generation=ref.generation), actor=actor)
 
@@ -107,7 +130,7 @@ class RuntimeClient:
         return await submit(self, target, spec, message_id=message_id, actor=actor,
                             descriptor=descriptor, options=options)
 
-    async def submit(self, command, *, actor):
+    async def _submit_internal(self, command, *, actor):
         if command.operation in {"answer", "resume"}:
             raise RuntimeRequestError("invalid_options", command.operation + " requires its dedicated control port")
         if command.operation == "cancel":
