@@ -3,8 +3,8 @@
 ## [12.0.0] - 2026-11-09
 
 ### Breaking Changes
-- **Removed `request_user_input` and waiting mechanism**: This feature had 0 definitions and 0 calls in production (design/93). The `request_user_input` tool, `HumanInputRequired` exception, `waiting` status, and `answer()` method have been removed. SQL #2 no longer includes the `waiting` NOT EXISTS subquery.
-- **Removed from STABLE_API**: `request_user_input`, `HumanInputRequired`, `answer`
+- **Removed `request_user_input` tool**: The public `request_user_input` tool has been removed from default_manifest and default_tools. Models can no longer directly request user input. The internal waiting mechanism remains for `wait_review` (finite child task reviews).
+- **Removed from STABLE_API**: `request_user_input` (the tool function)
 
 ### Added
 - **`submit()` smart dispatch**: Automatically chooses `send` (no active job) or `append` (active job), eliminating manual operation判断
@@ -16,10 +16,15 @@
 ### Changed
 - **`steer()` deprecated**: Use `priority()` instead (steer remains as alias for backward compatibility)
 - **`jobs` tool now reuses host interface core**: Ensures semantic consistency between tool calls and direct API usage
+- **Internal waiting mechanism preserved**: `HumanInputRequired`, `answer()`, and `waiting_for_input` status remain for internal use by `wait_review` (finite child task reviews)
 
 ### Performance
-- **SQL #2 simplified**: Removed waiting NOT EXISTS subquery (-1 SQL per send, -52 characters, -1 parameter)
 - **submit() cost**: +1 SELECT to check owner_token (only when submit is called)
+
+### Notes
+- The `waiting_gate` subquery in SQL #2 remains necessary for `wait_review` functionality
+- `HumanInputRequired` exception and `answer()` method are internal-only (not in STABLE_API)
+- Production usage showed 0 definitions and 0 calls for `request_user_input` tool (design/93)
 
 ## 11.0.0 — Design 203 (source delivery; not published)
 
