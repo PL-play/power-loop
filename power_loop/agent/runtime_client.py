@@ -91,7 +91,43 @@ class RuntimeClient:
         return await self._job_input(ref, "nudge", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
     async def steer(self, ref, body, *, message_id, actor, deadline_ms=None):
+        """Deprecated: use priority() instead.
+
+        High-priority message delivery. This is a message primitive without control side effects.
+        """
         return await self._job_input(ref, "steer", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
+
+    async def priority(self, target, body, *, message_id, actor, deadline_ms=None):
+        """High-priority message: arrives faster than append, can interrupt rounds waiting for tool results.
+
+        Pure message primitive, no control side effects. Does not stop any tasks or clear queues.
+        If you need to stop or cancel, use control primitives stop() or cancel().
+
+        Note: target can be TargetRef (session level) or JobRef (job level).
+        """
+        if target.job_id is not None:
+            # JobRef: delegate to steer (job-level steering)
+            return await self.steer(target, body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
+        else:
+            # TargetRef: need to get active job first
+            state = await self.inputs.db.fetchone(
+                f"SELECT owner_token FROM {self.inputs.state} WHERE session_id=?",
+                (target.session_id,))
+            if state is None or state["owner_token"] is None:
+                raise RuntimeRequestError("no_active_job", "priority requires an active job")
+
+            # Get the active job to create JobRef for steer
+            job = await self.inputs.db.fetchone(
+                f"SELECT job_id, generation FROM {self.inputs.jobs} "
+                "WHERE session_id=? AND status IN ('running','settling','model_closed') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (target.session_id,))
+            if job is None:
+                raise RuntimeRequestError("no_active_job", "priority requires an active job")
+
+            from power_loop.agent.runtime_types import JobRef
+            job_ref = JobRef(target.store_id, job["job_id"], job["generation"])
+            return await self.steer(job_ref, body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
     async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None, options=None):
         if ref.generation is None or ref.generation == 0:
