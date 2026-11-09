@@ -97,6 +97,13 @@ class RuntimeClient:
         """
         return await self._job_input(ref, "steer", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
+    async def answer(self, ref, *, interaction_id, wait_round, value, message_id, actor):
+        """Internal API for answering wait_review interactions. Not exposed in STABLE_API."""
+        self._require_open()
+        from power_loop.runtime.interactions import answer
+        return await answer(self, ref, interaction_id=interaction_id, wait_round=wait_round,
+                            value=value, message_id=message_id, actor=actor)
+
     async def priority(self, target, body, *, message_id, actor, deadline_ms=None):
         """High-priority message: arrives faster than append, can interrupt rounds waiting for tool results.
 

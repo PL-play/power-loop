@@ -657,14 +657,19 @@ class TaskRuntime:
                 consumed = await finish(binding)
             async with self.manager.joined_write() as tx:
                 await input_start.prepare_finish(tx)
-                if binding.resource_evidence.get("_runtime_error_code") is not None:
-                    evidence["error_code"] = binding.resource_evidence["_runtime_error_code"]
-                public = input_start.public_result(evidence)
-                from dataclasses import replace
+                if evidence.get("exit") == "waiting_for_input":
+                    from .interactions import save_wait
+                    await save_wait(input_start, tx, binding, evidence)
+                    finalized = True
+                else:
+                    if binding.resource_evidence.get("_runtime_error_code") is not None:
+                        evidence["error_code"] = binding.resource_evidence["_runtime_error_code"]
+                    public = input_start.public_result(evidence)
+                    from dataclasses import replace
 
-                from power_loop.agent.runtime_types import plain
-                evidence["_public_result"] = plain(replace(public, job_ref=input_start.model_ref,
-                    input_ref=None if input_start.owner else public.input_ref))
+                    from power_loop.agent.runtime_types import plain
+                    evidence["_public_result"] = plain(replace(public, job_ref=input_start.model_ref,
+                        input_ref=None if input_start.owner else public.input_ref))
                     await self.manager.close_model_execution(
                         actor, binding.lease, evidence=evidence,
                         resource_state=binding.resource_evidence.get("resource_state", "stopped"))

@@ -206,6 +206,7 @@ from power_loop.runtime.fold import (
     LLMSummaryFold,
     NoteOp,
 )
+from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.runtime.memory import (
     MemoryProvider,
     MemoryRecallHook,

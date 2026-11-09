@@ -2565,6 +2565,25 @@ class AgentPipeline:
                         output, failed = await pre_task
                     else:
                         output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
+                except HumanInputRequired as exc:
+                    self._cancel_pre_tasks(_pre)
+                    interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
+                    await self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
+                    # The model batched request_user_input with later tool_calls;
+                    # those won't run. Resolve them so the resumed turn isn't an
+                    # invalid sequence (assistant.tool_calls with no matching tool).
+                    await self._resolve_skipped_tool_calls(
+                        tool_calls[i + 1 :], reason="superseded by a user-input request",
+                        round_idx=round_idx,
+                    )
+                    await self._finalize("waiting_for_input", final_text=assistant_text, rounds=round_idx + 1)
+                    return self._make_result(
+                        "waiting_for_input",
+                        final_text=assistant_text,
+                        rounds=round_idx + 1,
+                        pending_tool_calls=tool_calls,
+                        pending_interactions=[interaction],
+                    )
                 except Exception as exc:
                     # ── Hook: TOOL_ERROR ──
                     from power_loop.contracts.errors import SessionBusy, SessionLeaseLost
