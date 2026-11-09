@@ -161,6 +161,39 @@ class RuntimeClient:
             expected_job_generation=ref.generation), actor=actor,
             descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
 
+    async def stop(self, job_id, *, actor, reason="Stopped by host", expected_generation=None):
+        """Stop task: request persistent cancellation of job and its supervised subtree.
+
+        Note: stop is a request, not immediate physical stop. acceptance != physical stop.
+        Can target main agent's job or subagent's job.
+        """
+        from power_loop.runtime import task_control
+        manager = self.inputs.store._task_manager
+        return await task_control.request_cancel(
+            manager, actor, job_id,
+            reason=reason, expected_generation=expected_generation,
+        )
+
+    async def cancel(self, job_id, *, actor, reason="Cancelled by host", clear_queue=False):
+        """Cancel task, optionally clearing pending messages in input_queue.
+
+        clear_queue=True: set status='void' for status='pending' AND mode='queue' messages
+        in the session, preventing stopped task from processing queued messages.
+
+        Use case: user clicks "stop" button and wants to completely stop, not process backlog.
+        """
+        result = await self.stop(job_id, actor=actor, reason=reason)
+        if clear_queue:
+            job = await self.inputs.db.fetchone(
+                f"SELECT session_id FROM {self.inputs.jobs} WHERE job_id=?",
+                (job_id,))
+            if job:
+                await self.inputs.db.execute(
+                    f"UPDATE {self.inputs.q} SET status='void' "
+                    "WHERE session_id=? AND status='pending' AND mode='queue'",
+                    (job["session_id"],))
+        return result
+
     async def workflow(self, target, spec, *, message_id, actor, descriptor=None, options=None):
         from power_loop.workflow.runner import submit
         return await submit(self, target, spec, message_id=message_id, actor=actor,

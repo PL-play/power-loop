@@ -139,8 +139,11 @@ async def _native(loop, sid, action, options):
     if len(targets) != 1:
         raise JobError("native_stop_requires_single_job_id")
     target = await _resolve(manager, actor, targets[0])
-    return await task_control.stop_from_current_call(loop, sid, target,
-        reason=options.get("reason", "Stopped by request"), expected_generation=options.get("expected_generation"))
+    # Use client.stop() to ensure consistency with host interface
+    client = runtime.client
+    return await client.stop(target, actor=actor,
+        reason=options.get("reason", "Stopped by request"),
+        expected_generation=options.get("expected_generation"))
 
 
 async def run_jobs(action="", **kwargs):
