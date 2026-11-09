@@ -137,15 +137,10 @@ class RuntimeInputStore:
         defaults = await self.authorize(tx, command.target, actor)
         if command.operation == "send" and not child_start and defaults.get("execution_role", "main") != "main":
             raise RuntimeRequestError("invalid_options", "child sessions require resume with their original JobRef")
-        waiting_gate = (f" AND NOT EXISTS (SELECT 1 FROM {self.jobs} j WHERE j.session_id=? AND j.status='waiting')"
-                        if command.operation == "send" else "")
         changed = await tx.execute(
-            f"UPDATE {self.state} SET inbox_version=inbox_version+1 WHERE session_id=? AND lifecycle='open'" + waiting_gate,
-            (command.target.session_id,) * (2 if waiting_gate else 1))
+            f"UPDATE {self.state} SET inbox_version=inbox_version+1 WHERE session_id=? AND lifecycle='open'",
+            (command.target.session_id,))
         if not changed:
-            state = await tx.fetchone(f"SELECT lifecycle FROM {self.state} WHERE session_id=?", (command.target.session_id,))
-            if state and state["lifecycle"] == "open":
-                raise RuntimeRequestError("waiting_input", "answer the pending interaction before starting a new turn")
             raise RuntimeRequestError("session_closed")
         ref = InputRef(command.target.store_id, command.target.session_id, command.message_id)
         old = await self.input(tx, ref)
@@ -371,7 +366,7 @@ class RuntimeInputStore:
                                result.status == "cancelled", payload["resource_state"]), result, fixed)
             if selected < job["generation"] or job["supervision_status"] == "closed":
                 raise RuntimeRequestError("not_found", "result no longer available")
-            state = "accepted" if selected == 0 else "waiting_input" if job["status"] == "waiting" else "running"
+            state = "accepted" if selected == 0 else "running"
             return (Status(input_ref, actual, state, None, False, job["cancel_requested_at"] is not None,
                            "not_started" if selected == 0 else job["resource_state"]), None, fixed)
 

@@ -1709,7 +1709,7 @@ class _ExecutionLoop:
         Defers on a still-in-flight status (the resume re-finalizes under the SAME
         ``send_index``; the idempotent UPSERT then overwrites). Best-effort — the caller swallows
         failures, since ``pl_messages`` remains the source of truth."""
-        if status in ("waiting_for_input", "pending_tools"):
+        if status == "pending_tools":
             return  # send not finished; the resume will re-finalize under the same send_index
         # 只取本 send 的行：这里要投影的就是这一个 send，从前是读全表再在 Python 里过滤，
         # 等于每个 send 都为一小段做一次 O(会话) 的读。投影模式下 pl_messages 永不压缩。
@@ -1895,22 +1895,6 @@ class _ExecutionLoop:
         pending.pop("pending_interactions", None)
         if pending.get("tool_call_ids") or pending.get("tool_calls"):
             await store.set_pending(sid, pending)
-
-    async def _waiting_result_if_needed(self, sid: str) -> StatefulResult | None:
-        store = await self._ensure_store()
-        state = await store.get_state(sid)
-        if state is None or not state.pending:
-            return None
-        pending = state.pending
-        interactions = list(pending.get("pending_interactions") or [])
-        if not interactions:
-            return None
-        return StatefulResult(
-            session_id=sid,
-            status="waiting_for_input",
-            pending_tool_calls=list(pending.get("tool_calls") or []),
-            pending_interactions=interactions,
-        )
 
 
 # ── helpers ──────────────────────────────────────────────────────────────

@@ -70,12 +70,6 @@ class RuntimeClient:
     async def steer(self, ref, body, *, message_id, actor, deadline_ms=None):
         return await self._job_input(ref, "steer", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
-    async def answer(self, ref, *, interaction_id, wait_round, value, message_id, actor):
-        self._require_open()
-        from power_loop.runtime.interactions import answer
-        return await answer(self, ref, interaction_id=interaction_id, wait_round=wait_round,
-                            value=value, message_id=message_id, actor=actor)
-
     async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None, options=None):
         if ref.generation is None or ref.generation == 0:
             raise RuntimeRequestError("stale_generation")

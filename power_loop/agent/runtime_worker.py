@@ -703,9 +703,6 @@ class RuntimeWorker:
                         response_format=options["response_format"], with_history=options["history"],
                         _initial_round_index=(record.meta["interaction"]["rounds"] if record.meta["operation"] == "answer" else 0),
                         _entry_send_index=send_index, _runtime_start=start)
-                    if child_result.status == 'waiting_for_input':
-                        from power_loop.runtime.wait_review import arm
-                        await arm(self, sid)
             finally:
                 if child_spec is not None:
                     from power_loop.contracts.event_payloads import (

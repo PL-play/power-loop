@@ -206,7 +206,6 @@ from power_loop.runtime.fold import (
     LLMSummaryFold,
     NoteOp,
 )
-from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import (
     MemoryProvider,
     MemoryRecallHook,
@@ -489,8 +488,6 @@ __all__ = [
 	"StoreBlackboard",
 	"render_entries",
 	"register_blackboard_tools",
-	"HumanInputRequired",
-	"request_user_input",
 	"LlmCallStartedPayload",
 	"LlmCallCompletedPayload",
 	"LlmResponseReceivedPayload",

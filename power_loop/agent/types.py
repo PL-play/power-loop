@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from power_loop.runtime.runtime_state import RuntimeProjector
     from power_loop.runtime.spec import AgentSpec
 
-LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "budget_exceeded", "context_checkpoint", "degraded"]
+LoopStatus = Literal["completed", "pending_tools", "cancelled", "hit_round_limit", "budget_exceeded", "context_checkpoint", "degraded"]
 LoopMessage = dict[str, Any]
 
 
