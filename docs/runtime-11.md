@@ -40,6 +40,22 @@ generation. Store/session/job/generation identities are not interchangeable.
 | `answer`, `resume` | Continue the matching interaction or original execution |
 | `StatefulAgentLoop(runtime=...)` | Convenience facade; no direct LLM/DSN constructor |
 
+### Host input choice
+
+- Ordinary conversation input: `append(TargetRef(store, session))`. An idle
+  session starts a run with it; a busy session's running job claims it at its
+  next round checkpoint, so a burst of messages shares one job.
+- `send` always starts its own new turn; a busy session keeps it pending until
+  the current job ends. Use it only when a separate turn is intended.
+- Interrupting input: a `steer` command addressed to the session (no job ID)
+  reaches whatever job that session is running; `steer(JobRef)` addresses one
+  exact generation. Steering interrupts tools whose `interrupt` mode is not
+  `finish` and skips calls not yet started; its text arrives at the next round
+  checkpoint. A durable stop is `cancel(JobRef, scope="subtree")`.
+- Retention is host-driven: call `SessionStore.purge_expired(now_ms)`
+  periodically (each call deletes a bounded batch; defaults in its docstring).
+  Without it task trees, events, follow-up rows and hook events keep growing.
+
 Consult the source signatures for required arguments. Model/tool configuration,
 representations, folds, hooks and resources are resolved by the factory. Per-input
 `RequestOptions` are frozen at acceptance. Register the same versioned definitions

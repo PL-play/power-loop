@@ -2,6 +2,11 @@
 
 ## 11.0.0 — Design 203 (source delivery; not published)
 
+- A steer addressed to a session (no job ID) now interrupts the job that session
+  is running, like a steer addressed to that exact job; before, only its text
+  arrived at the next round checkpoint. The runtime guide documents host input
+  choice and host-driven retention.
+
 - P7B: consuming an unstarted ManagedTool outcome closes its review notification
   while preserving the original suppressed result; hidden or failed reviews stay pending.
   Background rejection messages identify the capability and permitted alternatives.

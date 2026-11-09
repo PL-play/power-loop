@@ -205,6 +205,41 @@ async def test_queue_item_does_not_interrupt(store, runtime_agent) -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_append_joins_the_running_job_next_round(store, runtime_agent) -> None:
+    from power_loop import InputRef
+    llm = _LLM([("stream_then_gate", "first"), "done"])
+    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
+        system_prompt="S", max_rounds=3, compactor=None))
+    first = await loop.runtime.client.send(loop.target, "go", message_id="m1", actor=loop.actor)
+    await asyncio.wait_for(llm.hanging.wait(), 5)
+    await loop.runtime.client.append(loop.target, "one more thing", message_id="a1", actor=loop.actor)
+    llm.release.set()
+    await loop.runtime.client.wait(first.input_ref, actor=loop.actor, deadline_ms=None)
+    added = await loop.runtime.client.inspect(InputRef(loop.target.store_id, loop.target.session_id, "a1"),
+                                              actor=loop.actor)
+    original = await loop.runtime.client.inspect(first.input_ref, actor=loop.actor)
+    assert added.job_ref == original.job_ref
+    assert any("one more thing" in str(m.get("content")) for m in llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_session_steer_interrupts_the_running_job(store, runtime_agent) -> None:
+    from power_loop.agent.runtime_types import Command
+    probe = _Probe()
+    llm = _LLM([_call("slow"), "stopped"])
+    loop = await runtime_agent(model=llm, store=store, registry=_registry(probe, interrupt="abort"),
+                               config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None))
+    run = asyncio.create_task(loop.send("do the slow thing"))
+    await asyncio.wait_for(probe.started.wait(), 5)
+    await loop.runtime.client.submit(Command("s1", loop.target, "steer", {"body": "stop"}, "control"),
+                                     actor=loop.actor)
+    res = await asyncio.wait_for(run, 5)
+    assert res.status == "failed" and probe.cancelled and not probe.finished
+    assert (await loop.send("continue")).status == "completed"
+    assert any("stop" in str(m.get("content")) for m in llm.calls[1])
+
+
+@pytest.mark.asyncio
 async def test_a_steer_flag_that_cannot_clear_does_not_spin(store, runtime_agent) -> None:
     llm = _LLM(["fine"])
     loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(

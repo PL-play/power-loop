@@ -437,8 +437,9 @@ class RuntimeWorker:
                 ctx.control_read = None
             if (record and record.row["status"] == "pending"
                     and record.meta["operation"] == "steer" and ctx.job_ref is not None
-                    and record.row["target_job_id"] == ctx.job_ref.job_id
-                    and record.row["expected_job_generation"] == ctx.job_ref.generation):
+                    and (record.row["target_job_id"] is None
+                         or (record.row["target_job_id"], record.row["expected_job_generation"])
+                         == (ctx.job_ref.job_id, ctx.job_ref.generation))):
                 if read.hint_consumed:
                     return
                 if len(ctx.append_refs) < 100:
