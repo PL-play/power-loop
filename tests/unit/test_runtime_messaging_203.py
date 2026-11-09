@@ -58,7 +58,7 @@ async def fixture(store):
 
 
 def command(target, mid, body="hello", **kwargs):
-    return Command(mid, target, "send", {"body": body}, "new_turn", **kwargs)
+    return Command(mid, target, "send", {"body": body}, **kwargs)
 
 
 async def accept(port, cmd, actor):
@@ -222,7 +222,7 @@ async def running(store, mode):
 
 
 @pytest.mark.parametrize("mode", ["memory", "polling"])
-async def test_two_independent_results_and_frozen_options(registry_store, mode):
+async def test_busy_send_joins_running_job_with_its_frozen_options(registry_store, mode):
     store, _ = registry_store
     async with running(store, mode) as (runtime, model, target, actor):
         first = await runtime.client.send(target, "first", message_id="first", actor=actor,
@@ -230,13 +230,16 @@ async def test_two_independent_results_and_frozen_options(registry_store, mode):
         await asyncio.wait_for(model.started.wait(), 3)
         second = await runtime.client.send(target, "second", message_id="second", actor=actor,
                                            options=RequestOptions(temperature=0.8), deadline_ms=deadline())
-        assert (await runtime.client.inspect(second.input_ref, actor=actor)).job_ref is None
+        ctx = runtime.worker._active[target.session_id]
+        for _ in range(100):
+            if second.input_ref in ctx.append_refs:
+                break
+            await asyncio.sleep(0.01)
         model.release.set()
         result1 = await runtime.client.wait(first.input_ref, actor=actor, deadline_ms=deadline())
         result2 = await runtime.client.wait(second.input_ref, actor=actor, deadline_ms=deadline())
-        assert (result1.final_text, result2.final_text) == ("result-1", "result-2")
-        assert result1.job_ref != result2.job_ref
-        assert [request.temperature for request in model.requests] == [0.2, 0.8]
+        assert result1.job_ref == result2.job_ref and result2.final_text == "result-2"
+        assert [request.temperature for request in model.requests] == [0.2, 0.2]
         detached = RuntimeClient(store=store, transport=runtime.transport)
         assert (await detached.wait(first.input_ref, actor=actor, deadline_ms=deadline())).job_ref == result1.job_ref
         await detached.aclose()
@@ -275,16 +278,16 @@ async def test_cancel_command_validates_target_and_preserves_original_reason(reg
         job = (await client.inspect(first.input_ref, actor=actor)).job_ref
         second = await client.send(target, "queued", message_id="queued", actor=actor)
         queued_cancel = Command("cancel-queued", target, "cancel",
-            {"input_ref": plain(second.input_ref), "reason": "withdrawn"}, "control")
+            {"input_ref": plain(second.input_ref), "reason": "withdrawn"})
         with pytest.raises(RuntimeRequestError, match="forbidden"):
             await client.submit(queued_cancel, actor=TrustedActor("tenant", "intruder", None))
         with pytest.raises(RuntimeRequestError, match="invalid_options"):
             await client.submit(Command("bad-input", TargetRef(target.store_id, "another-session"), "cancel",
-                {"input_ref": plain(second.input_ref), "reason": "bad"}, "control"), actor=actor)
+                {"input_ref": plain(second.input_ref), "reason": "bad"}), actor=actor)
         _, other, _ = await fixture(store)
         with pytest.raises(RuntimeRequestError, match="forbidden"):
             await client.submit(Command("bad-job", TargetRef(target.store_id, other.session_id, job.job_id),
-                "cancel", {"reason": "bad"}, "control", expected_job_generation=job.generation), actor=actor)
+                "cancel", {"reason": "bad"}, expected_job_generation=job.generation), actor=actor)
         assert (await client.inspect(first.input_ref, actor=actor)).state == "running"
         assert (await client.inspect(second.input_ref, actor=actor)).state == "accepted"
         receipt = await client.submit(queued_cancel, actor=actor)
@@ -292,7 +295,7 @@ async def test_cancel_command_validates_target_and_preserves_original_reason(reg
         assert (await client.wait(second.input_ref, actor=actor, deadline_ms=deadline())).error == "withdrawn"
         exact = TargetRef(target.store_id, target.session_id, job.job_id)
         for message_id, reason in (("cancel-job", "first reason"), ("retry-job", "new reason")):
-            receipt = await client.submit(Command(message_id, exact, "cancel", {"reason": reason}, "control",
+            receipt = await client.submit(Command(message_id, exact, "cancel", {"reason": reason},
                 expected_job_generation=job.generation), actor=actor)
             assert receipt.reason == "first reason"
             assert receipt.message_id == f"cancel:{job.job_id}:{job.generation}"
@@ -323,29 +326,23 @@ async def test_wait_timeout_client_close_and_output_authorization(registry_store
 
 
 @pytest.mark.parametrize("mode", ["memory", "polling"])
-async def test_append_joins_active_job_but_new_turn_waits(registry_store, mode):
+async def test_serial_sends_join_the_active_job(registry_store, mode):
     store, _ = registry_store
     async with running(store, mode) as (runtime, model, target, actor):
         first = await runtime.client.send(target, "first", message_id="first", actor=actor)
         await asyncio.wait_for(model.started.wait(), 3)
-        second = await runtime.client.send(target, "second", message_id="second", actor=actor)
-        appended = await runtime.client.append(target, "append", message_id="append", actor=actor)
-        # Make delivery to the active execution deterministic before releasing the model.
+        later = [await runtime.client.send(target, body, message_id=body, actor=actor) for body in ("second", "third")]
         ctx = runtime.worker._active[target.session_id]
         for _ in range(100):
-            if appended.input_ref in ctx.append_refs:
+            if all(receipt.input_ref in ctx.append_refs for receipt in later):
                 break
             await asyncio.sleep(0.01)
-        assert appended.input_ref in ctx.append_refs
         model.release.set()
         original = await runtime.client.wait(first.input_ref, actor=actor, deadline_ms=deadline())
-        joined = await runtime.client.wait(appended.input_ref, actor=actor, deadline_ms=deadline())
-        separate = await runtime.client.wait(second.input_ref, actor=actor, deadline_ms=deadline())
-        assert joined.job_ref == original.job_ref
-        assert separate.job_ref != original.job_ref
-        assert joined.input_ref == appended.input_ref
-        cancel = await runtime.client.cancel(appended.input_ref, actor=actor)
-        assert cancel.reason == "already_applied"
+        for receipt in later:
+            joined = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline())
+            assert joined.job_ref == original.job_ref and joined.input_ref == receipt.input_ref
+        assert len(model.requests) == 2
 
 
 async def test_request_deadline_cancels_running_job(registry_store):
@@ -532,7 +529,7 @@ async def test_stream_final_result_and_reference_cleanup(registry_store):
         assert not runtime.client._outputs and runtime.client._slots == 0
 
 
-async def test_hot_backlog_progresses_and_other_session_is_not_starved(registry_store):
+async def test_busy_backlog_joins_running_job_and_other_session_is_not_starved(registry_store):
     store, _ = registry_store
     async with running(store, 'memory') as (runtime, model, target, actor):
         first = await runtime.client.send(target, 'first', message_id='first', actor=actor)
@@ -541,20 +538,12 @@ async def test_hot_backlog_progresses_and_other_session_is_not_starved(registry_
                     for i in range(105)]
         _, cold, _ = await fixture(store)
         other = await runtime.client.send(cold, 'cold', message_id='cold', actor=actor)
-        batches = []
-        original = runtime.worker.inputs.claim_inputs
-        async def claim(*args, **kwargs):
-            rows = await original(*args, **kwargs)
-            batches.append(len(rows))
-            return rows
-        runtime.worker.inputs.claim_inputs = claim
         model.release.set()
         assert (await runtime.client.wait(other.input_ref, actor=actor, deadline_ms=deadline())).status == 'completed'
-        assert len(model.requests) < 106
-        assert (await runtime.client.wait(receipts[-1].input_ref, actor=actor,
-                                         deadline_ms=int(time.time()*1000)+60000)).status == 'completed'
-        assert len(model.requests) == 107 and max(batches) == 1
-        assert (await runtime.client.wait(first.input_ref, actor=actor, deadline_ms=deadline())).status == 'completed'
+        original_job = await runtime.client.wait(first.input_ref, actor=actor, deadline_ms=deadline())
+        for receipt in receipts:
+            joined = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline())
+            assert joined.status == 'completed' and joined.job_ref == original_job.job_ref
         assert (await store.inbox_counts(target.session_id))['pending'] == 0
 
 
@@ -712,7 +701,7 @@ async def test_two_local_workers_serialize_same_session(registry_store):
             results = await asyncio.gather(*(runtime.client.wait(r.input_ref, actor=actor, deadline_ms=deadline())
                                             for r in (first, next_input)))
             assert all(result.status == 'completed' for result in results)
-            assert results[0].job_ref != results[1].job_ref
+            assert results[0].job_ref == results[1].job_ref
             assert len(model.requests) == 2
         finally:
             model.release.set()
@@ -899,7 +888,9 @@ async def test_factory_resolves_frozen_representation_and_rejects_missing_tools(
         target = await runtime.open_session(descriptor, actor=actor)
         one = await runtime.client.send(target, 'one', message_id='one', actor=actor,
             options=RequestOptions(representation_ref='test.verbatim@1'))
-        await asyncio.wait_for(model.started.wait(), 5)
+        model.release.set()
+        await runtime.client.wait(one.input_ref, actor=actor, deadline_ms=deadline())
+        model.release.clear()
         two = await runtime.client.send(target, 'two', message_id='two', actor=actor)
         metadata = (await store.get_session(target.session_id)).metadata
         changed = plain(descriptor)
@@ -1017,3 +1008,17 @@ async def test_queued_subscription_ignores_other_request_before_read(registry_st
             await out.aclose()
         await runner.aclose()
         store._db = raw
+
+
+async def test_host_reads_latest_job_messages_only_with_authority(registry_store):
+    store, _ = registry_store
+    async with running(store, "memory") as (runtime, model, target, actor):
+        model.release.set()
+        receipt = await runtime.client.send(target, "first " + "z"*900, message_id="first", actor=actor)
+        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline())
+        page = await runtime.client.messages(result.job_ref, actor=actor, preview_chars=100)
+        assert [r["role"] for r in page["records"]] == ["user", "assistant"]
+        assert len(page["records"][0]["preview"]) == 100 and page["records"][0]["truncated"]
+        assert "result-1" in page["records"][1]["preview"]
+        with pytest.raises(RuntimeRequestError, match="forbidden"):
+            await runtime.client.messages(result.job_ref, actor=TrustedActor("tenant", "intruder", None))

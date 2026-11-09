@@ -159,11 +159,8 @@ class LlmDegradedPayload(BaseEventPayload):
 
 @dataclass
 class SteerInterruptedPayload(BaseEventPayload):
-    """Emitted when steering (an inbox item with ``mode="steer"``) interrupted work in flight
-    (design/124 §7). ``where``: ``llm`` (the model's output was aborted; any text it already
-    streamed is VOID and will not reach history), ``tool`` (a running tool was aborted or moved
-    to the background), ``between_tools`` (remaining calls of the batch were not started).
-    ``action``: ``restart`` / ``abort`` / ``background`` / ``skip``."""
+    """Emitted when an urgent message (an inbox item with ``mode="steer"``) made the batch skip
+    a not-yet-started tool call: ``where="between_tools"``, ``action="skip"``."""
     where: str = ""
     action: str = ""
     round_index: int = 0

@@ -100,7 +100,7 @@ async def admit(loop, binding, actor, *, kind, title, descriptor, options, body,
             call_ref=actor.call_ref, tool_call_id=actor.tool_call_id,
             system_key=system_key, request={"input_ref": plain(input_ref)})
         command = Command(input_ref.message_id, TargetRef(port.store.store_id, sid),
-            "send", {"body": body}, "new_turn", options=plain(options))
+            "send", {"body": body}, options=plain(options))
         submitter = actor if system_key is None else TrustedActor(actor.tenant_id, actor.principal_id, None)
         receipt = await port.accept_input(tx, command, submitter, descriptor=descriptor, child_start=True)
         if receipt.newly_accepted:
@@ -114,7 +114,7 @@ async def admit(loop, binding, actor, *, kind, title, descriptor, options, body,
         "operation_id": registration.operation.operation_id, "status": "accepted", "mode": "create"}
 
 
-async def nudge(loop, sid, message):
+async def send_input(loop, sid, message, *, urgent=False):
     binding, actor = await tool_actor(loop)
     port = loop._runtime_worker.inputs
     await port.authorize(port.db, TargetRef(port.store.store_id, sid), actor)
@@ -132,7 +132,8 @@ async def nudge(loop, sid, message):
     manager = loop.task_runtime.manager
     async with manager.joined_write() as tx:
         await manager._fence(tx, binding.actor, binding.lease)
-        receipt = await port.accept_input(tx, Command(mid, target, "nudge", {"body": message}, "append",
+        receipt = await port.accept_input(tx, Command(mid, target, "send", {"body": message}, urgent,
             expected_job_generation=row["generation"]), actor)
-    await loop._runtime_worker.runtime.client._notify(target, mid, receipt.input_ref, ["work", "activation"])
+    await loop._runtime_worker.runtime.client._notify(target, mid, receipt.input_ref,
+        ["control", "work", "activation"] if urgent else ["work", "activation"])
     return plain(receipt)

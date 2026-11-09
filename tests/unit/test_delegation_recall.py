@@ -69,9 +69,9 @@ async def test_current_child_nudge_preserves_original_result_and_recall_authoriz
         ref = JobRef(**accepted['job_ref'])
         running_ref = (await agent.runtime.client.inspect(ref, actor=agent.actor)).job_ref
         with pytest.raises(RuntimeRequestError, match='forbidden'):
-            await agent.runtime.client.nudge(running_ref, 'forbidden', message_id='foreign',
+            await agent.runtime.client.send(running_ref, 'forbidden', message_id='foreign',
                 actor=replace(agent.actor, principal_id='stranger'))
-        receipt = await agent.runtime.client.nudge(running_ref, 'Also review B.', message_id='nudge', actor=agent.actor)
+        receipt = await agent.runtime.client.send(running_ref, 'Also review B.', message_id='nudge', actor=agent.actor)
         assert receipt.input_ref.message_id == 'nudge'
         release.set()
         result = await agent.runtime.client.wait(ref, actor=agent.actor, deadline_ms=now_ms()+10000)

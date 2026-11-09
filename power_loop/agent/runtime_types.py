@@ -192,7 +192,7 @@ class Command:
     target: TargetRef
     operation: str
     payload: dict
-    execution_mode: str
+    urgent: bool = False
     descriptor_ref: str | None = None
     options: dict | None = None
     expires_at_ms: int | None = None
@@ -201,10 +201,9 @@ class Command:
 
     def __post_init__(self):
         identifier(self.message_id)
-        modes = dict(send="new_turn", append="append", nudge="append", steer="control",
-                     answer="control", resume="new_turn", cancel="control", result_ready="result")
-        if modes.get(self.operation) != self.execution_mode or self.scope not in {"self", "subtree"}:
-            raise RuntimeRequestError("invalid_options", "operation/mode/scope")
+        if (self.operation not in {"send", "resume", "cancel"} or self.scope not in {"self", "subtree"}
+                or type(self.urgent) is not bool or self.urgent and self.operation != "send"):
+            raise RuntimeRequestError("invalid_options", "operation/urgent/scope")
         object.__setattr__(self, "payload", freeze(self.payload))
         object.__setattr__(self, "options", freeze(self.options or {}))
         for name in ("expires_at_ms", "expected_job_generation"):

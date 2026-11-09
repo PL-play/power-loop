@@ -45,7 +45,7 @@ async def _source(manager, tx, actor, caller, call_ref, tool_call_id):
         raise JobError("stop_caller_mismatch")
     # Cancellation is a safe control action even when this actual send's lease
     # expired. A closed or superseded execution still cannot issue new actions.
-    if source["intake"] != "open" or source["status"] not in ("running", "waiting", "settling"):
+    if source["intake"] != "open" or source["status"] not in ("running", "settling"):
         raise JobError("stop_caller_closed")
     seen, owner = {source["job_id"]}, source
     for _ in range(64):

@@ -88,7 +88,7 @@ class _InputStart:
 
     @property
     def child_job_id(self):
-        return (self.record.row["target_job_id"] if self.record.meta["operation"] in {"resume", "answer"}
+        return (self.record.row["target_job_id"] if self.record.meta["operation"] == "resume"
                 else self.record.row["delivered_job_id"])
 
     async def claim_owner(self, runtime, tx):
@@ -96,10 +96,6 @@ class _InputStart:
             return None
         from power_loop.runtime.jobs import JobRegistration, _record
         row = await runtime.manager._row(tx, self.child_job_id)
-        if self.record.meta["operation"] == "answer":
-            from power_loop.runtime.interactions import claim_answer
-            self.owner = await claim_answer(self, runtime, tx, row)
-            return self.owner
         if self.record.meta["operation"] == "resume":
             from power_loop.runtime.subagent_resume import resume_claim
             self.owner = await resume_claim(runtime, tx, self.record, row)
@@ -128,15 +124,6 @@ class _InputStart:
         state = await port.db.dialect.lock_state(tx, port.state, ctx.session_id)
         ctx.lease.require_owned()
         seq = state["next_seq"]
-        if self.record.meta["operation"] == "answer":
-            waiting = self.record.meta["interaction"]
-            self.next_seq = seq
-            await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,"
-                "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
-                (waiting["answer_seq"], self.send_index, now_ms(), ctx.session_id, ctx.input_ref.message_id))
-            ctx.job_ref = ref
-            binding.resource_evidence["_runtime_send_index"] = self.send_index
-            return
         self.next_seq = seq + 1
         body = json.loads(self.record.row["content"])
         role, name = "user", None
@@ -230,12 +217,6 @@ class _InputStart:
             manager = binding.runtime.manager
             row = await manager._row(tx, ctx.job_ref.job_id)
             manager._check_proof(row, self.owner.lease)
-            waiting = self.record.meta.get("interaction")
-            if waiting:
-                usage = dict(waiting["usage"])
-                for key, count in value.usage.items():
-                    usage[key] = usage.get(key, 0) + count
-                value = replace(value, usage=usage)
             if row["kind"] == "send":
                 await manager.close_model_execution(self.owner.actor, self.owner.lease,
                     evidence={**evidence, "_public_result": plain(value)})
@@ -358,17 +339,13 @@ class RuntimeWorker:
             self._overflow = False
         for ref in page.items:
             self._activate(ref.session_id)
-        jobs = await self.inputs.db.fetchall(f"SELECT job_id,session_id,status FROM {self.inputs.jobs} "
+        jobs = await self.inputs.db.fetchall(f"SELECT job_id,session_id FROM {self.inputs.jobs} "
             "WHERE kind IN ('subagent','background_tool','background_command','workflow','workflow_node') AND session_id IS NOT NULL "
-            "AND status IN ('running','waiting') AND outcome IS NULL AND job_id>? ORDER BY job_id LIMIT ?",
+            "AND status='running' AND outcome IS NULL AND job_id>? ORDER BY job_id LIMIT ?",
             (self._job_recovery_cursor, self.runtime.claim_limit))
         self._job_recovery_cursor = jobs[-1]["job_id"] if len(jobs) == self.runtime.claim_limit else ""
         for job in jobs:
-            if job['status'] == 'waiting':
-                from power_loop.runtime.wait_review import arm
-                await arm(self, job['session_id'], recover=True)
-            else:
-                self._activate(job["session_id"])
+            self._activate(job["session_id"])
 
     async def _recover_periodically(self):
         while True:
@@ -436,7 +413,7 @@ class RuntimeWorker:
             finally:
                 ctx.control_read = None
             if (record and record.row["status"] == "pending"
-                    and record.meta["operation"] == "steer" and ctx.job_ref is not None
+                    and record.row["mode"] == "steer" and ctx.job_ref is not None
                     and (record.row["target_job_id"] is None
                          or (record.row["target_job_id"], record.row["expected_job_generation"])
                          == (ctx.job_ref.job_id, ctx.job_ref.generation))):
@@ -532,9 +509,10 @@ class RuntimeWorker:
         r, env, ctx, deadline_task, output_task = self.runtime, None, None, None, None
         bus, on_delta = None, None
         try:
-            row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata,s.parent_session_id AS event_parent,s.spawn_depth AS event_depth FROM {self.inputs.q} q "
+            rows = await self.inputs.db.fetchall(f"SELECT q.*,s.metadata_json AS session_metadata,s.parent_session_id AS event_parent,s.spawn_depth AS event_depth FROM {self.inputs.q} q "
                 f"JOIN {r.store.t.sessions} s ON s.session_id=q.session_id "
-                "WHERE q.session_id=? AND q.status='pending' ORDER BY q.id LIMIT 1", (sid,))
+                "WHERE q.session_id=? AND q.status='pending' ORDER BY q.id LIMIT 2", (sid,))
+            row = rows[0] if rows else None
             recovery_only = row is None
             if recovery_only:
                 row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata,s.parent_session_id AS event_parent,s.spawn_depth AS event_depth FROM {self.inputs.jobs} j "
@@ -558,14 +536,14 @@ class RuntimeWorker:
                 record = self.inputs.record(row)
                 recovery_only = True
             ctx = _SessionExecution(r.store.store_id, sid, r.node_id, r.boot_id, record.ref)
-            # An idle worker may start after several append notifications were accepted.
-            # Discover that bounded backlog at the normal round checkpoint.
-            ctx.append_overflow = record.meta["operation"] in {"append", "nudge", "steer", "result_ready"}
+            # Inputs accepted before this execution registered left no notification for it.
+            # The first round checkpoint picks that bounded backlog up from the store.
+            ctx.append_overflow = len(rows) > 1
             ctx.options = RequestOptions(**record.meta["options"])
             scopes.enter_context(_bind_execution_context(ctx.snapshot, r.host_context_fields))
             ctx.task = asyncio.current_task()
             self._active[sid] = ctx
-            if row["target_job_id"] and record.meta["operation"] not in {"resume", "answer"}:
+            if row["target_job_id"] and record.meta["operation"] != "resume":
                 job = await self.inputs.db.fetchone(f"SELECT generation,status FROM {self.inputs.jobs} WHERE job_id=?", (row["target_job_id"],))
                 reason = ("target_terminal" if job is None or job["status"] != "running" else
                           "stale_generation" if job["generation"] != row["expected_job_generation"] else None)
@@ -691,8 +669,7 @@ class RuntimeWorker:
                         preset=child_spec.get("preset", "core"), sub_session_id=sid, depth=row["event_depth"]),
                     session_id=row["event_parent"], source="subagent"))
             try:
-                send_index = (record.meta["interaction"]["send_index"] if record.meta["operation"] == "answer"
-                              else int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1)
+                send_index = int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1
                 start = _InputStart(self, ctx, record, send_index)
                 await loop._interrupt_pending(sid)
                 if env.command is not None:
@@ -702,11 +679,7 @@ class RuntimeWorker:
                     child_result = await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
                         system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
                         response_format=options["response_format"], with_history=options["history"],
-                        _initial_round_index=(record.meta["interaction"]["rounds"] if record.meta["operation"] == "answer" else 0),
                         _entry_send_index=send_index, _runtime_start=start)
-                    if child_result.status == 'waiting_for_input':
-                        from power_loop.runtime.wait_review import arm
-                        await arm(self, sid)
             finally:
                 if child_spec is not None:
                     from power_loop.contracts.event_payloads import (
@@ -751,8 +724,8 @@ class RuntimeWorker:
         except RuntimeRequestError as exc:
             if exc.code == "input_not_startable" and ctx.job_ref is None:
                 return  # Cancel/expiry won the atomic start condition.
-            if ctx.job_ref is None and record.meta["operation"] in {"answer", "resume"} and exc.code in {
-                "target_cancelled", "interaction_expired", "target_not_resumable", "stale_generation",
+            if ctx.job_ref is None and record.meta["operation"] == "resume" and exc.code in {
+                "target_cancelled", "target_not_resumable", "stale_generation",
             }:
                 # The claim transaction rejected this continuation. Terminalize
                 # only its unbound input; the original job/result stays intact.
@@ -884,13 +857,13 @@ class RuntimeWorker:
             ctx.control_read.hint_consumed = True
         try:
             async with ctx.loop.task_runtime.manager.joined_write() as tx:
-                # Filter the finite notification batch; new_turn must remain pending.
+                # A resume or an input already bound to its own job start stays pending.
                 eligible = []
                 for ref in refs:
                     record = await self.inputs.input(tx, ref)
                     if record and record.meta["operation"] == "result_ready":
                         eligible.append(ref)
-                    elif record and record.meta["operation"] in {"append", "nudge", "steer"}:
+                    elif record and record.meta["operation"] == "send" and record.row["delivered_job_id"] is None:
                         row = record.row
                         reason = ("expired" if row["expires_at"] is not None and row["expires_at"] <= now_ms() else
                                   "stale_generation" if row["target_job_id"] and

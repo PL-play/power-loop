@@ -74,7 +74,7 @@ async def _run_rounds(runtime_agent, *, configured, override=None, append=False)
         config=AgentLoopConfig(system_prompt="t", max_rounds=configured))
     options = RequestOptions(max_rounds=override) if override is not None else None
     if append:
-        receipt = await agent.runtime.client.append(agent.target, "finalize", message_id="append",
+        receipt = await agent.runtime.client.send(agent.target, "finalize", message_id="append",
             actor=agent.actor)
         await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
         await agent.drain()

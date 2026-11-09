@@ -302,15 +302,6 @@ class SQLiteSink:
             "tool_call_ids": sorted(remaining),
             "tool_calls": [tc for tc in self._tool_calls if str(tc.get("id") or "") in remaining],
         }
-        known = getattr(self.store, "known_pending", None)
-        found, prior = known(self.session_id) if known is not None else (False, None)
-        if not found:
-            state = await self.store.get_state(self.session_id)
-            prior = state.pending if state is not None else None
-        interactions = [item for item in (prior or {}).get("pending_interactions") or []
-                        if str(item.get("tool_call_id") or "") in remaining]
-        if interactions:
-            pending["pending_interactions"] = interactions
         return pending
 
     async def on_assistant_tool_calls(

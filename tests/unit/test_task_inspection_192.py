@@ -28,7 +28,7 @@ async def runtime(registry_runtime):
     port = RuntimeInputStore(store)
     async with manager._write() as tx:
         await port.accept_input(tx, Command('original', TargetRef(store.store_id, actor.session_id),
-            'send', {'body': 'original task'}, 'new_turn'), TrustedActor(actor.tenant_id, actor.principal_id, None))
+            'send', {'body': 'original task'}), TrustedActor(actor.tenant_id, actor.principal_id, None))
         await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_job_id=?,delivered_job_generation=1 "
                          "WHERE session_id=? AND item_id='original'", (root.job.job_id, actor.session_id))
     # A later definition edit must not change the original alert's profile or attribution.
@@ -93,7 +93,7 @@ async def test_original_problem_creates_one_main_alert_without_finishing_or_stop
     assert inbox['session_id'] == actor.session_id and 'not a task result' in inbox['content']
     public = json.loads(json.loads(inbox['content']).split('Task alert data:\n', 1)[1])
     meta = json.loads(inbox['meta_json'])
-    assert meta['operation'] == 'append' and meta['descriptor']['definition_ref'] == 'inspection@1'
+    assert meta['operation'] == 'send' and meta['descriptor']['definition_ref'] == 'inspection@1'
     assert meta['descriptor']['host_context']['run_id'] == 101 and meta['options']['max_rounds'] == 3
     assert 'root' not in public and public['root_job_id'] == root.job.job_id
     assert 'executor_id' not in inbox['content'] and 'boot_id' not in inbox['content']

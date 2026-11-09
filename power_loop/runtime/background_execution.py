@@ -69,24 +69,13 @@ def automatic(registered):
     return registered.definition.interrupt == "background" and background_allowed(registered)
 
 
-async def invoke_and_wait(pipeline, registered, arguments, detach):
+async def invoke_and_wait(pipeline, registered, arguments):
     loop = agent_context.get_current_loop()
     receipt = await create(loop, registered.definition.name, arguments, automatic=True)
     _, actor = await tool_actor(loop)
-    wait = asyncio.create_task(loop._runtime_worker.runtime.client.wait(
-        JobRef(**receipt["job_ref"]), actor=actor, deadline_ms=None))
-    detached = asyncio.create_task(detach.wait())
-    try:
-        done, _ = await asyncio.wait({wait, detached}, return_when=asyncio.FIRST_COMPLETED)
-        if wait in done:
-            result = wait.result()
-            return result.final_text
-        return canonical({**receipt, "task_id": receipt["job_id"],
-            "message": "The original call continues in the background. Its result will be delivered automatically; do not repeat it."})
-    finally:
-        wait.cancel()
-        detached.cancel()
-        await asyncio.gather(wait, detached, return_exceptions=True)
+    result = await loop._runtime_worker.runtime.client.wait(
+        JobRef(**receipt["job_ref"]), actor=actor, deadline_ms=None)
+    return result.final_text
 
 
 async def action(loop, action, *, command=None, task_id=None, tool=None, args=None, task_ids=None, timeout_s=None):

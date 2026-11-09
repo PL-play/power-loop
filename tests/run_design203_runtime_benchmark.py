@@ -77,7 +77,7 @@ async def composition(store, lane, scenario, *, coordinator=None, transport=None
                 receipt = await agent.runtime.client.send(agent.target, 'run', message_id=mid, actor=agent.actor)
                 await asyncio.wait_for(model.entered.wait(), 10)
                 if scenario == 'append':
-                    extra = await agent.runtime.client.append(agent.target, 'extra', message_id=mid+'-append', actor=agent.actor)
+                    extra = await agent.runtime.client.send(agent.target, 'extra', message_id=mid+'-append', actor=agent.actor)
                     assert extra.newly_accepted
                     model.release.set()
                 else:

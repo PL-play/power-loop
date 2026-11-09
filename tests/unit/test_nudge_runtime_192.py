@@ -9,7 +9,7 @@ import pytest
 from power_loop import InputRef, JobRef, LLMResponse, LLMTokenUsage, RuntimeRequestError
 from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime import delegation
+from power_loop.runtime import child_tasks
 
 from .test_job_registry_192 import registry_store, runtime
 from .test_task_runtime_192 import finish, jobs, managed, receipt
@@ -76,7 +76,7 @@ async def issue_nudge(fixture, monkeypatch, *, message="NUDGED-42", repeat=False
             sent = True
             model.root_calls += 1
             return LLMResponse(raw_text="", tool_calls=[{"id": "actual-nudge", "type": "function", "function": {
-                "name": "spawn_agent", "arguments": json.dumps({"action": "nudge", "sub_session": accepted["session_id"], "message": message})}}],
+                "name": "spawn_agent", "arguments": json.dumps({"action": "send", "sub_session": accepted["session_id"], "message": message})}}],
                 token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10))
         result = await original(request, **kwargs)
         if get_session_id() != parent and "NUDGED-42" in json.dumps(request.messages, default=str):
@@ -86,14 +86,14 @@ async def issue_nudge(fixture, monkeypatch, *, message="NUDGED-42", repeat=False
     monkeypatch.setattr(model, "complete", complete)
     receipts = []
     if repeat:
-        original_nudge = delegation.nudge
+        original_nudge = child_tasks.send_input
 
         async def twice(*args, **kwargs):
             receipts.append(await original_nudge(*args, **kwargs))
             receipts.append(await original_nudge(*args, **kwargs))
             return receipts[0]
 
-        monkeypatch.setattr(delegation, "nudge", twice)
+        monkeypatch.setattr(child_tasks, "send_input", twice)
     result = await loop.send("add a correction to the same child")
     return accepted, result, receipts
 
@@ -144,7 +144,7 @@ async def test_control_refuses_wrong_actor_or_generation_and_does_not_reopen_clo
     else:
         await finish(managed)
     with pytest.raises(RuntimeRequestError):
-        await agent.runtime.client.nudge(ref,'forbidden correction',message_id='wrong',actor=actor)
+        await agent.runtime.client.send(ref,'forbidden correction',message_id='wrong',actor=actor)
     model.release.set()
     await agent.drain()
     assert model.child_calls==1

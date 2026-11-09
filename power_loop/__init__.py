@@ -206,7 +206,6 @@ from power_loop.runtime.fold import (
     LLMSummaryFold,
     NoteOp,
 )
-from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import (
     MemoryProvider,
     MemoryRecallHook,
@@ -256,7 +255,6 @@ from power_loop.runtime.skills import (
     register_skill_tools,
 )
 from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
-from power_loop.runtime.steer import wait_or_steer
 from power_loop.runtime.stop_policy import StopPolicy
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.schema import SchemaPolicy, StoreSchemaError
@@ -293,7 +291,6 @@ from power_loop.runtime.timer_backend import (
 from power_loop.runtime.timers import TimerRunner
 from power_loop.runtime.tool_billing import record_billing_receipt, tool_billing_active, tool_billing_managed
 from power_loop.runtime.tool_context import ToolContextConfig
-from power_loop.runtime.wait_review import WaitPolicy
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
     ToolRegistry,
@@ -314,7 +311,6 @@ from power_loop.tools.spawn_agent import (
     SPAWN_AGENT_DEFINITION,
     register_spawn_agent,
 )
-from power_loop.tools.wait_handoff import register_wait_handoff_tool
 
 from .llm_metrics import (
     CostExtractor,
@@ -335,7 +331,6 @@ _logging.getLogger("power_loop").addHandler(_logging.NullHandler())
 # docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed
 # without a major bump). Add freely; never remove/rename within a major version.
 STABLE_API = (
-    "WaitPolicy", "register_wait_handoff_tool",
     "TimerBackend", "TimerContext", "timer_context", "TimerDriver", "TimerDriverStatus", "StoreTimerBackend", "TimerRunner", "StoreBlackboard",
     "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
     "RuntimeClient", "RuntimeWorker", "ExecutionContext", "OutputSubscription",
@@ -389,7 +384,6 @@ STABLE_API = (
 )
 
 __all__ = [
-    "WaitPolicy", "register_wait_handoff_tool",
     "SessionOwnership",
     "SessionOwnershipCoordinator",
     "MemorySessionOwnershipCoordinator",
@@ -452,7 +446,6 @@ __all__ = [
 	"CancellationRequested",
 	"CompactionFailed",
 	"StopPolicy",
-	"wait_or_steer",
 	"is_permanent_llm_error",
 	"LLMRetryPolicy",
 	"with_retry",
@@ -489,8 +482,6 @@ __all__ = [
 	"StoreBlackboard",
 	"render_entries",
 	"register_blackboard_tools",
-	"HumanInputRequired",
-	"request_user_input",
 	"LlmCallStartedPayload",
 	"LlmCallCompletedPayload",
 	"LlmResponseReceivedPayload",

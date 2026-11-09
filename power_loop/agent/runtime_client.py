@@ -46,35 +46,27 @@ class RuntimeClient:
         if self._closed or (not reading and not self._accepting):
             raise RuntimeRequestError("session_closed")
 
-    async def send(self, target, body, *, message_id, actor, options=None, descriptor=None, deadline_ms=None):
+    async def send(self, target, body, *, message_id, actor, urgent=False, options=None, descriptor=None,
+                   deadline_ms=None):
+        """Start a job on an idle session, or join the running job at its next round.
+
+        ``target`` is a session ``TargetRef`` or a running ``JobRef``. ``urgent`` skips the
+        running job's not-yet-started tool calls so the message arrives one batch sooner.
+        ``options`` and ``descriptor`` apply only when this message starts the job.
+        """
+        if isinstance(target, JobRef):
+            if options is not None or descriptor is not None:
+                raise RuntimeRequestError("invalid_options", "a job input keeps its execution contract")
+            job = await self.inputs.resolve_job(self.inputs.db, target, actor)
+            if target.generation is None:
+                raise RuntimeRequestError("stale_generation")
+            return await self._submit(Command(message_id, TargetRef(target.store_id, job["session_id"], target.job_id),
+                "send", {"body": body}, urgent, expires_at_ms=deadline_ms,
+                expected_job_generation=target.generation), actor=actor)
         if target.job_id is not None:
-            raise RuntimeRequestError("invalid_options", "send targets a session")
-        return await self._submit(Command(message_id, target, "send", {"body": body}, "new_turn",
+            raise RuntimeRequestError("invalid_options", "address a job with its JobRef")
+        return await self._submit(Command(message_id, target, "send", {"body": body}, urgent,
             options=plain(options or RequestOptions()), expires_at_ms=deadline_ms), actor=actor, descriptor=descriptor)
-
-    async def append(self, target, body, *, message_id, actor, deadline_ms=None):
-        return await self.submit(Command(message_id, target, "append", {"body": body}, "append",
-                                         expires_at_ms=deadline_ms), actor=actor)
-
-    async def _job_input(self, ref, operation, body, *, message_id, actor, deadline_ms=None):
-        job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
-        if ref.generation is None:
-            raise RuntimeRequestError("stale_generation")
-        return await self.submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
-            operation, {"body": body}, "control" if operation == "steer" else "append",
-            expires_at_ms=deadline_ms, expected_job_generation=ref.generation), actor=actor)
-
-    async def nudge(self, ref, body, *, message_id, actor, deadline_ms=None):
-        return await self._job_input(ref, "nudge", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
-
-    async def steer(self, ref, body, *, message_id, actor, deadline_ms=None):
-        return await self._job_input(ref, "steer", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
-
-    async def answer(self, ref, *, interaction_id, wait_round, value, message_id, actor):
-        self._require_open()
-        from power_loop.runtime.interactions import answer
-        return await answer(self, ref, interaction_id=interaction_id, wait_round=wait_round,
-                            value=value, message_id=message_id, actor=actor)
 
     async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None, options=None):
         if ref.generation is None or ref.generation == 0:
@@ -104,7 +96,7 @@ class RuntimeClient:
         from .runtime_types import RuntimeDescriptor
         return await self._submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
             "resume", {"body": body or "Continue the original task using saved results. Do not replay unknown external actions."},
-            "new_turn", options=narrowed, expires_at_ms=deadline_ms,
+            options=narrowed, expires_at_ms=deadline_ms,
             expected_job_generation=ref.generation), actor=actor,
             descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
 
@@ -114,8 +106,8 @@ class RuntimeClient:
                             descriptor=descriptor, options=options)
 
     async def submit(self, command, *, actor):
-        if command.operation in {"answer", "resume"}:
-            raise RuntimeRequestError("invalid_options", command.operation + " requires its dedicated control port")
+        if command.operation == "resume":
+            raise RuntimeRequestError("invalid_options", "resume requires its dedicated control port")
         if command.operation == "cancel":
             if (set(command.payload) - {"input_ref", "reason"} or "reason" not in command.payload
                     or not isinstance(command.payload["reason"], str) or command.options
@@ -139,8 +131,6 @@ class RuntimeClient:
 
     async def _submit(self, command, *, actor, descriptor=None):
         self._require_open()
-        if command.operation not in {"send", "append", "nudge", "steer", "resume"}:
-            raise RuntimeRequestError("invalid_options", "operation requires its dedicated control port")
         if set(command.payload) != {"body"} or command.descriptor_ref is not None:
             raise RuntimeRequestError("invalid_options")
         body = command.payload["body"]
@@ -148,8 +138,8 @@ class RuntimeClient:
             raise RuntimeRequestError("invalid_options", "body must be text or a message")
         if command.scope != "self":
             raise RuntimeRequestError("invalid_options", "ordinary inputs have self scope")
-        if command.operation not in {"send", "resume"} and command.options:
-            raise RuntimeRequestError("invalid_options", "append does not accept execution overrides")
+        if command.operation == "send" and command.target.job_id is not None and (command.options or descriptor):
+            raise RuntimeRequestError("invalid_options", "a job input keeps its execution contract")
         try:
             async with self.inputs.db.transaction() as tx:
                 receipt = await self.inputs.accept_input(tx, command, actor, descriptor=descriptor)
@@ -165,7 +155,7 @@ class RuntimeClient:
         if receipt.state not in {"accepted"}:
             return receipt
         channels = ["work", "activation"]
-        if command.operation == "steer":
+        if command.urgent:
             channels.insert(0, "control")
         published = await self._notify(receipt.target, receipt.message_id, receipt.input_ref, channels)
         return replace(receipt, notification="published" if published else "failed",
@@ -222,8 +212,6 @@ class RuntimeClient:
                     receipt = await self.inputs.void_unbound(tx, input_ref, reason=reason, status="cancelled")
                 else:
                     job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], record.row["delivered_job_generation"])
-                if record.meta["operation"] in {"append", "nudge", "steer"} and record.row["status"] == "delivered":
-                    return self.inputs.receipt(record, reason="already_applied")
             if job_ref is not None:
                 row = await manager._row(tx, job_ref.job_id)
                 if job_ref.generation is None or row["generation"] != job_ref.generation:
@@ -244,24 +232,6 @@ class RuntimeClient:
                             (target.session_id, job_ref.job_id))
                         parent_ref = await self.inputs._commit_result(tx, job_ref,
                             Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
-                if row["status"] == "waiting" and row["outcome"] is None:
-                    import json
-                    state = await tx.fetchone(f"SELECT pending_json,next_seq FROM {self.inputs.state} WHERE session_id=?", (target.session_id,))
-                    pending = json.loads(state["pending_json"] or "{}")
-                    seq = state["next_seq"]
-                    for call in pending.get("tool_calls", []):
-                        await tx.execute(f"INSERT INTO {self.store.t.messages} "
-                            "(session_id,seq,role,tool_call_id,name,content,state,round_index,send_index,created_at) "
-                            "VALUES (?,?,'tool',?,?,?,'active',?,?,?)", (target.session_id, seq, call["id"],
-                            call["function"]["name"], "<cancelled>", pending["round_index"],
-                            pending["runtime_wait"]["send_index"], now_ms()))
-                        seq += 1
-                    await tx.execute(f"UPDATE {self.inputs.state} SET pending_json=NULL,next_seq=?,runtime_version=runtime_version+1 WHERE session_id=?",
-                                     (seq, target.session_id))
-                    await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',"
-                        "intake='closed',resource_state='stopped',version=version+1 WHERE job_id=? AND generation=? AND outcome IS NULL",
-                        (row["job_id"], job_ref.generation), obligations=True)
-                    parent_ref = await self.inputs._commit_result(tx, job_ref, Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
                 receipt = Receipt(input_ref, target, input_ref.message_id if input_ref else
                     f"cancel:{job_ref.job_id}:{job_ref.generation}", False, job_ref, "applied", "not_needed", reason)
         if job_ref is None:
@@ -292,6 +262,27 @@ class RuntimeClient:
     async def inspect(self, ref, *, actor):
         self._require_open(reading=True)
         return (await self.inputs.read(ref, actor))[0]
+
+    async def messages(self, ref, *, actor, source="messages", limit=20, preview_chars=500, max_chars=8000,
+                       seq=None, char_offset=None):
+        """Latest ``limit`` messages of an authorized job, each shortened to ``preview_chars``.
+
+        ``source="projection"`` lists the compact projected history. ``seq`` (messages) reads one
+        record in full in ``max_chars`` chunks continued by ``char_offset``. Returns the same
+        JSON-compatible page as the agent ``jobs get view=messages`` tool.
+        """
+        from power_loop.runtime.jobs import JobActor, JobError
+        from power_loop.runtime.task_history import read_history
+
+        self._require_open(reading=True)
+        row = await self.inputs.resolve_job(self.inputs.db, ref, actor)
+        try:
+            return await read_history(JobManager(self.store),
+                JobActor(row["tenant_id"], row["principal_id"], row["session_id"]), ref.job_id, source=source,
+                seq=seq if source == "messages" else None, id=seq if source == "projection" else None,
+                char_offset=char_offset, limit=limit, latest=True, preview_chars=preview_chars, max_chars=max_chars)
+        except JobError as exc:
+            raise RuntimeRequestError("invalid_options", exc.code) from exc
 
     async def list_jobs(self, target, *, actor, scope="self", unfinished=True, cursor=None, limit=100):
         self._require_open(reading=True)

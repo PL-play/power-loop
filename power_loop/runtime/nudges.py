@@ -270,8 +270,3 @@ def receipt(operation, replayed):
     return {key: operation.result[key] for key in ("job_id", "session_id", "run_id", "mode", "status")} | {
         "operation_id": operation.operation_id, "replayed": replayed} | {
             key: operation.result[key] for key in ("generation", "result_event_id") if key in operation.result}
-
-
-async def steer(loop, session_id, message):
-    from .child_tasks import nudge
-    return await nudge(loop, session_id, message)

@@ -35,8 +35,7 @@ class BackgroundParent(LLMService):
         pass
 
 
-@pytest.mark.parametrize("automatic", [False, True])
-async def test_background_job_survives_parent_and_delivers_once(registry_store, tmp_path, automatic, monkeypatch):
+async def test_background_job_survives_parent_and_delivers_once(registry_store, tmp_path):
     store, _ = registry_store
     gate, began = asyncio.Event(), asyncio.Event()
     count = 0
@@ -47,49 +46,19 @@ async def test_background_job_survives_parent_and_delivers_once(registry_store, 
         await gate.wait()
         return "background result"
     model = BackgroundParent()
-    if automatic:
-        from power_loop.core.pipeline import AgentPipeline
-        steered = asyncio.Event()
-        settle = AgentPipeline._settle_steered_tool
-        async def observe_steer(pipeline, *args, **kwargs):
-            steered.set()
-            return await settle(pipeline, *args, **kwargs)
-        monkeypatch.setattr(AgentPipeline, "_settle_steered_tool", observe_steer)
-        complete = model.complete
-        async def direct(request, **kwargs):
-            first = not model.sent
-            response = await complete(request, **kwargs)
-            if first:
-                response.tool_calls[0]['function'] = {'name':'slow', 'arguments':'{}'}
-            return response
-        model.complete = direct
     registry = create_default_tool_registry(workspace_dir=str(tmp_path))
     registry.register(ToolDefinition(name="slow", description="slow read", input_schema={"type": "object"},
-        pricing=Free("read"), async_capable=True, interrupt="background" if automatic else "finish"), slow)
+        pricing=Free("read"), async_capable=True, interrupt="finish"), slow)
     runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
     try:
-        if automatic:
-            original = await runner.runtime.client.send(runner.target, "start background", message_id="start", actor=runner.actor)
-            await asyncio.wait_for(began.wait(), 5)
-            status = await runner.runtime.client.inspect(original.input_ref, actor=runner.actor)
-            await runner.runtime.client.steer(status.job_ref, "respond now", message_id="steer", actor=runner.actor)
-            await asyncio.wait_for(steered.wait(), 5)
-            # Steering detaches the call, but the parent must wait for the sole
-            # execution slot before its next model call. The child owns it now.
-            assert len(model.requests) == 1
-            gate.set()
-            parent = await runner.runtime.client.wait(original.input_ref, actor=runner.actor, deadline_ms=now_ms()+10000)
-            await runner.finish(original.input_ref)
-        else:
-            parent = await runner.send("start background")
+        parent = await runner.send("start background")
         assert parent.status == "completed"
         rows = await store.load_all_messages(runner.target.session_id)
         receipt = json.loads(next(m.content for m in rows if m.tool_call_id == "background"))
         assert receipt["job_ref"]["generation"] == 0
         await asyncio.wait_for(began.wait(), 5)
         ref = JobRef(**receipt["job_ref"])
-        if not automatic:
-            assert not (await runner.runtime.client.inspect(ref, actor=runner.actor)).result_available
+        assert not (await runner.runtime.client.inspect(ref, actor=runner.actor)).result_available
         gate.set()
         result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms() + 10000)
         assert result.status == "completed" and result.final_text == "background result"
@@ -103,9 +72,8 @@ async def test_background_job_survives_parent_and_delivers_once(registry_store, 
         row = await runner.runtime.worker.inputs.db.fetchone(
             f"SELECT result_status,supervision_status FROM {runner.runtime.worker.inputs.jobs} WHERE job_id=?", (ref.job_id,))
         assert row == {"result_status": "handled", "supervision_status": "closed"}
-        # An automatic call's result can join the parent before its second model
-        # call; an explicit call finishes after the parent has already returned.
-        assert len(model.requests) in ({2, 3} if automatic else {3})
+        # The explicit call finishes after the parent has already returned.
+        assert len(model.requests) == 3
     finally:
         gate.set()
         await runner.aclose()

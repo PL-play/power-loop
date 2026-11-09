@@ -138,7 +138,7 @@ async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, 
             if original is None:
                 original = await inputs.execution_input(tx, actor.session_id, root_job_id)
             command = Command(key, TargetRef(manager.store.store_id, actor.session_id),
-                'append', {'body': render(value)}, 'append', options=original.meta['options'])
+                'send', {'body': render(value)}, options=original.meta['options'])
             await inputs.accept_input(tx, command, TrustedActor(actor.tenant_id, actor.principal_id, None),
                 descriptor=RuntimeDescriptor(**original.meta['descriptor']))
             await tx.execute(f"UPDATE {inputs.q} SET kind='task_alert' WHERE session_id=? AND item_id=?",

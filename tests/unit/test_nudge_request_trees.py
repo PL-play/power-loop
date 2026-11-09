@@ -25,12 +25,12 @@ async def test_independent_clients_nudge_same_original_execution_and_reopen_quer
     client = RuntimeClient(store=peer,transport=agent.runtime.transport,namespace=agent.runtime.namespace)
     bodies = ['first correction','  second correction\n    indentation preserved\n']
     try:
-        replies = await asyncio.gather(*(port.nudge(original.job_ref,body,actor=agent.actor,message_id=f'correction-{i}')
+        replies = await asyncio.gather(*(port.send(original.job_ref,body,actor=agent.actor,message_id=f'correction-{i}')
             for i,(port,body) in enumerate(zip((agent.runtime.client,client),bodies))))
-        repeat = await client.nudge(original.job_ref,bodies[0],actor=agent.actor,message_id='correction-0')
+        repeat = await client.send(original.job_ref,bodies[0],actor=agent.actor,message_id='correction-0')
         assert repeat.input_ref == replies[0].input_ref and not repeat.newly_accepted
         with pytest.raises(RuntimeRequestError,match='conflict'):
-            await client.nudge(original.job_ref,'different',actor=agent.actor,message_id='correction-0')
+            await client.send(original.job_ref,'different',actor=agent.actor,message_id='correction-0')
         for reply,body in zip(replies,bodies):
             record = await client.inputs.input(client.inputs.db,reply.input_ref)
             import json

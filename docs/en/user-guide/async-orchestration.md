@@ -17,17 +17,17 @@ generation 0 terminal result if the task never starts. The start input binds 0â†
 at claim and never follows subsequent resumes.
 
 Children retain frozen tool grants and configuration. Delegation is one level only.
-Later sends in the original main session can inspect, nudge or stop the original
-child without its parent loop. Nudges join a running generation; interrupted tasks
-require explicit resume. Inline `run_agent_spec` admits the same durable job and
+Later sends in the original main session can inspect, message or stop the original
+child without its parent loop. A message (`spawn_agent action=send`) joins the running
+generation at its next round; interrupted tasks require explicit resume. Inline `run_agent_spec` admits the same durable job and
 waits for it. Waiting keeps session ownership but releases execution capacity,
 including when configured capacity is one.
 
 `background_run(action="tool", tool=..., args=...)` and `action="run", command=...`
 admit independent background jobs. `check/list/wait/cancel` address the original
 `task_id`; a wait timeout does not cancel it. Background-eligible tools declared
-with `interrupt="background"` are admitted independently before dispatch. Steering
-ends only their foreground wait. The actual background owner settles the tool's
+with `interrupt="background"` are admitted independently before dispatch. The parent
+waits for them in the foreground; stopping the parent ends only that wait. The actual background owner settles the tool's
 original receipt against its own job and original root; admission does not double-charge it.
 
 The result and parent inbox reference commit together before notification. Active
@@ -42,27 +42,7 @@ resource. A lost resource becomes interrupted/unknown; a replacement worker must
 not rerun the command. `_RUNNING`, `BackgroundManager`, `BackgroundRuntimeProjector`
 and completion callbacks no longer own task execution or delivery.
 
-## Answers and explicit resume
-
-`request_user_input` stores the interaction, original job, send and round, then
-releases capacity. Inspect the input to observe `waiting_input`. A normal send is
-not an answer. A host can answer from another node:
-
-```python
-receipt = await runtime.client.answer(
-    job_ref, interaction_id=interaction_id, wait_round=wait_round,
-    value="blue", message_id="answer-1", actor=actor,
-)
-result = await runtime.client.wait(
-    original_input_ref, actor=actor, deadline_ms=deadline_ms,
-)
-```
-
-The answer input and matching tool message commit atomically. An identical repeat
-returns the original answer state. Conflicting, expired, wrong-round or newly
-submitted post-cancellation answers are rejected. Node changes preserve the job,
-generation, send, cumulative rounds and billing. `StatefulAgentLoop.submit_input`
-wraps the same endpoint.
+## Explicit resume
 
 Explicit resume requires a positive interrupted/unknown, uncancelled child generation.
 Generation 1 resumes as 2 with a new input bound to 2; the original `JobRef/0` and

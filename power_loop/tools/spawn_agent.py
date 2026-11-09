@@ -25,7 +25,7 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(pricing=Free("composite"),
     name="spawn_agent",
     description=(
         "Delegate work in an isolated child session, always asynchronously. create (default) "
-        "starts a task; nudge adds input to the same running child. "
+        "starts a task; send adds a message to the same child (urgent skips its not-yet-started tool calls). "
         "Returns session_id/run_id and acceptance, not completion. Results arrive in your "
         "task_done inbox with the original job reference, final_text, status and usage. "
         "You may pass_turn while waiting; inspect the original session for additional context."
@@ -33,10 +33,11 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(pricing=Free("composite"),
     input_schema={
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["create", "nudge"], "default": "create",
-                       "description": "create needs task; nudge needs sub_session and message and retains the original execution contract."},
-            "sub_session": {"type": "string", "description": "nudge only: direct child's session_id from a previous receipt; deleted children cannot continue."},
-            "message": {"type": "string", "description": "nudge only: correction, additional input or follow-up question."},
+            "action": {"type": "string", "enum": ["create", "send"], "default": "create",
+                       "description": "create needs task; send needs sub_session and message and retains the original execution contract."},
+            "sub_session": {"type": "string", "description": "send only: direct child's session_id from a previous receipt; deleted children cannot continue."},
+            "message": {"type": "string", "description": "send only: correction, additional input or follow-up question."},
+            "urgent": {"type": "boolean", "description": "send only: deliver before the child's not-yet-started tool calls."},
             "task": {
                 "type": "string",
                 "description": "create requires task: clear instructions, input locations and expected result.",
@@ -75,8 +76,7 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(pricing=Free("composite"),
         "required": [],
     },
     required_params=(),
-    # design/124 §7.3: a sub-agent is long, useful work — a steer moves it to the background
-    # (its result is delivered when it finishes) instead of killing it or blocking the turn.
+    # design/124 §8.4: a stop gives the sub-agent subtask_s to wind down instead of killing it.
     interrupt="background",
 )
 
@@ -98,19 +98,20 @@ async def _handle_spawn_agent(**kwargs: Any) -> str:
             "StatefulAgentLoop run."
         )
     action = kwargs.get("action", "create")
-    if action == "nudge":
-        from power_loop.runtime.delegation import nudge
+    if action == "send":
+        from power_loop.runtime.child_tasks import send_input
         sid, message = str(kwargs.get("sub_session") or "").strip(), kwargs.get("message")
         if not sid or not isinstance(message, str) or not message.strip():
-            return "Error: nudge requires sub_session and message."
+            return "Error: send requires sub_session and message."
         if any(k in kwargs for k in ("task", "name", "system_prompt", "tools", "max_rounds", "output_schema")):
-            return "Error: nudge retains the original contract; provide only sub_session and message."
+            return "Error: send retains the original contract; provide only sub_session, message and urgent."
         try:
-            return json.dumps(await nudge(loop, sid, message), ensure_ascii=False)
+            return json.dumps(await send_input(loop, sid, message, urgent=kwargs.get("urgent") is True),
+                              ensure_ascii=False)
         except ValueError as exc:
             return "Error: " + str(exc)
     if action != "create":
-        return "Error: action must be create or nudge."
+        return "Error: action must be create or send."
     task = str(kwargs.get("task") or "").strip()
     if not task:
         return "Error: spawn_agent requires 'task'."

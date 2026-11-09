@@ -71,7 +71,7 @@ run/path/iteration/attempt 形成稳定节点键。节点 job、session、start 
 ```python
 await handle.cancel("用户停止工作流")  # 先关闭整树新派发
 await runtime.client.cancel(node_ref, actor=actor, scope="self")  # 指定节点和代次
-await runtime.client.nudge(node_ref, "补充要求", message_id="note-1", actor=actor)
+await runtime.client.send(node_ref, "补充要求", message_id="note-1", actor=actor)
 
 # 工作流已有终态结果时，明确给出当前 generation。
 continued = await handle.resume(generation=current_generation, node_id="draft",
@@ -81,7 +81,7 @@ result = await continued.wait()
 
 显式继续在所选节点原 job 中开启新代次，其依赖尾部用新 attempt 重算；未变化分支复用
 原结果。节点在 foreach/loop 中存在多个迭代时，图级 resume 拒绝歧义；先检查具体 job，
-再提交范围明确的新任务。运行中节点使用 nudge/steer 或 answer；图级 resume 要求工作流
+再提交范围明确的新任务。运行中节点用 send 接收消息；图级 resume 要求工作流
 已经终结。已取消代次不会重新启动。
 
 自动与显式继续都保留累计 token 用量和原工作流截止时间。额度用尽仍可读取已有结果。
@@ -95,8 +95,8 @@ shared_execution=True；默认内存适配器仅供单进程使用。所有 work
 版本化环境定义。宿主负责 worker 路由和进程/容器隔离，SDK 不再逐叶子拉起进程或创建
 独立数据库。
 
-register_workflow_tool 提供 create/validate/status/list/leaves/logs、节点 nudge/steer
-和 cancel；register_workflow_tools 将同一受理路径注册为 create/validate/status 三个
+register_workflow_tool 提供 create/validate/status/list/leaves/logs、节点 send（可选 urgent）
+和 cancel，logs 列出节点最近的消息；register_workflow_tools 将同一受理路径注册为 create/validate/status 三个
 工具名。模型创建立即返回收据，结果进入原父 inbox。WorkflowToolPorts 保留定义加载、
 策略转换、工具授权收窄和有时限的展示观察函数；观察函数不决定任务完成。
 

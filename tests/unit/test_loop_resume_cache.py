@@ -285,7 +285,7 @@ async def test_appended_input_is_visible_after_worker_rebuild(runtime_agent):
     agent = await runtime_agent(model=model, config=AgentLoopConfig(compactor=None))
     task = asyncio.create_task(agent.send("first"))
     await asyncio.wait_for(entered.wait(), 5)
-    appended = await agent.runtime.client.append(agent.target, "steer", message_id="steer", actor=agent.actor)
+    appended = await agent.runtime.client.send(agent.target, "steer", message_id="steer", actor=agent.actor)
     release.set()
     await task
     await agent.runtime.client.wait(appended.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)

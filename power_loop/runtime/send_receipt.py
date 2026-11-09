@@ -17,7 +17,7 @@ MAX_BYTES = 1024 * 1024
 _TEXT = ("session_id", "status", "final_text")
 _COUNTS = ("rounds", "tool_calls")
 _FLAGS = ("passed", "new_input_after_pass")
-_LISTS = ("pending_tool_calls", "pending_interactions", "texts")
+_LISTS = ("pending_tool_calls", "texts")
 _FIELDS = {*_TEXT, *_COUNTS, *_FLAGS, *_LISTS, "usage", "pass_reason"}
 
 
@@ -113,7 +113,7 @@ async def read(manager, actor, job_id, *, expected_host_context=None, max_bytes=
                 raise
             raise JobError("send_receipt_evidence_unavailable_or_corrupt") from None
         await model_exit.require_stopped(manager, tx, row, payload)
-        if value["status"] != "completed" or value["pending_tool_calls"] or value["pending_interactions"]:
+        if value["status"] != "completed" or value["pending_tool_calls"]:
             raise JobError("send_receipt_requires_continuation")
         provenance = None
         if expected is not None:

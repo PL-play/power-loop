@@ -107,28 +107,6 @@ async def test_timer_remind_me_arms_a_durable_timer(store: SessionStore, runtime
 
 
 @pytest.mark.asyncio
-async def test_human_input_ask_human_pauses_then_submit_resumes(store: SessionStore, runtime_agent) -> None:
-    llm = _Scripted(responses=[
-        _tool_resp("c1", "ask_human", '{"prompt": "Proceed?", "options": ["yes", "no"]}'),
-        LLMResponse(raw_text="continued after approval"),
-    ])
-    loop = await _loop(runtime_agent, store, llm, _registry("ask_human"))
-
-    from power_loop.agent.runtime_store import now_ms
-    from tests.unit.test_history_projection_loop import question
-    receipt, pending = await question(loop, "ask before continuing")
-    interaction = pending["pending_interactions"][0]
-    assert interaction["prompt"] == "Proceed?"
-    assert interaction["options"][0]["value"] == "yes"
-    status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
-    answer = await loop.runtime.client.answer(status.job_ref, interaction_id=interaction["interaction_id"],
-        wait_round=pending["round_index"], value="yes", message_id="answer", actor=loop.actor)
-    resumed = await loop.runtime.client.wait(answer.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
-    assert resumed.status == "completed" and resumed.final_text == "continued after approval"
-    await loop.drain()
-
-
-@pytest.mark.asyncio
 async def test_subagent_delegate_returns_receipt_and_child_result(store, runtime_agent):
     from power_loop.agent.runtime_store import now_ms
     llm = _Scripted(responses=[_tool_resp("c1", "delegate", '{"task":"greet"}'),

@@ -20,7 +20,6 @@ def test_default_tool_registry_smoke(tmp_path: Path) -> None:
         "glob",
         "grep",
         "load_skill",
-        "request_user_input",
     ]:
         assert registry.has(name), f"missing default tool: {name}"
 

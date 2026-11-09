@@ -17,7 +17,6 @@ import pytest
 from power_loop import (
     AgentLoopConfig,
     ToolDefinition,
-    create_default_tool_registry,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.hooks import HookDirective, HookPoint
@@ -95,37 +94,3 @@ async def test_tool_after_break_resolves_remaining_tool_calls(runtime_agent) -> 
     r2 = await loop.send("again")
     assert r2.status in ("completed", "hit_round_limit")
 
-
-async def test_request_user_input_batched_resolves_later_tool_calls(runtime_agent) -> None:
-    reg = create_default_tool_registry(include=["request_user_input"])
-    reg.register(_echo_def(), lambda **k: "echoed")
-    llm = _Scripted(responses=[
-        _multi_tool(
-            ("c1", "echo", "{}"),
-            ("c2", "request_user_input",
-             '{"kind":"confirm","prompt":"ok?","options":[{"id":"yes","label":"Yes"}]}'),
-            ("c3", "echo", "{}"),
-        ),
-        LLMResponse(raw_text="resumed done", content_text="resumed done"),
-    ])
-    loop = await runtime_agent(
-        model=llm, registry=reg,
-        config=AgentLoopConfig(system_prompt="o", max_rounds=4, compactor=None),
-    )
-    sid = loop.target.session_id
-    from power_loop.agent.runtime_store import now_ms
-    from tests.unit.test_history_projection_loop import question
-    receipt, pending = await question(loop, "go")
-    # c1 executed, c3 resolved as skipped (not dangling); c2 is the interaction.
-    responded = {m.get("tool_call_id") for m in [dict(role=r.role, content=r.content, tool_calls=r.tool_calls, tool_call_id=r.tool_call_id) for r in await loop.runtime.store.load_active_messages(sid)] if m.get("role") == "tool"}
-    assert "c1" in responded and "c3" in responded
-
-    status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
-    answer = await loop.runtime.client.answer(status.job_ref,
-        interaction_id=pending['pending_interactions'][0]['interaction_id'],
-        wait_round=pending['round_index'], value={'choice':'yes'}, message_id='answer', actor=loop.actor)
-    resumed = await loop.runtime.client.wait(answer.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
-    assert resumed.status == "completed"
-    await loop.drain()
-    _assert_no_dangling([dict(role=r.role, tool_calls=r.tool_calls, tool_call_id=r.tool_call_id)
-                        for r in await loop.runtime.store.load_active_messages(sid)])

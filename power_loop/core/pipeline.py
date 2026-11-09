@@ -100,7 +100,6 @@ from power_loop.core.state import ContextManager
 from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.compact import CompactionContext
-from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.runtime.image_recall import drain_queued_images
 from power_loop.runtime.memory import MemorySnapshot
 from power_loop.runtime.retry import _status_of, with_retry
@@ -374,14 +373,10 @@ class AgentPipeline:
         self.store = store
         self._drain_follow_ups = drain_follow_ups
         self._drain_follow_ups_final = drain_follow_ups_final or drain_follow_ups
-        # design/124 §7: set while a steer-mode inbox item waits undelivered. The model call and
-        # interruptible tools race it; the next round's drain delivers the item (and clears it).
+        # Set while an urgent inbox item waits undelivered: the tool batch starts nothing new;
+        # the next round's drain delivers the item (and clears it).
         self._steer_event = steer_event
         self._model_policy_due = asyncio.Event()
-        self._steer_aborts = 0                     # consecutive steer-aborted model calls
-        # Z8: durable LLM_BEFORE injections already written by a round whose model call a steer
-        # aborted — the re-run round's hooks may produce them again; they're in history already.
-        self._aborted_persist_keys: set[str] = set()
         # design/124 §8.2: each running tool call's own stop token (child of the run's).
         self._tool_tokens: dict[asyncio.Future, CancellationToken] = {}
 
@@ -602,17 +597,9 @@ class AgentPipeline:
             drained = await self._drain_follow_ups()
         return committed
 
-    # ── Steering (design/124 §7) ──
+    # ── Urgent messages ──
 
-    #: Safety valve: more consecutive steer-aborts than this in one send and the model call
-    #: runs to completion regardless (a steer flag that can never be cleared must not spin).
-    MAX_STEER_ABORTS = 5
     STEER_SKIP_REASON = "为先处理用户的新消息，这个调用没有执行；需要的话重新调用"
-    STEER_ABORT_TEXT = ("[interrupted: 为先处理用户的新消息，这个调用已中断，结果没有产生。"
-                        "不是用户拒绝了它，需要的话可以重新执行。]")
-    STEER_BACKGROUND_TEXT = ("[moved to background: 为先处理用户的新消息，这个调用已转到后台继续运行，"
-                             "task_id={task_id}。完成后结果会自动送到你面前；不是用户拒绝了它，"
-                             "也不要重新调用。]")
 
     def _steer_pending(self) -> bool:
         ev = self._steer_event
@@ -624,14 +611,11 @@ class AgentPipeline:
         definition = getattr(rt, "definition", None) if rt is not None else None
         return str(getattr(definition, "interrupt", "finish") or "finish")
 
-    async def _race(self, work: asyncio.Future, *, steer: bool, policy_deadline: bool = False) -> tuple[Any, str]:
-        """Await ``work`` unless steering (when ``steer``) or a stop arrives first.
+    async def _race(self, work: asyncio.Future, *, policy_deadline: bool = False) -> tuple[Any, str]:
+        """Await ``work`` unless a stop (or the policy deadline) arrives first.
         ``(result, "done")`` when it finished (its exception propagates); ``(None, "stop")`` /
-        ``(None, "steer")`` otherwise — ``work`` is left RUNNING, the caller decides. A stop wins
-        over a steer that arrives in the same instant."""
+        ``(None, "policy_deadline")`` otherwise — ``work`` is left RUNNING, the caller decides."""
         waiters: dict[str, asyncio.Future] = {}
-        if steer and self._steer_event is not None:
-            waiters["steer"] = asyncio.ensure_future(self._steer_event.wait())
         if not self.cancel_token.is_never:
             waiters["stop"] = asyncio.ensure_future(self.cancel_token.wait())
         if policy_deadline:
@@ -664,9 +648,7 @@ class AgentPipeline:
             return work.result(), "done"
         if "stop" in waiters and waiters["stop"] in done:
             return None, "stop"
-        if "policy_deadline" in waiters and waiters["policy_deadline"] in done:
-            return None, "policy_deadline"
-        return None, "steer"
+        return None, "policy_deadline"
 
     def _start_tool(
         self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore | None = None,
@@ -674,22 +656,19 @@ class AgentPipeline:
     ) -> asyncio.Future:
         """Run one tool call as its own task with its OWN stop token (a child of the run's —
         design/124 §8.2), exposed to the handler as the current cancel token. Stopping the run
-        reaches it; stopping just this call (e.g. once it was moved to the background) leaves
-        the run alone."""
+        reaches it; stopping just this call leaves the run alone."""
         tok = self.cancel_token.child()
-        detach = asyncio.Event()
         assistant_seq = getattr(self.sink, "persisted_assistant_seq", None)
 
         async def _run() -> tuple[str, bool]:
             if sem is None:
                 return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
-                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq, background_detach=detach)
+                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
             async with sem:
                 return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
-                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq, background_detach=detach)
+                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
 
         fut = asyncio.ensure_future(_run())
-        fut.background_detach = detach
         self._tool_tokens[fut] = tok
         fut.add_done_callback(lambda f: self._tool_tokens.pop(f, None))
         return fut
@@ -720,50 +699,6 @@ class AgentPipeline:
         await asyncio.wait({work}, timeout=pol.abort_tool_s)
         return (f"[stopped: 用户要求停止（{reason}）；这个调用 {grace:.0f} 秒内没有结束，已强制中止，"
                 "结果不完整或没有。]", False)
-
-    async def _settle_steered_tool(
-        self, work: asyncio.Future, mode: str, tool_name: str, tool_args: dict[str, Any],
-        call_id: str, round_idx: int,
-    ) -> str:
-        """A steer arrived while this tool ran: ``abort`` cancels it, ``background`` hands the
-        running call to the background task table. Returns the synthetic result for the model."""
-        task_id = ""
-        if mode == "background":
-            # Admission finishes before returning a stable reference. Only the
-            # foreground wait ends; execution belongs to the independent job.
-            work.background_detach.set()
-            output, _ = await work
-            try:
-                task_id = json.loads(output).get("task_id", "")
-            except (ValueError, AttributeError):
-                pass
-        else:
-            work.cancel()
-            with contextlib.suppress(BaseException):
-                await work
-            output = self.STEER_ABORT_TEXT
-        self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
-            where="tool", action=mode, round_index=round_idx, tool_name=tool_name,
-            tool_call_id=call_id, task_id=task_id), round_index=round_idx)
-        return output
-
-    async def _restart_round_for_steer(self, round_idx: int, llm_before: Any) -> None:
-        """Close a round whose model call a steer aborted, so the next round (whose drain
-        delivers the steer) starts clean: paired round events, no usage row (the aborted call's
-        estimate is already in the run totals), the round not counted against the limit, and the
-        round's durable LLM_BEFORE injections remembered so they aren't written twice (Z8)."""
-        self._steer_aborts += 1
-        self._aborted_persist_keys.update(
-            _persist_key(m) for m in getattr(llm_before, "persist_messages", ()) or ())
-        self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
-            where="llm", action="restart", round_index=round_idx), round_index=round_idx)
-        self._emit(AgentEventType.ROUND_COMPLETED,
-                   RoundCompletedPayload(round_index=round_idx, has_tools=False),
-                   round_index=round_idx)
-        await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
-            round_index=round_idx, messages=self.history, has_tools=False, response_text=""))
-        await self._emit_sink(self.sink.on_round_ended, round_idx, usage=None)
-        self._round_limit += 1
 
     async def _resolve_skipped_tool_calls(
         self, skipped: Sequence[Mapping[str, Any]], *, reason: str, round_idx: int
@@ -889,8 +824,7 @@ class AgentPipeline:
             logger.debug("send summary log failed", exc_info=True)
 
     def _make_result(self, status: str, *, final_text: str = "", rounds: int = 0,
-                     pending_tool_calls: list | None = None,
-                     pending_interactions: list | None = None) -> AgentLoopResult:
+                     pending_tool_calls: list | None = None) -> AgentLoopResult:
         self._completed_rounds = rounds  # for MemorySnapshot
         self._log_send_summary(status, rounds)
         st = getattr(self, "_pass_state", None) or {}
@@ -910,7 +844,6 @@ class AgentPipeline:
             final_text=final_text,
             rounds=max(0, rounds - getattr(self, "_initial_round_index", 0)),
             pending_tool_calls=pending_tool_calls or [],
-            pending_interactions=pending_interactions or [],
             messages=self.history,
             usage=dict(self.ctx.usage_totals),
             tool_calls=int(self.ctx.tool_calls),
@@ -919,22 +852,6 @@ class AgentPipeline:
             new_input_after_pass=bool(st.get("new_input_after_pass")),
             texts=texts,
         )
-
-    async def _persist_pending_interaction(
-        self,
-        *,
-        interaction: dict[str, Any],
-        round_index: int,
-    ) -> None:
-        if self.store is None or self.session_id is None:
-            return
-        state = await self.store.get_state(self.session_id)
-        pending = dict(state.pending or {}) if state is not None else {}
-        interactions = list(pending.get("pending_interactions") or [])
-        interactions.append(interaction)
-        pending["pending_interactions"] = interactions
-        pending["round_index"] = round_index
-        await self.store.set_pending(self.session_id, pending)
 
     # ══════════════════════════════════════════════════════════════
     # Phase methods — pure business logic with explicit parameters.
@@ -1682,7 +1599,7 @@ class AgentPipeline:
     ) -> asyncio.Future:
         """同轮并发的一个成员：受信号量限流地跑 execute_tool（自带子停止标记，见 _start_tool）。
         contextvars 随 task 自动拷贝（PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样
-        留在 task 里，轮到它时再由串行路径的 HumanInputRequired / TOOL_ERROR 分支处理。"""
+        留在 task 里，轮到它时再由串行路径的 TOOL_ERROR 分支处理。"""
         return self._start_tool(tool_name, tool_args, sem, tool_call_id=tool_call_id)
 
     @staticmethod
@@ -1696,7 +1613,6 @@ class AgentPipeline:
         self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True,
         cancel_token: CancellationToken | None = None,
         tool_call_id: str | None = None, assistant_seq: int | None = None,
-        background_detach: asyncio.Event | None = None,
     ) -> tuple[str, bool]:
         """Execute a single tool and return ``(output_string, failed)``.
 
@@ -1739,8 +1655,7 @@ class AgentPipeline:
                                                          budget_attempt=budget_attempt)
                     from power_loop.runtime.native_returns import invoke
                     result = await invoke(self, registered, tool_args, receipt, budget_attempt=budget_attempt,
-                        dispatch=(lambda: invoke_and_wait(self, registered, tool_args,
-                            background_detach or asyncio.Event())) if independent else None)
+                        dispatch=(lambda: invoke_and_wait(self, registered, tool_args)) if independent else None)
             finally:
                 reset_current_cancel_token(_ctok)
         except (ToolNotFound, ToolValidationError) as exc:
@@ -2034,12 +1949,6 @@ class AgentPipeline:
             # the send (e.g. a periodic "you haven't called X in N rounds" reminder). Computed AFTER
             # hook_audit so these durable rows don't get counted as ephemeral injections.
             for _pm in llm_before.persist_messages:
-                _pk = _persist_key(_pm)
-                if _pk in self._aborted_persist_keys:
-                    # Z8: written by the round a steer aborted — already in history (and in
-                    # llm_before.messages via self.history); don't write it a second time.
-                    self._aborted_persist_keys.discard(_pk)
-                    continue
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
 
@@ -2089,20 +1998,14 @@ class AgentPipeline:
                         max_tokens=llm_before.max_tokens,
                         temperature=llm_before.temperature,
                     )
-                    # design/124 §7.2: the model call races incoming steering. A steer flag
-                    # already up at this point survived the round-start drain (store blip) —
-                    # racing it would abort at once, forever; so only a steer that arrives
-                    # DURING the call interrupts it, and only a bounded number of times.
-                    # design/124 §8.4: a STOP interrupts the model call too (immediately — its
-                    # output is discarded like a steered one, the run ends cancelled).
+                    # design/124 §8.4: a STOP interrupts the model call (immediately — its
+                    # output is discarded, the run ends cancelled).
                     from power_loop.runtime.model_attempts import is_managed
                     _managed_call = is_managed(self.session_id)
-                    _steer_ok = (not _managed_call and self._steer_event is not None and not self._steer_event.is_set()
-                                 and self._steer_aborts < self.MAX_STEER_ABORTS)
-                    if _steer_ok or _managed_call or not self.cancel_token.is_never:
+                    if _managed_call or not self.cancel_token.is_never:
                         self._model_policy_due.clear()
                         _llm_work = asyncio.ensure_future(_llm_call)
-                        response, _why = await self._race(_llm_work, steer=_steer_ok, policy_deadline=_managed_call)
+                        response, _why = await self._race(_llm_work, policy_deadline=_managed_call)
                         if _why == "policy_deadline":
                             from power_loop.runtime.task_runtime import _SEND
                             _binding = _SEND.get()
@@ -2131,13 +2034,9 @@ class AgentPipeline:
                             if _llm_work.done() or not _managed_call:
                                 with contextlib.suppress(BaseException):
                                     await _llm_work
-                            if _why == "stop":
-                                raise CancellationRequested(self.cancel_token.reason)
-                            await self._restart_round_for_steer(round_idx, llm_before)
-                            continue
+                            raise CancellationRequested(self.cancel_token.reason)
                     else:
                         response = await _llm_call
-                    self._steer_aborts = 0
                     await self._acknowledge_runtime()
                 except CancellationRequested as exc:
                     self._emit(
@@ -2461,9 +2360,8 @@ class AgentPipeline:
                 tool_name = _tool_call_name(tool_call)
                 tool_args = _tool_call_args(tool_call)
 
-                # design/124 §7.3: steering is waiting → don't START anything new this batch.
-                # (Calls already running concurrently go through the normal path below, where
-                # their own interrupt mode decides.) The next round's drain delivers the steer.
+                # An urgent message is waiting → don't START anything new this batch. Calls
+                # already running finish normally; the next round's drain delivers the message.
                 if self._steer_pending() and i not in _pre and i not in _pre_skip and not skip_batch:
                     await self._resolve_skipped_tool_calls(
                         [tool_call], reason=self.STEER_SKIP_REASON, round_idx=round_idx)
@@ -2545,45 +2443,20 @@ class AgentPipeline:
                 failed = False
                 _stopped = False
                 try:
-                    _mode = self._interrupt_mode(tool_name)
-                    _steerable = self._steer_event is not None and _mode != "finish"
-                    if _steerable or not self.cancel_token.is_never:
-                        # design/124 §7.3 / §8.4: race the call against steering (if its mode
-                        # allows) and against a stop (always).
+                    if not self.cancel_token.is_never:
+                        # design/124 §8.4: race the call against a stop.
                         _work = (pre_task if pre_task is not None
                                  else self._start_tool(tool_name, tool_args, tool_call_id=call_id))
-                        _res, _why = await self._race(_work, steer=_steerable)
+                        _res, _why = await self._race(_work)
                         if _why == "done":
                             output, failed = _res
-                        elif _why == "steer":
-                            output = await self._settle_steered_tool(
-                                _work, _mode, tool_name, tool_args, call_id, round_idx)
                         else:
-                            output, failed = await self._settle_stopped_tool(_work, _mode)
+                            output, failed = await self._settle_stopped_tool(_work, self._interrupt_mode(tool_name))
                             _stopped = True
                     elif pre_task is not None:
                         output, failed = await pre_task
                     else:
                         output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
-                except HumanInputRequired as exc:
-                    self._cancel_pre_tasks(_pre)
-                    interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
-                    await self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
-                    # The model batched request_user_input with later tool_calls;
-                    # those won't run. Resolve them so the resumed turn isn't an
-                    # invalid sequence (assistant.tool_calls with no matching tool).
-                    await self._resolve_skipped_tool_calls(
-                        tool_calls[i + 1 :], reason="superseded by a user-input request",
-                        round_idx=round_idx,
-                    )
-                    await self._finalize("waiting_for_input", final_text=assistant_text, rounds=round_idx + 1)
-                    return self._make_result(
-                        "waiting_for_input",
-                        final_text=assistant_text,
-                        rounds=round_idx + 1,
-                        pending_tool_calls=tool_calls,
-                        pending_interactions=[interaction],
-                    )
                 except Exception as exc:
                     # ── Hook: TOOL_ERROR ──
                     from power_loop.contracts.errors import SessionBusy, SessionLeaseLost

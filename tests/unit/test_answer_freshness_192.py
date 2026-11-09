@@ -20,7 +20,7 @@ async def test_empty_pass_cannot_recover_text_from_before_the_latest_input(regis
         _call('pass', 'pass_turn', {'reason':'Computed 43'})])
     registry = ToolRegistry()
     async def correct():
-        await agent.runtime.client.append(agent.target, 'Correction: return 43.', message_id='correction', actor=agent.actor)
+        await agent.runtime.client.send(agent.target, 'Correction: return 43.', message_id='correction', actor=agent.actor)
         return 'Correction queued.'
     registry.register(ToolDefinition(name='correct', description='Queue correction',
         input_schema={'type':'object'}, pricing=Free('test_fixture')), correct)

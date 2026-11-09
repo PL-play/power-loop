@@ -133,7 +133,7 @@ async def test_real_user_message_and_task_wakeup_arrive_separately_and_both_land
         await _until_in_flight(started, loop, sid)
         for mid, body in [('u1','User says: what is 17 + 25?'),
                           ('t1','[system] Your background task build-42 finished: BUILD FAILED (missing dependency libfoo).')]:
-            await loop.runtime.client.append(loop.target, body, message_id=mid, actor=loop.actor)
+            await loop.runtime.client.send(loop.target, body, message_id=mid, actor=loop.actor)
         res = await run
         assert res.status == "completed"
         rows = [r for r in await store.load_active_messages(sid) if r.role == 'user' and ('17 + 25' in str(r.content) or 'build-42' in str(r.content))]
@@ -185,7 +185,7 @@ async def test_real_image_survives_the_inbox(tmp_path: Any, runtime_agent) -> No
         await _until_in_flight(started, loop, sid)
         path = tmp_path / "blue.png"
         path.write_bytes(_solid_png(64, 64, (20, 90, 220)))
-        await loop.runtime.client.append(loop.target, {'role':'user', 'content':[
+        await loop.runtime.client.send(loop.target, {'role':'user', 'content':[
             {'type':'text', 'text':'这张图是什么纯色？只回颜色名。'},
             {'type':'attachment', 'attachment':create_attachment_ref(str(path))},
         ]}, message_id='img', actor=loop.actor)

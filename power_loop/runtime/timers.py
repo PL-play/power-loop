@@ -118,7 +118,7 @@ class TimerRunner:
                 from_status='firing', to_status='armed', due_at=int(time.time()*1000+ctx.postpone_s*1000))
             outcome = 'postponed'
         else:
-            await self.client.append(TargetRef(self.store.store_id, timer.session_id), ctx.message,
+            await self.client.send(TargetRef(self.store.store_id, timer.session_id), ctx.message,
                 message_id=f'timer-{timer.timer_id}-{timer.created_at}-{timer.fire_count}',
                 actor=TrustedActor(metadata['tenant_id'], metadata['principal_id'], None))
             await self.store.finish_firing_timer(timer.session_id, timer.timer_id)

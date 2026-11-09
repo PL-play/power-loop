@@ -18,14 +18,14 @@ from .runner import WorkflowRunHandle
 async def resume_run(client, ref, *, node_id, message, message_id, actor):
     """Continue one settled node and recompute its dependent tail.
 
-    Live leaves use client.nudge/steer; this entry never resumes a Python stack.
+    Live leaves take client.send; this entry never resumes a Python stack.
     """
     port = client.inputs
     job = await port.resolve_job(port.db, ref, actor)
     if job["kind"] != "workflow" or ref.generation != job["generation"]:
         raise RuntimeRequestError("stale_generation")
     if job["outcome"] is None:
-        raise RuntimeRequestError("target_not_resumable", "Use nudge or steer for a running leaf.")
+        raise RuntimeRequestError("target_not_resumable", "Use send for a running leaf.")
     import json
 
     creation = await port.db.fetchone(
@@ -62,7 +62,6 @@ async def resume_run(client, ref, *, node_id, message, message_id, actor):
             TargetRef(ref.store_id, job["session_id"], job["job_id"]),
             "resume",
             {"body": message},
-            "new_turn",
             expected_job_generation=ref.generation,
             options=plain(RequestOptions()),
         ),

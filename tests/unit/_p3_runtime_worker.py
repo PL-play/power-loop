@@ -69,12 +69,6 @@ async def main():
                 return LLMResponse(raw_text='child completed: ' + '|'.join(str(m.get('content','')) for m in request.messages if m.get('role') == 'user'),
                     token_usage=LLMTokenUsage(prompt_tokens=1,completion_tokens=1,total_tokens=2))
             messages = request.messages
-            if scenario == 'answer':
-                answers = [m for m in messages if m.get('tool_call_id')=='question']
-                if answers:
-                    return LLMResponse(raw_text='answer='+answers[-1]['content'])
-                return LLMResponse(raw_text='', tool_calls=[{'id':'question','type':'function',
-                    'function':{'name':'request_user_input','arguments':json.dumps({'prompt':'choose'})}}])
             latest = next((m.get('content','') for m in reversed(messages) if m.get('role') == 'user'), '')
             replies = [m for m in messages if m.get('role') == 'tool']
             def call(name, args, ident):
@@ -116,17 +110,7 @@ async def main():
     try:
         await runtime.worker.start()
         target = TargetRef(store.store_id, sid)
-        if role == 'A' and scenario == 'answer':
-            receipt = await runtime.client.send(target,'ask',message_id='ask',actor=actor)
-            for _ in range(500):
-                status = await runtime.client.inspect(receipt.input_ref,actor=actor)
-                if status.state=='waiting_input':
-                    break
-                await asyncio.sleep(.01)
-            from power_loop.agent.runtime_types import plain
-            state = await store.get_state(sid)
-            report(event='waiting', job_ref=plain(status.job_ref),input_ref=plain(receipt.input_ref),pending=state.pending)
-        elif role == 'A':
+        if role == 'A':
             receipt = await runtime.client.send(target,'create children',message_id='create',actor=actor)
             result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=now_ms()+10000)
             rows = await store.load_all_messages(sid)
@@ -151,13 +135,6 @@ async def main():
                     report(event='budget',plans=[g.request for g in []],reserved=host.reserve_calls,settled=host.apply_calls)
                 else:
                     data = json.loads(command)
-                    if scenario == 'answer':
-                        from power_loop.agent.runtime_types import InputRef, JobRef, plain
-                        receipt = await runtime.client.answer(JobRef(**data['job_ref']),interaction_id=data['interaction_id'],
-                            wait_round=data['wait_round'],value=data['value'],message_id='answer',actor=actor)
-                        result = await runtime.client.wait(InputRef(**data['input_ref']),actor=actor,deadline_ms=now_ms()+15000)
-                        report(event='answered', result=plain(result))
-                        continue
                     receipt = await runtime.client.send(target,'control:'+json.dumps(data),message_id=data['id'],actor=actor)
                     result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=now_ms()+15000)
                     rows = await store.load_all_messages(sid)

@@ -278,12 +278,18 @@ def _cursor(state, after):
 
 async def read_history(manager, actor, job_id, *, session_id=None, source="messages", ids=None, seq=None, id=None,
                        message_id=None, message_ids=None, send_index=None, limit=20, cursor=None,
-                       char_offset=None, max_chars=8000, output_file=None):
-    """Read saved originals/projections with durable task authority on every call."""
+                       char_offset=None, max_chars=8000, output_file=None, latest=False, preview_chars=400):
+    """Read saved originals/projections with durable task authority on every call.
+
+    ``latest`` lists the newest ``limit`` records of the selection instead of the oldest.
+    A multi-record listing shows at most ``preview_chars`` of each record; read one record
+    by ``seq``/``id`` with ``char_offset`` for the rest.
+    """
     _text(job_id, "job", 64)
     if session_id is not None:
         _text(session_id, "session", 255)
-    if type(limit) is not int or not 1 <= limit <= 100 or type(max_chars) is not int or not 1024 <= max_chars <= 32000:
+    if (type(limit) is not int or not 1 <= limit <= 100 or type(max_chars) is not int or not 1024 <= max_chars <= 32000
+            or type(preview_chars) is not int or not 100 <= preview_chars <= 4000):
         raise JobError("invalid_task_history_budget")
     selection = _selection(source, ids, seq, id, message_id, message_ids, send_index)
     offset = _number(char_offset, "char_offset", minimum=0) if char_offset is not None else 0
@@ -323,6 +329,11 @@ async def read_history(manager, actor, job_id, *, session_id=None, source="messa
             "query": query, "binding": binding, "upper": bounds["hi"], "after": 0, "snapshot_at": manager.now()}
         if state["upper"] > bounds["hi"]:
             return _bounded({**base, "status": "unavailable", "reason": "records_changed"}, max_chars)
+        if latest and cursor is None and output_file is None and not selection["single"]:
+            first = await tx.fetchone(f"SELECT {coord} AS c FROM {table} WHERE {where} AND {coord}<=? "
+                f"ORDER BY {coord} DESC LIMIT 1 OFFSET ?", (*params, state["upper"], limit-1))
+            if first is not None:
+                state["after"] = first["c"]-1
         rows = await _rows(manager, tx, sid, selection, state["upper"], state["after"], limit+1, forced_send=forced)
     if not rows:
         return _bounded({**base, "status": "unavailable", "reason": "records_not_found"}, max_chars)
@@ -367,9 +378,11 @@ async def read_history(manager, actor, job_id, *, session_id=None, source="messa
     shown = []
     for row in rows[:limit]:
         public = _record(manager, source, row)
-        text = dumps(_screen(public))
-        item = {key: public[key] for key in ("id", "seq", "send_index", "role", "name", "kind", "message_ref") if key in public}
-        shown.append({**item, "preview": text[:400], "total_chars": len(text), "truncated": len(text)>400})
+        listed = ("id", "seq", "send_index", "role", "name", "kind", "message_ref")
+        item = {key: public[key] for key in listed if key in public}
+        text = dumps({key: value for key, value in _screen(public).items()
+                      if key not in listed and key != "session_id" and value is not None})
+        shown.append({**item, "preview": text[:preview_chars], "total_chars": len(text), "truncated": len(text)>preview_chars})
     while shown:
         more = len(shown) < len(rows)
         result = {**base, "status": "ok", "records": shown, "upper": str(state["upper"]), "snapshot_at": state["snapshot_at"],

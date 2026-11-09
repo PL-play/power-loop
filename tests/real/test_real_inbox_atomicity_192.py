@@ -22,9 +22,9 @@ async def test_real_withdrawn_input_never_reaches_provider(runtime_agent,record_
             response=await super().complete(request,**kwargs)
             if self.calls==1 and phase=='terminal':
                 async def add_and_cancel():
-                    drop=await client.append(agent.target,'WITHDRAWN-DO-NOT-READ',message_id='drop',actor=agent.actor)
+                    drop=await client.send(agent.target,'WITHDRAWN-DO-NOT-READ',message_id='drop',actor=agent.actor)
                     if keep:
-                        await client.append(agent.target,'Return READY again.',message_id='keep',actor=agent.actor)
+                        await client.send(agent.target,'Return READY again.',message_id='keep',actor=agent.actor)
                     ctx=agent.runtime.worker._active[agent.target.session_id]
                     async with asyncio.timeout(5):
                         while len(ctx.append_refs)<1+int(keep):

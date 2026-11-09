@@ -7,7 +7,7 @@ async def accept(manager, tx, actor, root_job_id, key, kind, body):
     inputs = RuntimeInputStore(manager.store)
     original = await inputs.execution_input(tx, actor.session_id, root_job_id)
     await inputs.accept_input(tx, Command(key, TargetRef(manager.store.store_id, actor.session_id),
-        'append', {'body': body}, 'append', options=original.meta['options']),
+        'send', {'body': body}, options=original.meta['options']),
         TrustedActor(actor.tenant_id, actor.principal_id, None),
         descriptor=RuntimeDescriptor(**original.meta['descriptor']))
     await tx.execute(f'UPDATE {inputs.q} SET kind=? WHERE session_id=? AND item_id=?',

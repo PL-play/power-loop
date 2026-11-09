@@ -100,7 +100,7 @@ async def _atomic_pending_case(registry_store, stage, *, warm=False):
 
 @pytest.mark.parametrize('stage', ['commit', 'commit_ack'])
 @pytest.mark.parametrize('keep_second', [False, True])
-async def test_tool_result_and_remaining_interactions_commit_together(registry_store, stage, keep_second):
+async def test_tool_result_and_remaining_pending_commit_together(registry_store, stage, keep_second):
     store, connect = registry_store
     sid = await store.create_session()
     calls = CALLS + ([{**CALLS[0], 'id': 'second'}] if keep_second else [])
@@ -108,9 +108,6 @@ async def test_tool_result_and_remaining_interactions_commit_together(registry_s
     await sink.on_message_appended({'role': 'assistant', 'tool_calls': calls}, round_index=4)
     await sink.on_assistant_tool_calls(assistant_seq=1, tool_calls=calls, round_index=4)
     pending = (await store.get_state(sid)).pending
-    interactions = [{'tool_call_id': call['id'], 'interaction_id': call['id']} for call in calls]
-    pending['pending_interactions'] = interactions
-    await store.set_pending(sid, pending)
     original = store._db.transaction
 
     @asynccontextmanager
@@ -137,8 +134,8 @@ async def test_tool_result_and_remaining_interactions_commit_together(registry_s
         state = await reader.get_state(sid)
     rows = await reader.load_all_messages(sid)
     assert state.next_seq == 3 and len(rows) == 2 and rows[-1].content == 'actual result'
-    assert state.pending == ({**pending, 'tool_call_ids': ['second'], 'tool_calls': calls[1:],
-                              'pending_interactions': interactions[1:]} if keep_second else None)
+    assert state.pending == ({**pending, 'tool_call_ids': ['second'], 'tool_calls': calls[1:]}
+                             if keep_second else None)
 
 
 async def test_failed_receipt_binding_preserves_pending_and_raw_result(registry_store, monkeypatch):
@@ -150,8 +147,6 @@ async def test_failed_receipt_binding_preserves_pending_and_raw_result(registry_
     await sink.on_message_appended({'role': 'assistant', 'tool_calls': CALLS}, round_index=4)
     await sink.on_assistant_tool_calls(assistant_seq=1, tool_calls=CALLS, round_index=4)
     pending = (await store.get_state(sid)).pending
-    pending['pending_interactions'] = [{'tool_call_id': 'first', 'interaction_id': 'original'}]
-    await store.set_pending(sid, pending)
 
     async def unavailable(*args, **kwargs):
         raise OSError('receipt_binding_unavailable')

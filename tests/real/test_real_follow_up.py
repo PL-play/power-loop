@@ -19,7 +19,7 @@ async def test_idle_follow_up_steers_the_reply(runtime_agent):
             max_rounds=1, max_tokens=256, temperature=0, compactor=None))
     await agent.send('Name a primary color.')
     steer = "Forget the previous color. Reply with exactly one word — the color 'teal'."
-    receipt = await agent.runtime.client.append(agent.target, steer, message_id='idle-followup', actor=agent.actor)
+    receipt = await agent.runtime.client.send(agent.target, steer, message_id='idle-followup', actor=agent.actor)
     result = await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+60000)
     assert result.status == 'completed'
     await assert_passes(question=steer, answer=result.final_text,
@@ -41,7 +41,7 @@ async def test_inflight_follow_up_is_queued_merged_and_steers(runtime_agent):
     first = await agent.runtime.client.send(agent.target, 'Name a fruit.', message_id='fruit', actor=agent.actor)
     try:
         await asyncio.wait_for(entered.wait(), 60)
-        extra = await agent.runtime.client.append(agent.target, "Make sure the fruit you name is specifically 'mango'.",
+        extra = await agent.runtime.client.send(agent.target, "Make sure the fruit you name is specifically 'mango'.",
             message_id='fruit-followup', actor=agent.actor)
         assert extra.newly_accepted
         release.set()

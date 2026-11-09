@@ -34,7 +34,7 @@ async def test_real_steer_cuts_a_long_generation(tmp_path):
         receipt=await runner.runtime.client.send(runner.target,'写一篇至少5000字的小说，一直写下去。',message_id='novel',actor=runner.actor)
         await asyncio.wait_for(started.wait(),60)
         status=await runner.runtime.client.inspect(receipt.input_ref,actor=runner.actor)
-        await runner.runtime.client.steer(status.job_ref,'停止小说。只回答2+2等于几，只回一个数字。',message_id='steer',actor=runner.actor)
+        await runner.runtime.client.send(status.job_ref, '停止小说。只回答2+2等于几，只回一个数字。', urgent=True, message_id='steer',actor=runner.actor)
         result=await runner.runtime.client.wait(receipt.input_ref,actor=runner.actor,deadline_ms=now_ms()+120000)
         assert result.status=='completed' and '4' in result.final_text
         rows=await runner.runtime.store.load_all_messages(runner.target.session_id)
@@ -76,7 +76,7 @@ async def test_real_steer_preserves_tool_policy_and_provider_format(tmp_path,int
         receipt=await runner.runtime.client.send(runner.target,'Research electric bikes.',message_id='research',actor=runner.actor)
         await asyncio.wait_for(state['started'].wait(),60)
         status=await runner.runtime.client.inspect(receipt.input_ref,actor=runner.actor)
-        await runner.runtime.client.steer(status.job_ref,'Do not repeat research. What is the capital of France? Reply briefly.',message_id='steer',actor=runner.actor)
+        await runner.runtime.client.send(status.job_ref, 'Do not repeat research. What is the capital of France? Reply briefly.', urgent=True, message_id='steer',actor=runner.actor)
         result=await runner.runtime.client.wait(receipt.input_ref,actor=runner.actor,deadline_ms=now_ms()+120000)
         assert result.status=='completed' and 'paris' in result.final_text.lower()
         await settle(runner)

@@ -15,6 +15,9 @@ JOBS_DEFINITION = ToolDefinition(pricing=Free("local"),
         "list defaults to active obligations, which can include a finished outcome with unresolved resources or supervision. "
         "get reads one job_id; view=operations lists its saved operation call/receipt references, "
         "view=results lists canonical result versions. "
+        "view=messages lists the job's latest messages (default 20, at most 50; each shortened to preview_chars); "
+        "source=projection lists the compact projected history instead of originals; "
+        "seq (messages) or id (projection) reads one record in full, in character chunks. "
         "Select event_id for operations/results to read one saved event in character chunks, "
         "or output_file to export saved events as new workspace JSONL. Reads never acknowledge or execute them. "
         "stop requests durable cancellation for one job_id and its supervised subtree; acceptance is not physical stop. "
@@ -34,15 +37,25 @@ JOBS_DEFINITION = ToolDefinition(pricing=Free("local"),
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
         "max_chars": {"type": "integer", "minimum": 1024, "maximum": 32000},
         "cursor": {"type": "string"},
-        "view": {"type": "string", "enum": ["summary", "operations", "results"], "description": "get only."},
+        "view": {"type": "string", "enum": ["summary", "operations", "results", "messages"], "description": "get only."},
+        "source": {"type": "string", "enum": ["messages", "projection"], "description": "get view=messages: originals (default) or projected history."},
+        "seq": {"type": "integer", "minimum": 1, "description": "get view=messages: one original message by seq."},
+        "id": {"type": "integer", "minimum": 1, "description": "get view=messages source=projection: one projected record by id."},
+        "preview_chars": {"type": "integer", "minimum": 100, "maximum": 4000,
+            "description": "get view=messages: characters shown per listed message (default 500)."},
         "event_id": {"type": "string", "description": "get with view=operations/results: one exact event from the selected job."},
-        "char_offset": {"type": "integer", "minimum": 0, "description": "get event_id: returned next_char_offset for the next chunk."},
+        "char_offset": {"type": "integer", "minimum": 0, "description": "get event_id/seq/id: returned next_char_offset for the next chunk."},
         "output_file": {"type": "string", "description": "get view=operations/results: export selected saved events as JSONL to a new workspace file."},
         "reason": {"type": "string", "maxLength": 1000},
         "expected_generation": {"type": "integer", "minimum": 0},
     }, "required": ["action"], "additionalProperties": False},
     required_params=("action",),
 )
+
+
+MESSAGES_LIMIT = 20
+MESSAGES_MAX_LIMIT = 50
+MESSAGES_PREVIEW_CHARS = 500
 
 
 def _json(data):
@@ -116,9 +129,20 @@ async def _native(loop, sid, action, options):
             raise JobError("query_result_too_small")
         return result
     if action == "get":
+        view = options.get("view", "summary")
+        if view == "messages":
+            if set(options) - {"job_id", "view", "source", "seq", "id", "char_offset", "limit",
+                               "preview_chars", "max_chars"}:
+                raise JobError("invalid_jobs_parameters")
+            from power_loop.runtime.task_history import read_history
+            target = await _resolve(manager, actor, options.get("job_id"), metadata_only=True)
+            return await read_history(manager, actor, target, source=options.get("source", "messages"),
+                seq=options.get("seq"), id=options.get("id"), char_offset=options.get("char_offset"),
+                limit=min(options.get("limit", MESSAGES_LIMIT), MESSAGES_MAX_LIMIT),
+                latest=True, preview_chars=options.get("preview_chars", MESSAGES_PREVIEW_CHARS),
+                max_chars=_budget(options))
         if set(options) - {"job_id", "max_chars", "view", "event_id", "char_offset", "limit", "cursor", "output_file"}:
             raise JobError("invalid_jobs_parameters")
-        view = options.get("view", "summary")
         if view not in ("summary", "operations", "results"):
             raise JobError("invalid_jobs_parameters")
         target = await _resolve(manager, actor, options.get("job_id"), metadata_only=view != "summary")

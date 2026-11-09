@@ -10,7 +10,6 @@ Step-by-step project walkthroughs. Each tutorial builds a working application fr
 |---|---|---|
 | [Build a Chatbot](build-a-chatbot.md) | Multi-turn CLI chatbot with session persistence | Beginner |
 | [Tool Calling](tool-calling.md) | Agent with weather search, bash, and file tools | Beginner |
-| [Human-in-the-Loop](human-in-the-loop.md) | Agent that asks before running dangerous commands | Intermediate |
 | [Multi-Agent System](multi-agent.md) | Parent agent delegates research to sub-agents | Intermediate |
 | [Examples Guide](examples-guide.md) | Walkthrough of all 43 runnable examples with real output | All levels |
 

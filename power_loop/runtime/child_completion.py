@@ -26,7 +26,7 @@ async def continue_before_finish(pipeline, text, round_index):
         actor = replace(ctx.actor, call_ref=call, tool_call_id=job["tool_call_id"])
         wait = asyncio.create_task(loop._runtime_worker.runtime.client.wait(
             JobRef(ctx.store_id, job["job_id"], job["generation"]), actor=actor, deadline_ms=now_ms()+1800000))
-        _, why = await pipeline._race(wait, steer=False)
+        _, why = await pipeline._race(wait)
         if why == "stop":
             wait.cancel()
             await asyncio.gather(wait, return_exceptions=True)

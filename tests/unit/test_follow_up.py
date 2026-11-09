@@ -137,7 +137,7 @@ async def test_no_tools_drained_round_emits_round_completed(store: SessionStore,
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    await loop.runtime.client.append(loop.target, "steer me", message_id="steer me", actor=loop.actor)  # queued while round 0's LLM call is gated
+    await loop.runtime.client.send(loop.target, "steer me", message_id="steer me", actor=loop.actor)  # queued while round 0's LLM call is gated
     llm.release_first.set()
     result = await send_task
     assert result.status == "completed"
@@ -174,8 +174,8 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore, runt
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    first = await loop.runtime.client.append(loop.target, "focus on feelings", message_id="focus on feelings", actor=loop.actor)
-    second = await loop.runtime.client.append(loop.target, "keep it short", message_id="keep it short", actor=loop.actor)
+    first = await loop.runtime.client.send(loop.target, "focus on feelings", message_id="focus on feelings", actor=loop.actor)
+    second = await loop.runtime.client.send(loop.target, "keep it short", message_id="keep it short", actor=loop.actor)
     assert first.state == second.state == "accepted"
     assert first.input_ref != second.input_ref
 
@@ -246,7 +246,7 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    queued = await loop.runtime.client.append(loop.target, "please reply to the card", message_id="please reply to the card", actor=loop.actor)
+    queued = await loop.runtime.client.send(loop.target, "please reply to the card", message_id="please reply to the card", actor=loop.actor)
     assert queued.state == "accepted"
     llm.release_first.set()
     result = await send_task
@@ -269,11 +269,11 @@ async def test_idle_append_is_driven_without_host_flush_and_original_id_deduplic
     llm = _GateLLM(responses=[LLMResponse(raw_text="handled stranded steering")])
     llm.release_first.set()
     loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(compactor=None))
-    receipt = await loop.runtime.client.append(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
+    receipt = await loop.runtime.client.send(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
     result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
     assert result.status == "completed"
     await loop.drain()
-    duplicate = await loop.runtime.client.append(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
+    duplicate = await loop.runtime.client.send(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
     assert not duplicate.newly_accepted and duplicate.input_ref == receipt.input_ref
     assert len(llm.calls) == 1 and "stranded card submission" in str(llm.calls[0])
 
@@ -289,7 +289,7 @@ async def test_empty_activation_and_busy_append_do_not_start_duplicate_execution
     async with asyncio.timeout(5):
         while not llm.calls:
             await asyncio.sleep(.005)
-    await loop.runtime.client.append(loop.target, "steer", message_id="steer", actor=loop.actor)
+    await loop.runtime.client.send(loop.target, "steer", message_id="steer", actor=loop.actor)
     for _ in range(3):
         await loop.runtime.transport.publish(TransportPacket(42, loop.runtime.namespace, "duplicate-wake",
                                                             loop.target, "activation"))

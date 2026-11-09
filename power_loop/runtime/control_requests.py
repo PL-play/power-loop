@@ -120,7 +120,7 @@ async def accept(manager, actor, request, target, *, action, authorize):
                 caller.boot_id, source["version"])
             changed = await tx.write_job(caller.job_id, f"UPDATE {manager.jobs} SET version=version+1,updated_at=? "
                 "WHERE job_id=? AND root_job_id=? AND generation=? AND executor_id=? AND boot_id=? AND version=? "
-                "AND intake='open' AND status IN ('running','waiting','settling')", params)
+                "AND intake='open' AND status IN ('running','settling')", params)
             if changed != 1:
                 raise JobError(action+"_caller_changed")
             data = {"version": 1, "phase": "accepted", "action": action, "actor": asdict(actor),

@@ -1,4 +1,5 @@
 """Owned finite effects keep original authority, budget and query-only outcomes."""
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -23,9 +24,13 @@ from tests.runtime_fixture import RunningAgent
 from .test_job_registry_192 import registry_store
 from .test_managed_delivery_192 import consume_notice
 from .test_model_budgets_192 import Host
-from .test_wait_review_208 import call
 
 __all__=['registry_store']
+
+
+def call(name,args,identity):
+    return LLMResponse(raw_text='',tool_calls=[{'id':identity,'type':'function',
+        'function':{'name':name,'arguments':json.dumps(args)}}])
 pytestmark=[pytest.mark.unit,pytest.mark.asyncio]
 
 

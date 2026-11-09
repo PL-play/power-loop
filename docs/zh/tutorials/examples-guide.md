@@ -29,7 +29,6 @@
 | 18 | [18_multi_provider.py](../../../examples/18_multi_provider.py) | 真实模型装配 |
 | 19 | [19_full_chatbot.py](../../../examples/19_full_chatbot.py) | 工具、记忆与重开 |
 | 20 | [20_default_tools.py](../../../examples/20_default_tools.py) | 文件、shell 与后台工具 |
-| 21 | [21_request_user_input.py](../../../examples/21_request_user_input.py) | 等待用户回答 |
 | 22 | [22_follow_up_steering.py](../../../examples/22_follow_up_steering.py) | 忙时追加指引 |
 | 23 | [23_per_send_overrides.py](../../../examples/23_per_send_overrides.py) | 单次请求选项 |
 | 24 | [24_agent_notes.py](../../../examples/24_agent_notes.py) | 笔记 |

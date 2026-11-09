@@ -89,7 +89,7 @@ action is replayed to manufacture a result.
 await handle.cancel("user stopped the workflow")  # closes new subtree dispatch
 # For one running node, use its exact JobRef:
 await runtime.client.cancel(node_ref, actor=actor, scope="self")
-await runtime.client.nudge(node_ref, "additional guidance", message_id="note-1", actor=actor)
+await runtime.client.send(node_ref, "additional guidance", message_id="note-1", actor=actor)
 
 # After the workflow has a terminal result, use its current generation.
 continued = await handle.resume(generation=current_generation, node_id="draft",
@@ -101,7 +101,7 @@ Explicit continuation resumes the selected node job in a new generation and
 recomputes its dependent tail using new attempts. Unchanged branches reuse their
 results. A node appearing in several foreach/loop iterations is ambiguous for
 this graph-level API and is rejected; inspect its concrete jobs and send a new,
-explicitly scoped task. Running leaves use nudge/steer or answer; graph-level
+explicitly scoped task. Running leaves take messages via send; graph-level
 resume requires a terminal workflow. A cancelled generation is not restarted.
 
 Token usage and the workflow deadline remain cumulative across automatic and
@@ -120,7 +120,7 @@ profiles. Hosts decide worker routing and process/container isolation; the SDK
 has no per-leaf process launcher or private leaf database.
 
 `register_workflow_tool(registry)` exposes create/validate/status/list/leaves/logs,
-node nudge/steer and cancellation. `register_workflow_tools` exposes the same
+node send (optionally urgent) and cancellation; logs lists a node's latest messages. `register_workflow_tools` exposes the same
 admission path under create/validate/status tool names. Model creation returns a
 receipt immediately, and the result reaches the original parent inbox.
 `WorkflowToolPorts` supports spec loading, policy transforms, tool-grant limits

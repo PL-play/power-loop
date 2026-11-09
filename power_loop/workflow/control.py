@@ -1,4 +1,4 @@
-"""Model node steering resolves saved task bindings, never session metadata.
+"""Model node input resolves saved task bindings, never session metadata.
 
 Read authority selects the exact candidate only. The existing input/continuation
 adapter still owns atomic admission, dispatch and the physical session.

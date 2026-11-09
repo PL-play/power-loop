@@ -83,7 +83,7 @@ async def test_real_child_consumes_input_arriving_inside_pass(tmp_path,record_pr
     registry=create_default_tool_registry(include=[],bind=False)
     async def boundary_pass():
         request_pass('waiting for correction')
-        await runner.runtime.client.append(TargetRef(runner.runtime.store.store_id,get_session_id()),proof,
+        await runner.runtime.client.send(TargetRef(runner.runtime.store.store_id,get_session_id()),proof,
             message_id='correction',actor=runner.actor)
         return 'Passed control.'
     registry.register(ToolDefinition('boundary_pass','Yield for correction.',pricing=Free('fixture')),boundary_pass)

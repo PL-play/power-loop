@@ -369,7 +369,7 @@ class JobManager:
     def _execution_open(self, row):
         if row["intake"] != "open":
             raise JobError("job_intake_closed")
-        if row["status"] not in ("running", "waiting", "settling"):
+        if row["status"] not in ("running", "settling"):
             raise JobError("execution_not_running")
 
     @staticmethod
@@ -473,7 +473,7 @@ class JobManager:
         async with self._read() as tx:
             await self._validate_call(tx, actor, call_ref, tool_call_id)
             rows = []
-            for action in ("create", "nudge", "steer", "stop", "wait_decision"):
+            for action in ("create", "nudge", "steer", "stop"):
                 key = self._origin_key(actor, action, call_ref, tool_call_id, None)
                 row = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
                 if row is not None:
@@ -723,8 +723,6 @@ class JobManager:
                 raise JobError("session_ownership_mismatch")
         if parent is None and session_id != actor.session_id and kind != "workflow":
             raise JobError("root_session_required")
-        if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
-            raise JobError("owner_waiting_requires_input")
         job_id = ((managed_effects.job_id(self, actor, call_ref, tool_call_id) if effect is not None else None)
             or host_send_steps.job_id(self, actor, host_step)
             or ('job_'+_hash([self.store.store_id, key])[:32] if parent is None else 'job_'+secrets.token_hex(16)))

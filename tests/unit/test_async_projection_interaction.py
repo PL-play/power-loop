@@ -25,7 +25,7 @@ async def test_idle_append_is_a_new_projected_send(registry_store):
     try:
         await agent.send('first')
         assert {(r.send_index,r.kind) for r in await store.load_project_messages(agent.target.session_id)}=={(1,'user'),(1,'project')}
-        accepted=await agent.runtime.client.append(agent.target,'second',message_id='append',actor=agent.actor)
+        accepted=await agent.runtime.client.send(agent.target,'second',message_id='append',actor=agent.actor)
         result=await agent.runtime.client.wait(accepted.input_ref,actor=agent.actor,deadline_ms=now_ms()+10000)
         assert result.status=='completed'
         await agent.drain(after_input=accepted.input_ref)

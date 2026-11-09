@@ -7,7 +7,6 @@ import pytest
 
 from power_loop import create_default_tool_registry
 from power_loop.runtime.env import RuntimeEnvError
-from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.tools.default_tools import FILE_READ_STATE
 
 
@@ -20,14 +19,6 @@ def _sandbox(workspace: Path) -> Path:
 def test_workspace_tools_require_explicit_workspace() -> None:
     with pytest.raises(RuntimeEnvError, match="POWER_LOOP_WORKSPACE"):
         create_default_tool_registry(include=["read_file"])
-
-
-def test_request_user_input_does_not_require_workspace() -> None:
-    registry = create_default_tool_registry(include=["request_user_input"])
-    with pytest.raises(HumanInputRequired) as exc:
-        registry.invoke("request_user_input", {"prompt": "Approve?", "kind": "confirm"})
-    assert exc.value.prompt == "Approve?"
-    assert exc.value.kind == "confirm"
 
 
 def test_write_read_and_overwrite_guard(tmp_path: Path) -> None:

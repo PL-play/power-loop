@@ -9,14 +9,13 @@ Reuses the scripted-LLM helpers from test_stateful_loop.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pytest
 
-from power_loop import JobRef, create_default_tool_registry
+from power_loop import JobRef
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.types import AgentLoopConfig
@@ -127,52 +126,6 @@ async def _projection_loop_with_tools(runtime_agent, store, llm, tool_registry, 
     )
 
 
-async def question(runner, body):
-    receipt = await runner.runtime.client.send(runner.target, body, message_id='question', actor=runner.actor)
-    async with asyncio.timeout(10):
-        while True:
-            pending = (await runner.runtime.store.get_state(runner.target.session_id)).pending
-            if pending and pending.get('runtime_wait'):
-                return receipt, pending
-            await asyncio.sleep(.01)
-
-
-@pytest.mark.asyncio
-async def test_projection_submit_input_preserves_answer(store: SessionStore, runtime_agent) -> None:
-    llm = _Scripted(responses=[
-        _tool_resp("tc-input", "request_user_input",
-                   '{"kind":"confirm","prompt":"Approve?","options":[{"id":"yes","label":"Yes"}]}'),
-        LLMResponse(raw_text="Approved."),
-    ])
-    loop = await _projection_loop_with_tools(runtime_agent,
-        store, llm, create_default_tool_registry(include=["request_user_input"]))
-    sid = loop.target.session_id
-
-    receipt, pending = await question(loop, 'needs approval')
-    n = len(llm.calls)
-    status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
-    await loop.runtime.client.answer(status.job_ref,
-        interaction_id=pending['pending_interactions'][0]['interaction_id'],
-        wait_round=pending['round_index'], value={'choice':'yes'}, message_id='answer', actor=loop.actor)
-    resumed = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
-    await loop.drain()
-    assert resumed.status == "completed"
-    assert resumed.final_text == "Approved."
-
-    # The answer reaches the resumed LLM request as a paired tool result (would be DROPPED pre-fix).
-    req = llm.calls[n]
-    tool_msgs = [m for m in req if m.get("role") == "tool" and m.get("tool_call_id") == "tc-input"]
-    assert tool_msgs, "submitted answer dropped from the projected context"
-    assert "choice" in str(tool_msgs[0].get("content"))
-    # The assistant tool_call that owns it is also present and precedes the result (no orphan).
-    roles = [m.get("role") for m in req]
-    assert roles.index("assistant") < roles.index("tool")
-
-    # Store-level proof: the out-of-band tool row carries the active send's index, not NULL.
-    tool_rows = [r for r in await store.load_active_messages(sid) if r.role == "tool"]
-    assert tool_rows and all(r.send_index == 1 for r in tool_rows)
-
-
 @pytest.mark.asyncio
 async def test_unknown_pending_tool_is_not_replayed_and_keeps_its_send_index(store, runtime_agent):
     calls = []
@@ -239,28 +192,6 @@ async def test_child_session_projected_without_tool_context(store: SessionStore,
     assert result.status == 'completed'
     child = created['session_id']
     assert {(r.send_index, r.kind) for r in await store.load_project_messages(child)} == {(1, 'user'), (1, 'project')}
-    await loop.drain()
-
-
-@pytest.mark.asyncio
-async def test_waiting_for_input_defers_projection(store: SessionStore, runtime_agent) -> None:
-    llm = _Scripted(responses=[_tool_resp("c1", "request_user_input", '{"prompt": "ok?"}')])
-    loop = await runtime_agent(
-        model=llm, store=store,
-        registry=create_default_tool_registry(include=["request_user_input"]),
-        config=AgentLoopConfig(
-            system_prompt="S", max_rounds=3, compactor=None,
-            representation=DefaultDeterministicProjector(),
-        ),
-    )
-    sid = loop.target.session_id
-    receipt, _ = await question(loop, 'need approval')
-    status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
-    assert status.state == 'waiting_input' and not status.result_available
-    assert await store.load_project_messages(sid) == []
-    await loop.runtime.client.cancel(receipt.input_ref, actor=loop.actor)
-    result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
-    assert result.status == 'cancelled'
     await loop.drain()
 
 

@@ -2,10 +2,17 @@
 
 ## 11.0.0 — Design 203 (source delivery; not published)
 
-- A steer addressed to a session (no job ID) now interrupts the job that session
-  is running, like a steer addressed to that exact job; before, only its text
-  arrived at the next round checkpoint. The runtime guide documents host input
-  choice and host-driven retention.
+- One input call: `RuntimeClient.send(target, body, urgent=False)`. Idle sessions start
+  a job; while a job runs the message joins it at the next round (serial sends never
+  split). `urgent` only skips the current batch's not-yet-started tool calls; running
+  tools and model calls are never interrupted. `append`, `nudge`, `steer`, `answer` and
+  the `new_turn` mode are removed; stop is `cancel(ref)` (a delivered input stops the
+  job it joined). `spawn_agent` / `workflow` use `action=send` with `urgent`.
+- `request_user_input`, `HumanInputRequired`, `wait_or_steer`, `WaitPolicy`,
+  `register_wait_handoff_tool` and the `waiting_for_input` status are removed.
+- Latest-messages reads: `jobs get view=messages`, `workflow logs` and
+  `RuntimeClient.messages(job_ref)` list the newest 20 records (at most 50), each
+  shortened to 500 characters; `source=projection` lists the projected history.
 
 - P7B: consuming an unstarted ManagedTool outcome closes its review notification
   while preserving the original suppressed result; hidden or failed reviews stay pending.

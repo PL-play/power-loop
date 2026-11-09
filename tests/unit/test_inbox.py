@@ -128,14 +128,14 @@ async def test_duplicate_delivery_returns_original_result_without_new_model_call
         await agent.runtime.client.send(agent.target, 'changed', message_id='one', actor=agent.actor)
 
 
-async def test_inflight_append_preserves_image_and_hides_delivery_markers(store, make_agent):
+async def test_inflight_send_preserves_image_and_hides_delivery_markers(store, make_agent):
     model = _Gate([_tool_call('c1'), LLMResponse(raw_text='done')])
     gate = model.gate(0)
     agent = await make_agent(model)
     run = asyncio.create_task(agent.send('start'))
     await _wait_calls(model, 1)
     image = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}
-    receipt = await agent.loop.follow_up(agent.target,
+    receipt = await agent.runtime.client.send(agent.target,
         {'role': 'user', 'content': [{'type': 'text', 'text': 'look'}, image]},
         message_id='append', actor=agent.actor)
     # Notification handler runs separately from the gated model.
@@ -154,13 +154,13 @@ async def test_inflight_append_preserves_image_and_hides_delivery_markers(store,
     assert not any(r['status'] == 'claimed' for r in await store.inbox_items(agent.target.session_id))
 
 
-async def test_idle_append_starts_one_turn_and_retry_does_not_repeat(store, make_agent):
+async def test_idle_send_starts_one_turn_and_retry_does_not_repeat(store, make_agent):
     model = _Gate([LLMResponse(raw_text='done')])
     agent = await make_agent(model)
-    first = await agent.loop.follow_up(agent.target, 'idle append', message_id='a', actor=agent.actor)
+    first = await agent.runtime.client.send(agent.target, 'idle append', message_id='a', actor=agent.actor)
     result = await agent.runtime.client.wait(first.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
     await agent.drain()
-    second = await agent.loop.follow_up(agent.target, 'idle append', message_id='a', actor=agent.actor)
+    second = await agent.runtime.client.send(agent.target, 'idle append', message_id='a', actor=agent.actor)
     assert not second.newly_accepted and second.job_ref == result.job_ref
     assert len(model.calls) == 1
 
@@ -172,7 +172,7 @@ async def test_steer_text_is_persisted_once_and_bound_to_original_job(store, mak
     run = asyncio.create_task(agent.send('start'))
     await _wait_calls(model, 1)
     ctx = agent.runtime.worker._active[agent.target.session_id]
-    receipt = await agent.runtime.client.steer(ctx.job_ref, 'new direction', message_id='steer', actor=agent.actor)
+    receipt = await agent.runtime.client.send(ctx.job_ref, 'new direction', urgent=True, message_id='steer', actor=agent.actor)
     await asyncio.wait_for(ctx.loop.steer_event(ctx.session_id).wait(), 2)
     gate.set()
     result = await run
@@ -281,7 +281,7 @@ async def _check_steer_notifications(store, monkeypatch, notification, *, postgr
         async with asyncio.timeout(10):
             await _wait_calls(model, 1)
             ctx = worker._active[agent.target.session_id]
-            receipt = await agent.runtime.client.steer(ctx.job_ref, "new direction", message_id="steer", actor=agent.actor)
+            receipt = await agent.runtime.client.send(ctx.job_ref, "new direction", urgent=True, message_id="steer", actor=agent.actor)
             await received.wait()
             if notification == "delayed_void":
                 assert (await agent.runtime.client.cancel(receipt.input_ref, actor=agent.actor)).job_ref is None
@@ -302,7 +302,7 @@ async def _check_steer_notifications(store, monkeypatch, notification, *, postgr
                 if concurrent:
                     processed.clear()
                     delay_read = notification == "new_read"
-                    keep = await agent.runtime.client.steer(ctx.job_ref, "kept direction", message_id="keep", actor=agent.actor)
+                    keep = await agent.runtime.client.send(ctx.job_ref, "kept direction", urgent=True, message_id="keep", actor=agent.actor)
                     if delay_read:
                         await read_waiting.wait()
                     else:

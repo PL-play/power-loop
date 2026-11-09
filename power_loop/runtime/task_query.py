@@ -16,7 +16,7 @@ from .session_controls import ControlReadView
 
 _SCAN_LIMIT = 5000
 _OUTCOMES = frozenset({"succeeded", "failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"})
-_STATUSES = _OUTCOMES | frozenset({"created", "queued", "running", "waiting", "settling", "cancelling", "model_closed"})
+_STATUSES = _OUTCOMES | frozenset({"created", "queued", "running", "settling", "cancelling", "model_closed"})
 
 
 def _int(value, name, minimum, maximum):

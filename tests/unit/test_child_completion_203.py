@@ -46,7 +46,7 @@ async def test_child_finishes_original_work_before_delivering(registry_store,mon
             if pipeline.system_prompt.startswith('CHILD') and not injected:
                 injected=True
                 ctx=next(c for c in runner.runtime.worker._active.values() if c and c.session_id==pipeline.session_id)
-                await runner.runtime.client.nudge(ctx.job_ref,'new direction',message_id='late',actor=runner.actor)
+                await runner.runtime.client.send(ctx.job_ref,'new direction',message_id='late',actor=runner.actor)
             return await finish(pipeline,text,index)
         monkeypatch.setattr(child_completion,'continue_before_finish',nudge_first)
     try:

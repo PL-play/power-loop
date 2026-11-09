@@ -19,7 +19,6 @@ from tests.runtime_fixture import RunningAgent
 from tests.write_meter import WriteMeter
 
 from .test_background_runtime_203 import BackgroundParent
-from .test_interactions_runtime_203 import AskingModel
 from .test_job_registry_192 import registry_store
 from .test_send_row_profile import _snapshot
 from .test_send_sql_profile import Profiled, _counts
@@ -29,7 +28,7 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize('flow', ['subagent', 'background', 'answer', 'workflow'])
+@pytest.mark.parametrize('flow', ['subagent', 'background', 'workflow'])
 async def test_complete_flow_cost(registry_store, tmp_path, flow):
     store, _ = registry_store
     registry = create_default_tool_registry(workspace_dir=str(tmp_path))
@@ -60,8 +59,6 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
             await gate.wait()
             return 'background result'
         registry.register(ToolDefinition('slow', 'read', async_capable=True, pricing=Free('local')), slow)
-    else:
-        model = AskingModel()
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get('P0_WRITE_METER') else None
     store._db = profiled = Profiled(original, meter)
@@ -73,27 +70,14 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
         if meter:
             await meter.reset()
         started = time.monotonic()
-        if flow == 'answer':
-            receipt = await runner.runtime.client.send(runner.target, 'ask', message_id='ask', actor=runner.actor)
-            while receipt.input_ref not in runner.executions:
-                await asyncio.sleep(.01)
-            await runner.finish(receipt.input_ref)
-            status = await runner.runtime.client.inspect(receipt.input_ref, actor=runner.actor)
-            state = await store.get_state(runner.target.session_id)
-            pending = state.pending
-            await runner.runtime.client.answer(status.job_ref,
-                interaction_id=pending['pending_interactions'][0]['interaction_id'], wait_round=pending['round_index'],
-                value='blue', message_id='answer', actor=runner.actor)
-            result = await runner.runtime.client.wait(receipt.input_ref, actor=runner.actor, deadline_ms=now_ms()+10000)
-        else:
-            await runner.send('start')
-            rows = await store.load_all_messages(runner.target.session_id)
-            receipt = json.loads(next(m.content for m in rows if m.tool_call_id == ('spawn' if flow == 'subagent' else flow)))
-            gate.set()
-            result = await runner.runtime.client.wait(JobRef(**receipt['job_ref']), actor=runner.actor, deadline_ms=now_ms()+10000)
+        await runner.send('start')
+        rows = await store.load_all_messages(runner.target.session_id)
+        receipt = json.loads(next(m.content for m in rows if m.tool_call_id == ('spawn' if flow == 'subagent' else flow)))
+        gate.set()
+        result = await runner.runtime.client.wait(JobRef(**receipt['job_ref']), actor=runner.actor, deadline_ms=now_ms()+10000)
         assert result.status == 'completed'
-        parent_input = (None if flow == 'answer' else InputRef(store.store_id, runner.target.session_id,
-            hashlib.sha256(('result:' + result_id(result.job_ref.job_id, result.job_ref.generation)).encode()).hexdigest()))
+        parent_input = InputRef(store.store_id, runner.target.session_id,
+            hashlib.sha256(('result:' + result_id(result.job_ref.job_id, result.job_ref.generation)).encode()).hexdigest())
         await runner.drain(after_input=parent_input)
         elapsed = time.monotonic()-started
         records, tx_sites = list(profiled.records), list(profiled.tx_sites)

@@ -359,3 +359,36 @@ async def test_list_budget_never_skips_a_record_when_previews_are_trimmed(audit,
         assert exc.code == "task_history_budget_too_small" and not seen
     else:
         assert seen == ["1", "2", "3"]
+
+
+async def test_latest_lists_newest_records_with_bounded_previews(audit):
+    c = audit
+    for i in range(6):
+        await c.store.append_message(c.sid, role="assistant", content=f"LATE-{i}-" + "x"*900, send_index=1)
+    result = await read(c, latest=True, limit=2, preview_chars=100)
+    records = result["records"]
+    assert ["LATE-4" in r["preview"] for r in records] == [True, False]
+    assert "LATE-5" in records[1]["preview"] and result["next_cursor"] is None
+    assert all(len(r["preview"]) == 100 and r["truncated"] for r in records)
+    oldest = await read(c, limit=2)
+    assert "原请求" in oldest["records"][0]["preview"]
+
+
+async def test_jobs_messages_view_applies_default_and_maximum_limits(audit, monkeypatch):
+    from power_loop.tools import jobs
+
+    c = audit
+    for i in range(60):
+        await c.store.append_message(c.sid, role="assistant", content=f"ROW-{i}-" + "y"*900, send_index=1)
+    loop = SimpleNamespace(task_runtime=SimpleNamespace(manager=c.manager, actor=lambda sid: c.actor))
+    seen = []
+    original = task_history.read_history
+    async def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return await original(*args, **kwargs)
+    monkeypatch.setattr(task_history, "read_history", spy)
+    page = await jobs._native(loop, c.sid, "get", {"job_id": c.job, "view": "messages", "max_chars": 32000})
+    assert "ROW-59" in page["records"][-1]["preview"]
+    assert len(page["records"]) == 20 and all(len(r["preview"]) <= 500 for r in page["records"])
+    await jobs._native(loop, c.sid, "get", {"job_id": c.job, "view": "messages", "limit": 100, "max_chars": 32000})
+    assert seen[-1]["limit"] == 50 and seen[-1]["latest"] is True

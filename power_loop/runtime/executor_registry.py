@@ -480,7 +480,7 @@ async def _drain_scope(manager, identity, operation, request):
     if original is not None:
         return original
     jobs = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND supervision_status<>'closed' "
-        "AND executor_id=? AND boot_id=? AND status<>'waiting' "
+        "AND executor_id=? AND boot_id=? "
         "AND (intake='open' OR resource_state IN ('not_started','running','unknown')) ORDER BY job_id LIMIT ?",
         (*asdict(identity).values(), _LIMIT+1))
     if len(jobs) > _LIMIT:
@@ -530,8 +530,7 @@ async def _drain_tree(manager, identity, operation, reason, targets, creators):
                     manager._control_notifications.get().add(job_id)
                 continue
             changed = any(job[k] != target[k] for k in ("generation", "executor_id", "boot_id"))
-            closed = not changed and job["resource_state"] == "stopped" and (
-                job["intake"] == "closed" or job["status"] == "waiting")
+            closed = not changed and job["resource_state"] == "stopped" and job["intake"] == "closed"
             if not changed and not closed and job["cancel_requested_at"] is None:
                 status = job["status"] if job["supervision_status"] == "closed" or job["status"] == "model_closed" else (
                     "cancelled" if job["resource_state"] == "not_started" else "cancelling")

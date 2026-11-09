@@ -127,7 +127,7 @@ async def test_update_during_last_model_round_is_consumed_before_completion(regi
         nonlocal appended
         if not appended:
             appended = True
-            return await runner.runtime.client.append(runner.target, "once", actor=runner.actor, message_id="late")
+            return await runner.runtime.client.send(runner.target, "once", actor=runner.actor, message_id="late")
     async def append(self, message, **kwargs):
         await original(self, message, **kwargs)
         if stage == "after_final_append" and message.get("role") == "assistant" and not message.get("tool_calls"):
@@ -186,7 +186,7 @@ async def test_pass_turn_accepts_late_append_without_losing_it(registry_store, m
         nonlocal receipt
         await original(self, message, **kwargs)
         if message.get("role") == "tool" and message.get("tool_call_id") == "pass":
-            receipt = await runner.runtime.client.append(runner.target, "once", message_id="after-pass", actor=runner.actor)
+            receipt = await runner.runtime.client.send(runner.target, "once", message_id="after-pass", actor=runner.actor)
     monkeypatch.setattr(SQLiteSink, "on_message_appended", append)
     try:
         result = await runner.send("pass after this round")

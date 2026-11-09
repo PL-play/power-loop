@@ -247,7 +247,7 @@ async def recover_acquired_session(loop, session_id, *, cache_valid):
             changed = await tx.write_job(row['job_id'],
                 f"UPDATE {manager.jobs} SET status='interrupted',outcome='interrupted',"
                 "intake='closed',resource_state='unknown',version=version+1,updated_at=? "
-                "WHERE job_id=? AND generation=? AND outcome IS NULL AND status IN ('running','waiting','settling')",
+                "WHERE job_id=? AND generation=? AND outcome IS NULL AND status IN ('running','settling')",
                 (manager.now(), row['job_id'], row['generation']))
             if changed and public_job:
                 await port._commit_result(tx, ref, Result(ref, None, 'interrupted', error='execution owner lost'),

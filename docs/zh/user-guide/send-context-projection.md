@@ -190,7 +190,7 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 ## 行为说明
 
 - **子 agent 子 session 不投影** —— 按 `parent_session_id` 跳过；子 session 的明细在它自己的 session 里。
-- **未完成的 send 延迟投影** —— 以 `waiting_for_input` / `pending_tools` 结束的 send，等 resume 走到终态才投影（按 `(session_id, send_index, kind)` 幂等 upsert）。
+- **未完成的 send 延迟投影** —— 以 `pending_tools` 结束的 send，等 resume 走到终态才投影（按 `(session_id, send_index, kind)` 幂等 upsert）。
 - **投影前（遗留）的行逐字渲染，绝不丢弃** —— 在挂上投影 representation 之前（或 v2 之前、或经 export→import 恢复）写入的行 `send_index = NULL`。在这种 session 上开启投影**不会**抹掉它们：它们作为前缀逐字渲染，排在每个已投影 send 之前（时间上最早）。全新的 v2 session 不会有 NULL 行，所以这只对迁移/导入场景有意义。
 - **缺失或过时的投影回退逐字，绝不丢弃** —— 投影在 send 结束时是 best-effort；若它写失败/崩溃，该历史 send 在 `pl_messages` 里有行、投影表里没有，reader 会**用 `pl_messages` 逐字渲染**这个 send，而不是把它漏掉。投影行的 `version` 与当前 representation 不一致时同样触发这个回退。
 - **行为不当的 representation 只降级，不会污染 send** —— 若 `project_send`/`render` 抛异常，则跳过折叠，但该 send 的逐 send 行照常提交；`pl_messages` 仍是事实源。逐工具的 `project()` 钩子同样有异常保护（回退到截断默认）。

@@ -135,17 +135,13 @@ class RuntimeInputStore:
     async def accept_input(self, tx, command, actor, *, descriptor=None, child_start=False):
         """A: conditionally gate intake, freeze once, insert/dedupe the original row."""
         defaults = await self.authorize(tx, command.target, actor)
-        if command.operation == "send" and not child_start and defaults.get("execution_role", "main") != "main":
-            raise RuntimeRequestError("invalid_options", "child sessions require resume with their original JobRef")
-        waiting_gate = (f" AND NOT EXISTS (SELECT 1 FROM {self.jobs} j WHERE j.session_id=? AND j.status='waiting')"
-                        if command.operation == "send" else "")
+        if (command.operation == "send" and command.target.job_id is None and not child_start
+                and defaults.get("execution_role", "main") != "main"):
+            raise RuntimeRequestError("invalid_options", "child sessions take input through their JobRef")
         changed = await tx.execute(
-            f"UPDATE {self.state} SET inbox_version=inbox_version+1 WHERE session_id=? AND lifecycle='open'" + waiting_gate,
-            (command.target.session_id,) * (2 if waiting_gate else 1))
+            f"UPDATE {self.state} SET inbox_version=inbox_version+1 WHERE session_id=? AND lifecycle='open'",
+            (command.target.session_id,))
         if not changed:
-            state = await tx.fetchone(f"SELECT lifecycle FROM {self.state} WHERE session_id=?", (command.target.session_id,))
-            if state and state["lifecycle"] == "open":
-                raise RuntimeRequestError("waiting_input", "answer the pending interaction before starting a new turn")
             raise RuntimeRequestError("session_closed")
         ref = InputRef(command.target.store_id, command.target.session_id, command.message_id)
         old = await self.input(tx, ref)
@@ -171,7 +167,7 @@ class RuntimeInputStore:
         if options["model"] is not None and options["model"] not in allowed_models:
             raise RuntimeRequestError("invalid_options", "model outside frozen profile")
         digest = hashlib.sha256(canonical({
-            "operation": command.operation, "target": command.target, "body": command.payload,
+            "operation": command.operation, "urgent": command.urgent, "target": command.target, "body": command.payload,
             "descriptor": definition, "options": options, "deadline": command.expires_at_ms,
             "generation": command.expected_job_generation, "scope": command.scope,
             "source": actor,
@@ -188,19 +184,15 @@ class RuntimeInputStore:
                 raise RuntimeRequestError("stale_generation")
             if command.operation == "resume":
                 self.require_resumable(job)
-            elif command.operation == "answer":
-                if job["status"] != "waiting" or job["cancel_requested_at"] is not None:
-                    raise RuntimeRequestError("interaction_expired")
             elif job["status"] != "running":
                 raise RuntimeRequestError("target_not_running" if job["generation"] == 0 else "target_terminal")
-        meta = dict(protocol_version=42, operation=command.operation, execution_mode=command.execution_mode,
+        meta = dict(protocol_version=42, operation=command.operation,
                     request_id=command.message_id, request_hash=digest, descriptor=plain(definition),
-                    options=options, source_job_id=None, scope=command.scope, result_ref=None,
-                    interaction=None, reason=None)
+                    options=options, source_job_id=None, scope=command.scope, result_ref=None, reason=None)
         columns = ("session_id", "item_id", "kind", "mode", "status", "content", "meta_json", "created_at",
                    "target_job_id", "expected_job_generation", "expires_at")
         body = plain(command.payload["body"])
-        values = (ref.session_id, ref.message_id, "user", "steer" if command.operation == "steer" else "queue",
+        values = (ref.session_id, ref.message_id, "user", "steer" if command.urgent else "queue",
                   "pending", canonical(body), canonical(meta), now_ms(), command.target.job_id,
                   command.expected_job_generation, command.expires_at_ms)
         inserted = await tx.execute(self.db.dialect.insert_ignore(self.q, columns), values)
@@ -371,7 +363,7 @@ class RuntimeInputStore:
                                result.status == "cancelled", payload["resource_state"]), result, fixed)
             if selected < job["generation"] or job["supervision_status"] == "closed":
                 raise RuntimeRequestError("not_found", "result no longer available")
-            state = "accepted" if selected == 0 else "waiting_input" if job["status"] == "waiting" else "running"
+            state = "accepted" if selected == 0 else "running"
             return (Status(input_ref, actual, state, None, False, job["cancel_requested_at"] is not None,
                            "not_started" if selected == 0 else job["resource_state"]), None, fixed)
 
@@ -418,8 +410,12 @@ class RuntimeInputStore:
                           {**record.meta, "descriptor": profile["descriptor"], "options": profile["options"]})
 
     async def discard_cancelled_result(self, tx, record):
-        """An explicitly cancelled originating scope must not wake a new send."""
-        row = await tx.fetchone(f"SELECT parent_job_id,cancel_requested_at FROM {self.jobs} WHERE job_id=?",
+        """An explicitly cancelled originating scope must not wake a new send.
+
+        The result's own job is not its origin: a stopped child still reports to its parent.
+        """
+        row = await tx.fetchone(f"SELECT p.parent_job_id,p.cancel_requested_at FROM {self.jobs} j "
+                               f"JOIN {self.jobs} p ON p.job_id=j.parent_job_id WHERE j.job_id=?",
                                (record.meta["result_ref"]["job_id"],))
         while row:
             if row["cancel_requested_at"] is not None:
@@ -512,10 +508,10 @@ class RuntimeInputStore:
         item_id = hashlib.sha256(("result:" + result_key).encode()).hexdigest()
         ref = InputRef(job_ref.store_id, parent_sid, item_id)
         result_ref = dict(result_id=result_key, job_id=job_ref.job_id, generation=job_ref.generation)
-        meta = dict(protocol_version=42, operation="result_ready", execution_mode="result",
+        meta = dict(protocol_version=42, operation="result_ready",
                     request_id=item_id, request_hash=hashlib.sha256(canonical(result_ref).encode()).hexdigest(),
                     descriptor=None, options=None, source_job_id=job_ref.job_id, scope="self",
-                    result_ref=result_ref, interaction=None, reason=None)
+                    result_ref=result_ref, reason=None)
         columns = ("session_id", "item_id", "kind", "mode", "status", "content", "meta_json", "created_at")
         new_ref = await tx.execute(self.db.dialect.insert_ignore(self.q, columns),
             (parent_sid, item_id, "task_done", "queue", "pending", "", canonical(meta), now_ms()))

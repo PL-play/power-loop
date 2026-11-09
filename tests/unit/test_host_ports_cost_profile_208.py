@@ -182,8 +182,8 @@ async def test_late_child_result_retention_cost(registry_store):
         await meter.close()
 
 
-@pytest.mark.parametrize('operation', ['wait_continue', 'wait_defer', 'managed_notice_known', 'managed_notice_resolved'])
-async def test_wait_and_notice_cost(registry_store, operation):
+@pytest.mark.parametrize('operation', ['managed_notice_known', 'managed_notice_resolved'])
+async def test_notice_cost(registry_store, operation):
     store, _ = registry_store
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix)
@@ -209,21 +209,16 @@ async def test_wait_and_notice_cost(registry_store, operation):
             transactions=len(tx_sites), records=records, tx_sites=tx_sites,
             writes=await meter.report(), net_tables={name:[after[name][i]-before[name][i] for i in (0,1)]
                 for name in after if after[name]!=before[name]}, instrumented_elapsed_s=elapsed,
-            timing_note='Whole finite wait through original child completion, or accepted notice through original main completion; includes worker drain/close. Assertion-only reads excluded. Write triggers enabled; not a latency benchmark.')
+            timing_note='Accepted notice through original main completion; includes worker drain/close. Assertion-only reads excluded. Write triggers enabled; not a latency benchmark.')
         if output := os.environ.get('P7_PORTS_OUT'):
             with Path(output).open('a') as file:
                 file.write(json.dumps(data)+'\n')
     try:
-        if operation.startswith('wait_'):
-            from .test_wait_review_208 import test_finite_wait_preserves_original_child_and_capacity_one
-            await test_finite_wait_preserves_original_child_and_capacity_one(registry_store,
-                operation.removeprefix('wait_'), measure=measure)
-        else:
-            from .test_managed_delivery_192 import (
-                test_main_actually_consumes_the_known_outcome_and_original_error_is_unchanged,
-            )
-            await test_main_actually_consumes_the_known_outcome_and_original_error_is_unchanged(registry_store,
-                operation == 'managed_notice_resolved', measure=measure)
+        from .test_managed_delivery_192 import (
+            test_main_actually_consumes_the_known_outcome_and_original_error_is_unchanged,
+        )
+        await test_main_actually_consumes_the_known_outcome_and_original_error_is_unchanged(registry_store,
+            operation == 'managed_notice_resolved', measure=measure)
     finally:
         store._db = original
         await meter.close()

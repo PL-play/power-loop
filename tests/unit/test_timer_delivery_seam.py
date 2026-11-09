@@ -60,13 +60,13 @@ async def test_hook_rewrite_or_skip_applies_before_client_acceptance(registry_st
 async def test_unknown_acceptance_is_not_replayed_and_next_timer_can_fire(registry_store, monkeypatch):
     store, _ = registry_store
     async with timers(store) as (runtime, target, actor, source):
-        original = runtime.client.append
+        original = runtime.client.send
         calls = []
         async def lose_reply(*args, **kwargs):
             calls.append(kwargs['message_id'])
             await original(*args, **kwargs)
             raise ConnectionError('acceptance reply lost')
-        monkeypatch.setattr(runtime.client, 'append', lose_reply)
+        monkeypatch.setattr(runtime.client, 'send', lose_reply)
         timer = await runtime.timer_backend.create(source, delay_s=-1, note='unknown original')
         assert await runtime.timer_driver.scan_once() == 0
         assert (await store.get_timer(target.session_id, timer.timer_id)).status == 'unknown'
@@ -75,7 +75,7 @@ async def test_unknown_acceptance_is_not_replayed_and_next_timer_can_fire(regist
         assert (await runtime.client.wait(ref, actor=actor, deadline_ms=now_ms()+10000)).status == 'completed'
         assert await runtime.timer_driver.scan_once() == 0
         assert len(calls) == 1
-        monkeypatch.setattr(runtime.client, 'append', original)
+        monkeypatch.setattr(runtime.client, 'send', original)
         next_timer = await runtime.timer_backend.create(source, delay_s=-1, note='new invocation')
         assert await runtime.timer_driver.scan_once() == 1
         ref = InputRef(store.store_id, target.session_id, f'timer-{next_timer.timer_id}-{next_timer.created_at}-0')

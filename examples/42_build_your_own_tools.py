@@ -1,7 +1,7 @@
 """42 · Custom tools on the current Runtime ports.
 
 Run without a provider: python examples/42_build_your_own_tools.py
-Timer/board/notes/question handlers use public SDK primitives. Delegation and
+Timer/board/notes handlers use public SDK primitives. Delegation and
 background aliases retain the SDK implementation's permissions and lifecycle.
 The sequential research/draft command is a trusted host command: a worker slot
 is released while it waits for each child, including at capacity one.
@@ -19,7 +19,6 @@ from _runtime import demo_runtime
 from power_loop import (
     DEFAULT_NOTES_POLICY,
     AgentSpec,
-    HumanInputRequired,
     LLMResponse,
     LLMService,
     StoreBlackboard,
@@ -52,28 +51,6 @@ REMIND_TOOL = ToolDefinition(
         "required": ["delay_seconds", "note"],
     },
     required_params=("delay_seconds", "note"),
-pricing=Free("local"))
-
-
-# Questions are answered with RuntimeClient.answer using the visible wait round.
-
-async def _ask_human(prompt: str, options: list[str] | None = None) -> str:
-    raise HumanInputRequired(
-        kind="choice" if options else "text",
-        prompt=prompt,
-        options=[{"value": o, "label": o} for o in (options or [])],
-    )
-
-
-ASK_HUMAN_TOOL = ToolDefinition(
-    name="ask_human",
-    description="Pause and ask the human a question (optionally with choices) before continuing.",
-    input_schema={
-        "type": "object",
-        "properties": {"prompt": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}},
-        "required": ["prompt"],
-    },
-    required_params=("prompt",),
 pricing=Free("local"))
 
 
@@ -183,7 +160,6 @@ pricing=Free("composite"))
 # Ordinary handlers and aliases are registered through the public registry.
 _SIMPLE_TOOLS: tuple[tuple[ToolDefinition, Any], ...] = (
     (REMIND_TOOL, _remind_me),
-    (ASK_HUMAN_TOOL, _ask_human),
     (BOARD_WRITE_TOOL, _board_write),
     (BOARD_READ_TOOL, _board_read),
     (REMEMBER_TOOL, _remember),

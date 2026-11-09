@@ -135,62 +135,6 @@ async def test_model_submission_returns_receipt_and_delivers_to_parent(registry_
         await runner.aclose()
 
 
-async def test_wait_for_user_answer_does_not_restart_node(registry_store, tmp_path):
-    import asyncio
-    import json
-
-    from power_loop.agent.runtime_types import JobRef
-    from power_loop.tools import create_default_tool_registry
-
-    store, _ = registry_store
-    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
-
-    class Asking(Model):
-        async def complete(self, request, **kwargs):
-            answers = [m for m in request.messages if m.get("tool_call_id") == "question"]
-            if answers:
-                return LLMResponse(raw_text="answer=" + answers[-1]["content"])
-            return LLMResponse(
-                raw_text="",
-                tool_calls=[
-                    {
-                        "id": "question",
-                        "type": "function",
-                        "function": {"name": "request_user_input", "arguments": json.dumps({"prompt": "choose"})},
-                    }
-                ],
-            )
-
-    runner = await RunningAgent(store, Asking(), registry, AgentLoopConfig(compactor=None)).start()
-    node = leaf("A")
-    node["spec"]["tools"] = ["request_user_input"]
-    try:
-        handle = await runner.runtime.client.workflow(
-            runner.target, {"name": "answer", "root": node}, message_id="ask", actor=runner.actor
-        )
-        for _ in range(500):
-            job = await store._db.fetchone(f"SELECT * FROM {store.table_prefix}jobs WHERE kind='workflow_node'")
-            if job and job["status"] == "waiting":
-                break
-            await asyncio.sleep(0.01)
-        assert job["status"] == "waiting"
-        state = await store.get_state(job["session_id"])
-        interaction = state.pending["pending_interactions"][0]
-        await runner.runtime.client.answer(
-            JobRef(store.store_id, job["job_id"], job["generation"]),
-            actor=runner.actor,
-            interaction_id=interaction["interaction_id"],
-            wait_round=state.pending["round_index"],
-            value="blue",
-            message_id="answer",
-        )
-        result = await handle.wait(deadline_ms=now_ms() + 10000)
-        assert result.status == "completed" and result.final.text == "answer=blue", result
-        assert result.usage["calls"] == 2
-    finally:
-        await runner.aclose()
-
-
 async def test_required_child_finishes_before_downstream(registry_store, tmp_path):
     import json
 

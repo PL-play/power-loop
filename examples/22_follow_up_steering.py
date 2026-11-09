@@ -1,4 +1,4 @@
-"""22 · Append guidance to a running input; duplicate message IDs are recalled."""
+"""22 · A second send joins the running job; duplicate message IDs are recalled."""
 import asyncio
 import time
 
@@ -31,8 +31,8 @@ async def main():
     async with demo_runtime(model) as (runtime, loop, target, actor):
         receipt = await runtime.client.send(target, 'Discuss patience', message_id='first', actor=actor)
         await asyncio.wait_for(model.entered.wait(), 10)
-        added = await runtime.client.append(target, 'Include STEERED in your answer', message_id='guidance', actor=actor)
-        duplicate = await runtime.client.append(target, 'Include STEERED in your answer', message_id='guidance', actor=actor)
+        added = await runtime.client.send(target, 'Include STEERED in your answer', message_id='guidance', actor=actor)
+        duplicate = await runtime.client.send(target, 'Include STEERED in your answer', message_id='guidance', actor=actor)
         assert added.input_ref == duplicate.input_ref
         model.release.set()
         result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)

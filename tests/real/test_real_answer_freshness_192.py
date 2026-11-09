@@ -25,7 +25,7 @@ async def test_real_corrected_node_does_not_deliver_old_text_after_empty_pass(ru
         if sid!=agent.target.session_id and not node_sids:
             assert response.raw_text.strip()=='42' and not response.get_tool_calls()
             node_sids.append(sid)
-            await agent.runtime.client.append(TargetRef(agent.runtime.store.store_id,sid),
+            await agent.runtime.client.send(TargetRef(agent.runtime.store.store_id,sid),
                 "Correction: the current answer is 43. Call pass_turn exactly once with reason='Computed 43' and no assistant text. On a later final-answer request write 43 as assistant text.",
                 message_id='correction',actor=agent.actor)
         return response

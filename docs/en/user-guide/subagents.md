@@ -8,7 +8,7 @@ Register spawn_agent in the factory's ToolRegistry. A model-visible create retur
 
 AgentSpec selects name, system_prompt, tool allowlist, model options, round limits and optional output_schema. Validate those values before admission. Tool allowlists and depth limits apply on the child node. Model changes require the host's allowed_models declaration. Structured output is parsed and validated as a child result, not trusted solely because it looks like JSON.
 
-Use the original JobRef to inspect, wait, nudge, cancel or resume. Parent interruption does not silently cancel a healthy child; the result remains queryable. Workflow-node budgets and original owners continue across explicit resumes and do not refresh into a new root. Late child output retained in a finished node's history is not marked consumed until the node actually processes it.
+Use the original JobRef to inspect, wait, send a message, cancel or resume. Parent interruption does not silently cancel a healthy child; the result remains queryable. Workflow-node budgets and original owners continue across explicit resumes and do not refresh into a new root. Late child output retained in a finished node's history is not marked consumed until the node actually processes it.
 
 Factories reconstruct tools, workspace and hooks from stable profiles; neither a closure around a parent loop nor an old session handle is a deployment resource.
 

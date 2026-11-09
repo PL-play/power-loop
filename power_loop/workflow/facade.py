@@ -29,7 +29,7 @@ from .runner import WorkflowRunHandle
 from .spec import WorkflowSpec, WorkflowSpecError
 
 log = logging.getLogger(__name__)
-_ACTIONS = ("help", "validate", "create", "status", "list", "cancel", "leaves", "logs", "nudge", "steer")
+_ACTIONS = ("help", "validate", "create", "status", "list", "cancel", "leaves", "logs", "send")
 _MAX_FILE_BYTES = 1024 * 1024
 
 
@@ -250,6 +250,7 @@ def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
         "node": {"type": "string"},
         "node_job_id": {"type": "string"},
         "message": {"type": "string"},
+        "urgent": {"type": "boolean"},
         "reason": {"type": "string"},
         "expected_generation": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -264,6 +265,7 @@ def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
         "send_index": {"type": "integer", "minimum": 1},
         "char_offset": {"type": "integer", "minimum": 0},
         "output_file": {"type": "string"},
+        "preview_chars": {"type": "integer", "minimum": 100, "maximum": 4000},
     }
     if allow_inline_spec:
         properties["spec"] = {"type": "object"}
@@ -271,7 +273,9 @@ def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
         name="workflow",
         pricing=Free("composite"),
         description=(
-            "Create asynchronous workflows; inspect saved tasks, leaves and messages; cancel or steer an exact node. "
+            "Create asynchronous workflows; inspect saved tasks, leaves and messages; cancel or send a message to an exact node. "
+            "logs lists a node's latest messages (default 20, at most 50, each shortened to preview_chars, default 500); "
+            "source=projection lists its compact projected history; seq/id reads one record in full. "
             "Accepted is a receipt, not completion. Results arrive in the owner inbox. " + description_suffix
         ),
         input_schema={"type": "object", "properties": properties, "additionalProperties": False},
@@ -350,11 +354,15 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                 selected = await select_native_target(loop.task_runtime, sid, job, options)
                 node = await manager.get_job(actor, selected, include_result=False)
                 if action == "logs":
+                    from power_loop.tools.jobs import MESSAGES_LIMIT, MESSAGES_MAX_LIMIT, MESSAGES_PREVIEW_CHARS
+
                     value = await task_history.read_history(manager, actor, selected, **{
                         key: options[key] for key in ("source", "message_id", "message_ids", "seq", "id",
-                            "send_index", "limit", "cursor", "char_offset", "max_chars", "output_file")
+                            "send_index", "cursor", "char_offset", "max_chars", "output_file")
                         if key in options
-                    })
+                    }, limit=min(options.get("limit", MESSAGES_LIMIT), MESSAGES_MAX_LIMIT),
+                        preview_chars=options.get("preview_chars", MESSAGES_PREVIEW_CHARS),
+                        latest=options.get("cursor") is None)
                 else:
                     _, trusted = await tool_actor(loop)
                     client = loop._runtime_worker.runtime.client
@@ -367,8 +375,9 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                         )
                     else:
                         value = plain(
-                            await getattr(client, action)(
-                                ref, options["message"], actor=trusted, message_id=action + ":" + trusted.tool_call_id
+                            await client.send(
+                                ref, options["message"], actor=trusted, urgent=options.get("urgent") is True,
+                                message_id="send:" + trusted.tool_call_id,
                             )
                         )
         return _dump(value)

@@ -1,12 +1,9 @@
-"""Steering reaches the model while work is in flight (design/124 §7).
+"""Urgent input (``send(urgent=True)``) reaches the model at the next safe boundary.
 
-- a steer arriving during the model call aborts it; nothing it produced reaches history; the next
-  round carries the steer; the aborted call is billed as an estimate; no round is spent (Z8 too);
-- a queue-mode item does NOT interrupt anything;
+- urgent input received during the model call does not cut it; the next round carries the input;
+- a non-urgent input does not interrupt anything;
 - a flag that can never be cleared can't spin the loop;
-- tools: ``finish`` (default) runs to completion, ``abort`` is cancelled, ``background`` is adopted
-  into the background task table and delivered later; calls not yet started are skipped;
-- ``wait_or_steer`` lets a waiting tool return early.
+- a tool already running finishes (whatever its interrupt mode); calls not yet started are skipped.
 """
 
 from __future__ import annotations
@@ -22,7 +19,6 @@ from power_loop import (
     AgentHooks,
     AgentLoopConfig,
     SessionStore,
-    wait_or_steer,
 )
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
@@ -142,7 +138,7 @@ async def _steer(agent, body, message_id):
     from power_loop import InputRef
     current = await agent.runtime.client.inspect(InputRef(agent.target.store_id, agent.target.session_id, "m1"),
                                                   actor=agent.actor)
-    return await agent.runtime.client.steer(current.job_ref, body, message_id=message_id, actor=agent.actor)
+    return await agent.runtime.client.send(current.job_ref, body, urgent=True, message_id=message_id, actor=agent.actor)
 
 
 # ── the model call ────────────────────────────────────────────────────────────────────────
@@ -197,7 +193,7 @@ async def test_queue_item_does_not_interrupt(store, runtime_agent) -> None:
         system_prompt="S", max_rounds=3, compactor=None))
     run = asyncio.create_task(loop.send("go"))
     await asyncio.wait_for(llm.hanging.wait(), 5)
-    await loop.runtime.client.append(loop.target, "fyi", message_id="q1", actor=loop.actor)    # queue mode
+    await loop.runtime.client.send(loop.target, "fyi", message_id="q1", actor=loop.actor)    # queue mode
     gate.set()
     res = await run
     assert res.status == "completed"
@@ -212,7 +208,7 @@ async def test_session_append_joins_the_running_job_next_round(store, runtime_ag
         system_prompt="S", max_rounds=3, compactor=None))
     first = await loop.runtime.client.send(loop.target, "go", message_id="m1", actor=loop.actor)
     await asyncio.wait_for(llm.hanging.wait(), 5)
-    await loop.runtime.client.append(loop.target, "one more thing", message_id="a1", actor=loop.actor)
+    await loop.runtime.client.send(loop.target, "one more thing", message_id="a1", actor=loop.actor)
     llm.release.set()
     await loop.runtime.client.wait(first.input_ref, actor=loop.actor, deadline_ms=None)
     added = await loop.runtime.client.inspect(InputRef(loop.target.store_id, loop.target.session_id, "a1"),
@@ -220,23 +216,6 @@ async def test_session_append_joins_the_running_job_next_round(store, runtime_ag
     original = await loop.runtime.client.inspect(first.input_ref, actor=loop.actor)
     assert added.job_ref == original.job_ref
     assert any("one more thing" in str(m.get("content")) for m in llm.calls[1])
-
-
-@pytest.mark.asyncio
-async def test_session_steer_interrupts_the_running_job(store, runtime_agent) -> None:
-    from power_loop.agent.runtime_types import Command
-    probe = _Probe()
-    llm = _LLM([_call("slow"), "stopped"])
-    loop = await runtime_agent(model=llm, store=store, registry=_registry(probe, interrupt="abort"),
-                               config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None))
-    run = asyncio.create_task(loop.send("do the slow thing"))
-    await asyncio.wait_for(probe.started.wait(), 5)
-    await loop.runtime.client.submit(Command("s1", loop.target, "steer", {"body": "stop"}, "control"),
-                                     actor=loop.actor)
-    res = await asyncio.wait_for(run, 5)
-    assert res.status == "failed" and probe.cancelled and not probe.finished
-    assert (await loop.send("continue")).status == "completed"
-    assert any("stop" in str(m.get("content")) for m in llm.calls[1])
 
 
 @pytest.mark.asyncio
@@ -306,46 +285,15 @@ async def test_finish_mode_tool_runs_to_completion(store, runtime_agent) -> None
 
 
 @pytest.mark.asyncio
-async def test_abort_mode_tool_is_cancelled_unknown_and_new_input_can_continue(store, runtime_agent) -> None:
-    bus = AgentEventBus()
-    interrupted = _events(bus, AgentEventType.STEER_INTERRUPTED)
-    loop, sid, probe, llm, run = await _run_with_tool(runtime_agent, store, "abort", bus=bus)
-    res = await asyncio.wait_for(run, 5)
-    assert res.status == "failed" and "unresolved_prior_attempt" in res.error
-    assert len(llm.calls) == 1
-    assert (await loop.send("continue after cancellation")).status == "completed"
-    assert probe.cancelled and not probe.finished
-    rows = await store.load_active_messages(sid)
-    tool_rows = [r for r in rows if r.role == "tool"]
-    assert "interrupted" in tool_rows[0].content and "不是用户拒绝" in tool_rows[0].content
-    assert interrupted[0]["where"] == "tool" and interrupted[0]["action"] == "abort"
-    assert any("new question" in str(m.get("content")) for m in llm.calls[1])
-
-
-@pytest.mark.asyncio
-async def test_background_mode_tool_keeps_running_and_is_delivered_later(store, runtime_agent):
-    import json
-
-    from power_loop import JobRef
-    from power_loop.agent.runtime_store import now_ms
-    from power_loop.runtime.background import load_record
-    loop, sid, probe, llm, run = await _run_with_tool(runtime_agent, store, "background")
-    res = await asyncio.wait_for(run, 5)
-    assert res.status == "completed"
-    assert not probe.cancelled and not probe.finished
-    rows = await store.load_active_messages(sid)
-    receipt = json.loads(next(r.content for r in rows if r.role == "tool"))
-    assert "continues in the background" in receipt["message"]
-    original = await loop.runtime.client.inspect(JobRef(**receipt["job_ref"]), actor=loop.actor)
-    assert original.state == "running"
-    assert await load_record(store, sid, receipt["task_id"]) is None
+async def test_urgent_input_does_not_interrupt_a_running_abort_mode_tool(store, runtime_agent) -> None:
+    loop, sid, probe, llm, run = await _run_with_tool(runtime_agent, store, "abort")
+    await asyncio.sleep(0.05)
+    assert not run.done() and not probe.cancelled
     probe.release.set()
-    result = await loop.runtime.client.wait(JobRef(**receipt["job_ref"]), actor=loop.actor,
-                                           deadline_ms=now_ms()+10000)
-    assert result.status == "completed" and result.final_text == "slow tool real result"
-    await loop.drain()
-    original = await load_record(store, sid, receipt["task_id"])
-    assert original["status"] == "completed" and original["result"] == "slow tool real result"
+    res = await asyncio.wait_for(run, 5)
+    assert res.status == "completed" and probe.finished
+    assert "slow tool real result" in _texts(await store.load_active_messages(sid))
+    assert any("new question" in str(m.get("content")) for m in llm.calls[1])
 
 
 @pytest.mark.asyncio
@@ -369,36 +317,6 @@ async def test_calls_not_yet_started_are_skipped(store, runtime_agent) -> None:
 
 
 # ── waiting tools ─────────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_wait_or_steer_returns_early(store, runtime_agent) -> None:
-    started = asyncio.Event()
-    outcome: dict[str, Any] = {}
-
-    async def waiter(**kw: Any) -> str:
-        started.set()
-        _res, steered = await wait_or_steer(asyncio.sleep(3600))
-        outcome["steered"] = steered
-        return "stopped waiting — a new message arrived" if steered else "waited"
-
-    reg = ToolRegistry()
-    reg.register(ToolDefinition(name="wait", description="w",
-                                input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), waiter)
-    llm = _LLM([_call("wait"), "ok"])
-    loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(
-        system_prompt="S", max_rounds=3, compactor=None))
-    run = asyncio.create_task(loop.send("go"))
-    await asyncio.wait_for(started.wait(), 5)
-    await _steer(loop, "hey", "s")
-    res = await asyncio.wait_for(run, 5)
-    assert res.status == "completed" and outcome["steered"] is True
-
-
-@pytest.mark.asyncio
-async def test_wait_or_steer_outside_a_loop_just_waits() -> None:
-    res, steered = await wait_or_steer(asyncio.sleep(0, result="x"))
-    assert (res, steered) == ("x", False)
 
 
 def test_interrupt_value_is_validated() -> None:

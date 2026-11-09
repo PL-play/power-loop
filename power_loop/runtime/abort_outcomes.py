@@ -60,8 +60,6 @@ async def _original(manager, tx, source):
         if root['job_id'] != source['job_id'] or source['parent_job_id'] is not None:
             raise JobError('abort_outcome_requires_original_main')
     pending, calls, ref = await _verify(manager, tx, source, snapshot)
-    if pending.get('pending_interactions'):
-        raise JobError('pending_call_interaction_unresolved')
     checkpoint = await read_abort(manager, tx, source, ref, required=True)
     if [e['call_id'] for e in checkpoint['entries']] != [c['id'] for c in calls]:
         raise JobError('abort_outcome_call_set_changed')

@@ -29,8 +29,7 @@ Run from the SDK directory: `python examples/00_hello_world.py`. Runnable entrie
 | 18 | [18_multi_provider.py](../../../examples/18_multi_provider.py) | 多 Provider / Multi-provider: use three LLM providers or switch on demand |
 | 19 | [19_full_chatbot.py](../../../examples/19_full_chatbot.py) | Tools, memory, hooks and persisted history on a rebuilt local Runtime. |
 | 20 | [20_default_tools.py](../../../examples/20_default_tools.py) | File, shell, skill and background tools with explicit workspace grants. |
-| 21 | [21_request_user_input.py](../../../examples/21_request_user_input.py) | A paused task is answered by JobRef, interaction ID and wait round. |
-| 22 | [22_follow_up_steering.py](../../../examples/22_follow_up_steering.py) | Append guidance to a running input; duplicate message IDs are recalled. |
+| 22 | [22_follow_up_steering.py](../../../examples/22_follow_up_steering.py) | A send while a job runs joins that job; duplicate message IDs are recalled. |
 | 23 | [23_per_send_overrides.py](../../../examples/23_per_send_overrides.py) | RequestOptions limits visible tools and overrides this input's prompt. |
 | 24 | [24_agent_notes.py](../../../examples/24_agent_notes.py) | Notes use the current execution's store; a later input recalls them. |
 | 25 | [25_token_usage.py](../../../examples/25_token_usage.py) | Result usage is per input; stored session statistics accumulate. |

@@ -112,11 +112,6 @@ async def run_inline(spec, task, *, parent_loop):
     return {**plain(result), "session_id": receipt["session_id"], "run_id": receipt["run_id"]}
 
 
-async def nudge(loop, sid: str, message: str) -> dict[str, Any]:
-    from .child_tasks import nudge as submit
-    return await submit(loop, sid, message)
-
-
 def result_view(text: str, cap: int = 600) -> str | None:
     """Tool-context rule: only final_text may change, never envelope metadata."""
     import json

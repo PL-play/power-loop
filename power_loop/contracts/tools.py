@@ -49,17 +49,13 @@ class ToolDefinition:
     #:
     #: ``True`` 仍表示整个工具都可异步，``False`` 表示都不可——旧写法完全不受影响。
     async_capable: bool | frozenset[str] = False
-    #: 6.34.0（design/124 §7.3）：一条**插队**消息（``InboxItem(mode="steer")``）在本工具执行中
-    #: 到达时怎么办：
+    #: 任务被停止（design/124 §8.4）时本工具怎么收尾：
     #:
-    #: - ``"finish"``（默认）：等它跑完——很快的工具，或者停不掉的（在线程里跑的同步 handler）。
-    #: - ``"abort"``：取消执行，给模型一条「为先处理新消息已中断，需要可重新执行」的结果。
-    #:   只给可以安全重跑、取消后不留半截副作用的工具。
-    #: - ``"background"``：不打断，转成后台任务继续跑（``background_run`` 的任务表），给模型一条
-    #:   「已转后台、完成后自动送达」的结果——子 agent、同步等待的编排这类长任务：插队的也许
-    #:   根本不是要停它，转后台就零损失；真要停再按任务 id 停。
+    #: - ``"finish"``（默认）：最多等 ``finish_tool_s`` 拿到真实结果。
+    #: - ``"abort"``：立即取消。只给可以安全重跑、取消后不留半截副作用的工具。
+    #: - ``"background"``：作为独立后台任务执行；停止时最多等 ``subtask_s`` 让它自己收尾。
     #:
-    #: 未执行的后续工具调用一律不再开始，补「为先处理新消息未执行」。
+    #: 加急消息不打断正在执行的工具，只让同一批里还没开始的调用不再开始。
     interrupt: str = "finish"
     context_policy: ToolContextPolicy | None = None
     #: Optional presentation metadata; neither field grants execution authority.

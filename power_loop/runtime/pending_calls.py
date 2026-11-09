@@ -176,8 +176,6 @@ async def _expected(manager, tx, source, closed):
         batch = await expected_disposition(manager, tx, source, closed, optional=True)
         if batch is not None:
             return batch
-    if pending.get('pending_interactions'):
-        raise JobError('pending_call_interaction_unresolved')
     actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
     refs = []
     for call in calls:

@@ -118,7 +118,6 @@ class StatefulResult:
     final_text: str = ""
     rounds: int = 0
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    pending_interactions: list[dict[str, Any]] = field(default_factory=list)
     #: Cumulative token usage for this send (summed over every LLM call):
     #: {prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens,
     #:  total_tokens, calls}. Empty when the run never reached the LLM.
@@ -703,8 +702,8 @@ class _ExecutionLoop:
         return True
 
     def steer_event(self, session_id: str) -> asyncio.Event:
-        """The session's "steering is waiting" event (set while a ``mode="steer"`` item this
-        process accepted is undelivered). Interrupt points and waiting tools await it."""
+        """Set while an urgent inbox item for the session is undelivered; the tool batch
+        starts nothing new until the next round delivers it."""
         return _session_sync(session_id).steer
 
 
@@ -760,8 +759,6 @@ class _ExecutionLoop:
         from power_loop.runtime.session_ownership import recover_acquired_session
         await recover_acquired_session(self, sid, cache_valid=cache_valid)
         if state is None or not state.pending:
-            return 0
-        if state.pending.get("pending_interactions"):
             return 0
         return await self.abort_pending(sid, reason="执行中断，结果未知")
 
@@ -1084,8 +1081,6 @@ class _ExecutionLoop:
         if state is None or not state.pending:
             return
         pending = state.pending
-        if pending.get("pending_interactions"):
-            return
         round_index = int(pending.get("round_index") or 0)
         # Fall back to tool_call_ids (as abort_pending / _prime_sink_from_pending do): a pending that
         # carries only ids (e.g. a crash mid-abort left {tool_call_ids:[…], tool_calls:[]}) must
@@ -1638,7 +1633,6 @@ class _ExecutionLoop:
             final_text=result.final_text,
             rounds=result.rounds,
             pending_tool_calls=result.pending_tool_calls,
-            pending_interactions=result.pending_interactions,
             usage=result.usage,
             tool_calls=result.tool_calls,
             passed=result.passed,
@@ -1709,7 +1703,7 @@ class _ExecutionLoop:
         Defers on a still-in-flight status (the resume re-finalizes under the SAME
         ``send_index``; the idempotent UPSERT then overwrites). Best-effort — the caller swallows
         failures, since ``pl_messages`` remains the source of truth."""
-        if status in ("waiting_for_input", "pending_tools"):
+        if status == "pending_tools":
             return  # send not finished; the resume will re-finalize under the same send_index
         # 只取本 send 的行：这里要投影的就是这一个 send，从前是读全表再在 Python 里过滤，
         # 等于每个 send 都为一小段做一次 O(会话) 的读。投影模式下 pl_messages 永不压缩。
@@ -1877,41 +1871,6 @@ class _ExecutionLoop:
         sink._assistant_seq = pending.get("assistant_seq")
         sink._tool_calls = tool_calls
 
-    async def _remove_pending_interaction(self, sid: str, interaction_id: str) -> None:
-        store = await self._ensure_store()
-        state = await store.get_state(sid)
-        if state is None or not state.pending:
-            return
-        pending = dict(state.pending)
-        interactions = [
-            item
-            for item in list(pending.get("pending_interactions") or [])
-            if str(item.get("interaction_id")) != str(interaction_id)
-        ]
-        if interactions:
-            pending["pending_interactions"] = interactions
-            await store.set_pending(sid, pending)
-            return
-        pending.pop("pending_interactions", None)
-        if pending.get("tool_call_ids") or pending.get("tool_calls"):
-            await store.set_pending(sid, pending)
-
-    async def _waiting_result_if_needed(self, sid: str) -> StatefulResult | None:
-        store = await self._ensure_store()
-        state = await store.get_state(sid)
-        if state is None or not state.pending:
-            return None
-        pending = state.pending
-        interactions = list(pending.get("pending_interactions") or [])
-        if not interactions:
-            return None
-        return StatefulResult(
-            session_id=sid,
-            status="waiting_for_input",
-            pending_tool_calls=list(pending.get("tool_calls") or []),
-            pending_interactions=interactions,
-        )
-
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -1969,13 +1928,6 @@ class StatefulAgentLoop:
         receipt = await self.client.send(target, body, message_id=message_id, actor=actor,
                                          options=options, descriptor=descriptor, deadline_ms=deadline_ms)
         return await self.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline_ms)
-
-    async def follow_up(self, target, body, *, message_id, actor, deadline_ms=None):
-        return await self.client.append(target, body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
-
-    async def submit_input(self, ref, *, interaction_id, wait_round, value, message_id, actor):
-        return await self.client.answer(ref, interaction_id=interaction_id, wait_round=wait_round,
-                                        value=value, message_id=message_id, actor=actor)
 
     async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None):
         return await self.client.resume(ref, message_id=message_id, actor=actor, body=body, deadline_ms=deadline_ms)
