@@ -194,6 +194,72 @@ class RuntimeClient:
                     (job["session_id"],))
         return result
 
+    async def _query_session_core(self, session_id):
+        """Internal status query, shared by jobs tool and host interface."""
+        state = await self.inputs.db.fetchone(
+            f"SELECT lifecycle, owner_token, next_seq FROM {self.inputs.state} "
+            "WHERE session_id=?", (session_id,))
+        if state is None:
+            raise RuntimeRequestError("not_found")
+        active_job = await self.inputs.db.fetchone(
+            f"SELECT job_id, kind, status FROM {self.inputs.jobs} "
+            "WHERE session_id=? AND status IN ('running','settling','model_closed') "
+            "ORDER BY created_at DESC LIMIT 1", (session_id,))
+        pending_count = await self.inputs.db.fetchone(
+            f"SELECT COUNT(*) AS n FROM {self.inputs.q} "
+            "WHERE session_id=? AND status='pending'", (session_id,))
+        return {
+            "lifecycle": state["lifecycle"],
+            "has_active_job": active_job is not None,
+            "active_job_id": active_job["job_id"] if active_job else None,
+            "active_job_kind": active_job["kind"] if active_job else None,
+            "pending_count": int(pending_count["n"]) if pending_count else 0,
+        }
+
+    async def get_session_status(self, session_id, *, actor):
+        """Get session status. Host no longer needs raw SQL queries.
+
+        Returns:
+          lifecycle: open / closing / closed
+          has_active_job: bool
+          active_job_id: str | None
+          active_job_kind: send / subagent / workflow_node / ...
+          pending_count: int  # status='pending' in input_queue
+        """
+        await self.inputs.authorize(self.inputs.db, TargetRef(self.store.store_id, session_id), actor)
+        return await self._query_session_core(session_id)
+
+    async def get_job_status(self, job_id, *, actor):
+        """Get job status.
+
+        Returns:
+          job_id, kind, status, outcome, generation
+          cancel_requested: bool
+        """
+        from power_loop.agent.runtime_types import JobRef
+        job = await self.inputs.resolve_job(self.inputs.db, JobRef(self.store.store_id, job_id, None), actor)
+        return {
+            "job_id": job["job_id"],
+            "kind": job["kind"],
+            "status": job["status"],
+            "outcome": job["outcome"],
+            "generation": job["generation"],
+            "cancel_requested": job["cancel_requested_at"] is not None,
+        }
+
+    async def list_jobs(self, session_id, *, actor, status="active", kinds=None, limit=20):
+        """List jobs under the session.
+
+        status: active (running/settling/model_closed) / terminal (completed/cancelled) / all
+        kinds: filter by job types (send/subagent/workflow_node/...)
+        """
+        from power_loop.runtime import task_query
+        manager = self.inputs.store._task_manager
+        return await task_query.list_jobs(
+            manager, self.inputs._actor(actor, session_id),
+            status=status, kinds=kinds, limit=limit,
+        )
+
     async def workflow(self, target, spec, *, message_id, actor, descriptor=None, options=None):
         from power_loop.workflow.runner import submit
         return await submit(self, target, spec, message_id=message_id, actor=actor,
