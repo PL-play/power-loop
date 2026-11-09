@@ -35,7 +35,8 @@ async def test_store_session_lock_passes_the_shared_contract(registry_store):
                  "test_expiry_takeover_notifies_old_holder_and_rejects_renewal",
                  "test_expired_local_handle_rejects_writes_without_waiting_for_renewal"):
         await getattr(case, name)()
-    assert not await store._db.fetchall(f"SELECT session_id FROM {store.t.session_leases}")
+    assert not await store._db.fetchall(
+        f"SELECT session_id FROM {store.t.session_state} WHERE owner_token IS NOT NULL")
 
 
 class TestDatabaseSessionOwnership(SessionOwnershipContractTests, unittest.IsolatedAsyncioTestCase):

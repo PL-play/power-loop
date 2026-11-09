@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import asdict, dataclass
 
 from .jobs import JobError, _hash, _json
@@ -242,21 +241,6 @@ async def prepare(pipeline):
     try:
         from .execution_tools import prepare as prepare_owned
         await prepare_owned(pipeline, attempt)
-    except Exception:
-        if attempt.get('value') is not None:
-            from .tool_call_abort import _record
-            try:
-                await _record(attempt['value'])
-            except Exception as exc:
-                # Preserve the original failure. Without this positive durable
-                # checkpoint, source exit/pending recovery remains unknown.
-                logging.getLogger(__name__).warning(
-                    'Pre-admission abort checkpoint unavailable; original pending remains unresolved',
-                    extra={'source_job_id': attempt['value'].execution.lease.job_id,
-                           'assistant_seq': attempt['value'].ref.seq,
-                           'failure_type': type(exc).__name__[:128]},
-                )
-        raise
     finally:
         pipeline._native_abort_attempt = None
 

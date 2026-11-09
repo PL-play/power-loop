@@ -101,7 +101,7 @@ async def test_pg_concurrent_first_boot_provisioning_converges():
     prefix = 'firstboot_' + secrets.token_hex(6) + '_'
     stores = await asyncio.gather(*(open_store(PG_DSN, table_prefix=prefix) for _ in range(8)))
     try:
-        assert all(s.schema_version == 15 for s in stores)
+        assert all(s.schema_version == 16 for s in stores)
         assert len({s.store_id for s in stores}) == 1
         # The schema is usable and stamped exactly once (idempotent stamp).
         vtable = f"{stores[0].table_prefix}schema_migrations"

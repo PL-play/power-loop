@@ -18,7 +18,7 @@ from .schema import (
     validate_table_prefix,
 )
 
-TASK_SCHEMA_VERSION = 15
+TASK_SCHEMA_VERSION = 16
 TASK_PROTOCOL_VERSION = 42
 _QUERY_INDEXES = {
     'idx_retention_messages': ('messages', ('created_at',)),

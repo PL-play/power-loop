@@ -73,7 +73,7 @@ SESSION_TABLE_KEYS = (
     ('session_runtime_state', ('state_key',)), ('background_tasks', ('task_id',)),
     ('notes', ('note_id',)), ('project_messages', ('id',)),
     ('hook_events', ('event_id',)), ('follow_up_queue', ('id',)),
-    ('session_stats', ('session_id',)), ('session_leases', ('session_id',)),
+    ('session_stats', ('session_id',)),
 )
 
 

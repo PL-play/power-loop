@@ -143,7 +143,6 @@ class _Tables:
         self.notes = f"{prefix}notes"
         self.project_messages = f"{prefix}project_messages"
         self.hook_events = f"{prefix}hook_events"
-        self.session_leases = f"{prefix}session_leases"
         self.follow_up_queue = f"{prefix}follow_up_queue"
         self.context_cache = f"{prefix}context_cache"
         self.context_attempts = f"{prefix}context_attempts"

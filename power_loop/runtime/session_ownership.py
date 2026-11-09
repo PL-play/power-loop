@@ -40,6 +40,7 @@ the shared lease's expiry. Loss callbacks are synchronous and must not raise.
     epoch: int = 0
     node_id: str = ""
     boot_id: str = ""
+    installs_fence: bool = False
 
     def lose(self) -> None:
         if self.lost or self.released:
@@ -178,7 +179,8 @@ class _OwnershipPeriod:
             if _PERIODS.get(self.registry_key) is self:
                 del _PERIODS[self.registry_key]
             try:
-                await self.store.release_session_owner(self.session_id, self.lease)
+                if not self.lease.installs_fence:
+                    await self.store.release_session_owner(self.session_id, self.lease)
             finally:
                 await self.coordinator.release(self.lease)
 
@@ -268,23 +270,33 @@ async def _hold_session_ownership(loop, session_id):
                                   loop.config.session_lease_ttl_s)
         # The expected epoch belongs to this acquire request, never its reply.
         while True:
+            runtime = loop.task_runtime
+            node_id = runtime.executor_id if runtime else loop._owner_id
+            boot_id = runtime.boot_id if runtime else loop._owner_id
+            coordinator = loop.session_coordinator
+            if getattr(coordinator, "installs_session_fence", False):
+                lease = await coordinator.acquire(
+                    period.key, owner_id=loop._owner_id, ttl_s=period.ttl_s, on_lost=period.lost,
+                    node_id=node_id, boot_id=boot_id)
+                if lease is None:
+                    raise SessionBusy(f"session {session_id} is held by another owner")
+                period.lease = lease
+                break
             expected = await store.session_owner_epoch(session_id)
-            lease = await loop.session_coordinator.acquire(
+            lease = await coordinator.acquire(
                 period.key, owner_id=loop._owner_id, ttl_s=period.ttl_s, on_lost=period.lost)
             if lease is None:
                 raise SessionBusy(f"session {session_id} is held by another owner")
             period.lease = lease
-            runtime = loop.task_runtime
-            lease.node_id = runtime.executor_id if runtime else loop._owner_id
-            lease.boot_id = runtime.boot_id if runtime else loop._owner_id
+            lease.node_id, lease.boot_id = node_id, boot_id
             try:
                 installed = await store.install_session_owner(session_id, lease, expected)
             except BaseException:
-                await loop.session_coordinator.release(lease)
+                await coordinator.release(lease)
                 raise
             if installed:
                 break
-            await loop.session_coordinator.release(lease)
+            await coordinator.release(lease)
         _PERIODS[period.registry_key] = period
     task = asyncio.current_task()
     period.enter(task)

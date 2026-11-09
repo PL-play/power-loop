@@ -65,7 +65,7 @@ def validate_table_prefix(prefix: str) -> str:
     return prefix
 
 # Only the current task structure can be opened. No runtime migration.
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -74,7 +74,7 @@ _STORE_TABLES: tuple[str, ...] = (
     "sessions", "messages", "compactions", "usage_observations", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
     "timers", "notes", "project_messages", "hook_events",
-    "session_leases", "follow_up_queue", "context_cache", "context_attempts",
+    "follow_up_queue", "context_cache", "context_attempts",
 )
 _STORE_VIEWS = ('usage_rounds',)
 

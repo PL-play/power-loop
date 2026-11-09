@@ -44,14 +44,6 @@ class Dialect(Protocol):
         provisioning. Idempotent (CREATE … IF NOT EXISTS)."""
         ...
 
-    def leases_ddl(self, prefix: str) -> list[str]:
-        """DDL for the ``session_leases`` table, split out so the v6→v7 migration can add it.
-        Included in :meth:`ddl` for fresh provisioning. Idempotent (CREATE … IF NOT EXISTS).
-        (Until v8 this also created ``follow_up_queue``; that table is now :meth:`inbox_ddl`,
-        created by fresh provisioning or by the v7→v8 step — never by the v7 step, which would
-        race the v8 rebuild.)"""
-        ...
-
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:
         """DDL for the inbox table (``{prefix}follow_up_queue``, schema v8 shape) created under
         the name ``table`` — the v7→v8 migration builds it as ``…_v8`` and renames it into place.
@@ -181,7 +173,6 @@ class SqliteDialect:
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, note_id))""",
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
-            *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
             f"CREATE INDEX IF NOT EXISTS {p}idx_retention_messages ON {p}messages(created_at)",
             f"CREATE INDEX IF NOT EXISTS {p}idx_retention_usage ON {p}usage_observations(created_at)",
@@ -218,16 +209,6 @@ class SqliteDialect:
                 PRIMARY KEY (session_id, event_id))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_hook_events_session_msg "
             f"ON {p}hook_events(session_id, message_seq)",
-        ]
-
-    def leases_ddl(self, prefix: str) -> list[str]:
-        p = prefix
-        return [
-            f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
-                session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
-                token TEXT NOT NULL,
-                acquired_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-                fence INTEGER NOT NULL DEFAULT 1)""",
         ]
 
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:
@@ -367,7 +348,6 @@ class PostgresDialect:
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id))""",
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
-            *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
             f"CREATE INDEX IF NOT EXISTS {p}idx_retention_messages ON {p}messages(created_at)",
             f"CREATE INDEX IF NOT EXISTS {p}idx_retention_usage ON {p}usage_observations(created_at)",
@@ -404,16 +384,6 @@ class PostgresDialect:
                 PRIMARY KEY (session_id, event_id))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_hook_events_session_msg "
             f"ON {p}hook_events(session_id, message_seq)",
-        ]
-
-    def leases_ddl(self, prefix: str) -> list[str]:
-        p = prefix
-        return [
-            f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
-                session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
-                token TEXT NOT NULL,
-                acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
-                fence BIGINT NOT NULL DEFAULT 1)""",
         ]
 
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:
@@ -543,7 +513,6 @@ class MySQLDialect:
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id)) {opts}""",
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
-            *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
             *message_usage.view_ddl(self.name, p),
         ]
@@ -574,17 +543,6 @@ class MySQLDialect:
                 PRIMARY KEY (session_id, event_id),
                 KEY {p}idx_hook_events_session_msg (session_id, message_seq),
                 KEY {p}idx_retention_hooks (created_at)) {opts}""",
-        ]
-
-    def leases_ddl(self, prefix: str) -> list[str]:
-        p = prefix
-        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-        return [
-            f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
-                session_id VARCHAR(255) PRIMARY KEY, owner_id VARCHAR(255) NOT NULL,
-                token VARCHAR(64) NOT NULL,
-                acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
-                fence BIGINT NOT NULL DEFAULT 1) {opts}""",
         ]
 
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:

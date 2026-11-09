@@ -32,34 +32,13 @@ async def test_original_prepare_failure_records_abort_and_retains_unprocessed_pe
 
 
 
-async def test_abort_checkpoint_cannot_be_reused_from_host_or_dispatch_or_claim(registry_store, monkeypatch):
-    from power_loop.runtime import tool_call_abort, tool_call_plans
-    from power_loop.runtime.invocation import invocation_context
-    actual = tool_call_abort._record
-    captured, rejected = [], []
-    async def observe(attempt):
-        value = await actual(attempt)
-        captured.append(attempt)
-        runtime = attempt.execution.runtime
-        manager, actor = runtime.manager, attempt.execution.actor
-        jobs = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='background_tool'")
-        assert len(jobs) == 2
-        for job in jobs:
-            with pytest.raises(JobError, match='tool_call_batch_aborted'):
-                await manager.claim_job(actor, job['job_id'], executor_id='forbidden', boot_id='boot', expected_version=1)
-        entry = value['entries'][0]
-        with invocation_context(actor.session_id, attempt.ref.seq, entry['call_id']):
-            with pytest.raises(JobError, match='tool_call_plan_original_requires_reconciliation'):
-                await tool_call_plans.dispatch(attempt.pipeline, entry['tool_name'], {'text': 'hello'}, attempt.pipeline.tool_registry.get(entry['tool_name']))
-        rejected.append(True)
-        return value
-    monkeypatch.setattr(tool_call_abort, '_record', observe)
+async def test_prepare_failure_keeps_pending_without_an_abort_checkpoint(registry_store):
     async def configure(loop, state):
         fail_plan_once(loop.task_runtime.manager, 'commit_ack')
     c = await scenario(registry_store, call_count=2, configure=configure, expected_error='test_plan_commit_ack')
-    assert rejected == [True]
-    with pytest.raises(JobError, match='original_stack_required'):
-        await actual(captured[0])
+    assert (await c.store.get_state(c.sid)).pending
+    assert not await c.manager.db.fetchall(
+        f"SELECT event_id FROM {c.manager.events} WHERE event_type='tool_call_abort'")
     assert c.state.prepared == c.state.dispatched == 0
 
 
