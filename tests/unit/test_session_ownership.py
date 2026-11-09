@@ -20,6 +20,24 @@ class TestMemorySessionOwnership(SessionOwnershipContractTests, unittest.Isolate
         self.assertFalse(self.shared._leases)
 
 
+@pytest.mark.asyncio
+async def test_store_session_lock_passes_the_shared_contract(registry_store):
+    """The default database lock passes the shared-coordinator contract on this backend."""
+    store, _ = registry_store
+
+    class Checks(SessionOwnershipContractTests, unittest.IsolatedAsyncioTestCase):
+        async def coordinator(self):
+            from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
+            return StoreSessionOwnershipCoordinator(store)
+
+    case = Checks()
+    for name in ("test_exclusive_acquisition", "test_renew_and_release_then_reacquire",
+                 "test_expiry_takeover_notifies_old_holder_and_rejects_renewal",
+                 "test_expired_local_handle_rejects_writes_without_waiting_for_renewal"):
+        await getattr(case, name)()
+    assert not await store._db.fetchall(f"SELECT session_id FROM {store.t.session_leases}")
+
+
 class TestDatabaseSessionOwnership(SessionOwnershipContractTests, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         import tempfile

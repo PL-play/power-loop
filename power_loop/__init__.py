@@ -275,6 +275,7 @@ from power_loop.runtime.store.types import (
     SubagentLifecycle,
     TimerRow,
 )
+from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
 from power_loop.runtime.structured import (
     StructuredOutputError,
     StructuredOutputSpec,
@@ -340,6 +341,7 @@ STABLE_API = (
     "MessageTransport", "MemoryMessageTransport", "DatabasePollingTransport",
     "PublishReceipt", "SubscriptionSpec", "TransportCapabilities", "TransportPacket",
     "SessionOwnership", "SessionOwnershipCoordinator", "MemorySessionOwnershipCoordinator",
+    "StoreSessionOwnershipCoordinator",
     "StatefulAgentLoop",
     "AgentLoopConfig",
     "AgentLoopResult",
@@ -387,6 +389,7 @@ __all__ = [
     "SessionOwnership",
     "SessionOwnershipCoordinator",
     "MemorySessionOwnershipCoordinator",
+    "StoreSessionOwnershipCoordinator",
     "ResponseMetrics",
     "ProviderCost",
     "TokenUsageExtractor",

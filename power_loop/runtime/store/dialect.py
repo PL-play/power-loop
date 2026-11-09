@@ -225,6 +225,7 @@ class SqliteDialect:
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
                 session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+                token TEXT NOT NULL,
                 acquired_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
                 fence INTEGER NOT NULL DEFAULT 1)""",
         ]
@@ -410,6 +411,7 @@ class PostgresDialect:
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
                 session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+                token TEXT NOT NULL,
                 acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
                 fence BIGINT NOT NULL DEFAULT 1)""",
         ]
@@ -580,6 +582,7 @@ class MySQLDialect:
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
                 session_id VARCHAR(255) PRIMARY KEY, owner_id VARCHAR(255) NOT NULL,
+                token VARCHAR(64) NOT NULL,
                 acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
                 fence BIGINT NOT NULL DEFAULT 1) {opts}""",
         ]

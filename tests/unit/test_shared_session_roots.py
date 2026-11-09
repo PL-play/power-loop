@@ -23,7 +23,6 @@ from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_types import plain
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import _SEND
-from power_loop.testing.db_session_ownership import DatabaseSessionOwnershipCoordinator
 
 from .test_job_registry_192 import registry_store
 
@@ -32,6 +31,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 async def worker(dsn, prefix, directory, role):
+    """Two processes share one session through the database lock and polling transport."""
     directory = Path(directory)
     store = await open_store(dsn, table_prefix=prefix, schema='tasks')
     class Model(LLMService):
@@ -56,8 +56,7 @@ async def worker(dsn, prefix, directory, role):
     factory.register('serialize@1', build)
     transport = DatabasePollingTransport(RuntimeInputStore(store), interval_s=.03)
     runtime = Runtime(store=store, factory=factory, node_id=role, capacity=1,
-        transport=transport, coordinator=DatabaseSessionOwnershipCoordinator(directory/'ownership.db'),
-        shared_execution=True, timers_enabled=False, recovery_interval_s=None)
+        transport=transport, shared_execution=True, timers_enabled=False, recovery_interval_s=None)
     try:
         await runtime.worker.start()
         print('ready', flush=True)

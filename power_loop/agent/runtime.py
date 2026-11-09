@@ -113,10 +113,16 @@ class Runtime:
         self.required_profiles = frozenset(required_profiles)
         self.hooks, self.hook_timeout_s = hooks, hook_timeout_s
         self.node_id, self.boot_id, self.namespace = node_id, boot_id, namespace
-        self.coordinator = coordinator or MemorySessionOwnershipCoordinator()
+        # A shared runtime needs a lock every node can see. The database lock is
+        # the default; pass coordinator= to use another shared service instead.
+        if coordinator is None:
+            from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
+            coordinator = (StoreSessionOwnershipCoordinator(store) if shared_execution
+                           else MemorySessionOwnershipCoordinator())
+        self.coordinator = coordinator
         self.transport = transport or MemoryMessageTransport()
-        if shared_execution and (getattr(self.coordinator, "scope", "process") != "shared"
-                                 or self.transport.capabilities.scope != "shared"):
+        shared_lock = coordinator is None or getattr(coordinator, "scope", "process") == "shared"
+        if shared_execution and not (shared_lock and self.transport.capabilities.scope == "shared"):
             raise RuntimeRequestError("invalid_options", "shared_execution requires shared adapters")
         self.host_context_fields = {k: frozenset(v) for k, v in (host_context_fields or {}).items()}
         self.capacity, self.claim_limit = capacity, claim_limit
