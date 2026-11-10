@@ -37,7 +37,8 @@ async def main():
         receipt = await runtime.client.send(target, 'long work', message_id='third', actor=actor)
         await asyncio.wait_for(model.entered.wait(), 5)
         status = await runtime.client.inspect(receipt.input_ref, actor=actor)
-        await runtime.client.cancel(status.job_ref, actor=actor)
+        # Cancel using input_ref (works for both lightweight sends and full tasks)
+        await runtime.client.cancel(receipt.input_ref, actor=actor)
         cancelled = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
         assert cancelled.status == 'cancelled'
         print(failed.status, good.status, cancelled.status)
