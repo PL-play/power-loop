@@ -75,15 +75,21 @@ async def upgrade(binding, tx):
     from .jobs import _hash
     key = manager._origin_key(actor, "create", None, None, "input:" + message_id)
     now = manager.now()
+    # Check if runtime requires executor registration
+    executor_key = None
+    if hasattr(binding.runtime, '_lifecycle') and binding.runtime._lifecycle is not None:
+        from .executor_registry import ExecutorIdentity, _key
+        identity = ExecutorIdentity(actor.tenant_id, actor.principal_id, lease.executor_id, lease.boot_id)
+        executor_key = _key(manager, identity)
     await tx.insert_job(lease.job_id, lease.job_id,
         f"INSERT INTO {manager.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
         "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
         "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
-        "execution_role,control_owner_job_id,executor_id,boot_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "execution_role,control_owner_job_id,executor_id,boot_id,executor_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (lease.job_id, None, lease.job_id, actor.tenant_id, actor.principal_id, actor.session_id,
          actor.session_id, "send", "", lease.job_id, 0, "running", 1, lease.generation, "open",
-         "running", "open", "none", now, now, "main", None, lease.executor_id, lease.boot_id))
+         "running", "open", "none", now, now, "main", None, lease.executor_id, lease.boot_id, executor_key))
     await manager._insert_operation(tx, job_id=lease.job_id, version=1, actor=actor, action="create",
         key=key, fingerprint=_hash(["lightweight", message_id]), payload={"request": request})
     await tx.execute(
@@ -106,6 +112,21 @@ async def upgrade(binding, tx):
         "created_by_session_id": actor.session_id,
         "session_id": actor.session_id,
     }
+    # Add executor binding if runtime requires registration
+    if executor_key is not None:
+        from .executor_registry import ExecutorIdentity, registration_binding
+        scope_data["version"] = 2
+        # Create a minimal row dict for registration_binding
+        row = {
+            "job_id": lease.job_id,
+            "generation": lease.generation,
+            "tenant_id": actor.tenant_id,
+            "principal_id": actor.principal_id,
+            "executor_id": lease.executor_id,
+            "boot_id": lease.boot_id,
+            "executor_key": executor_key,
+        }
+        scope_data["executor_binding"] = await registration_binding(manager, tx, row)
     await _insert_scope(manager, tx, scope_id(manager, lease.job_id, lease.generation),
                         lease.job_id, "execution_scope", 1, scope_data)
     _remember_after_commit(manager, tx, "_membership_scopes", (lease.job_id, lease.generation), _json(scope_data))
