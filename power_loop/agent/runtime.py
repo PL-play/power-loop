@@ -135,8 +135,11 @@ class Runtime:
         self.timer_backend = (timer_backend or StoreTimerBackend(store)) if timers_enabled else None
         self.timer_driver = (timer_driver or TimerRunner(store=store, client=self.client, hooks=hooks)) if timers_enabled else None
         from power_loop.runtime.store.process_guard import ProcessStoreGuard
+        # Create process guard when using default (non-shared) runtime configuration.
+        # The guard prevents multiple independent processes from using the same store,
+        # independent of whether the session-level coordinator scope is shared or process.
         self.process_guard = (ProcessStoreGuard(store, self.coordinator, self.transport)
-            if getattr(self.coordinator, "scope", "process") == "process" else None)
+            if not shared_execution and self.transport.capabilities.scope != "shared" else None)
         self.worker = RuntimeWorker(self)
         self._closed = False
 
