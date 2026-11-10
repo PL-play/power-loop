@@ -12,7 +12,7 @@ pytestmark=[pytest.mark.real_llm,pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize('kind',['subagent','workflow_node'])
-@pytest.mark.parametrize('outcome',['known','unknown','missing_receipt','partial','exhausted'])
+@pytest.mark.parametrize('outcome',['known','unknown','missing_receipt','partial'])
 async def test_real_owned_effect_uses_original_task_and_budget(tmp_path,record_property,kind,outcome):
     store=await SessionStore.open(str(tmp_path/'owned-effect.db'),schema='tasks')
     provider=BoundedProvider(limit=3)

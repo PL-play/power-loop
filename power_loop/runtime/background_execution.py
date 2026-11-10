@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 from power_loop.agent.runtime_store import now_ms
@@ -23,7 +23,7 @@ from . import tool_attempts
 from .child_tasks import admit, tool_actor
 from .control_runtime import current, flush_binding, forget_completed, source
 from .jobs import JobError, _hash
-from .pricing import BillingReceipt, PricedCall, PricingError
+from .pricing import PricedCall
 from .store.types import SubagentLifecycle
 from .tool_contracts import background_allowed, validate_registration
 
@@ -121,20 +121,6 @@ async def action(loop, action, *, command=None, task_id=None, tool=None, args=No
     return encode_results(records)
 
 
-@dataclass
-class BackgroundReceipt:
-    budget_attempt: object
-    billing_receipt: BillingReceipt | None = None
-
-    def record(self, receipt):
-        tool_attempts._original_owner(self.budget_attempt)
-        if not isinstance(receipt, BillingReceipt):
-            raise PricingError("billing_receipt_required")
-        if self.billing_receipt is not None and self.billing_receipt != receipt:
-            raise PricingError("tool_billing_receipt_changed")
-        self.billing_receipt = receipt
-
-
 @contextmanager
 def _context(variable, value, reset):
     token = variable(value)
@@ -147,7 +133,6 @@ def _context(variable, value, reset):
 async def run(worker, ctx, record, env, runtime):
     from .jobs import JobRegistration, _record
     from .model_attempts import enable
-    from .tool_billing import receipt_context
     from .tool_call_plans import registration_value
     port, manager = worker.inputs, runtime.manager
     frozen = plain(ctx.descriptor.config["background"])
@@ -190,12 +175,9 @@ async def run(worker, ctx, record, env, runtime):
                     pricing_rule={"rule_id": pricing.rule_id, "rule_version": registered.pricing_version})
                 control = current(binding)
                 value = control.begin_attempt(key, "tool", prepared)
-                value["budget_required"] = (runtime._original_budget_config is not None
-                    and callable(getattr(runtime._original_budget_config.provider, "prepare_tool", None)))
                 control.record("attempt", key, value)
                 attempt = tool_attempts.ToolAttempt(binding, key, prepared,
                     PricedCall(name, arguments, source(binding)["execution_role"]), pricing, asyncio.current_task())
-                receipt = BackgroundReceipt(attempt)
                 status, text, error = "completed", "", None
                 async def stop_original():
                     await ctx.stop.wait()
@@ -206,13 +188,9 @@ async def run(worker, ctx, record, env, runtime):
                     ctx.task.cancel("background cancellation grace elapsed")
                 stopper = asyncio.create_task(stop_original())
                 try:
-                    await tool_attempts.reserve(attempt)
                     await tool_attempts.authorize_dispatch(attempt, None, source(binding))
-                    with receipt_context(receipt):
-                        output = await env.tool_registry.invoke_async(name, arguments)
+                    output = await env.tool_registry.invoke_async(name, arguments)
                     if isinstance(output, ToolResult):
-                        if output.billing_receipt:
-                            receipt.record(output.billing_receipt)
                         output = output.content
                     text = output if isinstance(output, str) else canonical(output)
                     if text.startswith("Error:"):
@@ -225,11 +203,9 @@ async def run(worker, ctx, record, env, runtime):
                     stopper.cancel()
                     await asyncio.gather(stopper, return_exceptions=True)
                     if control.get("attempt", key)["phase"] == "prepared":
-                        from .model_budgets import close_unstarted
-                        await close_unstarted(attempt)
                         control.abort_prepared(key)
                     else:
-                        tool_attempts.capture(attempt, receipt.billing_receipt, error)
+                        tool_attempts.capture(attempt, error)
                         await tool_attempts.finish(attempt)
                     async with manager.joined_write() as tx:
                         route = await port._lock_result_sessions(tx, ctx.job_ref)

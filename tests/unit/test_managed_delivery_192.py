@@ -41,7 +41,6 @@ class Controller(LLMService):
 
 async def controller(c, *, sees=True, fail=False):
     model = Controller(sees=sees, fail=fail)
-    c.host.service = model
     loop = RunningAgent(c.store, model, ToolRegistry(), task_runtime=c.runtime,
         config=AgentLoopConfig(model='test-model', max_tokens=20, max_rounds=2, compactor=None))
     loop.target = TargetRef(c.store.store_id, c.sid)
@@ -91,7 +90,7 @@ async def test_main_actually_consumes_the_known_outcome_and_original_error_is_un
             for raw in original:
                 assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.messages} WHERE id=?', (raw['id'],)) == raw
             assert c.state.dispatched == c.state.prepared == c.model.calls == model.calls == 1
-            assert c.host.reserve_calls == 2 and c.state.lookups == (1 if unknown else 0)
+            assert c.state.lookups == (1 if unknown else 0)
             inbox = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.follow_up_queue} WHERE item_id=?', (identity(c.manager, row),))
             assert len(inbox) == 1 and inbox[0]['status'] == 'delivered'
         finally:
@@ -153,7 +152,7 @@ async def test_duplicate_queue_after_handling_does_not_create_another_notificati
     receipt = await enqueue_runtime(c.runtime, c.actor, row['job_id'])
     assert receipt['inbox_status'] == 'delivered'
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq') == before
-    assert model.calls == c.state.dispatched == 1 and c.host.reserve_calls == 2
+    assert model.calls == c.state.dispatched == 1
 
 
 async def test_foreign_session_and_child_context_cannot_redirect_the_original_main(pending_review):
@@ -229,19 +228,3 @@ async def consume_queued(loop):
         result=await consume_notice(loop,row['item_id'])
     return result
 
-
-async def test_original_shared_budget_is_not_reset_for_a_known_result_notice(registry_store):
-    c=await scenario(registry_store,budgeted=True,pending=True,max_calls=1)
-    [row]=await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    c.state.resolved=True
-    await reconcile(c.runtime,c.actor,row['job_id'],c.adapter)
-    loop,reviewer=await controller(c)
-    try:
-        notice=await enqueue_runtime(c.runtime,c.actor,row['job_id'])
-        result=await consume_notice(loop,notice['notification_id'])
-        assert result.status=='failed' and result.error_code=='budget_max_calls_exhausted'
-        assert reviewer.calls==0 and c.host.reserve_calls==1
-        assert c.state.dispatched==c.state.prepared==c.state.lookups==1
-        assert (await c.manager.get_job(c.actor,row['job_id'])).result_status=='pending_delivery'
-    finally:
-        await loop.aclose()

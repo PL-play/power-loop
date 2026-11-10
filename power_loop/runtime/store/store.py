@@ -1547,11 +1547,16 @@ class SessionStore:
 
     async def update_session_prompt(self, session_id: str, system_prompt: str | None) -> None:
         send_reads.forget(self, session_id, "session")
+        updated = _now_ms()
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET system_prompt=?, updated_at=? WHERE session_id=?",
-                (system_prompt, _now_ms(), session_id),
+                (system_prompt, updated, session_id),
             )
+            cached = getattr(self, "_cached_sessions", {}).get(session_id)
+            if cached is not None:
+                cached.system_prompt = system_prompt
+                cached.updated_at = updated
 
     async def merge_session_metadata(self, session_id: str, patch: dict[str, Any]) -> None:
         """Shallow-merge ``patch`` into the session's ``metadata_json`` (read-modify-write under

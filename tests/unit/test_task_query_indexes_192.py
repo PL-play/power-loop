@@ -70,19 +70,16 @@ async def test_actual_recovery_queries_are_flat_and_every_task_relation_has_an_i
             classes = [PostgresDatabase, _PgTransaction]
         else:
             raise AssertionError('uncovered query-plan backend: '+backend)
-        names = (c.manager.jobs, c.manager.events, c.manager.prefix+'task_budget_attempts',
-                 c.manager.prefix+'session_obligations')
+        names = (c.manager.jobs, c.manager.events, c.manager.prefix+'session_obligations')
         async def inspect_sql(self, sql, params):
             if sql in plans or not re.match(r'\s*(SELECT|UPDATE|DELETE)\b', sql, re.I) or not any(name in sql for name in names):
                 return
             root_lookup = (f'SELECT root.* FROM {c.manager.jobs} root '
                 f'WHERE root.job_id=(SELECT root_job_id FROM {c.manager.jobs} WHERE job_id=?)')
-            pending_count = (f'SELECT COUNT(*) AS n FROM (SELECT 1 FROM {c.manager.prefix}task_budget_attempts '
-                'WHERE policy_key=? AND pending<>0 LIMIT ?) AS pending_attempts')
             # Flatness constrains discovery reads, not conditional writes'
             # ownership fences. Every statement still gets its index check.
             if sql.lstrip().upper().startswith('SELECT'):
-                assert not NESTED.search(sql) or sql in (root_lookup, root_lookup+' FOR UPDATE', pending_count), sql
+                assert not NESTED.search(sql) or sql in (root_lookup, root_lookup+' FOR UPDATE'), sql
             db = getattr(self, '_db', self)
             if backend == 'sqlite':
                 rows = await db._fetchall('EXPLAIN QUERY PLAN '+sql, params)
@@ -163,7 +160,7 @@ async def test_task_index_ddl_names_fit_all_supported_prefixes(registry_store):
     indexes = [sql for sql in rows if sql.startswith('CREATE INDEX ')]
     assert all(len(sql.split()[2]) <= 64 for sql in indexes)
     for suffix in ['idx_jobs_root_page','idx_jobs_session_kind','idx_jobs_control_owner','idx_jobs_main_page',
-                   'idx_events_job_type','idx_events_caller_type','idx_events_call','idx_budget_job','idx_context_capacity',
+                   'idx_events_job_type','idx_events_caller_type','idx_events_call','idx_context_capacity',
                    'idx_obligations_job']:
         assert any(sql.startswith('CREATE INDEX '+'x'*24+suffix+' ') for sql in indexes)
 
@@ -179,7 +176,7 @@ async def test_index_maintenance_sql_is_explicit_for_every_supported_dialect(bac
     assert statement == expected
     ddl = task_tables_ddl(backend, 'pl_')
     assert any('idx_events_caller_type' in sql for sql in ddl)
-    assert any('idx_budget_job' in sql for sql in ddl)
+    assert any('idx_context_capacity' in sql for sql in ddl)
 
 
 @pytest.mark.parametrize('plan', [

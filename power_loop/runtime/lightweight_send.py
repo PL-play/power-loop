@@ -104,16 +104,24 @@ async def ensure(binding):
         await upgrade(binding, tx)
 
 
-def remember_result(loop, ref, result):
+def remember_result(loop, ref, result, evidence=None):
     worker = getattr(loop, "_runtime_worker", None)
     if worker is None:
         return
-    results = getattr(worker.runtime.store, "lightweight_results", None)
+    store = worker.runtime.store
+    results = getattr(store, "lightweight_results", None)
     if results is None:
         results = {}
-        worker.runtime.store.lightweight_results = results
-    getattr(worker.runtime.store, "lightweight_accepted", {}).pop((ref.session_id, ref.message_id), None)
-    results[(ref.session_id, ref.message_id)] = (
+        store.lightweight_results = results
+    key = (ref.session_id, ref.message_id)
+    getattr(store, "lightweight_accepted", {}).pop(key, None)
+    results[key] = (
         Status(ref, result.job_ref, result.status, result.error, True,
                result.status == "cancelled", "stopped"),
         result, JobRef(ref.store_id, result.job_ref.job_id, result.job_ref.generation))
+    if evidence is not None:
+        remembered = getattr(store, "lightweight_evidence", None)
+        if remembered is None:
+            remembered = {}
+            store.lightweight_evidence = remembered
+        remembered[key] = dict(evidence)

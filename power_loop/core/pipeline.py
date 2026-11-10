@@ -1446,9 +1446,8 @@ class AgentPipeline:
                     resp.token_usage = usage
                     self.ctx.note_estimated_call(p_est + c_est)
                 if model_attempt is not None:
-                    from power_loop.runtime.response_capture import record
-                    await record(model_attempt, reported=reported,
-                        observation=response_observation(usage, resp), estimated=estimated)
+                    from power_loop.runtime.model_attempts import observe
+                    await observe(model_attempt, **response_observation(usage, resp), estimated=estimated)
                 from power_loop.llm_metrics import enforce_extraction_policy
                 enforce_extraction_policy(resp)
                 self._emit(
@@ -1649,12 +1648,12 @@ class AgentPipeline:
                     from power_loop.runtime.background_execution import automatic, invoke_and_wait
                     from power_loop.runtime.tool_attempts import begin_pipeline
                     independent = automatic(registered)
-                    budget_attempt = None if independent else await begin_pipeline(self, registered, tool_args)
+                    attempt = None if independent else await begin_pipeline(self, registered, tool_args)
                     from power_loop.runtime.tool_call_plans import dispatch as record_tool_dispatch
                     receipt = await record_tool_dispatch(self, tool_name, tool_args, registered,
-                                                         budget_attempt=budget_attempt)
+                                                         attempt=attempt)
                     from power_loop.runtime.native_returns import invoke
-                    result = await invoke(self, registered, tool_args, receipt, budget_attempt=budget_attempt,
+                    result = await invoke(self, registered, tool_args, receipt, attempt=attempt,
                         dispatch=(lambda: invoke_and_wait(self, registered, tool_args)) if independent else None)
             finally:
                 reset_current_cancel_token(_ctok)

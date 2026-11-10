@@ -8,7 +8,6 @@ from power_loop.runtime.jobs import JobActor, JobManager
 from power_loop.runtime.store.retention import DAY_MS
 
 from .test_job_registry_192 import registry_store
-from .test_send_sql_profile import _measure
 
 __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -178,27 +177,23 @@ async def test_categories_expire_without_removing_recent_or_active_work(registry
     assert not any((await store.purge_expired(NOW)).values())
 
 
-async def test_unsettled_fees_obligations_and_alerts_keep_their_tree(registry_store):
+async def test_obligations_and_alerts_keep_their_tree(registry_store):
     store, _ = registry_store
     db, p = store._db, store.table_prefix
-    jobs = [await root(store, reason) for reason in ('fee', 'obligation', 'alert')]
-    await insert(db, p+'task_budget_attempts', attempt_id='unacknowledged', job_id=jobs[0][0], policy_key='policy',
-                 version=1, phase='settling', pending=1, state_hash='unused', state_json='{}', created_at=OLD, updated_at=OLD)
-    await insert(db, p+'session_obligations', session_id=jobs[1][1], kind='result', source_id='pending',
-                 job_id=jobs[1][0], opened_version=1)
-    await insert(db, p+'job_events', event_id='alert', job_id=jobs[2][0], event_type='task_alert', job_version=1,
+    jobs = [await root(store, reason) for reason in ('obligation', 'alert')]
+    await insert(db, p+'session_obligations', session_id=jobs[0][1], kind='result', source_id='pending',
+                 job_id=jobs[0][0], opened_version=1)
+    await insert(db, p+'job_events', event_id='alert', job_id=jobs[1][0], event_type='task_alert', job_version=1,
                  payload_json='{}', delivery_status='pending', created_at=OLD)
-    await insert(db, store.t.follow_up_queue, session_id=jobs[2][1], item_id='alert', kind='task_alert', mode='queue',
+    await insert(db, store.t.follow_up_queue, session_id=jobs[1][1], item_id='alert', kind='task_alert', mode='queue',
                  status='claimed', content='still actionable', created_at=OLD, claim_token='claim', claimed_at=OLD, claim_owner_epoch=1)
     try:
         assert (await store.purge_expired(NOW)).get('task_trees', 0) == 0
-        assert len(await db.fetchall(f'SELECT job_id FROM {p}jobs')) == 3
+        assert len(await db.fetchall(f'SELECT job_id FROM {p}jobs')) == 2
     finally:
-        # Complete the three fixture obligations, then retention can delete them.
-        await db.execute(f'UPDATE {p}task_budget_attempts SET pending=0')
         await db.execute(f'DELETE FROM {p}session_obligations')
         await db.execute(f"UPDATE {store.t.follow_up_queue} SET status='delivered',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL,delivered_at=?", (OLD,))
-    assert (await store.purge_expired(NOW))['task_trees'] == 3
+    assert (await store.purge_expired(NOW))['task_trees'] == 2
 
 
 async def test_batch_bound_and_session_delete_preserve_parent_tree(registry_store):
@@ -254,23 +249,3 @@ async def test_session_job_and_category_filters_limit_what_is_purged(registry_st
     with pytest.raises(ValueError, match='unknown retention category'):
         await store.purge_expired(NOW, categories=['events'])
 
-
-async def test_purged_task_trees_do_not_reset_budget_policy_or_balances(registry_store):
-    store, connect = registry_store
-    await _measure(store, 1, True)
-    p = store.table_prefix
-    original = {table: await store._db.fetchall(f'SELECT * FROM {p}{table}')
-                for table in ('task_budget_policies', 'task_budget_scopes', 'session_stats')}
-    messages = await store._db.fetchall(f'SELECT session_id,seq,content FROM {store.t.messages} ORDER BY session_id,seq')
-    newest = (await store._db.fetchone(f'SELECT MAX(updated_at) AS at FROM {p}jobs'))['at']
-    report = await store.purge_expired(newest+100*DAY_MS)
-    assert report['task_trees'] == 2 and report['jobs'] == 2
-    for table, rows in original.items():
-        assert await store._db.fetchall(f'SELECT * FROM {p}{table}') == rows
-    assert await store._db.fetchall(f'SELECT session_id,seq,content FROM {store.t.messages} ORDER BY session_id,seq') == messages
-    assert not await store._db.fetchall(f"SELECT event_id FROM {p}job_events WHERE event_type IN ('model_budget_policy','model_budget_scope')")
-    await _measure(await connect(), 1, True)
-    sid = (await store._db.fetchone(f'SELECT session_id FROM {p}jobs LIMIT 1'))['session_id']
-    await store.close_session(sid)
-    assert not await store._db.fetchall(f'SELECT job_id FROM {p}jobs')
-    assert await store._db.fetchone(f'SELECT policy_key FROM {p}task_budget_policies')

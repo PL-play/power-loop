@@ -2,7 +2,6 @@
 import asyncio
 import json
 import time
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -13,14 +12,11 @@ from power_loop import (
     LLMRetryPolicy,
     LLMTokenUsage,
 )
-from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.history_sanitize import sanitize_request_messages
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.response_capture import ResponseCaptureReceipt
 from power_loop.runtime.retry import request_repair_kind
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import TaskRuntime
-from tests.unit.test_fold_calls_192 import FoldHost
 from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
 from tests.unit.test_request_sanitize import StrictModel, assert_valid_request, assistant, call
 from tests.unit.test_stateful_loop import _echo_registry
@@ -125,28 +121,8 @@ async def test_recovery_stops_within_original_budget(managed, ending, kind, dela
 async def test_rejected_history_recovers_once(registry_store, kind, fails_twice, mode, runtime_agent):  # noqa: F811
     store, _ = registry_store
     model = RepairModel(kind, fails_twice=fails_twice)
-    host = FoldHost()
-    host.service = model
-    observations = []
-    original_usage = host.prepare_usage
-    async def prepare_usage(context, grant, observation):
-        observations.append(observation)
-        return await original_usage(context, grant, observation)
-    host.prepare_usage = prepare_usage
-    original_prepare = host.prepare
-
-    async def prepare(context, request, *, service, purpose=None):
-        plan = await original_prepare(context, request, service=service, purpose=purpose)
-        return replace(plan, token_bound=max(plan.token_bound, request.max_tokens))
-    host.prepare = prepare
-
-    async def capture(packet):
-        return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "captured")
-    host.capture_response = capture
-    budget = BudgetConfig("repair", (LocalBudgetScope("shared", max_calls=20, max_tokens=100000),), host)
     runtime = (None if mode == "plain" else TaskRuntime(JobManager(store), tenant_id="eval",
-        principal_id="host", executor_id="repair", boot_id="boot", boot_contract_hash="a" * 64,
-        budget_config=budget if mode == "budgeted" else None))
+        principal_id="host", executor_id="repair", boot_id="boot", boot_contract_hash="a" * 64))
     loop = await runtime_agent(model=model, store=store, task_runtime=runtime, registry=_echo_registry(),
         config=AgentLoopConfig(compactor=None, delegation_policy="single_level", max_tokens=20,
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, give_up_on=None)))
@@ -170,11 +146,6 @@ async def test_rejected_history_recovers_once(registry_store, kind, fails_twice,
         if kind == "context":
             assert len(json.dumps(second)) < len(json.dumps(first))
         assert (await store.load_active_messages(sid))[:len(before)] == before
-        if mode == "budgeted":
-            assert host.reserve_calls == host.apply_calls == (3 if kind == "context" else 2)
-            zero = [o for o in observations if o['usage']['total_tokens'] == 0]
-            assert len(zero) == (2 if fails_twice else 1)
-            assert all(not o['estimated'] and o['status'] == 'returned' for o in zero)
     finally:
         await loop.aclose()
 

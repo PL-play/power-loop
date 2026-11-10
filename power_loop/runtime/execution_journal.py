@@ -16,10 +16,6 @@ def control_tables_ddl(name, prefix):
             job_id {short} NOT NULL, generation {integer} NOT NULL,
             batch_no {integer} NOT NULL, summary_json {body} NOT NULL,
             PRIMARY KEY (job_id, generation)){options}""",
-        f"""CREATE TABLE IF NOT EXISTS {prefix}execution_allocations (
-            allocation_id {short} PRIMARY KEY, execution_id {body}, job_id {short} NOT NULL,
-            generation {integer} NOT NULL, state_json {body} NOT NULL,
-            state_hash {short} NOT NULL){options}""",
     ]
 
 

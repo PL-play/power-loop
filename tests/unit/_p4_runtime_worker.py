@@ -16,15 +16,12 @@ from power_loop import (
 )
 from power_loop.agent.runtime_store import RuntimeInputStore
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.testing.db_session_ownership import DatabaseSessionOwnershipCoordinator
 from power_loop.tools import create_default_tool_registry
-
-from .test_model_budgets_192 import Host
 
 
 def report(**data):
@@ -54,14 +51,11 @@ async def main():
     registry = create_default_tool_registry(workspace_dir=workspace)
 
     async def hold():
-        from power_loop.runtime.task_runtime import _SEND
-
-        allocation = _SEND.get().resource_evidence["_control_allocation"]
         from pathlib import Path
 
         with (Path(workspace) / (role[0] + "-actions")).open("a") as marker:
             marker.write("external action\n")
-        report(event="running", calls=allocation.calls, used=allocation.used_calls)
+        report(event="running")
         await gate.wait()
         return "released"
 
@@ -121,24 +115,6 @@ async def main():
         async def close(self):
             pass
 
-    class Provider(Host):
-        async def prepare_tool(self, context, call, *, pricing):
-            return None
-
-        async def prepare(self, context, logical_request, *, service):
-            return BudgetPlan(logical_request.max_tokens, {"attempt_id": context["attempt_id"], "origin": context})
-
-    provider = Provider()
-    config = BudgetConfig(
-        "p4-shared",
-        (
-            LocalBudgetScope("root", max_calls=20, binding="root"),
-            LocalBudgetScope("leaf", max_calls=4 if scenario.startswith("auto_") else 2,
-                             binding="owner", owner_kinds=("workflow_node",)),
-        ),
-        provider,
-        max_pending=64,
-    )
     task_runtime = TaskRuntime(
         JobManager(store),
         tenant_id="tenant",
@@ -146,7 +122,6 @@ async def main():
         executor_id=role,
         boot_id=role,
         boot_contract_hash="a" * 64,
-        budget_config=config,
     )
     factory = RegistryRuntimeFactory()
 
@@ -180,8 +155,6 @@ async def main():
                 break
             if command == "release":
                 gate.set()
-            if command == "budget":
-                report(event="budget", reserved=provider.reserve_calls, settled=provider.apply_calls)
     finally:
         await task_runtime.shutdown(timeout_s=2)
         await runtime.aclose(timeout_s=2, cancel_running=True)

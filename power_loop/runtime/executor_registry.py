@@ -224,8 +224,7 @@ async def register(manager, identity, *, contract_hash, startup_lease_ms=30000):
     request = {"action": "register", "contract_hash": contract_hash, "startup_lease_ms": startup_lease_ms}
     operation = _operation_key(manager, identity, "register", "registration")
     async with manager._write() as tx:
-        from .budget_admissions import initialize
-        await initialize(manager, tx, identity)
+        await _ensure_principal(manager, tx, identity)
         from .executor_admissions import lock
         await lock(manager, tx, identity, registration=True)
         replay = await _recall(manager, tx, identity, operation, request)
@@ -391,21 +390,38 @@ async def require_accepting(manager, tx, identity, *, required=False, exclusive=
     return row
 
 
-async def admit_unbudgeted(manager, tx, identity, *, required):
-    """Before tree publication,join mandatory-policy and boot admission."""
-    from . import budget_admissions, executor_admissions
+def _principal_key(manager, tenant_id, principal_id):
+    return 'bp_' + _hash([manager.store.store_id, tenant_id, principal_id])[:48]
 
-    policy_key = budget_admissions.key(manager, identity.tenant_id, identity.principal_id)
+
+async def _ensure_principal(manager, tx, identity):
+    """Create the shared principal gate row. It carries no budget policy."""
+    from .execution_membership import _remember_after_commit, _trusted
+
+    policy_key = _principal_key(manager, identity.tenant_id, identity.principal_id)
+    if _trusted(manager, '_principal_gate_presence', policy_key):
+        return policy_key
+    table = manager.prefix + 'task_principal_admissions'
+    if not await tx.fetchone(f'SELECT policy_key FROM {table} WHERE policy_key=?', (policy_key,)):
+        await tx.write_principal_admission(
+            policy_key, manager.db.dialect.insert_ignore(table, ('policy_key', 'policy_hash')),
+            (policy_key, None))
+    _remember_after_commit(manager, tx, '_principal_gate_presence', policy_key, True)
+    return policy_key
+
+
+async def admit_unbudgeted(manager, tx, identity, *, required):
+    """Before tree publication, join the principal gate and boot admission."""
+    from . import executor_admissions
+
+    policy_key = _principal_key(manager, identity.tenant_id, identity.principal_id)
     row = await tx.unbudgeted_executor_admission(_key(manager, identity), policy_key)
     if row is None:
         # Optional unregistered runtimes instead share the logical-executor
         # absence gate. Row-presence caching never caches the policy value.
-        await budget_admissions.initialize(manager, tx, identity)
+        await _ensure_principal(manager, tx, identity)
         await executor_admissions.lock(manager, tx, identity, principal_key=policy_key)
     await require_accepting(manager, tx, identity, required=required)
-    if tx._principal_admission_hashes[policy_key] is not None:
-        raise JobError('budget_provider_required')
-    tx._budget_policy_admissions[policy_key] = None
 
 
 async def check_execution(manager, tx, row):

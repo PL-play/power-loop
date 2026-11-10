@@ -15,7 +15,7 @@ async def test_unstarted_result_write_failure_remains_readable_without_external_
     assert c.fault.fired
     assert c.result.status == 'failed'
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.model.calls == 1
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     assert row['generation'] == 0
     original = await terminate_unstarted(c.manager, c.actor, row['job_id'])

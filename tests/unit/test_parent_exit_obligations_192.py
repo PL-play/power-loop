@@ -1,28 +1,37 @@
 """A child remains queryable and controllable after its parent's execution ends."""
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from power_loop import AgentLoopConfig, JobRef, LLMResponse, LLMService, LLMTokenUsage
 from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime.budget_contracts import LocalBudgetScope
+from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 
-from .test_budget_tree_192 import tree_case
 from .test_job_registry_192 import registry_store
 
-__all__ = ['registry_store', 'tree_case']
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize('tree_case', [{'scopes':(LocalBudgetScope('authority', max_calls=20),)}], indirect=True)
+@pytest.fixture
+async def parent_case(registry_store):
+    store, _ = registry_store
+    runtime = TaskRuntime(JobManager(store), tenant_id='parent-exit', principal_id='host',
+        executor_id='executor', boot_id='boot', boot_contract_hash='a' * 64)
+    yield SimpleNamespace(store=store, runtime=runtime)
+    await runtime.shutdown(timeout_s=1)
+
+
 @pytest.mark.parametrize('exit_kind', ['hit_round_limit', 'context_checkpoint', 'budget_exceeded', 'provider_error'])
 @pytest.mark.parametrize('child_outcome', ['completed', 'cancelled'])
-async def test_parent_exit_preserves_child_control_result_and_known_fees(tree_case, runtime_agent, exit_kind, child_outcome):
-    c = tree_case
+async def test_parent_exit_preserves_child_control_result_and_known_fees(parent_case, runtime_agent, exit_kind, child_outcome):
+    c = parent_case
     entered, release = asyncio.Event(), asyncio.Event()
     class Model(LLMService):
         root = None
@@ -45,7 +54,6 @@ async def test_parent_exit_preserves_child_control_result_and_known_fees(tree_ca
         async def close(self):
             pass
     model, registry = Model(), ToolRegistry()
-    c.host.service = model
     register_spawn_agent(registry)
     agent = await runtime_agent(store=c.store, model=model, registry=registry, task_runtime=c.runtime,
         config=AgentLoopConfig(max_rounds=1 if exit_kind=='hit_round_limit' else 3,
@@ -63,8 +71,7 @@ async def test_parent_exit_preserves_child_control_result_and_known_fees(tree_ca
         ref = JobRef(**receipt['job_ref'])
         running = await agent.runtime.client.inspect(ref, actor=agent.actor)
         assert running.state == 'running'
-        applied = dict(c.host.applied)
-        assert parent.usage['total_tokens'] >= 10 and applied
+        assert parent.usage['total_tokens'] >= 10
         if child_outcome == 'cancelled':
             await agent.runtime.client.cancel(running.job_ref, actor=agent.actor, reason='stop after parent exit')
         else:
@@ -75,8 +82,6 @@ async def test_parent_exit_preserves_child_control_result_and_known_fees(tree_ca
             assert result.final_text == 'child result' and result.usage['total_tokens'] == 10
         await agent.drain()
         assert (await agent.runtime.client.wait(parent.input_ref, actor=agent.actor, deadline_ms=now_ms()+1000)) == parent
-        assert all(c.host.applied[key] == value for key, value in applied.items())
-        assert len(c.host.applied) >= len(applied) + int(child_outcome=='completed')
     finally:
         release.set()
         await agent.aclose()

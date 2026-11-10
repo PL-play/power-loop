@@ -1,4 +1,4 @@
-"""P1 completed-request timing against frozen P0 B. No write instrumentation."""
+"""P1 completed-request timing. No billing instrumentation."""
 import argparse
 import asyncio
 import gc
@@ -8,17 +8,14 @@ import subprocess
 import sys
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
-from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
 
-from power_loop import AgentLoopConfig, LLMService, RequestOptions, ToolDefinition, record_billing_receipt
+from power_loop import AgentLoopConfig, LLMService, RequestOptions, ToolDefinition
 from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.pricing import BillingReceipt, Free, Money
-from power_loop.runtime.response_capture import ResponseCaptureReceipt
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.schema import _STORE_TABLES
 from power_loop.runtime.store.task_schema import TASK_TABLES
@@ -26,8 +23,6 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.design203_benchmark import Model, batch, rss
 from tests.runtime_fixture import RunningAgent
-from tests.unit.test_model_budgets_192 import Host
-from tests.unit.test_nested_tool_billing_196 import Paid
 
 SCENARIOS = ('send', 'paid', 'append', 'cancel', 'stateless', 'same_session')
 
@@ -35,14 +30,8 @@ SCENARIOS = ('send', 'paid', 'append', 'cancel', 'stateless', 'same_session')
 @asynccontextmanager
 async def composition(store, lane, scenario, *, coordinator=None, transport=None, models=None):
     paid = scenario == 'paid'
-    model, registry, host = Model(4 if paid else 1), ToolRegistry(), Host()
-    async def capture(packet):
-        return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, 'fixture-original')
-    async def tool_plan(context, call, *, pricing):
-        return BudgetPlan(0, {'attempt_id': context['attempt_id'], 'origin': context}) if paid else None
+    model, registry = Model(4 if paid else 1), ToolRegistry()
     async def echo(text):
-        if paid:
-            await record_billing_receipt(BillingReceipt(provider_amount=Money(Decimal('1'), 'CNY')))
         return text
     class RoutedModel(LLMService):
         async def complete(self, request, **kwargs):
@@ -50,15 +39,12 @@ async def composition(store, lane, scenario, *, coordinator=None, transport=None
         async def close(self):
             pass
     service = RoutedModel() if models is not None else model
-    host.service, host.capture_response, host.prepare_tool = service, capture, tool_plan
     registry.register(ToolDefinition('echo', 'Return input', input_schema={
         'type': 'object', 'properties': {'text': {'type': 'string'}}},
-        async_capable=True, pricing=Paid() if paid else Free('fixture')), echo)
-    config = BudgetConfig('send-budget', (LocalBudgetScope('shared', max_calls=100000,
-        max_tokens=10000000, max_inflight=64),), host) if paid else None
+        async_capable=True, pricing=Free('fixture')), echo)
     accounting = TaskRuntime(JobManager(store), tenant_id='profile-'+scenario, principal_id='host',
         executor_id=f'bench-{lane}-'+os.urandom(4).hex(), boot_id=os.urandom(8).hex(),
-        lease_ms=300000, boot_contract_hash='a'*64, budget_config=config)
+        lease_ms=300000, boot_contract_hash='a'*64)
     agent = await RunningAgent(store, service, registry,
         AgentLoopConfig(max_rounds=5, max_tokens=20, compactor=None, delegation_policy='single_level'),
         task_runtime=accounting, coordinator=coordinator, transport=transport).start()

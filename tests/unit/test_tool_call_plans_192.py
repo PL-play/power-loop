@@ -71,7 +71,6 @@ async def test_lost_first_raw_reply_retains_unstarted_sibling_without_replay(reg
         assert negative.generation == 0 and negative.result_status == 'suppressed' and negative.supervision_status == 'closed'
         assert (await c.manager.get_job(c.actor, source_id)).supervision_status == 'closed'
         assert c.state.prepared == c.state.dispatched == c.model.calls == 1 and c.state.lookups == 0
-        assert c.host.reserve_calls == 2
         for message in raw:
             assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.messages} WHERE id=?', (message['id'],)) == message
         assert not await c.manager.db.fetchall(f"SELECT id FROM {c.store.t.messages} WHERE role='tool'")
@@ -129,7 +128,7 @@ async def test_whole_plan_transaction_never_dispatches_partial_or_unacknowledged
     async def configure(loop, state):
         failures.append(fail_plan_once(loop.task_runtime.manager, stage))
     c = await scenario(registry_store, call_count=2, budgeted=True, configure=configure, expected_error='test_plan_' + stage)
-    assert failures[0].fired and c.model.calls == c.host.reserve_calls == 1
+    assert failures[0].fired and c.model.calls == 1
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
     jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     plans = await c.manager.db.fetchall(f"SELECT event_type FROM {c.manager.events} WHERE event_type IN ('tool_call_plan','tool_call_plan_seal')")
@@ -144,7 +143,7 @@ async def test_whole_plan_transaction_never_dispatches_partial_or_unacknowledged
     # reconstruct missing plan/exit proofs or replay its callbacks.
     assert (await c.manager.get_job(c.actor, source['job_id'])).status == 'model_closed'
     assert c.result.status in {'failed', 'interrupted'}
-    assert c.state.dispatched == 0 and c.host.reserve_calls == 1
+    assert c.state.dispatched == 0
 
 
 

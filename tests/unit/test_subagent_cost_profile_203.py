@@ -88,7 +88,7 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
         assert sql['transactions'] == len(tx_sites)
         delta = {t:[after[t][0]-before[t][0],after[t][1]-before[t][1]] for t in after if after[t] != before[t]}
         assert after.get('execution_batches', (0,0))[0] == 0
-        for table in ('execution_checkpoints', 'execution_allocations', 'task_budget_attempts'):
+        for table in ('execution_checkpoints',):
             assert after[table][0] == 0
         if output := os.environ.get('P3_FLOW_OUT'):
             with Path(output).open('a') as file:

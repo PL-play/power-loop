@@ -6,7 +6,6 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.task_runtime import TaskRuntime
 from tests.real._bounded import BoundedProvider
-from tests.real._budget_evidence_host import RecoveryHost, config
 from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_task_query_indexes_192 import drop_index_sql
 
@@ -16,10 +15,9 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 async def test_original_real_history_reopens_only_with_index_on_correct_table(registry_store, record_property, runtime_agent):
     store, connect = registry_store
-    manager, service, host = JobManager(store), BoundedProvider(limit=1), RecoveryHost()
-    host.service = service
+    manager, service = JobManager(store), BoundedProvider(limit=1)
     runtime = TaskRuntime(manager, tenant_id='test', principal_id='host', executor_id='original',
-        boot_id='original', boot_contract_hash='a' * 64, budget_config=config(host))
+        boot_id='original', boot_contract_hash='a' * 64)
     loop = await runtime_agent(model=service, store=store, task_runtime=runtime,
         config=AgentLoopConfig(delegation_policy='single_level', max_rounds=1, max_tokens=2048))
     try:
@@ -54,7 +52,7 @@ async def test_original_real_history_reopens_only_with_index_on_correct_table(re
             await client.aclose()
             await client.transport.aclose()
         assert await restored.db.fetchone(f'SELECT * FROM {prefix}task_store WHERE id=1') == identity
-        assert service.calls == host.reserve_calls == host.apply_calls == 1
+        assert service.calls == 1
         record_property('verified_backend', db.dialect.name)
     finally:
         service.report(record_property)

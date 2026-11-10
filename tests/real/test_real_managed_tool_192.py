@@ -10,7 +10,6 @@ import json
 import pytest
 
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, ToolDefinition
-from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.managed_effects import (
     ManagedTool,
@@ -28,7 +27,6 @@ from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
 from ._bounded import BoundedProvider
-from .test_real_budget_tree_192 import RealBudgetHost
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
@@ -38,8 +36,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
     unclaimed = pending == "unclaimed"
     capacity = pending == "capacity"
     store = await SessionStore.open(str(tmp_path / "managed-tool.db"), schema="tasks")
-    provider, host = BoundedProvider(limit=2), RealBudgetHost()
-    host.service = provider
+    provider = BoundedProvider(limit=2)
     manager = JobManager(store)
     runtime = TaskRuntime(
         manager,
@@ -48,7 +45,6 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
         executor_id="executor",
         boot_id="boot",
         boot_contract_hash="d" * 64,
-        budget_config=BudgetConfig("generic-real-v1", (LocalBudgetScope("authority", max_calls=2),), host),
     )
     if unclaimed:
         claim = runtime.claim
@@ -136,7 +132,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
                 assert not observed["acknowledges_result"]
                 assert negative["resolution"] == "not_dispatched" and not negative["tool_receipt_written"]
                 assert (await manager.get_job(runtime.actor(sid), child["job_id"])).supervision_status == "closed"
-                assert provider.calls == host.reserve_calls == len(host.applied) == 2
+                assert provider.calls == 2
                 return
             if capacity:
                 assert result.status == "completed" and result.final_text.strip() == "REVIEWED"
@@ -147,7 +143,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
                 [raw] = [row for row in await store.load_all_messages(sid) if row.role == "tool"]
                 assert raw.content == "Error: managed_effect_result_capacity_unavailable"
                 assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type IN ('execution_scope','managed_effect_prepared','managed_effect_dispatch','managed_effect_resource_exit','managed_effect_tool_receipt')", (child["job_id"],))
-                assert provider.calls == host.reserve_calls == len(host.applied) == 2
+                assert provider.calls == 2
                 return
             assert implementation.prepared == implementation.executed == 1
             [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='background_tool'")
@@ -156,7 +152,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
             if pending:
                 assert original["managed_effect_pending"] is True
                 assert child["supervision_status"] == "open"
-                assert provider.calls == host.reserve_calls == len(host.applied) == 1
+                assert provider.calls == 1
                 assert await reconcile(runtime, runtime.actor(sid), child["job_id"], implementation) is None
                 implementation.resolved = True
                 recovered = await reconcile(runtime, runtime.actor(sid), child["job_id"], implementation)
@@ -167,7 +163,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
             else:
                 assert result.status == "completed" and result.final_text.strip() == "DONE"
                 assert child["supervision_status"] == "closed"
-                assert provider.calls == host.reserve_calls == len(host.applied) == 2
+                assert provider.calls == 2
                 assert implementation.queries == 0
             assert implementation.executed == 1
             assert (await manager.get_job(runtime.actor(sid), child["job_id"])).supervision_status == "closed"

@@ -10,7 +10,6 @@ from power_loop._vendor.llm_client.interface import LLMResponse, LLMTokenUsage
 from power_loop.contracts.errors import CancellationRequested
 from power_loop.contracts.events import AgentEventType
 from power_loop.runtime import model_attempts as attempts
-from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.fold import FoldContext, LLMSummaryFold
 from power_loop.runtime.fold_calls import FoldCalls
 from power_loop.runtime.jobs import JobError, JobManager
@@ -18,7 +17,6 @@ from power_loop.runtime.representation import ProjectedRepresentation, VerbatimR
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 
 from .test_job_registry_192 import registry_store
-from .test_model_budgets_192 import Host
 
 __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -38,19 +36,6 @@ class SummaryModel:
             prompt_tokens=40, completion_tokens=5, total_tokens=45))
 
 
-class FoldHost(Host):
-    def __init__(self):
-        super().__init__()
-        self.purposes = []
-        self.prepared = []
-
-    async def prepare(self, context, logical_request, *, service, purpose=None):
-        self.purposes.append(purpose)
-        self.prepared.append({"attempt_id": context["attempt_id"], "purpose": purpose,
-                              "model": service.capabilities.model})
-        return await super().prepare(context, logical_request, service=service)
-
-
 class Bus:
     def __init__(self):
         self.events = []
@@ -62,11 +47,9 @@ class Bus:
 @pytest.fixture
 async def fold_case(registry_store):
     store, _ = registry_store
-    manager, host = JobManager(store), FoldHost()
-    config = BudgetConfig("host-budget-v1", (LocalBudgetScope("shared", max_calls=5, max_tokens=50000, max_inflight=2),),
-                          host, max_pending=1, timeout_s=10)
+    manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id="fold-tenant", principal_id="host", executor_id="executor",
-                          boot_id="boot", lease_ms=300000, boot_contract_hash="a" * 64, budget_config=config)
+                          boot_id="boot", lease_ms=300000, boot_contract_hash="a" * 64)
     sid = await store.create_session()
     actor = runtime.actor(sid)
     reg = await manager.register_job(actor, kind="send", session_id=sid, system_key="send",
@@ -74,7 +57,7 @@ async def fold_case(registry_store):
     binding = await runtime.claim(actor, reg)
     await attempts.enable(binding)
     try:
-        yield SimpleNamespace(store=store, manager=manager, host=host, runtime=runtime, sid=sid, binding=binding)
+        yield SimpleNamespace(store=store, manager=manager, runtime=runtime, sid=sid, binding=binding)
     finally:
         await runtime.shutdown(timeout_s=1)
 
@@ -83,29 +66,19 @@ def _request():
     return LLMRequest(messages=[{"role": "user", "content": "fold this"}], max_tokens=20)
 
 
-async def _prepared(c):
-    return c.host.prepared
-
-
 async def test_fold_call_is_booked_once_as_fold_under_the_send(fold_case):
     c, bus = fold_case, Bus()
     model = SummaryModel()
-    c.host.service = model
     token = _SEND.set(c.binding)
     try:
         response = await FoldCalls(session_id=c.sid, bus=bus).wrap(model).complete(_request())
     finally:
         _SEND.reset(token)
     assert response.raw_text == "<summary>folded</summary>" and model.calls == 1
-    [prepared] = await _prepared(c)
-    assert prepared["purpose"] == "fold" and prepared["model"] == "summary-model"
-    assert c.host.purposes == ["fold"] and c.host.reserve_calls == 1
-    assert len(c.host.applied) == 1 and c.host.apply_calls == 1
     started, completed = bus.events
     assert started.type == AgentEventType.LLM_CALL_STARTED and completed.type == AgentEventType.LLM_CALL_COMPLETED
     assert started.data.purpose == completed.data.purpose == "fold"
-    assert completed.data.budget_managed is True and completed.data.total_tokens == 45
-    assert completed.data.model_attempt_id == prepared["attempt_id"]
+    assert completed.data.total_tokens == 45 and completed.data.model_attempt_id
     assert c.binding.resource_evidence.get("resource_state") != "unknown"
 
 
@@ -122,13 +95,12 @@ async def test_fold_call_without_the_send_binding_is_refused_not_sent(fold_case)
             await FoldCalls(session_id=other).wrap(model).complete(_request())
     finally:
         _SEND.reset(token)
-    assert model.calls == 0 and await _prepared(c) == []
+    assert model.calls == 0
 
 
 async def test_failed_fold_call_is_unknown_and_never_retried_by_a_fallback(fold_case):
     c = fold_case
     model = SummaryModel(error=RuntimeError("provider dropped"))
-    c.host.service = model
     calls = FoldCalls(session_id=c.sid)
     token = _SEND.set(c.binding)
     try:
@@ -138,16 +110,13 @@ async def test_failed_fold_call_is_unknown_and_never_retried_by_a_fallback(fold_
             await calls.wrap(model).complete(_request())
     finally:
         _SEND.reset(token)
-    assert model.calls == 1 and len(await _prepared(c)) == 1
+    assert model.calls == 1
     assert c.binding.resource_evidence["resource_state"] == "unknown"
-    [submission] = c.host.applied.values()
-    assert submission.attempt_id == c.host.prepared[0]["attempt_id"]
 
 
 async def test_cancelled_send_cancels_the_fold_through_a_swallowing_strategy(fold_case):
     c = fold_case
     model = SummaryModel()
-    c.host.service = model
     stop = CancellationToken()
     stop.cancel("stop")
     calls = FoldCalls(session_id=c.sid, cancel_token=stop)
@@ -162,21 +131,7 @@ async def test_cancelled_send_cancels_the_fold_through_a_swallowing_strategy(fol
         _SEND.reset(token)
     with pytest.raises(CancellationRequested):
         calls.raise_if_cancelled()
-    assert model.calls == 0 and await _prepared(c) == []
-
-
-async def test_host_without_fold_support_refuses_the_call(fold_case):
-    c = fold_case
-    model = SummaryModel()
-    c.host.service = model
-    c.host.prepare = Host.prepare.__get__(c.host)
-    token = _SEND.set(c.binding)
-    try:
-        with pytest.raises(TypeError):
-            await FoldCalls(session_id=c.sid).wrap(model).complete(_request())
-    finally:
-        _SEND.reset(token)
-    assert model.calls == 0 and c.host.reserve_calls == 0
+    assert model.calls == 0
 
 
 async def test_prepared_purpose_is_optional_and_only_fold(fold_case):

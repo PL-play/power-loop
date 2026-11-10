@@ -245,9 +245,9 @@ async def prepare(pipeline):
         pipeline._native_abort_attempt = None
 
 
-async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None):
+async def dispatch(pipeline, name, arguments, registered, *, attempt=None):
     from .execution_tools import dispatch as dispatch_owned
-    return await dispatch_owned(pipeline, name, arguments, registered, budget_attempt=budget_attempt)
+    return await dispatch_owned(pipeline, name, arguments, registered, attempt=attempt)
 
 
 async def queued_for_call(manager, tx, row, source, invocation):

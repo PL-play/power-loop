@@ -2,29 +2,10 @@
 
 import pytest
 
-from power_loop.runtime.jobs import JobError
-
 from .test_job_registry_192 import registry_store
-from .test_model_budgets_192 import budget_case, observed, start
 
-__all__ = ["registry_store", "budget_case"]
+__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
-
-
-async def test_unacknowledged_fee_blocks_tree_close(budget_case):
-    c = budget_case
-    c.host.apply_lost_ack = True
-    attempt = await start(c)
-    await observed(c, attempt)
-    await c.manager.close_model_execution(c.actor, c.binding.lease, evidence={"exit": "completed"})
-    with pytest.raises(JobError, match="budget_reconciliation_required"):
-        await c.manager.finalize_supervision(c.actor, c.binding.lease.job_id, generation=1)
-    row = await c.manager.get_job(c.actor, c.binding.lease.job_id)
-    assert row.supervision_status == "open"
-    pending = await c.manager.db.fetchall(
-        f"SELECT pending FROM {c.manager.prefix}task_budget_attempts WHERE job_id=?", (row.job_id,)
-    )
-    assert pending and pending[0]["pending"]
 
 
 async def test_synchronous_managed_effect_uses_caller_session(registry_store):

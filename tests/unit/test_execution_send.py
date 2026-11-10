@@ -28,21 +28,7 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
     original_db = store._db
     store._db = counted = CountedDatabase(original_db)
     manager = JobManager(store)
-    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
-
-    from .test_model_budgets_192 import Host
-    host = Host()
-    observations = []
-    prepare_usage = host.prepare_usage
-    async def record_usage(context, grant, observation):
-        observations.append(observation)
-        return await prepare_usage(context, grant, observation)
-    async def tool_plan(context, call, *, pricing):
-        return None
-    host.prepare_usage, host.prepare_tool = record_usage, tool_plan
-    config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=10000, max_tokens=1000000, max_inflight=64),), host)
-    runtime = TaskRuntime(manager, tenant_id="memory-send", principal_id="host", executor_id="executor", boot_id="boot", boot_contract_hash="a" * 64,
-                          budget_config=config if budgeted else None)
+    runtime = TaskRuntime(manager, tenant_id="memory-send", principal_id="host", executor_id="executor", boot_id="boot", boot_contract_hash="a" * 64)
     seen = []
     registry = ToolRegistry()
 
@@ -66,7 +52,6 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
             pass
 
     model = Model()
-    host.service = model
     loop = await RunningAgent(store, model, registry,
         AgentLoopConfig(max_rounds=models+1, max_tokens=20, compactor=None), task_runtime=runtime).start()
     sid = loop.target.session_id
@@ -92,13 +77,7 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
         # Persisted public results retain usage; transient checkpoints may be cleaned.
         queried = await loop.runtime.client.wait(result.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
         assert queried.usage == result.usage
-        if budgeted:
-            assert len(observations) == models
-            assert len(host.applied) == host.reserve_calls == models
-            [scope] = await manager.db.fetchall(f"SELECT counters_json FROM {manager.prefix}task_budget_scopes")
-            assert json.loads(scope["counters_json"]) == dict(used_calls=models, used_tokens=5 * models,
-                                                             held_calls=0, held_tokens=0, inflight=0)
-        assert not manager._execution_controls and not manager._live_budget_bindings
+        assert not manager._execution_controls
     finally:
         await loop.aclose()
         store._db = original_db

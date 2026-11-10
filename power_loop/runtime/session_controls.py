@@ -72,7 +72,6 @@ class ControlTransaction(ControlReadView):
         self._result_events: dict[str, dict] = {}
         self._executor_admissions: dict[str, bool] = {}
         self._executor_group_locks: dict[str, tuple[bool, bool]] = {}
-        self._budget_policy_admissions: dict[str, dict | None] = {}
         self._principal_admission_hashes: dict[str, str | None] = {}
 
     def __getattr__(self, name):

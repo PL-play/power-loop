@@ -30,7 +30,7 @@ def current(binding):
 
 async def project_events(manager, tx, identity, records):
     """Persist control projections in the checkpoint transaction."""
-    rows, budget_rows = [], []
+    rows = []
     def event(key, kind, payload, metadata):
         row = (key, identity.job_id, kind, metadata["job_version"], _hash(payload),
                _json(payload), "not_applicable", metadata["created_at"])
@@ -40,36 +40,8 @@ async def project_events(manager, tx, identity, records):
 
     for record in records:
         value = record["value"]
-        if record["kind"] == "allocation_adjustment_immutable":
-            from .execution_budget import project_adjustment
-            await project_adjustment(manager, tx, identity, value)
-            continue
-        if record["kind"] == "budget_policy_closed":
-            await tx.execute(f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (record["key"],))
-            continue
-        if record["kind"] == "budget_allocation":
-            from .execution_budget import project_allocation
-            # The full grant remains reserved while its owner is open. Its
-            # actual consumption is already in this checkpoint's summary and
-            # records; closing applies the cumulative difference exactly once.
-            # An overrun must still disable admission and book the excess now.
-            if value["closed"] or value["used_tokens"] > value["tokens"]:
-                await project_allocation(manager, tx, identity, record["key"], value)
-            continue
         if record["kind"] == "event_immutable":
             event(record["key"], value["event_type"], value["payload"], value["event_metadata"])
-            continue
-        if record["kind"] == "budget":
-            from .model_budgets import stored_state
-            stored = stored_state(value)
-            budget_rows.append((value["attempt_id"], identity.job_id, value["policy_key"], value["version"],
-                                value["phase"], int(value["pending"]), _hash(stored), _json(stored),
-                                value["started_at_ms"], value.get("finished_at_ms", value["started_at_ms"])))
-            continue
-    if budget_rows:
-        await upsert(manager, tx, manager.prefix + "task_budget_attempts",
-                     ("attempt_id", "job_id", "policy_key", "version", "phase", "pending", "state_hash",
-                      "state_json", "created_at", "updated_at"), "attempt_id", budget_rows)
     if not rows:
         return
     columns = ("event_id", "job_id", "event_type", "job_version", "request_hash", "payload_json",
@@ -143,14 +115,6 @@ async def append_correction(manager, tx, job, generation, records, *, summary_de
         raise JobError("execution_reconciliation_requires_quiescence")
     for key, delta in (summary_delta or {}).items():
         summary[key] += delta
-    for record in records:
-        if record["kind"] == "budget":
-            previous = await tx.fetchone(f"SELECT pending,phase FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?",
-                                         (record["key"],))
-            def unsettled(value):
-                return value is not None and (value["pending"] or value["phase"] not in ("released", "settling"))
-            summary["budget_attempts"] = summary.get("budget_attempts", 0) + int(previous is None)
-            summary["budget_unsettled"] = summary.get("budget_unsettled", 0) + int(unsettled(record["value"])) - int(unsettled(previous))
     await journal.append(identity, head["batch_no"] + 1, records, summary, transaction=tx)
     return head["batch_no"] + 1
 
@@ -168,24 +132,18 @@ async def require_closed(manager, tx, job_id, generation):
         raise JobError("execution_reconciliation_requires_quiescence")
 
 
-async def open_control(binding, *, policy_source=None):
+async def open_control(binding):
     runtime, manager = binding.runtime, binding.runtime.manager
     if binding.resource_evidence.get("_control_state") is not None:
         return current(binding)
     if (binding.lease.job_id, binding.lease.generation) in manager._execution_controls:
         raise JobError("execution_already_owned")
-    from .budget_policy_sources import prepared as prepare_policy
     from .model_attempts import _no_unknown_sends
-    from .model_budgets import ensure_policy, flush_observed_controls
 
-    await flush_observed_controls(binding)
-    async with prepare_policy(runtime, source=policy_source), manager._write() as tx:
-        from .budget_admissions import enter
-        await enter(runtime, tx)
+    async with manager._write() as tx:
         source = dict(await manager._fence(tx, binding.actor, binding.lease))
         if source["kind"] not in {"send", "background_tool", "background_command"} or source["session_id"] != binding.actor.session_id:
             raise JobError("model_attempt_owner_mismatch")
-        await ensure_policy(binding, transaction=tx, job=source)
         if not binding.resource_evidence.get("explicit_resume"):
             await _no_unknown_sends(manager, tx, source)
         import json
@@ -232,9 +190,6 @@ async def open_control(binding, *, policy_source=None):
         from .session_ownership import current_ownership
         state = ExecutionState(identity, journal, ownership=current_ownership(),
                                policy=runtime.checkpoint_policy, now_ms=lambda: manager.now())
-        policy = binding.resource_evidence.get("_control_budget_policy")
-        if policy is not None:
-            state.max_pending_obligations = policy["manifest"]["max_pending"]
         state.managed_check = managed_check
         await journal.create(identity, state.summary(), transaction=tx)
     binding.resource_evidence.pop("_control_journal_opening", None)
@@ -269,8 +224,6 @@ async def open_control(binding, *, policy_source=None):
             state.needs_reconciliation = True
         if state.cancel_requested:
             state.record("lifecycle", "cancel", {"requested": True})
-            from .execution_budget import allocation_record
-            allocation_record(binding)
     state.before_checkpoint = refresh
     manager._execution_controls[(source["job_id"], source["generation"])] = binding
     return state
@@ -290,9 +243,7 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
     if transaction is not None:
         await transaction.require_job(binding.lease.job_id)
     if close:
-        from .execution_budget import allocation_record
         state.closed = True
-        allocation_record(binding)
         if transaction is not None:
             # Joins the close transaction; a rollback keeps the batch for retry.
             manager = binding.runtime.manager
@@ -326,11 +277,3 @@ def forget_completed(binding):
     key = (state.identity.job_id, state.identity.generation)
     if manager._execution_controls.get(key) is binding:
         manager._execution_controls.pop(key)
-    forget_budget_bindings(binding)
-
-
-def forget_budget_bindings(binding):
-    manager = binding.runtime.manager
-    for kind, key in current(binding)._records:
-        if kind == "budget" and manager._live_budget_bindings.get(key) is binding:
-            manager._live_budget_bindings.pop(key)

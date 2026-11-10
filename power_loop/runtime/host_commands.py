@@ -1,7 +1,7 @@
 """Factory-resolved host commands execute on the ordinary input's worker.
 
 The input is the command's authority. It is never disguised as an assistant
-tool call. Internal model/paid calls retain this send's original budget owner.
+tool call.
 """
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from .nested_tools import join_children
 from .pricing import Free, PricedCall
 from .send_receipt import KEY, capture
 from .task_runtime import _SEND
-from .tool_billing import receipt_context
 
 
 async def run(loop, ctx, start, command, send_index):
@@ -60,13 +59,12 @@ async def run(loop, ctx, start, command, send_index):
                     call_ref=ref.to_dict(), call_id=ctx.input_ref.message_id, request_hash=_hash(arguments),
                     tool_name=name, pricing_rule={'rule_id': pricing.rule_id, 'rule_version': pricing.version()})
                 value = control.begin_attempt(key, 'tool', prepared)
-                value['budget_required'] = False
                 control.record('attempt', key, value)
                 control.dispatch(key)
                 attempt = tool_attempts.ToolAttempt(binding, key, prepared,
                     PricedCall(name, arguments, 'main'), pricing, asyncio.current_task())
                 slot = _Receipt(binding, ref, ctx.input_ref.message_id, _hash(command), _hash(name),
-                    asyncio.current_task(), budget_attempt=attempt)
+                    asyncio.current_task())
                 cache = binding.runtime._native_returns
                 cache.slots[cache.key(slot)] = slot
                 error, text = None, ''
@@ -77,8 +75,7 @@ async def run(loop, ctx, start, command, send_index):
                 stopper = asyncio.create_task(stop_command())
                 try:
                     ctx.stop.raise_if_cancelled()
-                    with receipt_context(slot):
-                        output = await loop.tool_registry.invoke_async(name, arguments)
+                    output = await loop.tool_registry.invoke_async(name, arguments)
                     await join_children(slot)
                     text = output if isinstance(output, str) else canonical(output)
                     await store.append_message(sid, role='assistant', content=text,
@@ -94,7 +91,7 @@ async def run(loop, ctx, start, command, send_index):
                 finally:
                     stopper.cancel()
                     await asyncio.gather(stopper, return_exceptions=True)
-                    tool_attempts.capture(attempt, None, error)
+                    tool_attempts.capture(attempt, error)
                     await tool_attempts.finish(attempt)
                     slot.finished = True
                     cache.slots.pop(cache.key(slot))

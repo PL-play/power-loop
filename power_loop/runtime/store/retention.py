@@ -85,8 +85,6 @@ def ready_condition(prefix):
         "j.supervision_status<>'closed' OR j.resource_state<>'stopped' OR j.intake<>'closed')) "
         f'AND NOT EXISTS (SELECT 1 FROM {prefix}jobs j JOIN {prefix}session_obligations o ON o.job_id=j.job_id '
         'WHERE j.root_job_id=root.job_id) '
-        f'AND NOT EXISTS (SELECT 1 FROM {prefix}jobs j JOIN {prefix}task_budget_attempts b ON b.job_id=j.job_id '
-        "WHERE j.root_job_id=root.job_id AND (b.pending=1 OR b.phase NOT IN ('released','settling'))) "
         f'AND NOT EXISTS (SELECT 1 FROM {prefix}jobs j JOIN {prefix}job_events e ON e.job_id=j.job_id '
         f'JOIN {prefix}follow_up_queue q ON q.session_id=root.session_id AND q.item_id=e.event_id '
         "WHERE j.root_job_id=root.job_id AND e.event_type='task_alert' AND q.status IN ('pending','claimed'))")
@@ -142,7 +140,6 @@ async def delete_tree(store, tx, root_id, limit, counts):
     specs = [(store.t.follow_up_queue, 'follow_up_queue', ('id',), where, (root_id, root_id))]
     for table, keys in (
         ('job_events', ('event_id',)), ('execution_checkpoints', ('job_id','generation')),
-        ('execution_allocations', ('allocation_id',)), ('task_budget_attempts', ('attempt_id',)),
         ('session_obligations', ('session_id','kind','source_id'))):
         specs.append((p+table, table, keys, f'job_id IN ({jobs})', (root_id,)))
     for table, category, keys, where, params in specs:

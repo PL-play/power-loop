@@ -36,8 +36,6 @@ _QUERY_INDEXES = {
     'idx_jobs_open_roots': ('jobs', ('supervision_status', 'parent_job_id', 'job_id')),
     'idx_jobs_executor_work': ('jobs', ('executor_id', 'resource_state', 'job_id')),
     'idx_jobs_executor_open': ('jobs', ('executor_id', 'supervision_status', 'kind', 'resource_state', 'job_id')),
-    'idx_budget_unsettled': ('task_budget_attempts', ('pending', 'attempt_id')),
-    'idx_budget_dispatch': ('task_budget_attempts', ('pending', 'phase', 'attempt_id')),
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_open': ('jobs', ('session_id', 'supervision_status', 'job_id')),
     'idx_jobs_session_resource': ('jobs', ('session_id', 'resource_state', 'job_id')),
@@ -47,14 +45,11 @@ _QUERY_INDEXES = {
     'idx_events_job_type': ('job_events', ('job_id', 'event_type', 'event_id')),
     'idx_events_caller_type': ('job_events', ('caller_session_id', 'event_type', 'job_id', 'event_id')),
     'idx_events_call': ('job_events', ('caller_session_id', 'tool_call_id', 'event_type')),
-    'idx_allocations_job': ('execution_allocations', ('job_id',)),
-    'idx_budget_job': ('task_budget_attempts', ('job_id', 'attempt_id')),
     'idx_context_capacity': ('context_cache', ('size_bytes',)),
     'idx_obligations_job': ('session_obligations', ('job_id',)),
 }
-_TASK_BASE_TABLES = ("task_store", "jobs", "job_events", "task_executors", "task_executor_events",
-                         "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
-TASK_TABLES = (*_TASK_BASE_TABLES, "execution_checkpoints", "execution_allocations",
+_TASK_BASE_TABLES = ("task_store", "jobs", "job_events", "task_executors", "task_executor_events")
+TASK_TABLES = (*_TASK_BASE_TABLES, "execution_checkpoints",
                "session_controls", "session_obligations", "task_context_events", "task_executor_admissions",
                "task_principal_admissions")
 
@@ -120,20 +115,6 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             group_key {small} PRIMARY KEY, registered INTEGER NOT NULL){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {prefix}task_principal_admissions (
             policy_key {small} PRIMARY KEY, policy_hash {small}){opts}""",
-        f"""CREATE TABLE IF NOT EXISTS {prefix}task_budget_policies (
-            policy_key {small} PRIMARY KEY, tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL,
-            request_hash {small} NOT NULL, manifest_json {body} NOT NULL, enabled INTEGER NOT NULL,
-            created_at {integer} NOT NULL){opts}""",
-        f"""CREATE TABLE IF NOT EXISTS {prefix}task_budget_scopes (
-            scope_key {small} PRIMARY KEY, policy_key {small} NOT NULL,
-            limits_hash {small} NOT NULL, limits_json {body} NOT NULL, counters_hash {small} NOT NULL, counters_json {body} NOT NULL){opts}""",
-        f"""CREATE TABLE IF NOT EXISTS {prefix}task_budget_attempts (
-            attempt_id {small} PRIMARY KEY, job_id {small}, execution_id {body},
-            tenant_id {sid}, principal_id {sid}, session_id {sid},
-            policy_key {small} NOT NULL,
-            version {integer} NOT NULL, phase {small} NOT NULL, pending INTEGER NOT NULL,
-            state_hash {small} NOT NULL, state_json {body} NOT NULL, root_context_json {body},
-            created_at {integer} NOT NULL, updated_at {integer} NOT NULL){opts}""",
         *control_tables_ddl(name, prefix),
         f"""CREATE TABLE IF NOT EXISTS {prefix}session_controls (
             session_id {sid} PRIMARY KEY, version {integer} NOT NULL){opts}""",
@@ -155,7 +136,6 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
         f"CREATE INDEX {prefix}idx_job_events_delivery ON {prefix}job_events(delivery_status, created_at)",
         f"CREATE INDEX {prefix}idx_executor_scope ON {prefix}task_executors(tenant_id,principal_id,executor_id,state,executor_key)",
         f"CREATE INDEX {prefix}idx_executor_events ON {prefix}task_executor_events(executor_key,created_at,event_id)",
-        f"CREATE INDEX {prefix}idx_budget_pending ON {prefix}task_budget_attempts(policy_key,pending,updated_at,attempt_id)",
     ]
 
 
@@ -245,62 +225,9 @@ async def _verify_task_schema_tx(tx, db, prefix):
             if not await _column_exists(tx, db.dialect.name, prefix + table, column):
                 raise StoreSchemaError("task executor schema incomplete")
 
-    required = {
-        "task_budget_policies": {
-            "policy_key",
-            "tenant_id",
-            "principal_id",
-            "request_hash",
-            "manifest_json",
-            "enabled",
-            "created_at",
-        },
-        "task_budget_scopes": {
-            "scope_key",
-            "policy_key",
-            "limits_hash",
-            "limits_json",
-            "counters_hash",
-            "counters_json",
-        },
-        "task_budget_attempts": {
-            "attempt_id",
-            "job_id",
-            "execution_id",
-            "tenant_id",
-            "principal_id",
-            "session_id",
-            "policy_key",
-            "version",
-            "phase",
-            "pending",
-            "state_hash",
-            "state_json",
-            "root_context_json",
-            "created_at",
-            "updated_at",
-        },
-    }
-    actual = {}
-    if db.dialect.name == "sqlite":
-        for table in required:
-            rows = await tx.fetchall(f"PRAGMA table_info({prefix}{table})")
-            actual[prefix + table] = {row["name"] for row in rows}
-    else:
-        current = "current_schema()" if db.dialect.name == "postgres" else "DATABASE()"
-        rows = await tx.fetchall(
-            "SELECT table_name AS budget_table,column_name AS budget_column FROM information_schema.columns "
-            f"WHERE table_schema={current} AND table_name IN (?,?,?)",
-            tuple(prefix + table for table in required),
-        )
-        for row in rows:
-            actual.setdefault(row["budget_table"], set()).add(row["budget_column"])
-    if any(not columns.issubset(actual.get(prefix + table, set())) for table, columns in required.items()):
-        raise StoreSchemaError("task budget schema incomplete")
     await _verify_query_indexes(tx, db, prefix)
     for table, columns in (
         ("execution_checkpoints", ("job_id", "generation", "batch_no", "summary_json")),
-        ("execution_allocations", ("allocation_id", "execution_id", "job_id", "generation", "state_json", "state_hash")),
         ("session_controls", ("session_id", "version")),
     ):
         for column in columns:

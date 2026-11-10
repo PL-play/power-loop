@@ -244,44 +244,20 @@ async def test_events_observe_custom_tool_lifecycle(store: SessionStore, runtime
 
 
 async def test_hook_arguments_price_actual_call_and_retain_original_history(registry_store, runtime_agent):
-    from decimal import Decimal
-
-    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
     from power_loop.runtime.jobs import JobManager
-    from power_loop.runtime.pricing import Charge, Estimate, Money
+    from power_loop.runtime.pricing import Free
     from power_loop.runtime.task_runtime import TaskRuntime
-    from tests.unit.test_model_budgets_192 import Host
 
     store, _ = registry_store
-    plans, charges, executed = [], [], []
-    class PerCharacter:
-        rule_id = 'characters'
-        def version(self):
-            return '1'
-        def estimate(self, call):
-            return Estimate(Money(Decimal(len(call.arguments['value'])), 'CNY'), {})
-        def settle(self, call, receipt, error):
-            return Charge(Money(Decimal(len(call.arguments['value'])), 'CNY'), 'exact', {}, self.rule_id, self.version())
+    executed = []
     async def save(value):
         executed.append(value)
         return value
-    host = Host()
-    async def plan(context, call, *, pricing):
-        plans.append(dict(call.arguments))
-        assert pricing.estimate(call).maximum.amount == Decimal(5)
-        return BudgetPlan(0, {'attempt_id': context['attempt_id'], 'origin': context})
-    prepare_usage = host.prepare_usage
-    async def capture(context, grant, observation):
-        if context['kind'] == 'tool':
-            charges.append(observation['charge'])
-        return await prepare_usage(context, grant, observation)
-    host.prepare_tool, host.prepare_usage = plan, capture
     model = _Scripted([_tool_resp('original', 'save', '{"value":"x"}'), LLMResponse(raw_text='done')])
-    host.service = model
     task_runtime = TaskRuntime(JobManager(store), tenant_id='hook-price', principal_id='host', executor_id='hook',
-        boot_id='boot', boot_contract_hash='a'*64, budget_config=BudgetConfig('hook-price', (LocalBudgetScope('scope', max_calls=10, max_tokens=100000),), host))
+        boot_id='boot', boot_contract_hash='a'*64)
     registry = ToolRegistry()
-    registry.register(ToolDefinition('save', 'save', required_params=('value',), pricing=PerCharacter()), save)
+    registry.register(ToolDefinition('save', 'save', required_params=('value',), pricing=Free('fixture')), save)
     hooks = AgentHooks()
     def replace(ctx):
         ctx.tool_args['value'] = 'hello'
@@ -290,8 +266,7 @@ async def test_hook_arguments_price_actual_call_and_retain_original_history(regi
         config=AgentLoopConfig(model="test", max_tokens=20, max_rounds=3, compactor=None))
     result = await agent.send('save')
     assert result.status == 'completed', result
-    assert plans == [{'value':'hello'}] and executed == ['hello']
-    assert len(charges) == 1 and charges[0]['amount'] == '5'
+    assert executed == ['hello']
     rows = await store.load_all_messages(agent.target.session_id)
     call = next(row for row in rows if row.tool_calls)
     assert call.tool_calls[0]['id'] == 'original' and call.tool_calls[0]['function']['arguments'] == '{"value":"x"}'

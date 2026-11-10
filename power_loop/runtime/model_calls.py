@@ -82,7 +82,6 @@ class ManagedModelLLM:
             response_observation,
             start_call,
         )
-        from power_loop.runtime.response_capture import record
         from power_loop.runtime.task_runtime import _SEND, check_dispatch
         from power_loop.workflow.admission import request_slot
 
@@ -137,7 +136,6 @@ class ManagedModelLLM:
                     raise error from exc
                 raise
             usage = getattr(response, "token_usage", None)
-            reported = response_observation(usage, response)
             estimated = usage is None or getattr(usage, "prompt_tokens", None) is None
             if estimated:
                 prompt = estimate_prompt_tokens(messages=request.messages, system_prompt=request.system_prompt,
@@ -148,8 +146,7 @@ class ManagedModelLLM:
                 usage = LLMTokenUsage(prompt_tokens=prompt, completion_tokens=completion,
                                       total_tokens=prompt + completion)
                 response.token_usage = usage
-            await record(attempt, reported=reported, observation=response_observation(usage, response),
-                         estimated=estimated)
+            await observe(attempt, **response_observation(usage, response), estimated=estimated)
             from power_loop.llm_metrics import enforce_extraction_policy
             try:
                 enforce_extraction_policy(response)

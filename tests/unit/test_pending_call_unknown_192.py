@@ -41,7 +41,6 @@ async def test_unknown_pending_needs_original_query_even_after_actual_callback_e
         result = await consume_queued(loop)
         assert result.status == 'completed' and reviewer.calls == 1
         assert c.state.lookups == c.state.prepared == c.state.dispatched == c.model.calls == 1
-        assert c.host.reserve_calls == 2
         assert (await c.manager.get_job(c.actor, row['job_id'])).result_status == 'handled'
         assert (await c.manager.get_job(c.actor, source.job_id)).supervision_status == 'closed'
         assert not await c.manager.db.fetchall(f"SELECT id FROM {c.store.t.messages} WHERE role='tool'")

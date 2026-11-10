@@ -218,6 +218,6 @@ async def test_native_assistant_append_lost_ack_keeps_raw_pending_without_memory
     assert pending['tool_call_ids'] == ['original-call', 'original-call-2']
     row = await c.store.get_message(c.sid, pending['assistant_seq'])
     assert row.role == 'assistant' and row.tool_calls == pending['tool_calls']
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.model.calls == 1
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
     assert not await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='background_tool'")

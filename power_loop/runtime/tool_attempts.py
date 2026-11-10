@@ -1,18 +1,11 @@
-"""Original tool invocation identity and frozen settlement in the budget journal.
-
-Tool observations are distinct from model attempts. Accounting counters and the
-host submission outbox use the existing budget engine. Recovery never invokes a
-handler or recalculates a persisted charge using a current registration.
-"""
+"""Original tool invocation identity, distinct from model attempts."""
 from __future__ import annotations
 
 import asyncio
-import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 from .jobs import JobError, _hash
-from .jobs import verify_stored as _verify_stored
-from .pricing import BillingReceipt, Charge, PricedCall, canonical
+from .pricing import PricedCall
 
 
 @dataclass
@@ -46,35 +39,6 @@ async def prepare(binding, ref, call_id, registered, arguments):
     return await prepare_attempt(binding, ref, call_id, registered, arguments)
 
 
-async def prepare_nested(parent, registered, arguments):
-    """An internal call belongs to this dispatched parent, with its own ID."""
-    import uuid
-
-    from power_loop.tools.registry import validate_pricing
-
-    from .control_runtime import current, source
-    from .nested_tools import require_parent
-    require_parent(parent)
-    binding, original = parent.binding, parent.budget_attempt
-    control = current(binding)
-    saved = control.get("attempt", original.attempt_id)
-    if saved is None or saved["phase"] != "dispatched" or saved["prepared"] != original.prepared:
-        raise JobError("tool_attempt_original_mismatch")
-    pricing = validate_pricing(registered)
-    nonce, scope = uuid.uuid4().hex, asdict(binding.lease)
-    key = "toolattempt_" + _hash(["nested", binding.runtime.manager.store.store_id, scope, original.attempt_id, nonce])[:48]
-    prepared = {k: original.prepared[k] for k in ("call_ref", "call_id", "session_id")}
-    prepared.update(version=2, attempt_id=key, scope=scope, invocation_id=nonce,
-        parent_attempt_id=original.attempt_id, parent_prepared_hash=_hash(original.prepared),
-        request_hash=_hash(arguments), tool_name=registered.definition.name,
-        pricing_rule={"rule_id": pricing.rule_id, "rule_version": registered.pricing_version})
-    value = control.begin_attempt(key, "tool", prepared)
-    value["budget_required"] = True
-    control.record("attempt", key, value)
-    return ToolAttempt(binding, key, prepared, PricedCall(registered.definition.name, arguments, source(binding)["execution_role"]),
-                       pricing, asyncio.current_task())
-
-
 def _original_owner(attempt):
     from .task_runtime import _SEND
     if _SEND.get() is not attempt.binding or asyncio.current_task() is not attempt.task:
@@ -84,18 +48,8 @@ def _original_owner(attempt):
         raise JobError('tool_pricing_binding_changed')
 
 
-async def reserve(attempt):
-    from . import model_budgets as budgets
-    _original_owner(attempt)
-    from .control_runtime import current
-    if not current(attempt.binding).get("attempt", attempt.attempt_id)["budget_required"]:
-        return False
-    return await budgets.reserve(attempt, attempt.call, pricing=attempt.pricing)
-
-
 async def authorize_dispatch(attempt, tx, job):
     from .control_runtime import current
-    from .execution_budget import authorize
     _original_owner(attempt)
     control = current(attempt.binding)
     saved = control.get("attempt", attempt.attempt_id)
@@ -103,45 +57,23 @@ async def authorize_dispatch(attempt, tx, job):
         raise JobError("tool_attempt_original_mismatch")
     if saved["phase"] != "prepared":
         raise JobError("tool_attempt_already_dispatched")
-    if saved["budget_required"]:
-        authorize(attempt)
     control.dispatch(attempt.attempt_id)
 
 
-def capture(attempt, receipt: BillingReceipt | None, error: BaseException | None):
+def capture(attempt, error: BaseException | None):
     """Freeze synchronously before any cancellable persistence/host await."""
     _original_owner(attempt)
     if attempt.observation is not None:
         raise JobError('tool_attempt_already_observed')
-    from .control_runtime import current
-    if not current(attempt.binding).get("attempt", attempt.attempt_id)["budget_required"]:
-        # Ordinary unpriced control still tracks physical completion. A raw
-        # supplier receipt remains in the native-return journal; this path
-        # neither fabricates a zero charge nor claims financial ownership.
-        cancelled = isinstance(error, asyncio.CancelledError)
-        attempt.observation = dict(status="unknown" if cancelled else "returned",
-            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, estimated=False,
-            outcome="cancelled" if cancelled else "failed" if error else "returned",
-            error_type=type(error).__name__ if error is not None else None, financial_authority=False)
-        return
-    charge = attempt.pricing.settle(attempt.call, receipt, error)
-    if (not isinstance(charge, Charge) or charge.rule_id != attempt.pricing.rule_id
-            or charge.rule_version != attempt.prepared['pricing_rule']['rule_version']):
-        raise JobError('tool_settlement_rule_mismatch')
     cancelled = isinstance(error, asyncio.CancelledError)
-    attempt.observation = dict(status='unknown' if cancelled else 'returned',
-        usage={'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}, estimated=False,
-        outcome='cancelled' if cancelled else 'failed' if error is not None else 'returned',
-        error_type=type(error).__name__ if error is not None else None,
-        provider_response_id=receipt.provider_request_id if receipt is not None else None,
-        charge=dict(amount=format(charge.amount.amount, 'f'), currency=charge.amount.currency,
-            quality=charge.quality, units=json.loads(canonical(charge.units)),
-            rule_id=charge.rule_id, rule_version=charge.rule_version))
+    attempt.observation = dict(status="unknown" if cancelled else "returned",
+        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, estimated=False,
+        outcome="cancelled" if cancelled else "failed" if error else "returned",
+        error_type=type(error).__name__ if error is not None else None)
 
 
 async def finish(attempt):
     from .control_runtime import current
-    from .execution_budget import observe
     if attempt.observation is None:
         raise JobError("tool_attempt_observation_required")
     control = current(attempt.binding)
@@ -149,55 +81,12 @@ async def finish(attempt):
     if saved is None or saved["prepared"] != attempt.prepared:
         raise JobError("tool_attempt_original_mismatch")
     control.observe(attempt.attempt_id, attempt.observation)
-    result = await observe(attempt, attempt.observation) if saved["budget_required"] else None
     await control.checkpoint()
-    return result
-
-
-async def observe_managed_free(attempt, tx, job):
-    """Known zero fee; the independent child owns its physical outcome."""
-    from .pricing import Free
-    _original_owner(attempt)
-    if type(attempt.pricing) is not Free or attempt.observation is not None:
-        raise JobError("managed_free_original_required")
-    charge = attempt.pricing.settle(attempt.call, None, None)
-    if (charge.rule_id != attempt.prepared['pricing_rule']['rule_id']
-            or charge.rule_version != attempt.prepared['pricing_rule']['rule_version']):
-        raise JobError('tool_settlement_rule_mismatch')
-    # Pricing itself has returned an exact zero, so it owns no vendor inflight
-    # slot. The independent managed child still retains the business outcome.
-    value = dict(status='returned',
-        usage={'prompt_tokens':0, 'completion_tokens':0, 'total_tokens':0}, estimated=False,
-        outcome='unknown', error_type=None, provider_response_id=None,
-        charge=dict(amount=format(charge.amount.amount,'f'), currency=charge.amount.currency,
-            quality=charge.quality, units={}, rule_id=charge.rule_id, rule_version=charge.rule_version))
-    attempt.observation = value
-    return await finish(attempt)
-
-
-@_verify_stored
-async def reconcile(runtime, actor, job_id, attempt_id):
-    from . import model_budgets as budgets
-    manager = runtime.manager
-    async with budgets.prepare_policy(runtime), manager._write() as tx:
-        await manager._authorize(tx, actor, job_id)
-        state = await budgets._read(manager, tx, attempt_id)
-        policy = await budgets._policy(runtime, tx)
-        if policy is None or state['job_id'] != job_id or state['policy_key'] != policy['policy_key']:
-            raise JobError('budget_reconciliation_scope_mismatch')
-        if state['observation'] is None:
-            raise JobError('budget_usage_not_ready')
-        from .control_runtime import require_closed
-        await require_closed(manager, tx, job_id, state['context']['generation'])
-    ack = await budgets._deliver(runtime, actor, job_id, attempt_id)
-    return dict(attempt_id=attempt_id, job_id=job_id, revision=ack['revision'],
-                request_hash=ack['request_hash'], usage_acknowledged=True, execution_authority=False)
 
 
 async def begin_pipeline(pipeline, registered, arguments):
     from .execution_tools import entry
     from .invocation import current_invocation
-    from .pricing import Free
     from .task_runtime import _SEND
     from .tool_contracts import policy
     binding = _SEND.get()
@@ -208,79 +97,5 @@ async def begin_pipeline(pipeline, registered, arguments):
     if not binding.resource_evidence["_control_tool_plan_required"]:
         return None
     seq, call_id = current_invocation(pipeline.session_id)
-    owned, selected = entry(binding, seq, call_id)
-    if selected["recovery"] is not None and not isinstance(registered.pricing, Free):
-        raise JobError("budget_managed_tool_adapter_unavailable")
-    attempt = await prepare(binding, owned["ref"], call_id, registered, arguments)
-    await reserve(attempt)
-    return attempt
-
-
-async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cancelled=False):
-    """Seal original dispatch before refunding a reservation; never replay tools."""
-    from . import model_budgets as budgets
-    from .budget_contracts import BudgetAck, BudgetGrant, BudgetSubmission
-    manager = runtime.manager
-    async with budgets.prepare_policy(runtime), manager._write() as tx:
-        job = await manager._authorize(tx, actor, job_id)
-        policy = await budgets._policy(runtime, tx)
-        state = await budgets._read(manager, tx, attempt_id)
-        if policy is None or state['job_id'] != job_id or state['policy_key'] != policy['policy_key']:
-            raise JobError('budget_reconciliation_scope_mismatch')
-        if state['phase'] == 'released':
-            return state['ack']
-        if state['phase'] != 'dispatch_closed':
-            raise JobError('budget_unstarted_execution_unconfirmed')
-        if state['phase'] not in ('local_reserved', 'host_reserving', 'host_reserved', 'dispatch_closed'):
-            raise JobError('budget_release_not_permitted')
-        if require_cancelled:
-            await budgets._require_cancelled_lineage(manager, tx, job)
-        if state['phase'] != 'dispatch_closed':
-            state.update(phase='dispatch_closed', pending=True)
-            await budgets._save(manager, tx, state, job)
-        if not state['host_intent']:
-            await budgets._refund_local(manager, tx, policy, state)
-            state.update(phase='released', pending=False, ack={'local_only': True, 'dispatch_not_authorized': True})
-            await budgets._save(manager, tx, state, job)
-            return state['ack']
-    provider = runtime.budget_config.provider
-    if state['submission'] is not None:
-        grant = None  # Replay the frozen release, including after a lost ACK.
-    elif state['grant'] is None:
-        raise JobError('budget_reconciliation_submission_required')
-    else:
-        grant = BudgetGrant(**state['grant'])
-    proof = dict(proof='dispatch_not_authorized', reservation_request_hash=state['plan_hash'],
-        event_id='mb_' + _hash([attempt_id, state['version']])[:48], evidence_hash=_hash(state))
-    if state['submission'] is None:
-        submission = await budgets._host_call(runtime, job_id, attempt_id, 'prepare_release',
-            lambda: provider.prepare_release(state['context'], grant, proof))
-        if type(submission) is not BudgetSubmission or (submission.attempt_id, submission.revision) != (attempt_id, 1):
-            raise JobError('invalid_budget_submission')
-        async with manager._write() as tx:
-            job = await manager._authorize(tx, actor, job_id)
-            state = await budgets._read(manager, tx, attempt_id)
-            if state['phase'] == 'released':
-                return state['ack']
-            if state['submission'] is not None and state['submission'] != asdict(submission):
-                raise JobError('budget_submission_conflict')
-            if state['submission'] is None:
-                state['submission'] = asdict(submission)
-                await budgets._save(manager, tx, state, job)
-    submission = BudgetSubmission(**state['submission'])
-    ack = await budgets._host_call(runtime, job_id, attempt_id, 'release', lambda: provider.release(submission))
-    if type(ack) is not BudgetAck or (ack.attempt_id, ack.revision, ack.request_hash) != (
-            attempt_id, submission.revision, submission.request_hash):
-        raise JobError('budget_ack_mismatch')
-    async with budgets.prepare_policy(runtime), manager._write() as tx:
-        job = await manager._authorize(tx, actor, job_id)
-        state = await budgets._read(manager, tx, attempt_id)
-        policy = await budgets._policy(runtime, tx)
-        if state['phase'] == 'released':
-            return state['ack']
-        if state['phase'] != 'dispatch_closed' or state['submission'] != asdict(submission):
-            raise JobError('budget_release_conflict')
-        await budgets._refund_local(manager, tx, policy, state)
-        state.update(phase='released', pending=False, ack=asdict(ack))
-        await budgets._save(manager, tx, state, job)
-    return asdict(ack)
+    owned, _selected = entry(binding, seq, call_id)
+    return await prepare(binding, owned["ref"], call_id, registered, arguments)

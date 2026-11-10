@@ -60,7 +60,6 @@ def event_identity(attempt):
         "model_attempt_store_id": attempt.binding.runtime.manager.store.store_id,
         "model_attempt_job_id": attempt.prepared["scope"]["job_id"],
         "model_attempt_generation": attempt.prepared["scope"]["generation"],
-        "budget_managed": attempt.binding.runtime._original_budget_config is not None,
     }
 
 
@@ -103,19 +102,9 @@ def response_observation(usage, response):
 
 
 async def enable(binding):
-    from .budget_policy_sources import PolicySourceChanged
     from .control_runtime import open_control
 
-    joined = binding.runtime.manager._joined_write.get() is not None
-    policy_source = None
-    while True:
-        try:
-            await open_control(binding, policy_source=policy_source)
-            break
-        except PolicySourceChanged as changed:
-            if joined:
-                raise
-            policy_source = changed.source
+    await open_control(binding)
     binding.resource_evidence["model_attempt_protocol"] = 1
 
 
@@ -199,9 +188,6 @@ async def dispatch(attempt):
         raise JobError("model_attempt_owner_mismatch")
     if saved["phase"] != "prepared":
         raise JobError("model_attempt_dispatch_already_admitted")
-    if binding.runtime._original_budget_config is not None:
-        from .execution_budget import authorize
-        authorize(attempt)
     control.dispatch(attempt.attempt_id)
     return None
 
@@ -256,8 +242,8 @@ async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amo
     return data
 
 
-async def require_quiescent(manager, tx, row, *, include_budget=True):
-    """Check the live execution and outstanding accounting before closing."""
+async def require_quiescent(manager, tx, row):
+    """Check the live execution before closing."""
     binding = manager._execution_controls.get((row["job_id"], row["generation"]))
     if binding is not None:
         from .control_runtime import current
@@ -265,9 +251,6 @@ async def require_quiescent(manager, tx, row, *, include_budget=True):
         if any(attempt["kind"] == "model" and attempt["phase"] == "dispatched"
                for attempt in state.active.values()):
             raise JobError("model_attempt_unsettled")
-    if include_budget:
-        from .model_budgets import require_quiescent as budget_quiescent
-        return await budget_quiescent(manager, tx, row)
     return []
 
 
@@ -293,31 +276,9 @@ async def start_call(pipeline, request, *, round_index, retry_index, model, purp
     except Exception:
         # Same key recall only; prepare never sends a provider request.
         attempt = await prepare(binding, **args)
-    from .model_budgets import close_unstarted, reserve
-
-    try:
-        await reserve(attempt, request, service=getattr(pipeline, "llm", None))
-    except Exception:
-        try:
-            await close_unstarted(attempt)
-        except Exception:
-            # Preserve the original admission error. Failed proof leaves the
-            # attempt unresolved; it never authorizes a retry or zero charge.
-            binding.resource_evidence["budget_pending"] = True
-            log.exception("Unreserved attempt closure remains pending: %s", attempt.attempt_id)
-        raise
-    from .response_capture import bind
-    attempt = replace(attempt, capture_binding=await bind(attempt))
     try:
         deadline = await dispatch(attempt)
     except JobError:
-        # This stack has not called the supplier. Release its original grant
-        # before losing that knowledge at execution shutdown.
-        try:
-            await close_unstarted(attempt)
-        except Exception:
-            binding.resource_evidence["budget_pending"] = True
-            log.exception("Undispatched attempt release remains pending: %s", attempt.attempt_id)
         raise
     except Exception:
         try:
@@ -363,29 +324,24 @@ async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, re
                              for e in (response_metrics or {}).get('errors', [])):
         args['error_type'] = 'response_cost_extraction_failed'
     try:
-        observation = await finish(attempt, **args)
+        await finish(attempt, **args)
     except Exception:
         try:
-            observation = await finish(attempt, **args)
+            await finish(attempt, **args)
         except Exception:
             # Retain the actual response/usage in the normal pipeline. Failed
-            # evidence persistence must block further dispatch, not charge or
+            # evidence persistence must block further dispatch, not
             # execute the same request again.
             attempt.binding.resource_evidence["resource_state"] = "unknown"
             log.exception("model attempt observation remains unresolved: %s", attempt.attempt_id)
             return
     try:
         from .control_runtime import current
-        from .model_budgets import observe as observe_budget
 
         control = current(attempt.binding)
-        await observe_budget(attempt, observation)
         if not control.closed:
             await control.checkpoint()
     except Exception:
-        # The actual model response must survive budget-delivery failure. The
-        # durable pending record blocks further paid work, not jobs/read/stop.
-        attempt.binding.resource_evidence["budget_pending"] = True
-        log.exception("budget handoff remains pending: %s", attempt.attempt_id)
+        log.exception("model attempt checkpoint remains unresolved: %s", attempt.attempt_id)
     if error is None or rejected:
         attempt.binding.resource_evidence.get("model_attempts_inflight", set()).discard(attempt.attempt_id)

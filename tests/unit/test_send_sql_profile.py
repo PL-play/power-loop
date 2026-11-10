@@ -10,7 +10,6 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager, nullcontext
-from decimal import Decimal
 
 import pytest
 
@@ -20,10 +19,9 @@ from power_loop import (
     LLMService,
     LLMTokenUsage,
     ToolDefinition,
-    record_billing_receipt,
 )
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.pricing import BillingReceipt, Free, Money
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
@@ -38,7 +36,7 @@ _PKG = os.path.join(_ROOT, "power_loop") + os.sep
 
 _SKIP = ("store.backends", "store.db")
 _BILLING = ("runtime.model_budgets", "runtime.execution_budget", "runtime.response_capture",
-            "runtime.tool_billing", "runtime.budget_", "runtime.native_returns")
+            "runtime.tool_billing", "runtime.budget_")
 _ORDINARY = ("runtime.store.", "runtime.runtime_state", "agent.", "core.")
 _CONTROL = ("runtime.execution_journal", "runtime.execution_state")
 
@@ -176,28 +174,16 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
     # than one second may also refresh the session activity time once.
     foreground = [r for r in records if not _executor_heartbeat(r["chain"])
                   and not any(site.startswith("runtime.timers:") for site in r["chain"])]
-    if not budgeted:
-        assert counts["billing"] == 0
-        # Ordinary unbilled turn: 14 statements. MySQL needs one extra read to
-        # take the lock and one extra read for the reply id. A tool round adds
-        # only its message writes.
-        base = 16 if dialect == "mysql" else 14
-        per_round = 6 if dialect == "mysql" else 4
-        activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
-        assert len(activity) <= 1
-        assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
-            dialect, models, len(foreground), len(activity))
-    else:
-        # Ordinary billed turn: the unbilled statements plus one reservation
-        # and one settlement. MySQL's extra reads are already in its base.
-        # A tool round still adds only its message writes.
-        base = 21 if dialect == "mysql" else 19
-        per_round = 6 if dialect == "mysql" else 4
-        activity = [r for r in foreground if " SET updated_at=" in r["sql"]
-                    and "task_budget_" not in r["sql"]]
-        assert len(activity) <= 1
-        assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
-            dialect, models, len(foreground), len(activity))
+    assert counts["billing"] == 0
+    # Ordinary turn: 14 statements. MySQL needs one extra read to take the
+    # lock and one extra read for the reply id. A tool round adds only its
+    # message writes. Pre-charge no longer adds statements.
+    base = 16 if dialect == "mysql" else 14
+    per_round = 6 if dialect == "mysql" else 4
+    activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
+    assert len(activity) <= 1
+    assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
+        dialect, models, len(foreground), len(activity))
 
 
 
@@ -237,33 +223,14 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
     meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
     store._db = profiled = Profiled(original, meter)
     manager = JobManager(store)
-    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
-    from power_loop.runtime.response_capture import ResponseCaptureReceipt
-
-    from .test_model_budgets_192 import Host
-    host = Host()
-
-    async def capture(packet):
-        return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
-
-    async def tool_plan(context, call, *, pricing):
-        if paid_tools:
-            return BudgetPlan(0, {'attempt_id': context['attempt_id'], 'origin': context})
-        return None
-    host.capture_response, host.prepare_tool = capture, tool_plan
-    config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=10000, max_tokens=1000000,
-                                                           max_inflight=64),), host)
     runtime = TaskRuntime(manager, tenant_id="profile", principal_id="host", executor_id=f"executor-h{history}",
-                          boot_id="boot", boot_contract_hash="a" * 64, budget_config=config if budgeted else None)
+                          boot_id="boot", boot_contract_hash="a" * 64)
     registry = ToolRegistry()
 
     async def echo(text):
-        if paid_tools:
-            await record_billing_receipt(BillingReceipt(provider_amount=Money(Decimal('1'), 'CNY')))
         return text
-    from .test_nested_tool_billing_196 import Paid
     registry.register(ToolDefinition("echo", "Return input", input_schema={
-        "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Paid() if paid_tools else Free("fixture")), echo)
+        "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("fixture")), echo)
 
     class Model(LLMService):
         calls = 0
@@ -283,7 +250,6 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
             pass
 
     model = Model()
-    host.service = model
     agent = await RunningAgent(store, model, registry,
         AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None,
                         delegation_policy="single_level"), task_runtime=runtime).start()
@@ -304,8 +270,6 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
         elapsed_s = time.monotonic() - started
         records, transactions, tx_sites = list(profiled.records), profiled.transactions, list(profiled.tx_sites)
         assert result.status == "completed" and model.calls == models
-        if paid_tools:
-            assert sum(key.startswith('toolattempt_') for key in host.applied) == models - 1
         if target := os.environ.get("P0_HISTORY_OUT"):
             with open(target, "a") as f:
                 f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,

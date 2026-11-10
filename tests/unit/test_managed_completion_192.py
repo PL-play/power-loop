@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 async def failure_case(registry_store, stage='result'):
     c = await scenario(registry_store, budgeted=True, completion_failure=stage)
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert c.state.prepared == c.state.dispatched == c.model.calls == c.host.reserve_calls == 1
+    assert c.state.prepared == c.state.dispatched == c.model.calls == 1
     assert c.state.lookups == 0
     assert c.runtime._managed_completions.pending_count() == 1
     return c, row
@@ -45,7 +45,7 @@ async def test_real_callback_exit_retained_across_storage_failures_and_exact_ret
     current = await c.manager.get_job(c.actor, row['job_id'])
     assert current.resource_state == 'stopped' and current.result_status == 'pending_delivery'
     assert current.result['display'] == 'Original effect completed'
-    assert c.state.prepared == c.state.dispatched == c.model.calls == c.host.reserve_calls == 1
+    assert c.state.prepared == c.state.dispatched == c.model.calls == 1
     assert c.state.lookups == 0
     with pytest.raises(JobError):
         await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
@@ -60,7 +60,7 @@ async def test_new_connection_restores_durable_checkpoint_without_runtime_or_bus
     reader = JobManager(await registry_store[1](schema="verify"))
     result = await restore_result(reader, c.actor, row['job_id'])
     assert await restore_result(reader, c.actor, row['job_id']) == result
-    assert c.state.lookups == 0 and c.model.calls == c.host.reserve_calls == c.state.dispatched == 1
+    assert c.state.lookups == 0 and c.model.calls == c.state.dispatched == 1
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq') == before
     # The original process must confirm its retained copy has been durably saved.
     assert c.runtime._managed_completions.pending_count() == 1
@@ -112,7 +112,7 @@ async def test_corrupt_or_wrong_generation_cannot_restore_original_result(regist
     with pytest.raises(JobError):
         await restore_result(c.manager, c.actor, row['job_id'])
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='result'", (row['job_id'],))
-    assert c.model.calls == c.host.reserve_calls == c.state.dispatched == 1 and c.state.lookups == 0
+    assert c.model.calls == c.state.dispatched == 1 and c.state.lookups == 0
 
 
 @pytest.mark.parametrize('fault', ['result', 'publication', 'result_ack'])
@@ -125,7 +125,7 @@ async def test_mechanical_result_repair_rolls_back_or_recalls_same_commit(regist
     assert len(results) == (1 if fault == 'result_ack' else 0)
     first = await restore_result(c.manager, c.actor, row['job_id'])
     assert await restore_result(c.manager, c.actor, row['job_id']) == first
-    assert c.model.calls == c.host.reserve_calls == c.state.dispatched == 1 and c.state.lookups == 0
+    assert c.model.calls == c.state.dispatched == 1 and c.state.lookups == 0
 
 
 async def test_parallel_readers_publish_only_one_original_result(registry_store):
@@ -134,7 +134,7 @@ async def test_parallel_readers_publish_only_one_original_result(registry_store)
     values = await asyncio.gather(*(restore_result(m, c.actor, row['job_id']) for m in readers))
     assert values[0] == values[1]
     assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='result'", (row['job_id'],))) == 1
-    assert c.model.calls == c.host.reserve_calls == c.state.dispatched == 1
+    assert c.model.calls == c.state.dispatched == 1
 
 
 async def test_foreign_actor_and_runtime_rebinding_cannot_use_retained_completion(registry_store):
@@ -206,7 +206,7 @@ async def test_invalid_callback_return_preserves_actual_exit_and_unknown_outcome
     result = json.loads(row['result_json'])
     assert result['managed_effect_pending'] and result['managed_effect_result'] is None
     assert len(result['display']) <= 32 and row['resource_state'] == 'stopped'
-    assert c.state.dispatched == c.model.calls == c.host.reserve_calls == 1 and c.state.lookups == 0
+    assert c.state.dispatched == c.model.calls == 1 and c.state.lookups == 0
     assert c.runtime._managed_completions.pending_count() == 0
 
 
@@ -224,7 +224,7 @@ async def test_durable_exit_can_publish_after_original_boot_and_job_leases_expir
     result = await restore_result(c.manager, c.actor, row['job_id'])
     assert result['owned_callback_exited'] and not result['execution_authority']
     assert (await c.manager.get_job(c.actor, row['job_id'])).result['display'] == 'Original effect completed'
-    assert c.model.calls == c.host.reserve_calls == c.state.dispatched == 1 and c.state.lookups == 0
+    assert c.model.calls == c.state.dispatched == 1 and c.state.lookups == 0
 
 
 @pytest.mark.parametrize('proof_kind', ['lookalike', 'false', 'different_result'])

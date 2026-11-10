@@ -19,9 +19,6 @@ async def busy(store, tx, session_id):
             return True
     if await tx.fetchone(f'SELECT source_id FROM {p}session_obligations WHERE session_id=? LIMIT 1', (session_id,)):
         return True
-    if await tx.fetchone(f'SELECT b.attempt_id FROM {p}jobs j JOIN {p}task_budget_attempts b ON b.job_id=j.job_id '
-                        "WHERE j.session_id=? AND (b.pending=1 OR b.phase NOT IN ('released','settling')) LIMIT 1", (session_id,)):
-        return True
     return False
 
 

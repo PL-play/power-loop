@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, ToolDefinition, ToolRegistry
-from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.managed_delivery import enqueue_runtime
 from power_loop.runtime.managed_effects import (
@@ -23,7 +22,6 @@ from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
 from .test_managed_delivery_192 import consume_notice
-from .test_model_budgets_192 import Host
 
 __all__=['registry_store']
 
@@ -35,14 +33,11 @@ pytestmark=[pytest.mark.unit,pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize('kind',['subagent','workflow_node'])
-@pytest.mark.parametrize('outcome',['known','unknown','missing_receipt','partial','exhausted'])
+@pytest.mark.parametrize('outcome',['known','unknown','missing_receipt','partial'])
 async def test_owned_effect_original_result_is_visible_without_replaying_action(registry_store,kind,outcome,*,provider=None):
     store,_=registry_store
     state=SimpleNamespace(main_calls=0,child_calls=0,prepared=0,executed=0,queries=0,resolved=False,raw_failed=False,raw_count=0)
-    manager,host=JobManager(store),Host()
-    if provider is not None:
-        from tests.real.test_real_budget_tree_192 import RealBudgetHost
-        host=RealBudgetHost()
+    manager=JobManager(store)
     class Model(LLMService):
         async def complete(self,request,**kwargs):
             if request.system_prompt.startswith('CHILD'):
@@ -70,10 +65,7 @@ async def test_owned_effect_original_result_is_visible_without_replaying_action(
             return response
         async def close(self):pass
     model=Model()
-    host.service=model
-    runtime=TaskRuntime(manager,tenant_id='owned',principal_id='host',executor_id='original',boot_id='boot',boot_contract_hash='c'*64,
-        budget_config=BudgetConfig('owned-v1',(LocalBudgetScope('shared',max_calls=12),
-            LocalBudgetScope('child',max_calls=1 if outcome=='exhausted' else 2,binding='owner',owner_kinds=('subagent','workflow_node'))),host))
+    runtime=TaskRuntime(manager,tenant_id='owned',principal_id='host',executor_id='original',boot_id='boot',boot_contract_hash='c'*64)
     async def prepare(context,arguments):
         assert arguments=={}
         state.prepared+=1
@@ -123,13 +115,9 @@ async def test_owned_effect_original_result_is_visible_without_replaying_action(
         if outcome=='unknown':
             state.resolved=True
             await reconcile(runtime,actor,effect['job_id'],adapter)
-        elif outcome in {'known','exhausted'}:
+        elif outcome=='known':
             assert effect['result_status']=='handled'
-            if outcome=='exhausted':
-                assert state.child_calls==1
-                [owner]=await manager.db.fetchall(f"SELECT outcome FROM {manager.jobs} WHERE kind=?",(kind,))
-                assert owner['outcome']=='failed'
-            assert host.reserve_calls==len(host.applied) and state.queries==0
+            assert state.queries==0
             return
         notice=await enqueue_runtime(runtime,actor,effect['job_id'])
         assert not notice['execution_authority'] and not notice['billing_settled']
@@ -139,6 +127,5 @@ async def test_owned_effect_original_result_is_visible_without_replaying_action(
         assert await store.load_all_messages(effect['session_id'])==original
         assert state.executed==state.prepared==expected_calls and state.queries==(1 if outcome=='unknown' else 0)
         assert (await manager.db.fetchone(f"SELECT COUNT(*) AS n FROM {manager.jobs} WHERE kind=?",(kind,)))['n']==1
-        assert host.reserve_calls==len(host.applied) and host.reserve_calls>0
     finally:
         await runner.aclose()

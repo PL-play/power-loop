@@ -17,7 +17,7 @@ async def require_stopped(manager, tx, row, model):
             or row["kind"] != "send"):
         raise JobError("model_exit_unconfirmed")
     from .model_attempts import require_quiescent
-    return await require_quiescent(manager, tx, row, include_budget=False)
+    return await require_quiescent(manager, tx, row)
 
 
 def historical_row(row, scope):

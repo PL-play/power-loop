@@ -17,7 +17,6 @@ from power_loop import (
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_types import TargetRef, TrustedActor
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.factory import open_store
@@ -25,8 +24,6 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.testing.db_session_ownership import DatabaseSessionOwnershipCoordinator
 from power_loop.tools import create_default_tool_registry
 from power_loop.tools.spawn_agent import register_spawn_agent
-
-from .test_model_budgets_192 import Host
 
 
 def report(**value):
@@ -52,9 +49,7 @@ async def main():
     register_jobs_tools(registry)
     async def hold():
         from power_loop.core.agent_context import get_session_id
-        from power_loop.runtime.task_runtime import _SEND
-        allocation = _SEND.get().resource_evidence['_control_allocation']
-        report(event='child_running', sid=get_session_id(), allocation_calls=allocation.calls, used_calls=allocation.used_calls)
+        report(event='child_running', sid=get_session_id())
         await gate.wait()
         return 'original tool completed'
     registry.register(ToolDefinition(name='hold', description='wait for test gate', interrupt='abort',
@@ -88,18 +83,9 @@ async def main():
         async def close(self):
             pass
 
-    model, host = Model(), Host()
-    class Provider(Host):
-        async def prepare_tool(self, context, call, *, pricing):
-            return None
-
-        async def prepare(self, context, logical_request, *, service):
-            return BudgetPlan(logical_request.max_tokens, {'attempt_id': context['attempt_id'], 'origin':context})
-    host = Provider()
-    config = BudgetConfig('p3-shared', (LocalBudgetScope('original-root', max_calls=50, binding='root'),
-        LocalBudgetScope('child', max_calls=2, binding='owner', owner_kinds=('subagent',))), host, max_pending=64)
+    model = Model()
     task_runtime = TaskRuntime(JobManager(store), tenant_id='tenant', principal_id='principal', executor_id=role, boot_id=role,
-        boot_contract_hash='a'*64, budget_config=config)
+        boot_contract_hash='a'*64)
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(model, registry, AgentLoopConfig(compactor=None,max_tokens=10), task_runtime=task_runtime)
@@ -131,8 +117,6 @@ async def main():
                 if command == 'release':
                     gate.set()
                     report(event='released')
-                elif command == 'budget':
-                    report(event='budget',plans=[g.request for g in []],reserved=host.reserve_calls,settled=host.apply_calls)
                 else:
                     data = json.loads(command)
                     receipt = await runtime.client.send(target,'control:'+json.dumps(data),message_id=data['id'],actor=actor)

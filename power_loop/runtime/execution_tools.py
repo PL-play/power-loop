@@ -121,7 +121,7 @@ async def prepare(pipeline, attempt):
                      "by_id": {e["call_id"]: e for e in entries}, "registrations": originals}
 
 
-async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None):
+async def dispatch(pipeline, name, arguments, registered, *, attempt=None):
     from .invocation import current_invocation
     from .task_runtime import _SEND
     from .tool_call_plans import identity, registration_value, start_id
@@ -148,15 +148,16 @@ async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None
     dispatched = binding.resource_evidence.setdefault("_control_dispatched_tools", set())
     if key in dispatched:
         raise JobError("tool_call_already_dispatched")
-    if budget_attempt is not None:
+    if attempt is not None:
         from .tool_attempts import authorize_dispatch
-        await authorize_dispatch(budget_attempt, None, job)
+        await authorize_dispatch(attempt, None, job)
     dispatched.add(key)
     if selected["recovery"] is not None:
         # A managed child must see the start before it can claim its own lease.
-        if budget_attempt is not None:
-            from .tool_attempts import observe_managed_free
-            await observe_managed_free(budget_attempt, None, job)
+        if attempt is not None:
+            from .tool_attempts import capture, finish
+            capture(attempt, None)
+            await finish(attempt)
         await control.checkpoint(force=True)
         return
     slot = binding.runtime._native_returns.reserve(binding, ref, plan, selected, plan_hash=owned["hash"])
@@ -193,8 +194,6 @@ async def prepare_attempt(binding, ref, call_id, registered, arguments):
     if control.get("attempt", key) is not None:
         raise JobError("tool_attempt_already_prepared")
     value = control.begin_attempt(key, "tool", prepared, control_only=control_only)
-    config = binding.runtime._original_budget_config
-    value["budget_required"] = not control_only and config is not None and callable(getattr(config.provider, "prepare_tool", None))
     control.record("attempt", key, value)
     return ToolAttempt(binding, key, prepared, PricedCall(registered.definition.name, arguments, job["execution_role"]), pricing, asyncio.current_task())
 
@@ -229,11 +228,3 @@ async def persist_return(runtime, slot):
     except BaseException:
         slot.failed = True
         raise
-
-
-async def persist_billing_receipt(runtime, slot):
-    cache = runtime._native_returns
-    cache.require(slot)
-    if slot.billing_receipt is None:
-        raise JobError("tool_billing_receipt_missing")
-    slot.billing_saved = True

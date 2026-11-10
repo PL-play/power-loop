@@ -20,7 +20,7 @@ async def test_original_prepare_failure_records_abort_and_retains_unprocessed_pe
                        expected_error='test_plan_' + stage)
     assert c.result.status == 'failed'
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.model.calls == 1
     # Original assistant calls remain queryable; no action can be replayed by
     # interpreting the absence of an obsolete admission checkpoint.
     raw = await c.store.load_all_messages(c.sid)

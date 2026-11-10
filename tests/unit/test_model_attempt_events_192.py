@@ -16,7 +16,6 @@ from power_loop import (
     LLMService,
     LLMTokenUsage,
 )
-from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -24,7 +23,6 @@ from power_loop.tools.spawn_agent import register_spawn_agent
 from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
-from .test_model_budgets_192 import Host
 
 __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -80,11 +78,9 @@ class Model(LLMService):
 
 
 @pytest.fixture
-async def event_case(registry_store, request):
+async def event_case(registry_store):
     store, _ = registry_store
-    mode = getattr(request, "param", "budget")
-    model, host, bus, events = Model(), Host(), AgentEventBus(), []
-    host.service = model
+    model, bus, events = Model(), AgentEventBus(), []
     bus.subscribe(None, lambda event: events.append(event))
     manager = JobManager(store)
     runtime = TaskRuntime(
@@ -95,9 +91,6 @@ async def event_case(registry_store, request):
             boot_id="boot",
             lease_ms=300000,
             boot_contract_hash="a" * 64,
-            budget_config=BudgetConfig("events", (LocalBudgetScope("shared", max_calls=10),), host)
-            if mode == "budget"
-            else None,
         )
     registry = ToolRegistry()
     register_spawn_agent(registry)
@@ -111,7 +104,7 @@ async def event_case(registry_store, request):
     ).start()
     try:
         yield SimpleNamespace(
-            store=store, manager=manager, runtime=runtime, model=model, host=host, loop=loop, bus=bus, events=events, mode=mode
+            store=store, manager=manager, runtime=runtime, model=model, loop=loop, bus=bus, events=events
         )
     finally:
         model.release.set()
@@ -125,7 +118,6 @@ def paired(c):
     return started, completed
 
 
-@pytest.mark.parametrize("event_case", ["tracked", "budget"], indirect=True)
 async def test_same_short_call_id_in_two_sends_does_not_reuse_the_durable_attempt_id(event_case):
     c = event_case
     sid = c.loop.target.session_id
@@ -138,10 +130,8 @@ async def test_same_short_call_id_in_two_sends_does_not_reuse_the_durable_attemp
     for event in started + completed:
         payload = event.data
         assert payload.model_attempt_store_id == c.store.store_id
-        assert payload.budget_managed == (c.mode == "budget")
         assert payload.model_attempt_generation == 1
-        job = await c.manager.get_job(c.runtime.actor(sid), payload.model_attempt_job_id)
-        assert job.session_id == sid and event.data.model_attempt_id in ids
+        assert event.session_id == sid and event.data.model_attempt_id in ids
     assert {e.data.model_attempt_id for e in completed} == set(ids)
 
 
@@ -160,7 +150,7 @@ async def test_failed_or_cancelled_wire_call_keeps_the_same_original_identity(ev
     await c.loop.finish(receipt.input_ref, failed=True)
     started, completed = paired(c)
     assert len(started) == 1 and started[0].data.model_attempt_id == completed[0].data.model_attempt_id
-    assert completed[0].data.model_attempt_id and completed[0].data.budget_managed
+    assert completed[0].data.model_attempt_id
     assert completed[0].data.success is False and completed[0].data.estimated is True
 
 
@@ -176,20 +166,7 @@ async def test_child_events_keep_their_own_job_and_sid_without_reusing_main_iden
     children = [e for e in completed if e.session_id != sid]
     assert len(children) == 1
     for event in completed:
-        job = await c.manager.get_job(c.runtime.actor(event.session_id), event.data.model_attempt_job_id)
-        assert job.session_id == event.session_id and event.data.model_attempt_store_id == c.store.store_id
-        assert event.data.budget_managed
-
-
-async def test_rejected_budget_has_no_fake_call_started_or_completed_event(event_case):
-    c = event_case
-    # The trusted test host returns a bound lower than the request output cap.
-    from power_loop.runtime.budget_contracts import BudgetPlan
-
-    async def invalid_bound(context, request, *, service):
-        return BudgetPlan(1, {"attempt_id": context["attempt_id"]})
-
-    c.host.prepare = invalid_bound
-    result = await c.loop.send("Must not dispatch")
-    assert result.status == "failed" and c.model.calls == 0
-    assert not [e for e in c.events if e.type in (AgentEventType.LLM_CALL_STARTED, AgentEventType.LLM_CALL_COMPLETED)]
+        assert event.data.model_attempt_store_id == c.store.store_id
+        if event.session_id != sid:
+            job = await c.manager.get_job(c.runtime.actor(event.session_id), event.data.model_attempt_job_id)
+            assert job.session_id == event.session_id

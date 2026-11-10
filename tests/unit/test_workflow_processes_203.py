@@ -115,8 +115,7 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             if automatic:
                 await event(a, "completed" if scenario == "auto_completed" else "continuing")
             else:
-                first = await event(a, "running")
-                assert first["calls"] == first["used"] == 1
+                await event(a, "running")
         if scenario == "unknown_leaf":
             a.kill()
             await a.wait()
@@ -186,10 +185,6 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
         assert len(nodes) == 2
         assert all(n["generation"] == (2 if automatic and n["title"] == "A" else 1)
                    and n["outcome"] == "succeeded" for n in nodes)
-        for process in (a, b):
-            await command(process, "budget")
-            budget = await event(process, "budget")
-            assert budget["reserved"] == budget["settled"] == (4 if automatic and process is a else 2)
         assert result.usage["calls"] == (6 if automatic else 4)
         if automatic:
             assert result.usage["total_tokens"] == 12

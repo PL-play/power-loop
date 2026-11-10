@@ -152,14 +152,11 @@ def main() -> int:
         "tests/unit/test_execution_membership_192.py",
         "tests/unit/test_workflow_result_delivery_192.py",
         "tests/unit/test_workflow_projection_atomic_192.py",
-        "tests/unit/test_workflow_continuation_budget_192.py",
         "tests/unit/test_completion_window_192.py",
         "tests/unit/test_inbox_atomicity_192.py",
         "tests/unit/test_request_shutdown_handoff_192.py",
         "tests/unit/test_finalization_192.py",
         "tests/unit/test_model_attempts_192.py",
-        "tests/unit/test_budget_contracts_192.py",
-        "tests/unit/test_model_budgets_192.py",
         "tests/unit/test_model_attempt_transport_192.py",
         "tests/unit/test_model_attempt_edges_192.py",
         "tests/unit/test_answer_freshness_192.py",
@@ -213,14 +210,12 @@ def main() -> int:
     scopes.append("tests/real/test_real_workflow_node_facade_192.py")
     scopes.append("tests/real/test_real_workflow_resources_192.py")
     scopes.append("tests/real/test_real_workflow_resource_profile_192.py")
-    scopes.append("tests/real/test_real_workflow_continuation_budget_192.py")
     scopes.append("tests/real/test_real_completion_window_192.py")
     scopes.append("tests/real/test_real_model_attempts_192.py")
     scopes.append("tests/real/test_real_send_receipt_192.py")
     scopes.append("tests/real/test_real_answer_freshness_192.py")
     scopes.append("tests/real/test_real_executor_registry_192.py")
     scopes.append("tests/real/test_real_executor_lifecycle_192.py")
-    scopes.append("tests/real/test_real_budget_tree_192.py")
     scopes.append("tests/real/test_real_timer_roles_192.py")
     scopes.append("tests/real/test_real_completion_windows_192.py")
     scopes.append("tests/real/test_real_inbox_atomicity_192.py")

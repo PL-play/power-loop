@@ -212,7 +212,6 @@ from power_loop.runtime.memory import (
     MemorySnapshot,
     tag_as_memory,
 )
-from power_loop.runtime.nested_tools import invoke_priced_tool
 from power_loop.runtime.notes import (
     DEFAULT_NOTES_POLICY,
     NoteMemory,
@@ -290,7 +289,6 @@ from power_loop.runtime.timer_backend import (
     timer_context,
 )
 from power_loop.runtime.timers import TimerRunner
-from power_loop.runtime.tool_billing import record_billing_receipt, tool_billing_active, tool_billing_managed
 from power_loop.runtime.tool_context import ToolContextConfig
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
@@ -591,10 +589,6 @@ __all__ = [
 	"get_effective_tools",
 	"ToolDefinition",
 	"ToolResult",
-	"record_billing_receipt",
-	"tool_billing_managed",
-	"tool_billing_active",
-	"invoke_priced_tool",
 	"validate_tool_args",
 	"ToolRegistry",
 	"AsyncToolInSyncContext",

@@ -163,7 +163,6 @@ class JobManager:
         # Explicit host bus: never leak task observations to the global default.
         self.event_bus = event_bus
         self._execution_controls = {}
-        self._live_budget_bindings = {}
         self._control_notifications = ContextVar("execution_control_notifications", default=None)
         self._control_retirements = ContextVar("execution_control_retirements", default=None)
         self._control_commit_hooks = ContextVar("execution_control_commit_hooks", default=None)
@@ -289,8 +288,6 @@ class JobManager:
                     from .control_runtime import current
                     current(binding).cancel_requested = True
                     current(binding).needs_reconciliation = True
-                    from .control_runtime import forget_budget_bindings
-                    forget_budget_bindings(binding)
         finally:
             self._control_commit_hooks.reset(hooks_token)
             self._control_rollback_hooks.reset(undo_token)

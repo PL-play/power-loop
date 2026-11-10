@@ -8,7 +8,7 @@ import asyncio
 import copy
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from .jobs import JobError, _hash, _json
@@ -57,80 +57,6 @@ class ExecutionIdentity:
         return _hash(asdict(self))
 
 
-@dataclass
-class LocalAllocation:
-    """One authority-owned, bounded allocation, never a new wallet balance."""
-    allocation_id: str
-    calls: int
-    tokens: int
-    max_inflight: int
-    used_calls: int = 0
-    used_tokens: int = 0
-    held_tokens: int = 0
-    inflight: int = 0
-    holds: dict[str, int] = field(default_factory=dict)
-    finished: dict[str, int] = field(default_factory=dict)
-    observed: dict[str, tuple[int | None, bool]] = field(default_factory=dict)
-    report_version: int = 0
-
-    def __post_init__(self):
-        if not self.allocation_id or any(type(v) is not int or v < 0
-                                        for v in (self.calls, self.tokens, self.max_inflight)):
-            raise JobError("invalid_execution_allocation")
-
-    def reserve(self, attempt_id: str, token_bound: int):
-        if type(token_bound) is not int or token_bound < 0:
-            raise JobError("invalid_execution_token_bound")
-        if attempt_id in self.holds or attempt_id in self.finished:
-            raise JobError("execution_attempt_already_admitted")
-        if self.used_calls >= self.calls:
-            raise JobError("budget_max_calls_exhausted")
-        if self.inflight >= self.max_inflight:
-            raise JobError("budget_max_inflight_exhausted")
-        if self.used_tokens + self.held_tokens + token_bound > self.tokens:
-            raise JobError("budget_max_tokens_exhausted")
-        self.used_calls += 1
-        self.inflight += 1
-        self.held_tokens += token_bound
-        self.holds[attempt_id] = token_bound
-
-    def observe(self, attempt_id: str, actual_tokens: int | None, *, returned=True):
-        if actual_tokens is not None and (type(actual_tokens) is not int or actual_tokens < 0):
-            raise JobError("invalid_execution_token_usage")
-        if attempt_id in self.observed:
-            if self.observed[attempt_id] != (actual_tokens, returned):
-                raise JobError("execution_usage_conflict")
-            return
-        if attempt_id not in self.holds:
-            raise JobError("execution_allocation_hold_missing")
-        bound = self.holds[attempt_id]
-        # Real usage must be recorded even when a provider exceeds its bound.
-        if actual_tokens is not None:
-            self.used_tokens += actual_tokens
-            self.held_tokens -= bound
-        if returned:
-            self.inflight -= 1
-        if actual_tokens is not None and returned:
-            self.holds.pop(attempt_id)
-            self.finished[attempt_id] = actual_tokens
-        self.observed[attempt_id] = (actual_tokens, returned)
-
-    def release_unstarted(self, attempt_id):
-        if attempt_id in self.observed or attempt_id not in self.holds:
-            raise JobError("budget_release_not_permitted")
-        self.used_calls -= 1
-        self.held_tokens -= self.holds.pop(attempt_id)
-        self.inflight -= 1
-        # A released identity is never a new admission key.
-        self.finished[attempt_id] = 0
-
-    def summary(self):
-        return {key: getattr(self, key) for key in (
-            "allocation_id", "calls", "tokens", "max_inflight", "used_calls",
-            "used_tokens", "held_tokens", "inflight",
-        )}
-
-
 class ExecutionState:
     """Memory reducer and checkpoint coordinator for one admitted owner.
 
@@ -160,10 +86,7 @@ class ExecutionState:
         self.tools = 0
         self.completed = 0
         self.unknown = 0
-        self.budget_attempts = 0
-        self.budget_unsettled = 0
         self.active: dict[str, dict[str, Any]] = {}
-        self.allocations: dict[str, LocalAllocation] = {}
         self._records: dict[tuple[str, str], dict] = {}
         self._dirty: dict[tuple[str, str], dict] = {}
         self._dirty_sizes: dict[tuple[str, str], int] = {}
@@ -205,11 +128,6 @@ class ExecutionState:
             return False
         if old is not None and kind.endswith("_immutable"):
             raise JobError("execution_record_conflict")
-        if kind == "budget":
-            def unsettled(item):
-                return item is not None and (item["pending"] or item["phase"] not in ("released", "settling") or item["ack"] is None)
-            self.budget_attempts += old is None
-            self.budget_unsettled += int(unsettled(value)) - int(unsettled(old))
         self._records[identity] = value
         self._dirty[identity] = {"kind": kind, "key": key, "value": value}
         self._dirty_bytes += len(encoded.encode()) - self._dirty_sizes.get(identity, 0)
@@ -299,9 +217,7 @@ class ExecutionState:
                 "inflight": len(self.active), "closed": self.closed,
                 "cancel_requested": self.cancel_requested,
                 "needs_reconciliation": self.needs_reconciliation,
-                "pending_obligations": len(self.pending_obligations),
-                "budget_attempts": self.budget_attempts, "budget_unsettled": self.budget_unsettled,
-                "allocations": [a.summary() for a in self.allocations.values()]}
+                "pending_obligations": len(self.pending_obligations)}
 
     def due(self):
         return bool(self._dirty) and (
@@ -406,7 +322,7 @@ class ExecutionState:
         for key, value in list(self.active.items()):
             if value["phase"] == "prepared":
                 self.abort_prepared(key)
-        self.needs_reconciliation |= bool(self.active or self.unknown or any(a.holds for a in self.allocations.values()))
+        self.needs_reconciliation |= bool(self.active or self.unknown)
         self.record("lifecycle", "close", {"closed": True,
                     "needs_reconciliation": self.needs_reconciliation})
         # A previous failed flush may be followed by late observations. Commit

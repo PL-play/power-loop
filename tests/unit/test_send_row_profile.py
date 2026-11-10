@@ -62,25 +62,11 @@ async def _events(db, table):
 @pytest.mark.parametrize("r,k", [(1, 0), (4, 1), (32, 1), (32, 4)])
 async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
     store, _ = registry_store
-    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
-    from power_loop.runtime.response_capture import ResponseCaptureReceipt
-    from tests.unit.test_model_budgets_192 import Host
-    host = Host()
-
-    async def capture(packet):
-        return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
-
-    async def tool_plan(context, call, *, pricing):
-        return None
-    host.capture_response, host.prepare_tool = capture, tool_plan
-    config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=100000, max_tokens=10000000,
-                                                           max_inflight=64),), host)
     original_db = store._db
     meter = await WriteMeter.install(original_db, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
     store._db = profiled = Profiled(original_db, meter)
     runtime = TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host", executor_id=f"rows-{r}-{k}",
-                          boot_id="boot", lease_ms=300000, boot_contract_hash="a" * 64,
-                          budget_config=config if budgeted else None)
+                          boot_id="boot", lease_ms=300000, boot_contract_hash="a" * 64)
     registry = ToolRegistry()
 
     async def echo(text):
@@ -106,7 +92,6 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
             pass
 
     model = Model()
-    host.service = model
     agent = await RunningAgent(store, model, registry,
         AgentLoopConfig(max_rounds=r + 1, max_tokens=20, compactor=None,
                         delegation_policy="single_level"), task_runtime=runtime).start()
@@ -141,11 +126,8 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
                                     "budgeted": budgeted, "tables": delta, "job_events": ev,
                                     "sql": sql, "transactions": len(tx_sites), "records": records, "tx_sites": tx_sites,
                                     "writes": writes, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
-        assert delta.get('task_budget_attempts', (0, 0))[0] == 0
-        assert largest.get('task_budget_attempts', 0) == 0
         assert after.get('execution_batches', (0, 0))[0] == 0
-        assert after['execution_checkpoints'][0] == 0
-        assert after['execution_allocations'][0] == 0 and after['task_budget_attempts'][0] == 0
+        assert after.get('execution_checkpoints', (0, 0))[0] == 0
     finally:
         await runtime.shutdown(timeout_s=1)
         await agent.aclose()

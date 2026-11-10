@@ -13,7 +13,6 @@ from power_loop.runtime.execution_state import (
     CheckpointPolicy,
     ExecutionIdentity,
     ExecutionState,
-    LocalAllocation,
 )
 from power_loop.runtime.jobs import JobError
 
@@ -284,22 +283,6 @@ async def test_local_lease_expiry_blocks_admission_but_not_original_observation(
         state.begin_attempt("expired", "tool", {})
     assert state.observe("original", {"status": "returned", "usage": {"total_tokens": 13}})
     await state.close()
-
-
-async def test_allocation_never_refunds_unknown_or_invents_capacity():
-    allowance = LocalAllocation("authority-grant", calls=2, tokens=100, max_inflight=2)
-    allowance.reserve("unknown", 40)
-    allowance.reserve("known", 50)
-    allowance.observe("known", 12)
-    assert allowance.held_tokens == 40
-    assert allowance.used_calls == 2
-    with pytest.raises(JobError, match="max_calls_exhausted"):
-        allowance.reserve("extra", 1)
-    allowance.observe("known", 12)
-    assert allowance.used_tokens == 12
-    with pytest.raises(JobError, match="usage_conflict"):
-        allowance.observe("known", 13)
-
 
 
 

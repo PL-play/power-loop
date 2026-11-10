@@ -13,7 +13,6 @@ import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 
 from .invocation import current_invocation
 from .jobs import JobActor, JobError, JobLease, JobManager, JobRegistration
@@ -124,16 +123,6 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         async with manager._write() as tx:
             await _source(manager, tx, execution.actor, execution.lease, ref, call_id)
         return registered
-    from .execution_budget import check
-    policy = check(execution)
-    if policy is not None:
-        from power_loop.tools.registry import validate_pricing
-
-        from .pricing import Free
-        pricing = validate_pricing(registered)
-        tool_port = callable(getattr(execution.runtime.budget_config.provider, 'prepare_tool', None))
-        if (not declared.native_admitted and not tool_port) or (not isinstance(pricing, Free) and not tool_port):
-            raise JobError("budget_tool_adapter_unavailable:" + tool_name)
     await check_dispatch(session_id, invocation=current_invocation(session_id))
     return registered
 
@@ -226,7 +215,6 @@ class TaskRuntime:
         boot_id: str,
         lease_ms: int = 30000,
         boot_contract_hash: str | None = None,
-        budget_config=None,
         require_host_send_steps: bool = False,
         checkpoint_policy=None,
     ):
@@ -238,14 +226,6 @@ class TaskRuntime:
         if type(require_host_send_steps) is not bool:
             raise JobError("invalid_host_send_step_requirement")
         self.require_host_send_steps = self._original_host_step_requirement = require_host_send_steps
-        if budget_config is not None:
-            from .budget_contracts import BudgetConfig
-
-            if type(budget_config) is not BudgetConfig or boot_contract_hash is None:
-                raise JobError("budget_runtime_requires_trusted_boot")
-        self.budget_config = budget_config
-        self._original_budget_config = budget_config
-        self._budget_handles = {}
         from .execution_state import CheckpointPolicy
         if checkpoint_policy is not None and type(checkpoint_policy) is not CheckpointPolicy:
             raise JobError("invalid_checkpoint_policy")
@@ -377,47 +357,6 @@ class TaskRuntime:
         if self._lifecycle is None:
             raise JobError("executor_lifecycle_not_configured")
         return self._completion_status(await self._lifecycle.status())
-
-    async def reconcile_budget_usage(self, session_id, *, job_id, attempt_id):
-        """Replay frozen usage, or release an expired send's unfrozen fees.
-
-        This control operation does not start a boot, admit a model request,
-        reconstruct an Execution, or settle a job's supervision. Unknown usage
-        is discarded after closing the expired execution, per design 200.
-        """
-        from .model_budgets import reconcile_usage
-        return await reconcile_usage(self, self.actor(session_id), job_id, attempt_id)
-
-    async def release_unstarted_budget(self, session_id, *, job_id, attempt_id, require_cancelled=False):
-        """Recover an original unstarted reservation without an execution lease.
-
-        Atomically prevents original dispatch before any host release. A host
-        failure retains the original pending reservation for a later retry.
-        Automatic scanners must set require_cancelled=True: an unsealed attempt
-        then requires persisted cancellation of itself or an ancestor. Timeouts,
-        missing heartbeats and a new controller are not cancellation evidence.
-        """
-        from .model_budgets import release_unstarted
-        return await release_unstarted(self, self.actor(session_id), job_id, attempt_id,
-                                       require_cancelled=require_cancelled)
-
-    async def stage_budget_usage_revision(self, session_id, *, job_id, attempt_id, expected_revision, evidence):
-        """Trusted host stages one original-attempt revision; no provider I/O.
-
-        On conflict the collector must retain its source evidence and reconcile;
-        rejection is not acceptance. Resume with reconcile_budget_usage.
-        """
-        from .budget_revisions import stage
-        return await stage(self, self.actor(session_id), job_id, attempt_id,
-                           expected_revision=expected_revision, evidence=evidence)
-
-    def budget_control_tasks(self):
-        """Original live HTTP/preparation tasks, retained even after waiter cancellation.
-
-        Control-only hosts may wait/cancel these during their bounded shutdown;
-        task exit does not prove remote rollback or billing settlement.
-        """
-        return tuple(task for task in self._budget_handles.values() if not task.done())
 
     def track_task(self, task, *, cancel_token=None, job_id=None):
         if not isinstance(task, asyncio.Task):
@@ -586,13 +525,9 @@ class TaskRuntime:
             if step is not None:
                 request[FIELD] = step
         from .model_attempts import enable
-        from .model_budgets import flush_observed_controls
 
         await self.ensure_started()
         self.check_local_admission()
-        await flush_observed_controls(SimpleNamespace(runtime=self))
-        from .budget_policy_sources import PolicySourceChanged
-        from .budget_policy_sources import prepared as prepare_policy
         lightweight = (owner is None and not input_start.child_job_id
                        and input_start.record.meta["operation"] == "send")
         if lightweight:
@@ -605,43 +540,33 @@ class TaskRuntime:
                 await input_start.bind(tx, binding)
         else:
             # Registration, claim and control admission commit together or not at all.
-            policy_source = None
-            while True:
-                try:
-                    async with prepare_policy(self, source=policy_source), self.manager.joined_write():
-                        tx = self.manager._joined_write.get()
-                        await input_start.prepare(tx)
-                        if input_start.child_job_id:
-                            owner = await input_start.claim_owner(self, tx)
-                        if self.budget_config is None:
-                            from .executor_registry import ExecutorIdentity, admit_unbudgeted
-                            await admit_unbudgeted(self.manager, tx,
-                                ExecutorIdentity(self.tenant_id, self.principal_id, self.executor_id, self.boot_id),
-                                required=self._lifecycle is not None)
-                        else:
-                            from .budget_admissions import enter
-                            await enter(self, tx)
-                        registration = await self.manager.register_job(
-                            registering_actor,
-                            kind="send",
-                            session_id=sid,
-                            parent=owner.lease if owner else None,
-                            system_key=system_key,
-                            request=request,
-                            fresh=True,
-                        )
-                        if registration.replayed:
-                            # No automatic replay of a possibly side-effecting pending attempt.
-                            raise JobError("task_send_requires_reconciliation")
-                        binding = await self.claim(actor, registration)
-                        await input_start.bind(tx, binding)
-                        binding.resource_evidence["_control_registered_payload"] = registration.operation.result
-                        if input_start.record.meta["operation"] == "resume":
-                            binding.resource_evidence["explicit_resume"] = True
-                        await enable(binding)
-                    break
-                except PolicySourceChanged as changed:
-                    policy_source = changed.source
+            async with self.manager.joined_write():
+                tx = self.manager._joined_write.get()
+                await input_start.prepare(tx)
+                if input_start.child_job_id:
+                    owner = await input_start.claim_owner(self, tx)
+                from .executor_registry import ExecutorIdentity, admit_unbudgeted
+                await admit_unbudgeted(self.manager, tx,
+                    ExecutorIdentity(self.tenant_id, self.principal_id, self.executor_id, self.boot_id),
+                    required=self._lifecycle is not None)
+                registration = await self.manager.register_job(
+                    registering_actor,
+                    kind="send",
+                    session_id=sid,
+                    parent=owner.lease if owner else None,
+                    system_key=system_key,
+                    request=request,
+                    fresh=True,
+                )
+                if registration.replayed:
+                    # No automatic replay of a possibly side-effecting pending attempt.
+                    raise JobError("task_send_requires_reconciliation")
+                binding = await self.claim(actor, registration)
+                await input_start.bind(tx, binding)
+                binding.resource_evidence["_control_registered_payload"] = registration.operation.result
+                if input_start.record.meta["operation"] == "resume":
+                    binding.resource_evidence["explicit_resume"] = True
+                await enable(binding)
         input_start.committed()
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         failure = None
@@ -667,12 +592,10 @@ class TaskRuntime:
             if last is not None:
                 evidence["last_assistant_ref"] = last.to_dict()
             consumed = ()
-            if binding.resource_evidence.get("_lightweight_hold"):
-                from .lightweight_budget import settle
-                await settle(binding)
             if binding.resource_evidence.get("lightweight"):
                 from .lightweight_send import remember_result
-                remember_result(loop, input_start.context.input_ref, input_start.public_result(evidence))
+                remember_result(loop, input_start.context.input_ref,
+                                input_start.public_result(evidence), evidence)
             if ((not binding.resource_evidence.get("lightweight") or binding.resource_evidence.get("upgraded"))
                     and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass")):
                 from .result_consumption import finish

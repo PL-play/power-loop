@@ -52,20 +52,10 @@ async def scenario(
     expected_error=None,
     call_names=None,
     argument_text="hello",
-    max_calls=2,
 ):
     store, _ = registry_store
     manager = JobManager(store)
-    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
-
-    from .test_model_budgets_192 import Host
-
-    host = Host() if budgeted else None
-    budget = (
-        BudgetConfig("test-budget", (LocalBudgetScope("test", max_calls=max_calls, max_tokens=200, max_inflight=1),), host)
-        if host
-        else None
-    )
+    host = None
     runtime = TaskRuntime(
         manager,
         tenant_id="api-effect-test",
@@ -73,7 +63,6 @@ async def scenario(
         executor_id="executor",
         boot_id="boot",
         boot_contract_hash="b" * 64 if budgeted else None,
-        budget_config=budget,
     )
     fault = None
     if unstarted_failure is not None:
@@ -210,8 +199,6 @@ async def scenario(
             pass
 
     model = Model()
-    if host:
-        host.service = model
     loop = await RunningAgent(store, model, registry,
         AgentLoopConfig(max_rounds=3, model='test-model', max_tokens=20, compactor=None,
             **({'tool_result_max_chars':capacity} if capacity is not None else {})),
@@ -280,7 +267,7 @@ async def test_unknown_api_outcome_stops_another_model_and_can_be_queried(regist
 async def test_actual_budget_policy_admits_only_the_sdk_bound_api_handler(registry_store, pending):
     c = await scenario(registry_store, budgeted=True, pending=pending)
     assert c.state.prepared == c.state.dispatched == 1
-    assert c.host.reserve_calls == c.model.calls == (1 if pending else 2)
+    assert c.model.calls == (1 if pending else 2)
     [child] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     assert json.loads(child["result_json"])["usage"] == {}
 
@@ -289,7 +276,7 @@ async def test_a_name_lookalike_does_not_receive_native_budget_permission(regist
     c = await scenario(registry_store, budgeted=True, fake_handler=True)
     assert c.state.prepared == c.state.dispatched == 0
     assert not await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert c.host.reserve_calls == c.model.calls == 2
+    assert c.model.calls == 2
 
 
 async def test_failed_preparation_is_known_not_dispatched_and_does_not_stick_pending(registry_store):
@@ -469,7 +456,7 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
 
     c = await scenario(registry_store, budgeted=True, claim_failure=True)
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
-    assert c.model.calls == c.host.reserve_calls == 2
+    assert c.model.calls == 2
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     assert row["generation"] == 0 and row["resource_state"] == "stopped"
     assert row["result_status"] == "suppressed" and row["supervision_status"] == "closed"
@@ -498,7 +485,7 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
         )
         == raw
     )
-    assert c.state.dispatched == 0 and c.model.calls == c.host.reserve_calls == 2
+    assert c.state.dispatched == 0 and c.model.calls == 2
 
 
 
@@ -543,7 +530,7 @@ async def test_retained_original_row_is_rebound_after_storage_failure_without_re
 
     c = await scenario(registry_store, budgeted=True, claim_failure=unclaimed, receipt_bind_failure=True)
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.model.calls == 1
     with pytest.raises(JobError, match="evidence_missing"):
         await read_raw_receipt(c.manager, c.actor, row["job_id"])
     before = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq")
@@ -554,7 +541,7 @@ async def test_retained_original_row_is_rebound_after_storage_failure_without_re
     assert await reconcile_raw_receipt(restored, c.actor, row["job_id"]) == observed
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq") == before
     assert c.state.dispatched == (0 if unclaimed else 1) and c.state.lookups == 0
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.model.calls == 1
     current = await c.manager.get_job(c.actor, row["job_id"])
     assert current.result_status == ("none" if unclaimed else "handled")
 

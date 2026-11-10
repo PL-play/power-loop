@@ -99,8 +99,6 @@ async def _finish(manager, tx, row, seen):
         raise JobError("finalization_result_unsettled")
     if row["supervision_status"] == "closed":
         return _event_reference(event)
-    from .model_budgets import require_quiescent
-    await require_quiescent(manager, tx, row)
     if row["kind"] == "send":
         from .pending_calls import SNAPSHOT, require_disposition
         payload = json.loads(event["payload_json"])
@@ -131,8 +129,7 @@ async def _finish(manager, tx, row, seen):
         raise JobError("finalization_execution_changed")
     tx.remember_row(manager.jobs, "job_id", row["job_id"],
         {**row, "supervision_status": "closed", "version": row["version"] + 1, "updated_at": now})
-    for table in ("execution_checkpoints", "execution_allocations", "task_budget_attempts"):
-        await tx.execute(f"DELETE FROM {manager.prefix}{table} WHERE job_id=?", (row["job_id"],))
+    await tx.execute(f"DELETE FROM {manager.prefix}execution_checkpoints WHERE job_id=?", (row["job_id"],))
     return _event_reference(event)
 
 

@@ -61,7 +61,7 @@ async def test_pending_retires_only_for_actual_review_and_raw_messages_remain_or
         assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.messages} WHERE id=?', (message['id'],)) == message
     assert not await c.manager.db.fetchall(f"SELECT id FROM {c.store.t.messages} WHERE role='tool'")
     assert c.state.dispatched == c.state.prepared == c.model.calls == reviewer.calls == 1
-    assert c.state.lookups == 0 and c.host.reserve_calls == 2
+    assert c.state.lookups == 0
 
 
 
