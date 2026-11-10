@@ -752,11 +752,9 @@ class _ExecutionLoop:
         from power_loop.runtime.session_ownership import _CURRENT
         period = _CURRENT.get()
         pending = getattr(None if period is None else period.lease, "pending_json", None)
-        # An ordinary unbilled turn already read pending_json while taking the
-        # session. Empty means there is no tool call to close and no task row.
-        if (period is not None and hasattr(period.lease, "pending_json")
-                and getattr(getattr(self, "task_runtime", None), "budget_config", None) is None
-                and not pending):
+        # An ordinary turn already read pending_json while taking the session.
+        # Empty means there is no tool call to close and no task row to scan.
+        if period is not None and hasattr(period.lease, "pending_json") and not pending:
             return 0
         store = await self._ensure_store()
         state = await store.state_snapshot(sid)

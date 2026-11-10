@@ -287,6 +287,12 @@ async def reserve(attempt, logical_request, *, service=None, pricing=None):
     binding = attempt.binding
     control = current(binding)
     control.require_admission()
+    if (binding.runtime.budget_config is not None
+            and binding.resource_evidence.get("lightweight")
+            and not binding.resource_evidence.get("upgraded")
+            and binding.resource_evidence.get("_control_budget_policy") is None):
+        from .lightweight_budget import install_local_policy
+        install_local_policy(binding)
     policy = check(binding)
     if policy is None:
         return False
@@ -319,7 +325,11 @@ async def reserve(attempt, logical_request, *, service=None, pricing=None):
         # host intent must then form one local choice against that closer.
         if control.get("budget", attempt.attempt_id) is not None:
             raise JobError("budget_attempt_already_reserved")
-        allocation_id = await allocate(binding, plan.token_bound, attempt.attempt_id)
+        if binding.resource_evidence.get("lightweight") and not binding.resource_evidence.get("upgraded"):
+            from .lightweight_budget import hold
+            allocation_id = await hold(binding, plan.token_bound)
+        else:
+            allocation_id = await allocate(binding, plan.token_bound, attempt.attempt_id)
         state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
             policy_key=policy["policy_key"], context=context, plan=asdict(plan), plan_hash=plan.request_hash,
             phase="host_reserving", pending=True, started_at_ms=binding.runtime.manager.now(),
@@ -359,6 +369,9 @@ def authorize(attempt):
 
 async def observe(attempt, observation):
     from . import model_budgets as budgets
+    if attempt.binding.resource_evidence.get("_lightweight_hold") and not attempt.binding.resource_evidence.get("upgraded"):
+        from .lightweight_budget import record_usage
+        return await record_usage(attempt, observation)
     if check(attempt.binding) is None:
         return
     binding, control = attempt.binding, current(attempt.binding)

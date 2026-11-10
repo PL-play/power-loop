@@ -593,7 +593,7 @@ class TaskRuntime:
         await flush_observed_controls(SimpleNamespace(runtime=self))
         from .budget_policy_sources import PolicySourceChanged
         from .budget_policy_sources import prepared as prepare_policy
-        lightweight = (self.budget_config is None and owner is None and not input_start.child_job_id
+        lightweight = (owner is None and not input_start.child_job_id
                        and input_start.record.meta["operation"] == "send")
         if lightweight:
             from .lightweight_send import open_lightweight
@@ -667,6 +667,9 @@ class TaskRuntime:
             if last is not None:
                 evidence["last_assistant_ref"] = last.to_dict()
             consumed = ()
+            if binding.resource_evidence.get("_lightweight_hold"):
+                from .lightweight_budget import settle
+                await settle(binding)
             if binding.resource_evidence.get("lightweight"):
                 from .lightweight_send import remember_result
                 remember_result(loop, input_start.context.input_ref, input_start.public_result(evidence))

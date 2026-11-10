@@ -128,9 +128,11 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             scope_key {small} PRIMARY KEY, policy_key {small} NOT NULL,
             limits_hash {small} NOT NULL, limits_json {body} NOT NULL, counters_hash {small} NOT NULL, counters_json {body} NOT NULL){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {prefix}task_budget_attempts (
-            attempt_id {small} PRIMARY KEY, job_id {small} NOT NULL, policy_key {small} NOT NULL,
+            attempt_id {small} PRIMARY KEY, job_id {small}, execution_id {body},
+            tenant_id {sid}, principal_id {sid}, session_id {sid},
+            policy_key {small} NOT NULL,
             version {integer} NOT NULL, phase {small} NOT NULL, pending INTEGER NOT NULL,
-            state_hash {small} NOT NULL, state_json {body} NOT NULL,
+            state_hash {small} NOT NULL, state_json {body} NOT NULL, root_context_json {body},
             created_at {integer} NOT NULL, updated_at {integer} NOT NULL){opts}""",
         *control_tables_ddl(name, prefix),
         f"""CREATE TABLE IF NOT EXISTS {prefix}session_controls (
@@ -264,12 +266,17 @@ async def _verify_task_schema_tx(tx, db, prefix):
         "task_budget_attempts": {
             "attempt_id",
             "job_id",
+            "execution_id",
+            "tenant_id",
+            "principal_id",
+            "session_id",
             "policy_key",
             "version",
             "phase",
             "pending",
             "state_hash",
             "state_json",
+            "root_context_json",
             "created_at",
             "updated_at",
         },
@@ -293,7 +300,7 @@ async def _verify_task_schema_tx(tx, db, prefix):
     await _verify_query_indexes(tx, db, prefix)
     for table, columns in (
         ("execution_checkpoints", ("job_id", "generation", "batch_no", "summary_json")),
-        ("execution_allocations", ("allocation_id", "job_id", "generation", "state_json", "state_hash")),
+        ("execution_allocations", ("allocation_id", "execution_id", "job_id", "generation", "state_json", "state_hash")),
         ("session_controls", ("session_id", "version")),
     ):
         for column in columns:

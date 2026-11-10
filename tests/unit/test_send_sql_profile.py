@@ -172,6 +172,10 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
                        "transactions": transactions, "tx_sites": tx_sites, "elapsed_s": elapsed_s,
                        "records": records}, f)
     counts = _counts(records, tx_sites)
+    # Heartbeats and timer scans follow wall time, not the send. A send longer
+    # than one second may also refresh the session activity time once.
+    foreground = [r for r in records if not _executor_heartbeat(r["chain"])
+                  and not any(site.startswith("runtime.timers:") for site in r["chain"])]
     if not budgeted:
         assert counts["billing"] == 0
         # Ordinary unbilled turn: 14 statements. MySQL needs one extra read to
@@ -179,11 +183,21 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
         # only its message writes.
         base = 16 if dialect == "mysql" else 14
         per_round = 6 if dialect == "mysql" else 4
-        # A send longer than one second may refresh the session's activity time once.
-        activity = [r for r in records if " SET updated_at=" in r["sql"]]
+        activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
         assert len(activity) <= 1
-        assert len(records) - len(activity) <= base + per_round * (models - 1), (
-            dialect, models, len(records), len(activity))
+        assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
+            dialect, models, len(foreground), len(activity))
+    else:
+        # Ordinary billed turn: the unbilled statements plus one reservation
+        # and one settlement. MySQL's extra reads are already in its base.
+        # A tool round still adds only its message writes.
+        base = 21 if dialect == "mysql" else 19
+        per_round = 6 if dialect == "mysql" else 4
+        activity = [r for r in foreground if " SET updated_at=" in r["sql"]
+                    and "task_budget_" not in r["sql"]]
+        assert len(activity) <= 1
+        assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
+            dialect, models, len(foreground), len(activity))
 
 
 
