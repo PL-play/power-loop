@@ -749,6 +749,15 @@ class _ExecutionLoop:
 
     async def _interrupt_pending(self, sid: str) -> int:
         """Reuse the send-entry snapshot; only stale pending causes writes."""
+        from power_loop.runtime.session_ownership import _CURRENT
+        period = _CURRENT.get()
+        pending = getattr(None if period is None else period.lease, "pending_json", None)
+        # An ordinary unbilled turn already read pending_json while taking the
+        # session. Empty means there is no tool call to close and no task row.
+        if (period is not None and hasattr(period.lease, "pending_json")
+                and getattr(getattr(self, "task_runtime", None), "budget_config", None) is None
+                and not pending):
+            return 0
         store = await self._ensure_store()
         state = await store.state_snapshot(sid)
         cached = self._session_cache.get(sid)
@@ -1558,6 +1567,8 @@ class _ExecutionLoop:
             changes, changes_token = store.begin_polling(sid)
             try:
                 async def _drain_follow_ups(*, force=False) -> list[LoopMessage]:
+                    if force and getattr(self, "_lightweight_turn", False):
+                        force = False
                     await changes.refresh(force=force)
                     return await self._drain_follow_up_messages(sid)
 

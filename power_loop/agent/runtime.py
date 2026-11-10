@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from power_loop.agent.types import AgentLoopConfig
-from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 
 from .runtime_client import RuntimeClient
 from .runtime_transport import MemoryMessageTransport
@@ -113,12 +112,10 @@ class Runtime:
         self.required_profiles = frozenset(required_profiles)
         self.hooks, self.hook_timeout_s = hooks, hook_timeout_s
         self.node_id, self.boot_id, self.namespace = node_id, boot_id, namespace
-        # A shared runtime needs a lock every node can see. The database lock is
-        # the default; pass coordinator= to use another shared service instead.
+        # The database lock is the default. Pass coordinator= for another service.
         if coordinator is None:
             from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
-            coordinator = (StoreSessionOwnershipCoordinator(store) if shared_execution
-                           else MemorySessionOwnershipCoordinator())
+            coordinator = StoreSessionOwnershipCoordinator(store)
         self.coordinator = coordinator
         self.transport = transport or MemoryMessageTransport()
         shared_lock = coordinator is None or getattr(coordinator, "scope", "process") == "shared"

@@ -83,6 +83,8 @@ async def admit(loop, binding, actor, *, kind, title, descriptor, options, body,
     input_ref = InputRef(port.store.store_id, sid, "start_" + key[:32])
     async with manager.joined_write() as tx:
         await port.lock_owned(tx, TargetRef(port.store.store_id, actor.session_id), loop._runtime_worker_context)
+        from power_loop.runtime.lightweight_send import upgrade
+        await upgrade(binding, tx)
         await manager._fence(tx, binding.actor, binding.lease)
         if system_key is None:
             await manager._validate_call(tx, binding.actor, actor.call_ref, actor.tool_call_id)

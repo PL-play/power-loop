@@ -430,12 +430,23 @@ class SessionStore:
 
     async def get_session(self, session_id: str) -> SessionRow | None:
         holding = self._holding(session_id)
+        cached = getattr(self, "_cached_sessions", {}).get(session_id)
+        if cached is not None:
+            if holding.touched < cached.updated_at:
+                holding.touched = cached.updated_at
+            return cached
         row = await self._db.fetchone(
             f"SELECT * FROM {self.t.sessions} WHERE session_id=?", (session_id,)
         )
-        if row:
-            holding.touched = row["updated_at"]
-        return _row_to_session(row) if row else None
+        value = _row_to_session(row) if row else None
+        if value is not None:
+            if holding.touched < value.updated_at:
+                holding.touched = value.updated_at
+            sessions = getattr(self, "_cached_sessions", None)
+            if sessions is None:
+                self._cached_sessions = sessions = {}
+            sessions[session_id] = value
+        return value
 
     @contextlib.asynccontextmanager
     async def send_read_scope(self, session_id, *, ownership=None):
@@ -452,6 +463,11 @@ class SessionStore:
         try:
             yield snapshot
         finally:
+            if snapshot.next_seq is not None:
+                sequences = getattr(self, "_next_seqs", None)
+                if sequences is None:
+                    self._next_seqs = sequences = {}
+                sequences[session_id] = snapshot.next_seq
             snapshot.retire()
             if self._session_holdings.get(session_id) is snapshot:
                 del self._session_holdings[session_id]
@@ -1556,10 +1572,15 @@ class SessionStore:
                 return
             current = _loads(row["metadata_json"]) or {}
             current.update(patch)
+            updated = _now_ms()
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET metadata_json=?, updated_at=? WHERE session_id=?",
-                (_dumps(current), _now_ms(), session_id),
+                (_dumps(current), updated, session_id),
             )
+            cached = getattr(self, "_cached_sessions", {}).get(session_id)
+            if cached is not None:
+                cached.metadata = dict(current)
+                cached.updated_at = updated
 
     # ── timers (durable wake-ups; see runtime/timers.py) ──────────────────
 

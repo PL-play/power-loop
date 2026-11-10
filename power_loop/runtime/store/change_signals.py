@@ -35,8 +35,9 @@ class ChangeReader:
 
     async def refresh(self, *, force=False):
         snapshot = self.store._holding(self.session_id).change_snapshot
-        if not force and snapshot is not None and snapshot[0] != self.snapshot_seq:
-            self.snapshot_seq, self.versions = snapshot
+        if not force and snapshot is not None:
+            if snapshot[0] != self.snapshot_seq:
+                self.snapshot_seq, self.versions = snapshot
             return
         row = await self.store._db.fetchone(
             f"SELECT {','.join(COLUMNS)} FROM {self.store.t.session_state} WHERE session_id=?", (self.session_id,))

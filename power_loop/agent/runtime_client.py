@@ -342,13 +342,35 @@ class RuntimeClient:
         subscription = None
         try:
             # Subscribe first, then inspect. A completion in either window is visible.
+            local_key = None
             if isinstance(ref, InputRef):
-                target = TargetRef(ref.store_id, ref.session_id)
-                await self.inputs.authorize(self.inputs.db, target, actor)
+                local_key = (ref.session_id, ref.message_id)
+                store = self.inputs.store
+                local = (local_key in getattr(store, "lightweight_accepted", {})
+                         or local_key in getattr(store, "lightweight_results", {}))
+                if not local:
+                    target = TargetRef(ref.store_id, ref.session_id)
+                    await self.inputs.authorize(self.inputs.db, target, actor)
                 subscription = await self.transport.subscribe(SubscriptionSpec(
                     self.namespace, ref.store_id, "output", "client", ref.session_id))
                 await subscription.ready()
+            announced = False
             while True:
+                if local_key is not None:
+                    remembered = getattr(self.inputs.store, "lightweight_results", {}).get(local_key)
+                    if remembered is not None and remembered[1] is not None:
+                        return replace(remembered[1], input_ref=original)
+                    if not announced and local_key in getattr(self.inputs.store, "lightweight_accepted", {}):
+                        announced = True
+                        remaining = 30.0 if deadline_ms is None else (deadline_ms - now_ms()) / 1000
+                        if remaining <= 0:
+                            raise WaitTimeout(str(original))
+                        try:
+                            delivery = await asyncio.wait_for(anext(subscription), min(30.0, remaining))
+                            await delivery.ack()
+                        except TimeoutError:
+                            pass
+                        continue
                 _, result, selected = await self.inputs.read(ref, actor)
                 if result:
                     return replace(result, input_ref=original if isinstance(original, InputRef) else None)

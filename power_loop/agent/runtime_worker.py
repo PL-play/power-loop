@@ -85,6 +85,8 @@ class _InputStart:
         self.structured_output, self.output_error = None, None
         self.owner = None
         self.parent_result = None
+        self.lightweight = False
+        self.change_snapshot = None
 
     @property
     def child_job_id(self):
@@ -105,6 +107,8 @@ class _InputStart:
         return self.owner
 
     async def prepare(self, tx):
+        if self.lightweight:
+            return
         port, ctx = self.worker.inputs, self.context
         records = await port.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx, 1, [ctx.input_ref])
         if not records:
@@ -116,11 +120,15 @@ class _InputStart:
             self.record = await port.result_input(self.record, tx)
 
     async def bind(self, tx, binding):
+        if binding.resource_evidence.get("lightweight"):
+            await self._bind_lightweight(tx, binding)
+            return
         port, ctx, store = self.worker.inputs, self.context, self.worker.runtime.store
         self.model_ref = JobRef(ctx.store_id, binding.lease.job_id, binding.lease.generation)
         lease = self.owner.lease if self.owner else binding.lease
         ref = JobRef(ctx.store_id, lease.job_id, lease.generation)
-        await port.bind_input_job(tx, ctx.input_ref, ref, ctx, claim_token=self.record.row["claim_token"])
+        if not binding.resource_evidence.get("lightweight"):
+            await port.bind_input_job(tx, ctx.input_ref, ref, ctx, claim_token=self.record.row["claim_token"])
         state = await port.db.dialect.lock_state(tx, port.state, ctx.session_id)
         ctx.lease.require_owned()
         seq = state["next_seq"]
@@ -153,12 +161,93 @@ class _InputStart:
         ctx.root_job_id = source.get("root_job_id", ref.job_id)
         binding.resource_evidence["_runtime_send_index"] = self.send_index
 
+    async def _bind_lightweight(self, tx, binding):
+        """Allocate the user seq, insert that message, and mark the input delivered."""
+        from power_loop.contracts.errors import SessionLeaseLost
+
+        port, ctx, store = self.worker.inputs, self.context, self.worker.runtime.store
+        self.model_ref = JobRef(ctx.store_id, binding.lease.job_id, binding.lease.generation)
+        ref = self.model_ref
+        columns = "next_seq,inbox_version,background_version,runtime_version"
+        known = getattr(store, "_next_seqs", {}).get(ctx.session_id)
+        state = None
+        if known is not None:
+            statement, arguments, guarded = store._state_update(
+                ctx.session_id, ["next_seq=?"], (known + 1,),
+                condition=" AND next_seq=?", condition_values=(known,))
+            if store._db.dialect.name == "mysql":
+                matched = await tx.execute(statement, arguments) == 1
+            else:
+                state = await tx.fetchone(statement + f" RETURNING {columns}", arguments)
+                matched = state is not None
+            if matched:
+                seq = known
+            else:
+                known = None
+        if known is None:
+            statement, arguments, guarded = store._state_update(
+                ctx.session_id, ["next_seq=next_seq+1"], ())
+            if store._db.dialect.name == "mysql":
+                changed = await tx.execute(statement, arguments)
+                if guarded and changed != 1:
+                    raise SessionLeaseLost(ctx.session_id)
+                state = await tx.fetchone(
+                    f"SELECT {columns} FROM {store.t.session_state} WHERE session_id=?", (ctx.session_id,))
+            else:
+                state = await tx.fetchone(statement + f" RETURNING {columns}", arguments)
+                if state is None:
+                    raise SessionLeaseLost(ctx.session_id)
+            seq = int(state["next_seq"]) - 1
+        self.next_seq = seq + 1
+        body = json.loads(self.record.row["content"])
+        role, name = "user", None
+        content, structured = (body, False) if isinstance(body, str) else _encode_content(body.get("content"))
+        if not isinstance(body, str):
+            role, name = body.get("role", "user"), body.get("name")
+        input_meta = ({"inbox": {"item_ids": [ctx.input_ref.message_id], "kinds": [self.record.row["kind"]]}}
+            if self.record.row["kind"] != "user" else {})
+        meta = _meta_with_content_encoding(input_meta, structured=structured)
+        if self.record.meta["options"].get("metadata"):
+            meta = dict(meta or {}, send=self.record.meta["options"]["metadata"])
+        timestamp = now_ms()
+        await tx.execute(f"INSERT INTO {store.t.messages} "
+            "(session_id,seq,role,name,content,state,meta_json,send_index,created_at) VALUES (?,?,?,?,?,'active',?,?,?)",
+            (ctx.session_id, seq, role, name, content, canonical(meta or {}), self.send_index, timestamp))
+        changed = await tx.execute(
+            f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,meta_json=?,"
+            "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
+            "WHERE session_id=? AND item_id=? AND status='pending'",
+            (seq, self.send_index, timestamp, canonical(self.record.meta), ctx.session_id, ctx.input_ref.message_id))
+        if not changed:
+            raise RuntimeRequestError("input_not_startable")
+        ctx.job_ref = ref
+        ctx.parent_job_id = None
+        ctx.root_job_id = ref.job_id
+        binding.resource_evidence["_runtime_send_index"] = self.send_index
+        if state is None:
+            versions = getattr(store, "_change_versions", {}).get(ctx.session_id, (0, 0, 0))
+        else:
+            versions = (state["inbox_version"], state["background_version"], state["runtime_version"])
+            saved = getattr(store, "_change_versions", None)
+            if saved is None:
+                store._change_versions = saved = {}
+            saved[ctx.session_id] = versions
+        self.change_snapshot = (seq, versions)
+        store._holding(ctx.session_id).touched = timestamp
+
     def committed(self):
         holding = self.worker.runtime.store._holding(self.context.session_id)
         holding.rows.pop("state", None)
         holding.next_seq = self.next_seq
         holding.runtime["send_index"] = self.send_index
-        holding.change_snapshot = None
+        indexes = getattr(self.worker.runtime.store, "_send_indexes", None)
+        if indexes is None:
+            self.worker.runtime.store._send_indexes = indexes = {}
+        indexes[self.context.session_id] = self.send_index
+        if self.change_snapshot is None:
+            holding.change_snapshot = None
+        else:
+            holding.change_snapshot = self.change_snapshot
 
     async def prepare_finish(self, tx):
         self.result_route = await self.worker.inputs._lock_result_sessions(tx, self.context.job_ref)
@@ -658,6 +747,9 @@ class RuntimeWorker:
             loop._runtime_worker_context = ctx
             loop._runtime_worker = self
             loop._owner_id = r.node_id + "/" + r.boot_id
+            role = identity.get("execution_role")
+            if row["event_parent"] is None and role in (None, "main") and identity.get("kind") != "wf_driver":
+                loop._known_session_role = "main"
             ctx.loop = loop
             child_spec = descriptor.config.get("child_spec")
             child_result = None
@@ -669,7 +761,12 @@ class RuntimeWorker:
                         preset=child_spec.get("preset", "core"), sub_session_id=sid, depth=row["event_depth"]),
                     session_id=row["event_parent"], source="subagent"))
             try:
-                send_index = int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1
+                known_index = getattr(r.store, "_send_indexes", {}).get(sid)
+                if known_index is None:
+                    found = await r.store._db.fetchone(
+                        f"SELECT MAX(send_index) AS n FROM {r.store.t.messages} WHERE session_id=?", (sid,))
+                    known_index = int(found["n"] or 0)
+                send_index = known_index + 1
                 start = _InputStart(self, ctx, record, send_index)
                 await loop._interrupt_pending(sid)
                 if env.command is not None:

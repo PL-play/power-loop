@@ -174,6 +174,16 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
     counts = _counts(records, tx_sites)
     if not budgeted:
         assert counts["billing"] == 0
+        # Ordinary unbilled turn: 14 statements. MySQL needs one extra read to
+        # take the lock and one extra read for the reply id. A tool round adds
+        # only its message writes.
+        base = 16 if dialect == "mysql" else 14
+        per_round = 6 if dialect == "mysql" else 4
+        # A send longer than one second may refresh the session's activity time once.
+        activity = [r for r in records if " SET updated_at=" in r["sql"]]
+        assert len(activity) <= 1
+        assert len(records) - len(activity) <= base + per_round * (models - 1), (
+            dialect, models, len(records), len(activity))
 
 
 

@@ -54,7 +54,7 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
                     f"owner_token=IF(@takeover, incoming.owner_token, {table}.owner_token)",
                     (session_id, lease.token, node_id, boot_id, deadline, now))
                 row = await tx.fetchone(
-                    f"SELECT owner_token,owner_epoch,lifecycle FROM {table} WHERE session_id=?",
+                    f"SELECT owner_token,owner_epoch,lifecycle,pending_json FROM {table} WHERE session_id=?",
                     (session_id,))
             else:
                 row = await tx.fetchone(
@@ -65,17 +65,19 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
                     "owner_boot_id=excluded.owner_boot_id, owner_lease_until_ms=excluded.owner_lease_until_ms, "
                     f"owner_epoch={table}.owner_epoch+1 "
                     f"WHERE {table}.lifecycle='open' AND ({table}.owner_token IS NULL OR {table}.owner_lease_until_ms<=?) "
-                    "RETURNING owner_token,owner_epoch,lifecycle",
+                    "RETURNING owner_token,owner_epoch,lifecycle,pending_json",
                     (session_id, lease.token, node_id, boot_id, deadline, now))
                 if row is None:
                     row = await tx.fetchone(
-                        f"SELECT owner_token,owner_epoch,lifecycle FROM {table} WHERE session_id=?", (session_id,))
+                        f"SELECT owner_token,owner_epoch,lifecycle,pending_json FROM {table} WHERE session_id=?",
+                        (session_id,))
         if row is not None and row["lifecycle"] != "open":
             from power_loop.agent.runtime_types import RuntimeRequestError
             raise RuntimeRequestError("session_closed")
         if row is None or row["owner_token"] != lease.token:
             return None
         lease.epoch = int(row["owner_epoch"])
+        lease.pending_json = row["pending_json"]
         return lease
 
     async def renew(self, lease, *, ttl_s):

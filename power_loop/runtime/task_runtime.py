@@ -552,8 +552,12 @@ class TaskRuntime:
         registering_actor = actor
         if owner is not None and (owner.runtime is not self or owner.actor.session_id != sid):
             owner = None
-        if owner is None and not input_start.child_job_id and await session_role(self.manager.store, sid) != "main":
-            raise JobError("task_owner_required")
+        if owner is None and not input_start.child_job_id:
+            role = getattr(loop, "_known_session_role", None)
+            if role is None:
+                role = await session_role(self.manager.store, sid)
+            if role != "main":
+                raise JobError("task_owner_required")
         from power_loop.agent.runtime_types import plain
         request = {"input_ref": plain(input_start.context.input_ref), "send_index": send_index}
         system_key = "input:" + input_start.context.input_ref.message_id
@@ -589,44 +593,55 @@ class TaskRuntime:
         await flush_observed_controls(SimpleNamespace(runtime=self))
         from .budget_policy_sources import PolicySourceChanged
         from .budget_policy_sources import prepared as prepare_policy
-        # Registration, claim and control admission commit together or not at all.
-        policy_source = None
-        while True:
-            try:
-                async with prepare_policy(self, source=policy_source), self.manager.joined_write():
-                    tx = self.manager._joined_write.get()
-                    await input_start.prepare(tx)
-                    if input_start.child_job_id:
-                        owner = await input_start.claim_owner(self, tx)
-                    if self.budget_config is None:
-                        from .executor_registry import ExecutorIdentity, admit_unbudgeted
-                        await admit_unbudgeted(self.manager, tx,
-                            ExecutorIdentity(self.tenant_id, self.principal_id, self.executor_id, self.boot_id),
-                            required=self._lifecycle is not None)
-                    else:
-                        from .budget_admissions import enter
-                        await enter(self, tx)
-                    registration = await self.manager.register_job(
-                        registering_actor,
-                        kind="send",
-                        session_id=sid,
-                        parent=owner.lease if owner else None,
-                        system_key=system_key,
-                        request=request,
-                        fresh=True,
-                    )
-                    if registration.replayed:
-                        # No automatic replay of a possibly side-effecting pending attempt.
-                        raise JobError("task_send_requires_reconciliation")
-                    binding = await self.claim(actor, registration)
-                    await input_start.bind(tx, binding)
-                    binding.resource_evidence["_control_registered_payload"] = registration.operation.result
-                    if input_start.record.meta["operation"] == "resume":
-                        binding.resource_evidence["explicit_resume"] = True
-                    await enable(binding)
-                break
-            except PolicySourceChanged as changed:
-                policy_source = changed.source
+        lightweight = (self.budget_config is None and owner is None and not input_start.child_job_id
+                       and input_start.record.meta["operation"] == "send")
+        if lightweight:
+            from .lightweight_send import open_lightweight
+            binding = open_lightweight(self, actor, sid, input_start.context.input_ref.message_id)
+            loop._lightweight_turn = True
+            input_start.lightweight = True
+            async with self.manager._write() as tx:
+                await input_start.prepare(tx)
+                await input_start.bind(tx, binding)
+        else:
+            # Registration, claim and control admission commit together or not at all.
+            policy_source = None
+            while True:
+                try:
+                    async with prepare_policy(self, source=policy_source), self.manager.joined_write():
+                        tx = self.manager._joined_write.get()
+                        await input_start.prepare(tx)
+                        if input_start.child_job_id:
+                            owner = await input_start.claim_owner(self, tx)
+                        if self.budget_config is None:
+                            from .executor_registry import ExecutorIdentity, admit_unbudgeted
+                            await admit_unbudgeted(self.manager, tx,
+                                ExecutorIdentity(self.tenant_id, self.principal_id, self.executor_id, self.boot_id),
+                                required=self._lifecycle is not None)
+                        else:
+                            from .budget_admissions import enter
+                            await enter(self, tx)
+                        registration = await self.manager.register_job(
+                            registering_actor,
+                            kind="send",
+                            session_id=sid,
+                            parent=owner.lease if owner else None,
+                            system_key=system_key,
+                            request=request,
+                            fresh=True,
+                        )
+                        if registration.replayed:
+                            # No automatic replay of a possibly side-effecting pending attempt.
+                            raise JobError("task_send_requires_reconciliation")
+                        binding = await self.claim(actor, registration)
+                        await input_start.bind(tx, binding)
+                        binding.resource_evidence["_control_registered_payload"] = registration.operation.result
+                        if input_start.record.meta["operation"] == "resume":
+                            binding.resource_evidence["explicit_resume"] = True
+                        await enable(binding)
+                    break
+                except PolicySourceChanged as changed:
+                    policy_source = changed.source
         input_start.committed()
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         failure = None
@@ -652,32 +667,40 @@ class TaskRuntime:
             if last is not None:
                 evidence["last_assistant_ref"] = last.to_dict()
             consumed = ()
-            if evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
+            if binding.resource_evidence.get("lightweight"):
+                from .lightweight_send import remember_result
+                remember_result(loop, input_start.context.input_ref, input_start.public_result(evidence))
+            if ((not binding.resource_evidence.get("lightweight") or binding.resource_evidence.get("upgraded"))
+                    and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass")):
                 from .result_consumption import finish
                 consumed = await finish(binding)
-            async with self.manager.joined_write() as tx:
-                await input_start.prepare_finish(tx)
-                if binding.resource_evidence.get("_runtime_error_code") is not None:
-                    evidence["error_code"] = binding.resource_evidence["_runtime_error_code"]
-                public = input_start.public_result(evidence)
-                from dataclasses import replace
+            if binding.resource_evidence.get("lightweight") and not binding.resource_evidence.get("upgraded"):
+                finalized = True
+            else:
+                async with self.manager.joined_write() as tx:
+                    await input_start.prepare_finish(tx)
+                    if binding.resource_evidence.get("_runtime_error_code") is not None:
+                        evidence["error_code"] = binding.resource_evidence["_runtime_error_code"]
+                    public = input_start.public_result(evidence)
+                    from dataclasses import replace
 
-                from power_loop.agent.runtime_types import plain
-                evidence["_public_result"] = plain(replace(public, job_ref=input_start.model_ref,
-                    input_ref=None if input_start.owner else public.input_ref))
-                await self.manager.close_model_execution(
-                    actor, binding.lease, evidence=evidence,
-                    resource_state=binding.resource_evidence.get("resource_state", "stopped"))
-                evidence.pop("_public_result", None)
-                await input_start.finish(tx, binding, evidence)
-                from .finalization import try_finalize
-                await try_finalize(self.manager, actor, binding.lease.job_id, binding.lease.generation)
-                finalized = not owner and not consumed
+                    from power_loop.agent.runtime_types import plain
+                    evidence["_public_result"] = plain(replace(public, job_ref=input_start.model_ref,
+                        input_ref=None if input_start.owner else public.input_ref))
+                    await self.manager.close_model_execution(
+                        actor, binding.lease, evidence=evidence,
+                        resource_state=binding.resource_evidence.get("resource_state", "stopped"))
+                    evidence.pop("_public_result", None)
+                    await input_start.finish(tx, binding, evidence)
+                    from .finalization import try_finalize
+                    await try_finalize(self.manager, actor, binding.lease.job_id, binding.lease.generation)
+                    finalized = not owner and not consumed
             await input_start.notify_finished()
             from .finalization import after_send
 
             try:
-                if not finalized:
+                if not finalized and not (binding.resource_evidence.get("lightweight")
+                                           and not binding.resource_evidence.get("upgraded")):
                     await after_send(self.manager, actor, binding.lease, consumed=consumed)
             except Exception:
                 # The model exit is already durable. A failed mechanical

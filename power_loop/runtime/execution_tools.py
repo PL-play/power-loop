@@ -99,6 +99,8 @@ async def prepare(pipeline, attempt):
     if not all(controls):
         control.require_admission()
     if any(e["recovery"] is not None for e in entries):
+        from .lightweight_send import ensure
+        await ensure(binding)
         # Independent effects need their own durable jobs. Their registration is
         # an explicit control-plane event, not one job for each ordinary call.
         await control.checkpoint(force=True)

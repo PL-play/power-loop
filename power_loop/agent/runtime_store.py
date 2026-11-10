@@ -148,7 +148,9 @@ class RuntimeInputStore:
         if not changed:
             raise RuntimeRequestError("session_closed")
         ref = InputRef(command.target.store_id, command.target.session_id, command.message_id)
-        old = await self.input(tx, ref)
+        # A new message id inserts directly. A duplicate insert hits the conflict
+        # check below, so the common path does not read the inbox first.
+        old = None
         frozen_descriptor = (plain(descriptor) if descriptor is not None else
                              old.meta["descriptor"] if old else defaults["runtime_descriptor"])
         definition = RuntimeDescriptor(**frozen_descriptor)
@@ -206,6 +208,10 @@ class RuntimeInputStore:
                 raise RuntimeRequestError("duplicate_input_conflict")
             return self.receipt(existing)
         row = dict(zip(columns, values, strict=True), delivered_job_id=None, delivered_job_generation=None)
+        accepted = getattr(self.store, "lightweight_accepted", None)
+        if accepted is None:
+            self.store.lightweight_accepted = accepted = {}
+        accepted[(ref.session_id, ref.message_id)] = True
         return self.receipt(InputRecord(ref, row, meta), new=True)
 
     @staticmethod
@@ -311,6 +317,10 @@ class RuntimeInputStore:
 
     async def read(self, ref, actor):
         """Resolve once, then read the selected immutable result, including 0/1."""
+        if isinstance(ref, InputRef):
+            remembered = getattr(self.store, "lightweight_results", {}).get((ref.session_id, ref.message_id))
+            if remembered is not None:
+                return remembered
         from power_loop.runtime.result_revisions import result_id
         input_ref, job_ref = None, ref
         async with self.db.read_snapshot() as reader:
