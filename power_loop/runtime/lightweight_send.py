@@ -49,6 +49,7 @@ def open_lightweight(runtime, actor, session_id, message_id):
             "execution_role": "main", "session_id": session_id, "tenant_id": actor.tenant_id,
             "principal_id": actor.principal_id, "root_job_id": lease.job_id, "parent_job_id": None,
             "executor_id": lease.executor_id, "boot_id": lease.boot_id,
+            "created_by_session_id": session_id,
         },
     )
     from .root_context import _authority
@@ -89,6 +90,25 @@ async def upgrade(binding, tx):
         f"UPDATE {manager.store.t.follow_up_queue} SET delivered_job_id=?,delivered_job_generation=? "
         "WHERE session_id=? AND item_id=?",
         (lease.job_id, lease.generation, actor.session_id, message_id))
+    # Create execution_scope event for membership verification
+    from dataclasses import asdict
+    from .execution_membership import scope_id, _insert as _insert_scope, _remember_after_commit
+    from .jobs import _json
+    scope_data = {
+        "version": 1,
+        "lease": asdict(lease),
+        "owner": None,
+        "tenant_id": actor.tenant_id,
+        "principal_id": actor.principal_id,
+        "kind": "send",
+        "execution_role": "main",
+        "parent_job_id": None,
+        "created_by_session_id": actor.session_id,
+        "session_id": actor.session_id,
+    }
+    await _insert_scope(manager, tx, scope_id(manager, lease.job_id, lease.generation),
+                        lease.job_id, "execution_scope", 1, scope_data)
+    _remember_after_commit(manager, tx, "_membership_scopes", (lease.job_id, lease.generation), _json(scope_data))
     binding.resource_evidence["upgraded"] = True
 
 
