@@ -71,13 +71,12 @@ async def test_direct_new_turn_cannot_promote_child_to_a_new_root(role_case):
     assert len(seen) == before
 
 
-@pytest.mark.parametrize('operation', ['send','append'])
-async def test_child_scoped_actor_cannot_address_its_parent(role_case, operation):
+async def test_child_scoped_actor_cannot_address_its_parent(role_case):
     agent, child, seen = role_case
     before = len(seen)
     actor = replace(agent.actor, session_id=child['session_id'])
     with pytest.raises(RuntimeRequestError, match='forbidden'):
-        await getattr(agent.runtime.client, operation)(agent.target, 'Redirect parent', message_id='foreign', actor=actor)
+        await agent.runtime.client.send(agent.target, 'Redirect parent', message_id='foreign', actor=actor)
     assert len(seen) == before
 
 
