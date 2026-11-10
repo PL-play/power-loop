@@ -41,7 +41,7 @@ async def main():
             receipt=await runtime.client.send(target,'Name the capital of France in one sentence.',message_id='real-send',actor=actor)
         result=await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=now_ms()+120000)
         while runtime.worker._tasks:
-            await asyncio.gather(*tuple(runtime.worker._tasks))
+            await asyncio.wait(tuple(runtime.worker._tasks))
         print(json.dumps({'result':plain(result),'root':plain(target)}),flush=True)
     finally:
         await runtime.aclose(timeout_s=5,cancel_running=True)

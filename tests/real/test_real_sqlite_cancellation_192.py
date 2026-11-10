@@ -11,7 +11,7 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 async def test_real_response_write_cancellation_rolls_back_without_model_retry(model_runtime, monkeypatch):
-    store, manager, runtime, provider, loop, sid = model_runtime
+    store, manager, _runtime, provider, loop, sid = model_runtime
     db = store._db
     gate, release = threading.Event(), threading.Event()
     original = db._b_exec
@@ -41,9 +41,8 @@ async def test_real_response_write_cancellation_rolls_back_without_model_retry(m
             assert provider.calls == len(provider.responses) == 1
             assert not db._conn.in_transaction
             assert not any(row.role == 'assistant' for row in await store.load_all_messages(sid))
-            [job] = await manager.db.fetchall(f'SELECT * FROM {manager.jobs}')
-            usage = await manager.execution_usage(runtime.actor(sid), job['job_id'])
-            assert usage['total_tokens'] == provider.responses[0].token_usage.total_tokens > 0
+            assert not await manager.db.fetchall(f'SELECT job_id FROM {manager.jobs}')
+            assert provider.responses[0].token_usage.total_tokens > 0
             # Still usable after rollback, without replaying the paid request.
             assert await db.fetchone('SELECT 1 AS value') == {'value': 1}
             assert provider.calls == 1

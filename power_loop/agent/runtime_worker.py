@@ -53,6 +53,7 @@ class _SessionExecution:
     lease: object = None
     stop: CancellationToken = field(default_factory=CancellationToken)
     append_refs: dict = field(default_factory=dict)
+    joined_inputs: list = field(default_factory=list)
     claiming_refs: frozenset[InputRef] = field(default_factory=frozenset)
     control_read: _ControlInputRead | None = None
     append_overflow: bool = False
@@ -213,6 +214,9 @@ class _InputStart:
         await tx.execute(f"INSERT INTO {store.t.messages} "
             "(session_id,seq,role,name,content,state,meta_json,send_index,created_at) VALUES (?,?,?,?,?,'active',?,?,?)",
             (ctx.session_id, seq, role, name, content, canonical(meta or {}), self.send_index, timestamp))
+        await tx.execute(port.db.dialect.upsert(store.t.session_runtime_state, ("session_id", "state_key"),
+                         ("value_json", "updated_at")),
+                         (ctx.session_id, "send_index", canonical(self.send_index), timestamp))
         changed = await tx.execute(
             f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,meta_json=?,"
             "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
@@ -449,9 +453,11 @@ class RuntimeWorker:
                 async for delivery in subscription:
                     packet = delivery.packet
                     ctx = self._active.get(packet.target.session_id)
-                    if packet.channel == "control" and (packet.payload or {}).get("cancelled"):
-                        deadline = self._wait_deadlines.pop(JobRef(packet.target.store_id,
-                            packet.target.job_id, packet.payload["generation"]), None)
+                    if packet.channel == "control" and (packet.payload or {}).get("cancelled") and packet.target.job_id:
+                        generation = (packet.payload or {}).get("generation")
+                        if generation is not None:
+                            deadline = self._wait_deadlines.pop(JobRef(packet.target.store_id,
+                                packet.target.job_id, generation), None)
                         if deadline is not None:
                             deadline.cancel()
                     if packet.channel == "control" and ctx is not None:
@@ -492,6 +498,10 @@ class RuntimeWorker:
 
     async def _control(self, ctx, packet):
         # Never enters the normal execution semaphore or the loop's send lock.
+        payload = packet.payload or {}
+        if payload.get("cancelled") and payload.get("generation") is None and packet.input_ref == ctx.input_ref:
+            ctx.stop.cancel(payload.get("reason") or "cancelled")
+            return
         if packet.input_ref is not None:
             # The serial control listener has one in-flight read. Keep its
             # consumption fact across awaits, even after the claim batch ends.
@@ -988,8 +998,19 @@ class RuntimeWorker:
             content, structured = (body, False) if isinstance(body, str) else _encode_content(body.get("content"))
             rows.append(dict(record.row, content=content, meta={"structured": structured}))
         messages = render_inbox_rows(rows, wrap=True) if rows else []
+        job_ref = ctx.job_ref
+        if job_ref is not None:
+            # An ordinary turn's id is only in memory. Do not point a follow-up at a missing task row.
+            found = await self.inputs.db.fetchone(
+                f"SELECT job_id FROM {ctx.loop.task_runtime.manager.jobs} WHERE job_id=?", (job_ref.job_id,))
+            if found is None:
+                job_ref = None
+        for record in records:
+            if record.ref != ctx.input_ref and record.ref not in ctx.joined_inputs:
+                ctx.joined_inputs.append(record.ref)
         for message in messages:
-            message["_inbox"]["job_ref"] = plain(ctx.job_ref)
+            if job_ref is not None:
+                message["_inbox"]["job_ref"] = plain(job_ref)
         return messages
 
     async def shutdown(self, *, timeout_s=30.0, cancel_running=False):

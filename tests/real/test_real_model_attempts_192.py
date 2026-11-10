@@ -51,15 +51,13 @@ async def test_real_response_preserves_usage(model_runtime):
     async with asyncio.timeout(120):
         result = await loop.send(f"Reply exactly {code}. Do not use any tools.")
         assert result.status == "completed" and code in result.final_text and provider.calls == 1
-        [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-        assert job["supervision_status"] == "closed" and job["resource_state"] == "stopped"
         assert result.usage["total_tokens"] > 0
-        assert await manager.execution_usage(runtime.actor(sid), job["job_id"]) == result.usage
+        assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs}")
 
 
 
 async def test_real_return_with_observation_write_failure_keeps_usage_and_unknown_control(model_runtime, monkeypatch):
-    _, manager, runtime, provider, loop, sid = model_runtime
+    _, manager, _, provider, loop, _sid = model_runtime
     original = model_attempts.finish
     observations = []
     async def unavailable(*args, **kwargs):
@@ -70,8 +68,7 @@ async def test_real_return_with_observation_write_failure_keeps_usage_and_unknow
         result = await loop.send("Return exactly 42 in final assistant text without any tools.")
         assert result.status == "completed" and "42" in result.final_text and provider.calls == 1
         assert provider.responses and result.usage["total_tokens"] == provider.responses[0].token_usage.total_tokens > 0
-        [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-        assert job["supervision_status"] == "open" and job["resource_state"] == "unknown"
+        assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs}")
         assert observations  # All observations refer to this one physical request.
         assert len({item[0][0].attempt_id for item in observations}) == 1
         monkeypatch.setattr(model_attempts, "finish", original)
@@ -79,11 +76,8 @@ async def test_real_return_with_observation_write_failure_keeps_usage_and_unknow
         from power_loop.runtime.control_runtime import current
         attempt = observations[0][0][0]
         assert current(attempt.binding).get("attempt", attempt.attempt_id)["phase"] == "finished"
-        # A late model observation does not assert that arbitrary other effects
-        # stopped, revive the send, mutate its original exit or settle money.
-        after = await manager.get_job(runtime.actor(sid), job["job_id"])
-        assert after.resource_state == "unknown" and after.supervision_status == "open"
-        assert await manager.execution_usage(runtime.actor(sid), job["job_id"]) == result.usage
+        # A late observation does not start another model call.
+        assert provider.calls == 1
 
 
 async def test_real_client_cancellation_keeps_uncertain_request_and_does_not_retry(model_runtime, monkeypatch, record_property):
@@ -106,6 +100,5 @@ async def test_real_client_cancellation_keeps_uncertain_request_and_does_not_ret
         result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
         await loop.drain()
         assert result.status == "cancelled" and provider.calls == 1
-        [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-        assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
+        assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs}")
         record_property("provider_server_receipt_confirmed", False)

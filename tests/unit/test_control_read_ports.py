@@ -64,14 +64,20 @@ async def test_membership_usage_and_call_lookup_have_no_control_writer(registry_
 
 async def test_root_provenance_and_owned_transcript_bindings_have_no_control_writer(root_case, monkeypatch):
     c = root_case
-    assert (await c.send("one actual root", source={"namespace":"test.read", "payload":{"request_id":"read-only"}})).status == "completed"
-    [root] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE parent_job_id IS NULL")
+    source = {"namespace": "test.read", "payload": {"request_id": "read-only"}}
+    assert (await c.send("one actual root", source=source)).status == "completed"
+    # An ordinary turn keeps provenance in memory. Reading it requires a real task.
+    assert not await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='send'")
+    document = root_context._document(source["namespace"], source["payload"])
+    registered = await c.manager.register_job(c.actor, kind="send", session_id=c.sid, system_key="input:root-1",
+        request={"host_context": document, "send_index": 1, "input_ref": {
+            "store_id": c.store.store_id, "session_id": c.sid, "message_id": "root-1"}})
     before, calls = await originals(c.manager), list(c.model.calls)
     with monkeypatch.context() as patch:
         patch.setattr(c.manager, "_write", forbidden_writer)
-        context = await root_context.read(c.manager, c.actor, root["job_id"])
+        context = await root_context.read(c.manager, c.actor, registered.job.job_id)
         assert context["payload"] == {"request_id": "read-only"} and not context["execution_authority"]
-        bindings = await task_sessions.list_sessions(c.manager, c.actor, root["job_id"])
+        bindings = await task_sessions.list_sessions(c.manager, c.actor, registered.job.job_id)
         assert [binding["session_id"] for binding in bindings["bindings"]] == [c.sid]
         assert not bindings["execution_authority"]
     assert await originals(c.manager) == before and c.model.calls == calls

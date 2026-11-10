@@ -4,17 +4,17 @@ import json
 import sys
 
 from power_loop import SessionStore
-from power_loop.runtime.jobs import JobActor, JobManager
-from power_loop.runtime.send_receipt import read
 
 
 async def main():
-    path, prefix, actor_json, job_id, context_json = sys.argv[1:]
+    path, prefix, session_id = sys.argv[1:]
     store = await SessionStore.open(path, table_prefix=prefix, schema="verify")
     try:
-        receipt = await read(JobManager(store), JobActor(**json.loads(actor_json)), job_id,
-            expected_host_context=json.loads(context_json))
-        print(json.dumps({"receipt": receipt, "real_provider_requests": 0}))
+        rows = await store.load_all_messages(session_id)
+        print(json.dumps({
+            "assistant": [row.content for row in rows if row.role == "assistant"],
+            "real_provider_requests": 0,
+        }))
     finally:
         await store.close()
 

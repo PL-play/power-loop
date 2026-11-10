@@ -148,6 +148,9 @@ async def test_cancel_after_claim_before_callback_records_original_result(regist
 
     entered, release, called = asyncio.Event(), asyncio.Event(), []
     async def barrier(binding):
+        evidence = getattr(binding, "resource_evidence", None) or {}
+        if evidence.get("lightweight") and not evidence.get("upgraded"):
+            return  # Ordinary send has no task row until it starts a background job.
         if binding.runtime.manager._joined_write.get() is not None:
             return  # Main admission holds its transaction; this barrier is after child claim.
         row = await binding.runtime.manager.get_job(binding.actor, binding.lease.job_id)

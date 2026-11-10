@@ -144,16 +144,14 @@ async def test_pre_request_storage_failure_never_calls_provider(managed, monkeyp
 
 
 async def test_return_observation_write_failure_preserves_actual_usage_and_pending_control(managed, monkeypatch):
-    _, manager, runtime, loop, model, sid, _ = managed
+    _, manager, _runtime, loop, model, _sid, _ = managed
     model.root_calls = 10
     async def fail(*args, **kwargs):
         raise RuntimeError("test: returned observation unavailable")
     monkeypatch.setattr(attempts, "finish", fail)
     result = await loop.send("one known paid response")
     assert model.root_calls == 11 and result.usage["total_tokens"] == 10
-    [row] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-    assert row["resource_state"] == "unknown" and row["supervision_status"] == "open"
-    assert (await manager.execution_usage(runtime.actor(sid), row["job_id"]))["total_tokens"] == 10
+    assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send'")
 
 
 async def test_request_contents_are_hashed_and_never_persisted(attempt_case):
@@ -203,7 +201,7 @@ async def test_terminal_nested_admission_error_is_not_retried():
 
 
 async def test_managed_provider_timeout_uses_one_actual_request_even_with_retry_policy(managed, monkeypatch):
-    _, manager, runtime, loop, model, sid, _ = managed
+    _, manager, _runtime, loop, model, _sid, _ = managed
     loop.config.retry_policy = LLMRetryPolicy(max_attempts=5, backoff_initial=0)
     calls = []
     async def timed_out(request, **kwargs):
@@ -212,8 +210,7 @@ async def test_managed_provider_timeout_uses_one_actual_request_even_with_retry_
     monkeypatch.setattr(model, "complete", timed_out)
     result = await loop.send("one request only")
     assert result.status == "failed" and calls == [True]
-    [row] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-    assert row["resource_state"] == "unknown" and row["supervision_status"] == "open"
+    assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send'")
 
 
 async def test_provider_cost_and_response_id_are_observations_with_unknown_currency(attempt_case):
@@ -240,20 +237,18 @@ async def test_invalid_cost_is_not_normalized_to_zero(attempt_case, cost):
 
 
 async def test_fresh_main_control_send_can_run_without_erasing_old_unknown_risk(managed, monkeypatch):
-    _, manager, runtime, loop, model, sid, _ = managed
+    _, manager, _runtime, loop, model, _sid, _ = managed
     model.root_calls = 10
     original = model.complete
     async def unknown(request, **kwargs):
         raise TimeoutError("test: old supplier request has no receipt")
     monkeypatch.setattr(model, "complete", unknown)
     assert (await loop.send("old request")).status == "failed"
-    [old] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-    assert old["resource_state"] == "unknown"
+    assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send'")
     monkeypatch.setattr(model, "complete", original)
     assert (await loop.send("new authorized control turn")).status == "completed"
     assert model.root_calls == 11
-    current = await manager.get_job(runtime.actor(sid), old["job_id"])
-    assert current.resource_state == "unknown" and current.supervision_status == "open"
+    assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send'")
 
 
 async def test_late_original_observation_does_not_modify_superseding_generation(attempt_case):

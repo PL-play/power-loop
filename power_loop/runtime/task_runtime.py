@@ -594,8 +594,10 @@ class TaskRuntime:
             consumed = ()
             if binding.resource_evidence.get("lightweight"):
                 from .lightweight_send import remember_result
-                remember_result(loop, input_start.context.input_ref,
-                                input_start.public_result(evidence), evidence)
+                public = input_start.public_result(evidence)
+                remember_result(loop, input_start.context.input_ref, public, evidence)
+                for extra in input_start.context.joined_inputs:
+                    remember_result(loop, extra, public, evidence)
             if ((not binding.resource_evidence.get("lightweight") or binding.resource_evidence.get("upgraded"))
                     and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass")):
                 from .result_consumption import finish

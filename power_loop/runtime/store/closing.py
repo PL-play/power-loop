@@ -146,4 +146,7 @@ async def delete_sessions(store, session_id, *, cascade=True, limit=1000, resour
             if count:
                 deleted.append(sid)
                 store._forget_appended(sid)
+                cached = getattr(store, "_cached_sessions", None)
+                if cached is not None:
+                    cached.pop(sid, None)
     return deleted

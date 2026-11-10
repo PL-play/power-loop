@@ -166,7 +166,7 @@ async def test_runtime_start_and_cancel_serialize_on_original_input(registry_sto
         first = await runtime.client.send(target, 'first', message_id='first', actor=actor)
         original_result = await runtime.client.wait(first.input_ref, actor=actor, deadline_ms=deadline())
         while runtime.worker._tasks:
-            await asyncio.gather(*tuple(runtime.worker._tasks))
+            await asyncio.wait(tuple(runtime.worker._tasks))
         model.release.clear()
         held, release = asyncio.Event(), asyncio.Event()
         if winner == 'cancel':

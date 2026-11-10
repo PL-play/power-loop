@@ -1,11 +1,9 @@
-"""Original generation usage comes from canonical results and logical edges."""
-
-import json
+"""Ordinary send usage stays on the result. It is not a task result event."""
 
 import pytest
 
 from power_loop import AgentLoopConfig
-from power_loop.runtime.jobs import JobActor, JobManager
+from power_loop.runtime.jobs import JobManager
 from tests.runtime_fixture import RunningAgent
 
 from ._workflow_fixture_203 import Model
@@ -20,17 +18,11 @@ async def test_send_has_one_result_and_retains_original_usage_after_reopen(regis
     runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None, system_prompt="main")).start()
     try:
         result = await runner.send("run")
+        assert result.usage["total_tokens"] > 0
         manager = JobManager(await connect())
-        actor = JobActor(runner.actor.tenant_id, runner.actor.principal_id, runner.target.session_id)
-        events = await manager.db.fetchall(
-            f"SELECT event_type,payload_json FROM {manager.events} WHERE job_id=?", (result.job_ref.job_id,)
-        )
-        kinds = [e["event_type"] for e in events]
-        assert kinds.count("result") == 1
-        assert not {"model_closed", "supervision_closed", "execution_membership_seal"}.intersection(kinds)
-        saved = json.loads(next(e["payload_json"] for e in events if e["event_type"] == "result"))
-        assert saved["result"]["usage"] == result.usage
-        assert saved["evidence"]["last_assistant_ref"]["session_id"] == runner.target.session_id
-        assert await manager.execution_usage(actor, result.job_ref.job_id, generation=1) == result.usage
+        # An ordinary turn keeps usage on the result. It writes no send task and no result event.
+        assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send'")
+        assert not await manager.db.fetchall(
+            f"SELECT event_id FROM {manager.events} WHERE event_type='result'")
     finally:
         await runner.aclose()

@@ -221,6 +221,6 @@ async def test_later_processing_error_preserves_already_paid_round_usage(registr
     result = await agent.send("Complete original request")
     assert result.status == 'failed' and result.error == 'RuntimeError'
     assert len(calls) == 1
-    [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='send'")
-    assert (await manager.execution_usage(task_runtime.actor(agent.target.session_id), job["job_id"]))["total_tokens"] == 10
     assert result.usage['total_tokens'] == 10
+    # An ordinary failed turn keeps usage on the result. It does not create a send task.
+    assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send'")

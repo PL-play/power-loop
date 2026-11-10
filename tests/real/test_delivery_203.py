@@ -47,7 +47,7 @@ async def live_runtime(tmp_path, *, config=None):
             result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline)
             while runtime.worker._tasks:
                 import asyncio
-                await asyncio.gather(*tuple(runtime.worker._tasks))
+                await asyncio.wait(tuple(runtime.worker._tasks))
             assert result.status == "completed", result
             return result
         yield store, target, send

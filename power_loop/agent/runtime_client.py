@@ -195,6 +195,7 @@ class RuntimeClient:
                 row = await self.inputs.resolve_job(self.inputs.db, ref, actor)
                 target = TargetRef(ref.store_id, row["session_id"], ref.job_id)
         parent_ref = None
+        stop_running = False
         async with manager.joined_write() as tx:
             await self.inputs.authorize(tx, target, actor)
             result_route = None
@@ -214,7 +215,11 @@ class RuntimeClient:
                 if record is None:
                     raise RuntimeRequestError("not_found")
                 if record.row["delivered_job_id"] is None:
-                    receipt = await self.inputs.void_unbound(tx, input_ref, reason=reason, status="cancelled")
+                    if record.row["status"] == "delivered":
+                        stop_running = True
+                        receipt = self.inputs.receipt(record)
+                    else:
+                        receipt = await self.inputs.void_unbound(tx, input_ref, reason=reason, status="cancelled")
                 else:
                     job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], record.row["delivered_job_generation"])
             if job_ref is not None:
@@ -244,7 +249,11 @@ class RuntimeClient:
                 receipt = Receipt(input_ref, target, input_ref.message_id if input_ref else
                     f"cancel:{job_ref.job_id}:{job_ref.generation}", False, job_ref, "applied", "not_needed", reason)
         if job_ref is None:
-            success = await self._notify(target, receipt.message_id, input_ref, ['output'], {'kind': 'completed'})
+            if stop_running:
+                success = await self._notify(target, receipt.message_id, input_ref, ["control"],
+                    {"cancelled": True, "reason": reason})
+            else:
+                success = await self._notify(target, receipt.message_id, input_ref, ['output'], {'kind': 'completed'})
             return replace(receipt, notification='published' if success else 'failed')
         success = await self._notify(TargetRef(target.store_id, target.session_id, job_ref.job_id),
             receipt.message_id, input_ref, ["control"], {"generation": job_ref.generation, "cancelled": True})

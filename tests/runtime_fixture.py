@@ -74,7 +74,7 @@ class RunningAgent:
                 await self.execution_started.wait_for(lambda: after_input in self.executions)
             await self.finish(after_input)
         while self.runtime.worker._tasks:
-            await asyncio.gather(*tuple(self.runtime.worker._tasks))
+            await asyncio.wait(tuple(self.runtime.worker._tasks))
         self.executions = {ref: task for ref, task in self.executions.items() if not task.done()}
 
     async def aclose(self):
