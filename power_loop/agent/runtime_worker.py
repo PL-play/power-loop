@@ -219,9 +219,10 @@ class _InputStart:
                          (ctx.session_id, "send_index", canonical(self.send_index), timestamp))
         changed = await tx.execute(
             f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,meta_json=?,"
+            "delivered_job_id=?,delivered_job_generation=?,"
             "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
             "WHERE session_id=? AND item_id=? AND status='pending'",
-            (seq, self.send_index, timestamp, canonical(self.record.meta), ctx.session_id, ctx.input_ref.message_id))
+            (seq, self.send_index, timestamp, canonical(self.record.meta), ref.job_id, ref.generation, ctx.session_id, ctx.input_ref.message_id))
         if not changed:
             raise RuntimeRequestError("input_not_startable")
         ctx.job_ref = ref
