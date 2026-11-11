@@ -45,6 +45,7 @@ async def observe(binding, messages, *, round_index, send_index):
                 original_id = notice["result_id"] if event["event_type"] == "managed_effect_delivery" else notice["result"]["event_id"]
                 managed_notice = event["event_type"] == "managed_effect_delivery"
                 event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (original_id,))
+                generation = target["generation"]
                 # A generation-zero negative stays suppressed as an execution
                 # result, but its explicit review notice still needs consumption.
                 negative_review = (managed_notice and target["generation"] == 0
@@ -67,8 +68,8 @@ async def observe(binding, messages, *, round_index, send_index):
             if event["delivery_status"] != "handled" and (negative_review or event["delivery_status"] != "suppressed"):
                 if len(binding.consumed_inputs) >= 1000 and event["event_id"] not in binding.consumed_inputs:
                     raise JobError("consumed_input_limit")
-                binding.consumed_inputs[event["event_id"]] = (target["job_id"], target["root_job_id"], generation,
-                    "managed_review" if negative_review else event["event_type"])
+                kind = "managed_review" if negative_review else event["event_type"]
+                binding.consumed_inputs[event["event_id"]] = (target["job_id"], target["root_job_id"], generation, kind)
 
 
 async def finish(binding):
