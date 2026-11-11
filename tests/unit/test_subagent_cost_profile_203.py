@@ -67,6 +67,7 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
         before = await _snapshot(original, store.table_prefix)
         profiled.records.clear()
         profiled.tx_sites.clear()
+        profiled.tx_categories.clear()
         if meter:
             await meter.reset()
         started = time.monotonic()
@@ -81,7 +82,8 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
         await runner.drain(after_input=parent_input)
         elapsed = time.monotonic()-started
         records, tx_sites = list(profiled.records), list(profiled.tx_sites)
-        sql = {**_counts(records, tx_sites), 'total_sql':len(records), 'transactions':len(tx_sites)}
+        sql = {**_counts(records, tx_sites, profiled.tx_categories),
+               'total_sql':len(records), 'transactions':len(tx_sites)}
         writes = await meter.report() if meter else None
         after = await _snapshot(original, store.table_prefix)
         assert sql['total_sql'] == len(records)

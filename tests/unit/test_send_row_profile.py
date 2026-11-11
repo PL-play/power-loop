@@ -104,12 +104,13 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         model.calls = 0
         profiled.records.clear()
         profiled.tx_sites.clear()
+        profiled.tx_categories.clear()
         if meter:
             await meter.reset()
         started = time.monotonic()
         result = await agent.send("run")
         elapsed_s = time.monotonic() - started
-        sql = _counts(profiled.records, profiled.tx_sites)
+        sql = _counts(profiled.records, profiled.tx_sites, profiled.tx_categories)
         sql["total"] = len(profiled.records)
         records, tx_sites = list(profiled.records), list(profiled.tx_sites)
         assert result.status == "completed" and model.calls == r

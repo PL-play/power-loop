@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager, nullcontext
@@ -37,26 +38,78 @@ _PKG = os.path.join(_ROOT, "power_loop") + os.sep
 _SKIP = ("store.backends", "store.db")
 _BILLING = ("runtime.model_budgets", "runtime.execution_budget", "runtime.response_capture",
             "runtime.tool_billing", "runtime.budget_")
-_ORDINARY = ("runtime.store.", "runtime.runtime_state", "agent.", "core.")
-_CONTROL = ("runtime.execution_journal", "runtime.execution_state")
+_CATEGORIES = ("message", "session_control", "legacy_job_control", "billing", "periodic")
+_LEGACY_TABLES = (
+    "task_store", "jobs", "job_events", "execution_checkpoints", "session_controls",
+    "session_obligations", "task_context_events", "task_executors", "task_executor_events",
+    "task_executor_admissions", "task_principal_admissions",
+)
+_MESSAGE_TABLES = (
+    "messages", "project_messages", "compactions", "usage_observations", "session_stats",
+    "notes", "hook_events", "context_cache", "context_attempts",
+)
+_SESSION_TABLES = (
+    "sessions", "session_state", "follow_up_queue", "session_runtime_state", "shared_state",
+    "background_tasks", "timers",
+)
+_LEGACY_MODULES = (
+    "runtime.jobs", "runtime.lightweight_send", "runtime.subagent_resume",
+    "runtime.execution_journal", "runtime.execution_membership", "runtime.finalization",
+    "runtime.finalization_plan", "runtime.result_revisions", "runtime.result_proof",
+    "runtime.result_consumption", "runtime.executor_admissions", "runtime.executor_lifecycle",
+    "runtime.executor_registry", "runtime.session_obligations", "runtime.controller_handoff",
+    "runtime.controller_recovery", "runtime.controller_retirement", "runtime.controller_task_exit",
+    "runtime.control_requests", "runtime.control_runtime", "runtime.managed_claim",
+    "runtime.managed_completion", "runtime.managed_delivery", "runtime.original_owner_review",
+    "runtime.pending_owner", "runtime.nudges", "runtime.node_inputs", "runtime.task_control",
+    "runtime.task_events", "runtime.task_inspection", "runtime.task_query", "runtime.task_sessions",
+    "runtime.child_completion", "runtime.completion_windows", "runtime.result_notices",
+    "runtime.operation_records", "runtime.host_send_steps", "workflow.control", "workflow.resume",
+)
 
 
-def _category(chain):
+def _periodic(chain):
+    return (_executor_heartbeat(chain) or any(site.startswith("runtime.timers:") for site in chain)
+            or any(site.startswith("runtime.store.retention:") for site in chain))
+
+
+def _category(chain, sql=""):
     chain = [c for c in chain if not c.startswith(_SKIP)]
-    if any(c.startswith(_CONTROL) for c in chain):
-        return "control"
+    if _periodic(chain):
+        return "periodic"
     if any(c.startswith(_BILLING) for c in chain):
         return "billing"
-    if any(c.startswith("runtime.") and not c.startswith(_ORDINARY) for c in chain):
-        return "control"
-    return "ordinary"
+    normalized = sql.lower()
+    if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _LEGACY_TABLES):
+        return "legacy_job_control"
+    if any(c.startswith(_LEGACY_MODULES) for c in chain):
+        return "legacy_job_control"
+    if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _MESSAGE_TABLES):
+        return "message"
+    if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _SESSION_TABLES):
+        return "session_control"
+    if sql:
+        raise AssertionError(("unclassified SQL", sql, chain))
+    if any(c.startswith(("agent.", "runtime.session_ownership", "runtime.store_session_ownership"))
+           for c in chain):
+        return "session_control"
+    if any(c.startswith(("runtime.store.", "runtime.runtime_state", "core.")) for c in chain):
+        return "message"
+    return "legacy_job_control"
 
 
-def _counts(records, tx_sites):
-    counts = {"ordinary": 0, "billing": 0, "control": 0, "control_tx": 0}
+def _counts(records, tx_sites, tx_categories=None):
+    counts = {name: 0 for name in _CATEGORIES}
+    counts.update({name + "_tx": 0 for name in _CATEGORIES})
     for record in records:
-        counts[_category(record["chain"])] += 1
-    counts["control_tx"] = sum(_category(chain) == "control" for chain in tx_sites)
+        counts[_category(record["chain"], record["sql"])] += 1
+    for category in tx_categories or [_category(chain) for chain in tx_sites]:
+        counts[category + "_tx"] += 1
+    counts.update(
+        ordinary=counts["message"],
+        control=counts["session_control"] + counts["legacy_job_control"],
+        control_tx=counts["session_control_tx"] + counts["legacy_job_control_tx"],
+    )
     return counts
 
 
@@ -75,6 +128,7 @@ class Profiled:
         self.db, self.dialect = db, db.dialect
         self.meter = meter
         self.records, self.transactions, self.tx_sites = [], 0, []
+        self.tx_categories = []
         self.tx_depth = 0
 
     def __getattr__(self, name):
@@ -83,24 +137,48 @@ class Profiled:
     def note(self, sql, rows=None):
         self.records.append({"sql": " ".join(sql.split())[:240], "chain": _sites(), "rows": rows})
 
+    @staticmethod
+    def _transaction_category(records, site):
+        categories = {_category(record["chain"], record["sql"]) for record in records}
+        if "legacy_job_control" in categories:
+            return "legacy_job_control"
+        if "billing" in categories:
+            return "billing"
+        if any(c.startswith(("runtime.store.store:", "runtime.runtime_state:", "core.")) for c in site):
+            return "message"
+        for category in ("session_control", "message", "periodic"):
+            if category in categories:
+                return category
+        return _category(site)
+
     @asynccontextmanager
     async def transaction(self):
         self.transactions += 1
-        self.tx_sites.append(_sites())
-        async with self.db.transaction() as tx:
-            measured = _Tx(self, tx)
-            yield measured
-            if measured.before is not None:
-                after = await self.meter.totals(tx)
-                self.meter.max_tx_rows = max(self.meter.max_tx_rows, after[0] - measured.before[0])
-                self.meter.max_tx_bytes = max(self.meter.max_tx_bytes, after[1] - measured.before[1])
+        site = _sites()
+        self.tx_sites.append(site)
+        start = len(self.records)
+        try:
+            async with self.db.transaction() as tx:
+                measured = _Tx(self, tx)
+                yield measured
+                if measured.before is not None:
+                    after = await self.meter.totals(tx)
+                    self.meter.max_tx_rows = max(self.meter.max_tx_rows, after[0] - measured.before[0])
+                    self.meter.max_tx_bytes = max(self.meter.max_tx_bytes, after[1] - measured.before[1])
+        finally:
+            self.tx_categories.append(self._transaction_category(self.records[start:], site))
 
     @asynccontextmanager
     async def read_snapshot(self):
         self.transactions += 1
-        self.tx_sites.append(_sites())
-        async with self.db.read_snapshot() as reader:
-            yield _Tx(self, reader)
+        site = _sites()
+        self.tx_sites.append(site)
+        start = len(self.records)
+        try:
+            async with self.db.read_snapshot() as reader:
+                yield _Tx(self, reader)
+        finally:
+            self.tx_categories.append(self._transaction_category(self.records[start:], site))
 
     async def fetchone(self, sql, params=()):
         result = await self.db.fetchone(sql, params)
@@ -159,7 +237,8 @@ class _Tx:
 @pytest.mark.parametrize("budgeted", [False, True])
 async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=False):
     store, _ = registry_store
-    records, transactions, tx_sites, elapsed_s = await _measure(store, models, budgeted, paid_tools=paid_tools)
+    records, transactions, tx_sites, elapsed_s, tx_categories = await _measure(
+        store, models, budgeted, paid_tools=paid_tools)
     dialect = store._db.dialect.name
     target = os.environ.get("POWER_LOOP_SQL_PROFILE")
     if target:
@@ -169,17 +248,18 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
             json.dump({"models": models, "tools": models - 1, "budgeted": budgeted, "paid_tools": paid_tools,
                        "transactions": transactions, "tx_sites": tx_sites, "elapsed_s": elapsed_s,
                        "records": records}, f)
-    counts = _counts(records, tx_sites)
+    counts = _counts(records, tx_sites, tx_categories)
     # Heartbeats and timer scans follow wall time, not the send. A send longer
     # than one second may also refresh the session activity time once.
     foreground = [r for r in records if not _executor_heartbeat(r["chain"])
                   and not any(site.startswith("runtime.timers:") for site in r["chain"])]
     assert counts["billing"] == 0
-    # Ordinary turn: 14 statements. MySQL needs one extra read to take the
-    # lock and one extra read for the reply id. A tool round adds only its
-    # message writes. Pre-charge no longer adds statements.
-    base = 16 if dialect == "mysql" else 14
-    per_round = 6 if dialect == "mysql" else 4
+    assert counts["control_tx"] <= 3
+    # Design 215 P0 / option A: accept/claim/final are three control
+    # transactions. One latest inbox_version read is required per loop boundary.
+    # The original pre-change failures are recorded separately in the P0 baseline.
+    base = 24 if dialect == "mysql" else 22
+    per_round = 7 if dialect == "mysql" else 5
     activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
     assert len(activity) <= 1
     assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
@@ -195,21 +275,21 @@ async def test_paid_tool_send_sql_profile(registry_store, models):
 @pytest.mark.parametrize("budgeted", [False, True])
 async def test_send_sql_independent_of_history(registry_store, budgeted):
     store, _ = registry_store
-    short_records, _, short_tx, _ = await _measure(store, 3, budgeted)
-    long_records, _, long_tx, _ = await _measure(store, 3, budgeted, history=20)
+    short_records, _, short_tx, _, short_categories = await _measure(store, 3, budgeted)
+    long_records, _, long_tx, _, long_categories = await _measure(store, 3, budgeted, history=20)
     # The executor heartbeat follows elapsed wall time, not transcript length.
     # Keep it in all reported costs; compare foreground work for this invariant.
-    def foreground(records, sites):
+    def foreground(records, sites, categories):
         def periodic(chain):
             return _executor_heartbeat(chain) or any(site.startswith('runtime.timers:') for site in chain)
-        # Timer scans run by wall clock as well. Keep every scan in the raw
-        # whole-request report; compare only foreground history-dependent work.
+        keep = [index for index, chain in enumerate(sites) if not periodic(chain)]
         return _counts([r for r in records if not periodic(r['chain'])],
-                       [chain for chain in sites if not periodic(chain)])
-    short, long = foreground(short_records, short_tx), foreground(long_records, long_tx)
-    for name in ("billing", "control", "control_tx"):
+                       [sites[index] for index in keep], [categories[index] for index in keep])
+    short = foreground(short_records, short_tx, short_categories)
+    long = foreground(long_records, long_tx, long_categories)
+    for name in ("session_control", "legacy_job_control", "billing", "control_tx"):
         assert long[name] == short[name], (name, short, long)
-    assert long["ordinary"] <= short["ordinary"] + 1, (short, long)
+    assert long["message"] <= short["message"] + 1, (short, long)
 
 
 def _executor_heartbeat(chain):
@@ -262,6 +342,7 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
         model.calls = 0
         profiled.records.clear()
         profiled.tx_sites.clear()
+        profiled.tx_categories.clear()
         profiled.transactions = 0
         if meter:
             await meter.reset()
@@ -269,11 +350,12 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
         result = await agent.send("run")
         elapsed_s = time.monotonic() - started
         records, transactions, tx_sites = list(profiled.records), profiled.transactions, list(profiled.tx_sites)
+        tx_categories = list(profiled.tx_categories)
         assert result.status == "completed" and model.calls == models
         if target := os.environ.get("P0_HISTORY_OUT"):
             with open(target, "a") as f:
                 f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
-                                    "history": history, "sql": _counts(records, tx_sites),
+                                    "history": history, "sql": _counts(records, tx_sites, tx_categories),
                                     "total_sql": len(records), "transactions": transactions,
                                     "executor_heartbeat_sql": sum(_executor_heartbeat(r['chain']) for r in records),
                                     "executor_heartbeat_tx": sum(_executor_heartbeat(chain) for chain in tx_sites)}) + "\n")
@@ -282,7 +364,7 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
                 f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
                                     "paid_tools": paid_tools, "history": history,
                                     "writes": await meter.report()}) + "\n")
-        return records, transactions, tx_sites, elapsed_s
+        return records, transactions, tx_sites, elapsed_s, tx_categories
     finally:
         await agent.aclose()
         await runtime.shutdown(timeout_s=1)
