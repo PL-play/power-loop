@@ -224,6 +224,19 @@ class RuntimeClient:
                     job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], record.row["delivered_job_generation"])
             if job_ref is not None:
                 row = await manager._row(tx, job_ref.job_id)
+                # Lightweight tasks don't have job rows
+                if row is None:
+                    # For lightweight tasks, just void the input and notify
+                    if input_ref:
+                        await tx.execute(f"UPDATE {self.inputs.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
+                            "WHERE session_id=? AND item_id=? AND status IN ('pending','claimed','delivered')",
+                            (target.session_id, input_ref.message_id))
+                        receipt = Receipt(input_ref, target, input_ref.message_id, False, job_ref, "applied", "not_needed", reason)
+                        success = await self._notify(target, receipt.message_id, input_ref, ["control"],
+                            {"cancelled": True, "reason": reason})
+                        return replace(receipt, notification='published' if success else 'failed')
+                    else:
+                        raise RuntimeRequestError("not_found")
                 if job_ref.generation is None or row["generation"] != job_ref.generation:
                     raise RuntimeRequestError("stale_generation")
                 reason = row["cancel_reason"] or reason

@@ -487,6 +487,14 @@ class RuntimeInputStore:
             f"JOIN {self.state} state ON state.session_id IN (job.session_id,parent.session_id) "
             "WHERE job.job_id=? ORDER BY state.session_id" + suffix, (job_ref.job_id,))
         if not rows:
+            # Lightweight tasks don't have job rows; try to find the session via follow_up_queue
+            row = await tx.fetchone(
+                f"SELECT session_id FROM {self.q} WHERE delivered_job_id=?",
+                (job_ref.job_id,))
+            if row:
+                # Lock only the session state for lightweight tasks
+                await self.db.dialect.lock_state(tx, self.state, row["session_id"])
+                return {"session_id": row["session_id"], "source_session_id": row["session_id"], "parent_session_id": None}
             raise RuntimeRequestError("not_found")
         return rows[0]
 
