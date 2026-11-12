@@ -328,6 +328,112 @@ async def test_claim_release_after_build_failure(registry_store):
         await node_b.transport.aclose()
 
 
+async def test_release_claim_honours_matching_cancel(registry_store):
+    """A cancel accepted during claimed build terminalizes the whole batch on release."""
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    first = await port.accept(root, "first", message_id="m1", actor=ACTOR)
+    second = await port.accept(root, "second", message_id="m2", actor=ACTOR)
+    model_a = CountingModel()
+    build_started = asyncio.Event()
+    finish_build = asyncio.Event()
+    factory = RegistryRuntimeFactory()
+
+    async def build(descriptor, context):
+        assert context.input_ref == first.input_ref
+        assert context.send_index == 1 and context.owner_epoch == 1
+        build_started.set()
+        await finish_build.wait()
+        raise RuntimeRequestError("resource_unavailable", "build failed after cancel")
+
+    factory.register("test.agent@215", build)
+    node_a = Runtime(store=store, factory=factory, node_id="A", boot_id="A",
+                     recovery_interval_s=None, timers_enabled=False)
+    third = None
+    try:
+        await node_a.worker.start()
+        await node_a.worker.recover()
+        await asyncio.wait_for(build_started.wait(), 5)
+        receipt = await node_a.client.cancel(first.input_ref, actor=ACTOR, reason="stop build")
+        assert receipt.state == "cancel_requested"
+        third = await port.accept(root, "third", message_id="m3", actor=ACTOR)
+        from .test_send_sql_profile import Profiled, _counts
+        original = store._db
+        profiled = Profiled(original)
+        store._db = profiled
+        try:
+            finish_build.set()
+            while node_a.worker._tasks:
+                await asyncio.wait(tuple(node_a.worker._tasks))
+            counts = _counts(profiled.records, profiled.tx_sites, profiled.tx_categories)
+            assert profiled.transactions == 1
+            assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+            if output := os.environ.get("P215_RELEASE_PROFILE_OUT"):
+                with open(output, "a") as stream:
+                    stream.write(json.dumps({
+                        "db": original.dialect.name, "scenario": "release_claim_matching_cancel",
+                        "sql": len(profiled.records), "counts": counts,
+                        "transactions": profiled.transactions,
+                    }) + "\n")
+        finally:
+            store._db = original
+
+        for ref in (first.input_ref, second.input_ref):
+            result = await port.get_result(ref, actor=ACTOR)
+            assert result.status == "cancelled" and result.send_index == 1
+            assert result.error_code == "cancelled" and result.error == "stop build"
+            assert result.result_seq is None
+        rows = await store._db.fetchall(
+            f"SELECT item_id,status,terminal_status,error_code,error_detail,completed_at "
+            f"FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY item_id",
+            (root.session_id,))
+        assert [row["item_id"] for row in rows] == ["m1", "m2", "m3"]
+        for row in rows[:2]:
+            assert row["status"] == "delivered" and row["terminal_status"] == "cancelled"
+            assert row["error_code"] == "cancelled" and row["error_detail"] == "stop build"
+            assert row["completed_at"] is not None
+        assert rows[2]["status"] == "pending" and rows[2]["terminal_status"] is None
+        state = await store._db.fetchone(
+            f"SELECT execution_state,active_send_index,owner_token FROM {store.t.session_state} "
+            "WHERE session_id=?", (root.session_id,))
+        assert state == {"execution_state": "queued", "active_send_index": None, "owner_token": None}
+        messages = await store._db.fetchall(
+            f"SELECT role FROM {store.t.messages} WHERE session_id=?", (root.session_id,))
+        assert messages == []
+        assert model_a.calls == 0
+    finally:
+        finish_build.set()
+        await node_a.worker.shutdown(timeout_s=2)
+        await node_a.client.aclose()
+        await node_a.transport.aclose()
+
+    model_b = CountingModel()
+    capable = RegistryRuntimeFactory()
+
+    async def capable_build(descriptor, context):
+        return ExecutionEnvironment(
+            model_b, None, AgentLoopConfig(max_rounds=4, compactor=None))
+
+    capable.register("test.agent@215", capable_build)
+    node_b = Runtime(store=store, factory=capable, node_id="B", boot_id="B",
+                     recovery_interval_s=None, timers_enabled=False)
+    try:
+        await node_b.worker.start()
+        await node_b.worker.recover()
+        result = await asyncio.wait_for(
+            node_b.client.wait(third.input_ref, actor=ACTOR, deadline_ms=None), 10)
+        assert result.status == "completed" and result.send_index == 2
+        assert model_b.calls == 1
+        for ref in (first.input_ref, second.input_ref):
+            assert (await port.get_result(ref, actor=ACTOR)).status == "cancelled"
+    finally:
+        await node_b.worker.shutdown(timeout_s=2)
+        await node_b.client.aclose()
+        await node_b.transport.aclose()
+
+
 async def test_worker_discovers_and_takes_over_expired_run(registry_store):
     store, _ = registry_store
     port = RuntimeInputStore(store)
