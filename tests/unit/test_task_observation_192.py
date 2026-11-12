@@ -10,10 +10,9 @@ import pytest
 from power_loop import AgentEvent, AgentEventBus, AgentEventType, TaskSupervisionClosedPayload
 from power_loop.runtime.jobs import JobError, JobManager
 
-from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import jobs, managed
 
-__all__ = ["registry_store", "managed"]
+__all__ = ["managed"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 TYPE = AgentEventType.TASK_SUPERVISION_CLOSED
 

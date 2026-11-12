@@ -18,9 +18,8 @@ from power_loop.runtime.session_controls import ControlTransaction
 
 from .test_executor_drain_trees import stop_worker
 from .test_executor_registry_192 import boot, root, start
-from .test_job_registry_192 import registry_store
 
-__all__ = ['boot', 'registry_store']
+__all__ = ['boot']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

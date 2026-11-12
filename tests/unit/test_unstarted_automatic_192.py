@@ -3,10 +3,8 @@ import pytest
 
 from power_loop.runtime.managed_effects import terminate_unstarted
 
-from .test_job_registry_192 import registry_store
 from .test_managed_effects_192 import scenario
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 @pytest.mark.parametrize('stage', ['result', 'commit', 'commit_ack'])

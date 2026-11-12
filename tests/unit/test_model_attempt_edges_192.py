@@ -8,11 +8,10 @@ import pytest
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime.jobs import JobError
 
-from .test_job_registry_192 import registry_store
 from .test_model_attempts_192 import attempt_case, completed, prepare
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
-__all__ = ["attempt_case", "registry_store"]
+__all__ = ["attempt_case"]
 
 
 async def test_active_model_call_limit(attempt_case, monkeypatch):

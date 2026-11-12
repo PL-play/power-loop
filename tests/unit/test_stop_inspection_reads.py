@@ -10,11 +10,10 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_control import recall_stop, signal_local
 from power_loop.runtime.task_runtime import Execution, TaskRuntime
 
-from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled
 from .test_task_control_192 import control
 
-__all__ = ["registry_store", "control"]
+__all__ = ["control"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

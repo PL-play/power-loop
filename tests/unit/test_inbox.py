@@ -27,10 +27,6 @@ from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ["registry_store"]
-
 
 class _Gate(LLMService):
     """Scripted LLM; call #n blocks until ``gates[n]`` is set (if one is registered)."""

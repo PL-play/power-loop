@@ -12,11 +12,9 @@ from power_loop.tools.registry import ToolRegistry
 from tests.control_faults import control_mutations
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_managed_completion_192 import failure_case
 from .test_managed_effects_192 import scenario
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

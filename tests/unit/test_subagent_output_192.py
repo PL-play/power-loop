@@ -8,10 +8,9 @@ from power_loop import JobRef
 from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
 
-from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import finish, jobs, managed, receipt
 
-__all__ = ['registry_store', 'managed']
+__all__ = ['managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

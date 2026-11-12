@@ -10,9 +10,6 @@ from power_loop.agent.runtime_store import now_ms
 from power_loop.tools.spawn_agent import register_spawn_agent
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -5,11 +5,10 @@ import pytest
 
 from power_loop.agent.runtime_store import now_ms
 
-from .test_job_registry_192 import registry_store
 from .test_subagent_resume_192 import ready
 from .test_task_runtime_192 import managed
 
-__all__ = ['registry_store', 'managed', 'ready']
+__all__ = ['managed', 'ready']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -122,3 +122,42 @@ async def runtime_agent(tmp_path):
         await agent.aclose()
     for store in reversed(stores):
         await store.close()
+
+
+@pytest.fixture(params=["sqlite", "postgres", "mysql"])
+async def registry_store(request, tmp_path):
+    """Neutral three-database store fixture; no JobManager or obligation projection."""
+    import secrets
+    from urllib.parse import urlparse
+
+    from power_loop.runtime.store.factory import open_store
+    from power_loop.runtime.store.session_native_ddl import CONTRACT_TABLES
+
+    backend = request.param
+    dsn = str(tmp_path / "registry.db") if backend == "sqlite" else os.environ.get(
+        "POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"
+    )
+    if not dsn:
+        pytest.skip(f"isolated {backend} test DSN not configured")
+    if backend != "sqlite" and not urlparse(dsn).path.endswith("_test"):
+        pytest.fail("server store tests refuse a database without _test suffix")
+    prefix = "s215_" + secrets.token_hex(4) + "_"
+    stores, prefixes = [], set()
+
+    async def connect(*, schema="tasks", suffix=""):
+        active_prefix = prefix + suffix
+        store = await open_store(dsn, table_prefix=active_prefix, schema=schema)
+        stores.append(store)
+        prefixes.add(active_prefix)
+        return store
+
+    store = await connect()
+    try:
+        yield store, connect
+    finally:
+        if backend != "sqlite":
+            for active_prefix in prefixes:
+                for name in (*CONTRACT_TABLES, "schema_migrations"):
+                    await store._db.execute(f"DROP TABLE IF EXISTS {active_prefix}{name}")
+        for opened in reversed(stores):
+            await opened.close()

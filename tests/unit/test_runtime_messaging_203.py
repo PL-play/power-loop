@@ -42,9 +42,6 @@ from power_loop.runtime.jobs import JobActor, JobManager
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 from power_loop.tools.registry import ToolRegistry
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -627,8 +624,7 @@ async def test_model_callbacks_stream_through_worker_and_overflow_is_bounded(reg
 
 async def test_tool_identity_reads_only_self_and_logical_descendants(registry_store):
     from power_loop.runtime.jobs import JobError
-
-    from .test_job_registry_192 import call
+    from tests.legacy_job_helpers import call
     store, _ = registry_store
     port, root, host = await fixture(store)
     metadata = (await store.get_session(root.session_id)).metadata

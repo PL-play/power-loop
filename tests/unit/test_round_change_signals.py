@@ -18,9 +18,7 @@ from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
 from ._change_signal_crash_worker import write
-from .test_job_registry_192 import registry_store
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

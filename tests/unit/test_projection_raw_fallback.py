@@ -4,10 +4,8 @@ import pytest
 from power_loop import AgentLoopConfig, LLMResponse, ProjectedRepresentation
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_stateful_loop import _Scripted
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def test_missing_and_stale_projection_reads_originals(registry_store):

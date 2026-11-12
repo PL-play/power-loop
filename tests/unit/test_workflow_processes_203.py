@@ -14,9 +14,7 @@ from power_loop.agent.runtime_types import JobRef, RuntimeDescriptor, RuntimeReq
 from power_loop.workflow import journal
 
 from ._workflow_fixture_203 import leaf
-from .test_job_registry_192 import registry_store
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

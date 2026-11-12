@@ -7,11 +7,9 @@ import pytest
 from power_loop.agent.runtime_types import RuntimeRequestError
 from power_loop.contracts.errors import SessionBusy
 
-from .test_job_registry_192 import registry_store
 from .test_retention import NOW, OLD, insert, root
 from .test_runtime_messaging_203 import accept, command, fixture
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

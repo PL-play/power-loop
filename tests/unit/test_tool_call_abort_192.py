@@ -5,10 +5,8 @@ import pytest
 from power_loop.runtime.jobs import JobError
 
 from ._tool_plan_faults_192 import fail_plan_once
-from .test_job_registry_192 import registry_store
 from .test_managed_effects_192 import scenario
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

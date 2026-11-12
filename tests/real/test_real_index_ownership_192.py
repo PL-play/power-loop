@@ -5,11 +5,9 @@ from power_loop import AgentLoopConfig, RuntimeClient
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.task_runtime import TaskRuntime
+from tests.legacy_job_helpers import drop_index_sql
 from tests.real._bounded import BoundedProvider
-from tests.unit.test_job_registry_192 import registry_store
-from tests.unit.test_task_query_indexes_192 import drop_index_sql
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 

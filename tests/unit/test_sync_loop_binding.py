@@ -5,10 +5,8 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore
 from tests.runtime_fixture import RunningAgent
-from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_subagent import _Scripted
 
-__all__ = ['registry_store']
 pytestmark = pytest.mark.unit
 
 

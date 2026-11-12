@@ -10,10 +10,7 @@ from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
 from .test_background_runtime_203 import BackgroundParent
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, _tool_resp
-
-__all__ = ['registry_store']
 
 
 async def test_idle_append_is_a_new_projected_send(registry_store):

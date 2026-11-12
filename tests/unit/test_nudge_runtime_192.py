@@ -10,11 +10,11 @@ from power_loop import InputRef, JobRef, LLMResponse, LLMTokenUsage, RuntimeRequ
 from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import child_tasks
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
 from .test_task_runtime_192 import finish, jobs, managed, receipt
 
-__all__ = ['registry_store', 'runtime', 'managed']
+__all__ = ['runtime', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

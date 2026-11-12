@@ -7,9 +7,7 @@ from power_loop.workflow import journal
 from tests.runtime_fixture import RunningAgent
 
 from ._workflow_fixture_203 import Model, leaf
-from .test_job_registry_192 import registry_store
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

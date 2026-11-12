@@ -11,9 +11,6 @@ from power_loop import DatabasePollingTransport, RuntimeClient
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_types import JobRef, TargetRef, TrustedActor
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

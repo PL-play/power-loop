@@ -23,10 +23,9 @@ from power_loop.runtime.store.factory import _make_database
 
 from .test_executor_drain_trees import stop_worker, wait_ready
 from .test_executor_registry_192 import boot, start
-from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled, _counts
 
-__all__ = ['boot', 'registry_store']
+__all__ = ['boot']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

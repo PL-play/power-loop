@@ -29,10 +29,9 @@ from power_loop.runtime.tool_contracts import (
 from power_loop.tools import _bind_handler
 from power_loop.tools.registry import ToolRegistry
 
-from .test_job_registry_192 import registry_store
 from .test_task_control_192 import control
 
-__all__ = ["registry_store", "control"]
+__all__ = ["control"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

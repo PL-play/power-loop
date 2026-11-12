@@ -10,10 +10,8 @@ from power_loop import (
 )
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
-from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_request_sanitize import StrictModel
 
-__all__ = ["registry_store"]
 
 def response(text='', calls=None):
     return LLMResponse(raw_text=text, tool_calls=calls or [],

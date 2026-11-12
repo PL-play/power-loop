@@ -7,10 +7,7 @@ import pytest
 
 from power_loop import StoreBlackboard, StoreTimerBackend, TimerContext
 
-from .test_job_registry_192 import registry_store
 from .test_runtime_messaging_203 import fixture
-
-__all__ = ['registry_store']
 
 
 @pytest.mark.parametrize('mode', ['timers', 'board'])

@@ -29,10 +29,8 @@ from power_loop.tools.jobs import run_jobs
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 
-from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import AdapterModel
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

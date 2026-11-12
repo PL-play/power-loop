@@ -3,12 +3,11 @@ import pytest
 
 from power_loop.runtime import finalization
 from power_loop.runtime.jobs import JobManager
+from tests.legacy_job_helpers import runtime as registry_runtime
 
-from .test_job_registry_192 import registry_store
-from .test_job_registry_192 import runtime as registry_runtime
 from .test_send_sql_profile import _measure
 
-__all__ = ['registry_store', 'registry_runtime']
+__all__ = ['registry_runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

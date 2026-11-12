@@ -7,10 +7,6 @@ import pytest
 from power_loop import MemoryMessageTransport, RegistryRuntimeFactory, Runtime, RuntimeClient, RuntimeRequestError
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
-
 
 async def child(store):
     kind = store._db.dialect.name

@@ -10,10 +10,8 @@ from power_loop import AgentLoopConfig, RuntimeEnv, create_default_tool_registry
 from power_loop.agent.runtime_store import now_ms
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, _tool_resp
 
-__all__ = ['registry_store']
 
 class _MarkerBackend:
     """A stand-in sandbox backend: tags the launch env with a unique marker and

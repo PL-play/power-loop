@@ -15,9 +15,6 @@ from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import TaskRuntime
 from tests.real._llm import make_llm
-from tests.unit.test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 
 pytestmark = pytest.mark.asyncio
 

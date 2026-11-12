@@ -1,10 +1,8 @@
 import pytest
 
 from ._native_no_return_stop_192 import exercise
-from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import AdapterModel
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

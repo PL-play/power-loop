@@ -5,7 +5,6 @@ import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, RequestOptions
 from power_loop.runtime.history_projector import IdentityProjector
-from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
 from tests.unit.test_request_sanitize import StrictModel, assert_valid_request, call
 from tests.unit.test_stateful_loop import _echo_registry
 

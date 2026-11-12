@@ -13,10 +13,9 @@ from power_loop.runtime import completion_windows as windows
 from power_loop.runtime.completion import CompletionWindow
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
 from power_loop.runtime.task_runtime import _OWNER, Execution, TaskRuntime
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
-
-__all__ = ['registry_store', 'runtime']
+__all__ = ['runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

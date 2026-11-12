@@ -17,7 +17,6 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.retry import request_repair_kind
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import TaskRuntime
-from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
 from tests.unit.test_request_sanitize import StrictModel, assert_valid_request, assistant, call
 from tests.unit.test_stateful_loop import _echo_registry
 

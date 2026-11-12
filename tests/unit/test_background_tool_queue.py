@@ -7,10 +7,7 @@ from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.pricing import Free
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, _tool_resp
-
-__all__ = ['registry_store']
 
 
 async def test_queue_releases_capacity_on_failure_and_cancelled_work_never_invokes(registry_store, tmp_path):

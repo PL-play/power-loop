@@ -11,9 +11,6 @@ from power_loop.agent.runtime_types import RuntimeRequestError
 from power_loop.core.agent_context import get_session_id
 from power_loop.tools.spawn_agent import register_spawn_agent
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

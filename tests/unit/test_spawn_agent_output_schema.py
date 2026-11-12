@@ -17,10 +17,8 @@ from power_loop.tools.spawn_agent import (
 )
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, _tool_resp
 
-__all__ = ['registry_store']
 LABEL_SCHEMA = {'type':'object','required':['label'],'properties':{'label':{'type':'string'}}}
 
 def test_tool_schema_exposes_optional_output_schema() -> None:

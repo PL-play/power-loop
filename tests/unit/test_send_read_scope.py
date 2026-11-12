@@ -12,9 +12,6 @@ from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.jobs import TRUST_OWN_WRITES, verify_stored
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

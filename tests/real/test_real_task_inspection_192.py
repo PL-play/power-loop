@@ -17,12 +17,12 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_inspection import CONSTRAINTS, inspect_tasks
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.jobs import register_jobs_tools
-from tests.unit.test_task_inspection_192 import POLICY, registry_runtime, registry_store, runtime, troubled
+from tests.unit.test_task_inspection_192 import POLICY, registry_runtime, runtime, troubled
 
 from ._bounded import BoundedProvider
 from ._live_fixture import BorrowedProvider
 
-__all__=['registry_store','registry_runtime','runtime']
+__all__=['registry_runtime','runtime']
 pytestmark=[pytest.mark.real_llm,pytest.mark.asyncio]
 
 

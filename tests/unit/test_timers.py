@@ -29,9 +29,6 @@ from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLM
 from power_loop.tools import DEFAULT_TOOL_HANDLERS
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 
 @dataclass
 class _Scripted(LLMService):

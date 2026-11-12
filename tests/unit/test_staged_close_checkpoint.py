@@ -6,9 +6,7 @@ import json
 import pytest
 
 from .test_execution_checkpoints import case, complete
-from .test_job_registry_192 import registry_store
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

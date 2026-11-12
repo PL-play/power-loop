@@ -23,10 +23,8 @@ from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, _tool_resp
 
-__all__ = ['registry_store']
 pytestmark = pytest.mark.unit
 USAGE = LLMTokenUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12)
 

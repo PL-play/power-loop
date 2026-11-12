@@ -7,9 +7,6 @@ import pytest
 from power_loop.runtime.jobs import JobActor, JobManager
 from power_loop.runtime.store.retention import DAY_MS
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 NOW = 200 * DAY_MS
 OLD = 1

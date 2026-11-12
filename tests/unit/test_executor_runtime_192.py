@@ -6,14 +6,13 @@ import pytest
 from power_loop import JobRef, RuntimeRequestError
 from power_loop.agent.runtime_store import now_ms
 
-from .test_job_registry_192 import registry_store
 from .test_subagent_resume_192 import ready
 from .test_subagent_resume_192 import (
     test_original_job_and_session_resume_once_with_distinct_results_and_usage as verify_resume,
 )
 from .test_task_runtime_192 import managed, receipt
 
-__all__ = ['registry_store', 'ready', 'managed']
+__all__ = ['ready', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -28,9 +28,6 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -101,6 +98,10 @@ def _category(chain, sql=""):
     if any(c.startswith(_LEGACY_MODULES) or c.startswith("runtime.child_tasks:")
            or c in _LEGACY_RUNTIME_STORE_CALLS for c in chain):
         return "legacy_job_control"
+    if "agent.runtime_store:_db_now" in chain:
+        return "session_control"
+    if normalized.startswith("select last_insert_id()"):
+        return "message"
     if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _MESSAGE_TABLES):
         return "message"
     if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _SESSION_TABLES):

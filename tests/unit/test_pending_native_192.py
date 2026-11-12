@@ -11,10 +11,8 @@ from power_loop.runtime.task_runtime import _SEND
 from power_loop.runtime.tool_call_plans import dispatch
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
-from .test_job_registry_192 import registry_store
 from .test_managed_effects_192 import scenario
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

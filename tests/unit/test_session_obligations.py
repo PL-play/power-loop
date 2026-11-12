@@ -3,11 +3,11 @@ import pytest
 
 from power_loop.runtime.abort_outcomes import pending_reviews
 from power_loop.runtime.jobs import JobManager
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
 from .test_send_sql_profile import Profiled
 
-__all__ = ["registry_store", "runtime"]
+__all__ = ["runtime"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def rows(manager):

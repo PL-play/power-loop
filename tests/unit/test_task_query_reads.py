@@ -8,11 +8,11 @@ import pytest
 
 from power_loop.runtime import task_query
 from power_loop.runtime.jobs import JobManager
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
 from .test_send_sql_profile import Profiled, _counts
 
-__all__ = ["registry_store", "runtime"]
+__all__ = ["runtime"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

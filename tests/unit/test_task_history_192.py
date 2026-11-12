@@ -20,9 +20,6 @@ from power_loop.runtime.env import RuntimeEnv, runtime_env_context
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 from power_loop.tools.default_tools import run_recall_send
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

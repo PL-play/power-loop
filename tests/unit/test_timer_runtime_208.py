@@ -16,11 +16,8 @@ from power_loop import (
     create_default_tool_registry,
 )
 
-from .test_job_registry_192 import registry_store
 from .test_runtime_messaging_203 import fixture
 from .test_timers import _Scripted
-
-__all__ = ['registry_store']
 
 
 async def composition(store):

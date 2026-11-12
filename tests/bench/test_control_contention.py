@@ -23,10 +23,9 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.conftest import registry_store
 from tests.runtime_fixture import RunningAgent
-from tests.unit.test_job_registry_192 import registry_store
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.bench, pytest.mark.asyncio]
 
 class Model(LLMService):

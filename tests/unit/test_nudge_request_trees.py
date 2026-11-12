@@ -6,10 +6,9 @@ import pytest
 from power_loop import JobRef, RuntimeClient, RuntimeRequestError
 from power_loop.agent.runtime_store import now_ms
 
-from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import managed, receipt
 
-__all__ = ['registry_store','managed']
+__all__ = ['managed']
 pytestmark = pytest.mark.asyncio
 
 

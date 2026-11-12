@@ -8,10 +8,9 @@ import pytest
 from power_loop.runtime import root_context, root_control
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 
-from .test_job_registry_192 import registry_store
 from .test_root_context_192 import NAMESPACE, root_case
 
-__all__ = ["registry_store", "root_case"]
+__all__ = ["root_case"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 PAYLOAD = {"origin_run_id": 101}
 

@@ -6,10 +6,8 @@ import pytest
 from power_loop import AgentHooks, HookDirective, HookPoint, InputRef, TimerRunner
 from power_loop.agent.runtime_store import now_ms
 
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, timers
 
-__all__ = ['registry_store']
 pytestmark = pytest.mark.asyncio
 
 

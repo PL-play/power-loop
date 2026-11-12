@@ -8,10 +8,9 @@ from power_loop.agent.stateful_loop import StatefulResult
 from power_loop.runtime import send_receipt
 from power_loop.runtime.jobs import JobError, JobManager
 
-from .test_job_registry_192 import registry_store
 from .test_root_context_192 import NAMESPACE, root_case
 
-__all__ = ["registry_store", "root_case"]
+__all__ = ["root_case"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

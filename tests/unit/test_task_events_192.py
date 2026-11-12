@@ -12,11 +12,11 @@ from power_loop.runtime.env import RuntimeEnv, runtime_env_context
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 from power_loop.runtime.result_revisions import result_id
 from power_loop.tools.jobs import run_jobs
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
 from .test_nudge_runtime_192 import nudge_case
 
-__all__ = ['registry_store', 'runtime', 'nudge_case']
+__all__ = ['runtime', 'nudge_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

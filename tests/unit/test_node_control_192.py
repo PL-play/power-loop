@@ -9,9 +9,6 @@ import pytest
 from power_loop import LLMResponse
 from power_loop.core.agent_context import get_session_id
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

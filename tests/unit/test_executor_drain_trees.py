@@ -10,9 +10,8 @@ from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobError, JobManager
 
 from .test_executor_registry_192 import boot, root, start
-from .test_job_registry_192 import registry_store
 
-__all__ = ["boot", "registry_store"]
+__all__ = ["boot"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

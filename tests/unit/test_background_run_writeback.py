@@ -12,10 +12,8 @@ from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_timers import _Scripted, _tool_resp
 
-__all__ = ['registry_store']
 pytestmark = pytest.mark.unit
 
 

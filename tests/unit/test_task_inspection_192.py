@@ -6,11 +6,9 @@ import pytest
 
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 from power_loop.runtime.task_inspection import InspectionPolicy, inspect_tasks, read_alert
+from tests.legacy_job_helpers import runtime as registry_runtime
 
-from .test_job_registry_192 import registry_store
-from .test_job_registry_192 import runtime as registry_runtime
-
-__all__ = ['registry_store', 'registry_runtime']
+__all__ = ['registry_runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 POLICY = InspectionPolicy(grace_ms=1000, runtime_ms=10000, result_ms=1000, escalation_ms=5000)
 

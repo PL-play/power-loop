@@ -83,6 +83,22 @@ def _row_payload(row: Mapping[str, Any]) -> str | LoopMessage:
     return str(content)
 
 
+def session_batch_content(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """One deterministic user-message body for the whole atomic input snapshot."""
+    return {
+        "version": 1,
+        "items": [
+            {
+                "message_id": row["item_id"],
+                "priority": row["priority"],
+                "kind": row["kind"],
+                "content": json.loads(row["content_json"]),
+            }
+            for row in rows
+        ],
+    }
+
+
 def _merge_plain(payloads: list[str | LoopMessage]) -> LoopMessage | None:
     """Like :func:`merge_follow_up_inputs` but WITHOUT the ``<follow_up>`` envelope — the input
     of a fresh send is the send's own input, not steering into someone else's run."""
@@ -241,6 +257,7 @@ __all__ = [
     "InboxItem",
     "inbox_row",
     "render_inbox_rows",
+    "session_batch_content",
     "follow_up_text",
     "format_follow_up_user_message",
     "merge_follow_up_inputs",

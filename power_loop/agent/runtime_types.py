@@ -1,13 +1,27 @@
-"""Serializable identities and contracts for the message runtime (design 203)."""
+"""Session-native identities and public storage contracts (design 215)."""
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from power_loop.runtime.message_ref import MessageRef
+
+PROTOCOL_VERSION = 43
+Priority = Literal["normal", "urgent"]
+SessionKind = Literal["agent", "workflow_driver", "background"]
+ExecutionState = Literal["idle", "queued", "running", "recovering"]
+InputState = Literal["pending", "delivered", "void", "waiting_continuation"]
+TerminalStatus = Literal["completed", "failed", "cancelled", "interrupted"]
+ResultKind = Literal[
+    "agent_result", "workflow_result", "workflow_node_result",
+    "background_result", "managed_effect_result",
+]
+CancelPropagation = Literal["linked", "independent"]
+Lifecycle = Literal["open", "closing", "closed"]
 
 
 class RuntimeRequestError(ValueError):
@@ -26,11 +40,12 @@ class WaitTimeout(TimeoutError):
 
 
 class StoreError(RuntimeError):
-    """The submit transaction failed; its commit outcome may be unknown."""
+    """A commit outcome is unknown; retry or inspect the original InputRef."""
 
     def __init__(self, input_ref):
+        self.code = "store_commit_unknown"
         self.input_ref = input_ref
-        super().__init__("input commit not confirmed; inspect or retry the original InputRef")
+        super().__init__("store_commit_unknown: inspect or retry the original InputRef")
 
 
 def plain(value):
@@ -44,18 +59,26 @@ def plain(value):
 
 
 def canonical(value) -> str:
-    return json.dumps(plain(value), sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, allow_nan=False)
+    return json.dumps(
+        plain(value), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    )
+
+
+def sha256_canonical(value) -> str:
+    return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
 
 
 def freeze(value):
-    """Validate at the public boundary and detach all nested caller-owned data."""
+    """Validate strict JSON and detach nested caller-owned data."""
+
     def immutable(v):
         if isinstance(v, dict):
             return MappingProxyType({k: immutable(x) for k, x in v.items()})
         if isinstance(v, list):
             return tuple(immutable(x) for x in v)
         return v
+
     try:
         return immutable(json.loads(canonical(value)))
     except (TypeError, ValueError) as exc:
@@ -63,7 +86,10 @@ def freeze(value):
 
 
 def identifier(value, limit=64):
-    if not isinstance(value, str) or not 0 < len(value) <= limit:
+    if (
+        not isinstance(value, str) or not 0 < len(value) <= limit
+        or value != value.strip() or not value.isprintable()
+    ):
         raise RuntimeRequestError("invalid_options", "invalid identifier")
 
 
@@ -71,13 +97,10 @@ def identifier(value, limit=64):
 class TargetRef:
     store_id: str
     session_id: str
-    job_id: str | None = None
 
     def __post_init__(self):
         identifier(self.store_id, 255)
         identifier(self.session_id, 255)
-        if self.job_id is not None:
-            identifier(self.job_id)
 
 
 @dataclass(frozen=True)
@@ -90,19 +113,6 @@ class InputRef:
         identifier(self.store_id, 255)
         identifier(self.session_id, 255)
         identifier(self.message_id)
-
-
-@dataclass(frozen=True)
-class JobRef:
-    store_id: str
-    job_id: str
-    generation: int | None = None
-
-    def __post_init__(self):
-        identifier(self.store_id, 255)
-        identifier(self.job_id)
-        if self.generation is not None and (type(self.generation) is not int or self.generation < 0):
-            raise RuntimeRequestError("stale_generation")
 
 
 @dataclass(frozen=True)
@@ -122,8 +132,8 @@ class TrustedActor:
 
 @dataclass(frozen=True)
 class RuntimeDescriptor:
-    schema_version: int
-    kind: str
+    schema_version: Literal[2]
+    kind: SessionKind
     definition_ref: str
     model_profile_ref: str | None
     tool_profile_ref: str
@@ -133,17 +143,101 @@ class RuntimeDescriptor:
     host_context: dict
 
     def __post_init__(self):
-        if self.schema_version != 1 or self.kind not in {
-            "agent", "workflow_driver", "workflow_node", "background_tool", "background_command"
+        if self.schema_version != 2 or self.kind not in {
+            "agent", "workflow_driver", "background"
         }:
             raise RuntimeRequestError("definition_unavailable")
-        for name in (self.definition_ref, self.tool_profile_ref, self.hook_profile_ref,
-                     self.resource_profile_ref):
+        for name in (
+            self.definition_ref, self.tool_profile_ref,
+            self.hook_profile_ref, self.resource_profile_ref,
+        ):
             identifier(name, 255)
+            if not name.endswith("@215"):
+                raise RuntimeRequestError("definition_unavailable", name)
         if self.model_profile_ref is not None:
             identifier(self.model_profile_ref, 255)
+            if not self.model_profile_ref.endswith("@215"):
+                raise RuntimeRequestError("definition_unavailable", self.model_profile_ref)
         object.__setattr__(self, "config", freeze(self.config))
         object.__setattr__(self, "host_context", freeze(self.host_context))
+
+
+@dataclass(frozen=True)
+class Receipt:
+    input_ref: InputRef | None
+    target: TargetRef
+    message_id: str | None
+    newly_accepted: bool
+    state: str
+    send_index: int | None
+    notification: str
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class Result:
+    input_ref: InputRef
+    target: TargetRef
+    status: TerminalStatus
+    send_index: int | None
+    result_seq: int | None
+    final_text: str = ""
+    usage: dict = None
+    structured_output: Any = None
+    error: str | None = None
+    error_code: str | None = None
+    result_delivery_error: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "usage", freeze(self.usage or {}))
+        object.__setattr__(self, "structured_output", freeze(self.structured_output))
+
+
+@dataclass(frozen=True)
+class Status:
+    input_ref: InputRef | None
+    target: TargetRef
+    execution_state: ExecutionState
+    input_state: InputState | None
+    terminal_status: TerminalStatus | None
+    send_index: int | None
+    result_available: bool
+    result_seq: int | None
+    cancel_requested: bool
+    reason: str | None
+    error_code: str | None
+    result_delivery_error: str | None
+    continuation_of: str | None
+    continuation_index: int | None
+
+
+@dataclass(frozen=True)
+class MessageRow:
+    id: int
+    session_id: str
+    seq: int
+    role: str
+    name: str | None
+    content: str | None
+    tool_calls: list[dict[str, Any]] | None
+    tool_call_id: str | None
+    round_index: int | None
+    state: str
+    meta: dict[str, Any]
+    send_index: int | None
+    created_at: int
+
+
+@dataclass(frozen=True)
+class MessagePage:
+    items: tuple[MessageRow, ...]
+    next_after_seq: int | None
+
+
+@dataclass(frozen=True)
+class SessionPage:
+    items: tuple[TargetRef, ...]
+    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -160,30 +254,38 @@ class RequestOptions:
     representation_ref: str | None = None
     metadata: dict | None = None
 
-    def __post_init__(self):
-        for name in ("tools", "response_format", "metadata"):
-            object.__setattr__(self, name, freeze(getattr(self, name)))
-        if self.response_format is not None:
-            if not isinstance(self.response_format, Mapping):
-                raise RuntimeRequestError("invalid_options", "response_format must be an object")
-            if self.response_format.get("type") == "json_schema":
-                schema = self.response_format.get("json_schema")
-                if not isinstance(schema, Mapping) or not isinstance(schema.get("schema"), Mapping):
-                    raise RuntimeRequestError("invalid_options", "json_schema.schema must be an object")
-        if type(self.history) is not bool:
-            raise RuntimeRequestError("invalid_options", "history must be boolean")
-        for name in ("max_tokens", "max_rounds", "max_tokens_per_run"):
-            value = getattr(self, name)
-            if value is not None and (type(value) is not int or value < 0):
-                raise RuntimeRequestError("invalid_options", name)
-        if self.temperature is not None and (type(self.temperature) not in (int, float) or self.temperature < 0):
-            raise RuntimeRequestError("invalid_options", "temperature")
-        freeze(self.temperature)
-        for name in ("model", "system_prompt", "representation_ref"):
-            if getattr(self, name) is not None and not isinstance(getattr(self, name), str):
-                raise RuntimeRequestError("invalid_options", name)
-        if self.tools is not None and (not isinstance(self.tools, tuple) or any(not isinstance(t, str) or not t for t in self.tools)):
-            raise RuntimeRequestError("invalid_options", "tools")
+
+def result_message_id(
+    child_target: TargetRef,
+    start_input: InputRef,
+    send_index: int | None,
+    result_kind: ResultKind,
+) -> str:
+    if (child_target.store_id, child_target.session_id) != (
+        start_input.store_id, start_input.session_id
+    ):
+        raise RuntimeRequestError("invalid_options", "result target/start mismatch")
+    if result_kind not in {
+        "agent_result", "workflow_result", "workflow_node_result",
+        "background_result", "managed_effect_result",
+    }:
+        raise RuntimeRequestError("invalid_options", "result_kind")
+    execution_key = (
+        f"send:{send_index}" if send_index is not None
+        else f"input:{start_input.message_id}"
+    )
+    return "res_" + sha256_canonical([
+        child_target.store_id, child_target.session_id, execution_key, result_kind,
+    ])[:56]
+
+
+# The following declarations belong to the unmigrated pre-P2 execution modules.
+# They are not used by schema 17 or RuntimeInputStore and are removed with those modules.
+@dataclass(frozen=True)
+class JobRef:
+    store_id: str
+    job_id: str
+    generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -199,61 +301,10 @@ class Command:
     expected_job_generation: int | None = None
     scope: str = "self"
 
-    def __post_init__(self):
-        identifier(self.message_id)
-        if (self.operation not in {"send", "resume", "cancel"} or self.scope not in {"self", "subtree"}
-                or type(self.urgent) is not bool or self.urgent and self.operation != "send"):
-            raise RuntimeRequestError("invalid_options", "operation/urgent/scope")
-        object.__setattr__(self, "payload", freeze(self.payload))
-        object.__setattr__(self, "options", freeze(self.options or {}))
-        for name in ("expires_at_ms", "expected_job_generation"):
-            value = getattr(self, name)
-            if value is not None and (type(value) is not int or value < 0):
-                raise RuntimeRequestError("invalid_options", name)
-
-
-@dataclass(frozen=True)
-class Receipt:
-    input_ref: InputRef | None
-    target: TargetRef
-    message_id: str
-    newly_accepted: bool
-    job_ref: JobRef | None
-    state: str
-    notification: str
-    reason: str | None = None
-
-
-@dataclass(frozen=True)
-class Status:
-    input_ref: InputRef | None
-    job_ref: JobRef | None
-    state: str
-    reason: str | None
-    result_available: bool
-    cancel_requested: bool
-    resource_state: str
-
-
-@dataclass(frozen=True)
-class Result:
-    job_ref: JobRef | None
-    input_ref: InputRef | None
-    status: str
-    final_text: str = ""
-    usage: dict | None = None
-    structured_output: Any = None
-    error: str | None = None
-    error_code: str | None = None
-
-    def __post_init__(self):
-        object.__setattr__(self, "usage", freeze(self.usage or {}))
-        object.__setattr__(self, "structured_output", freeze(self.structured_output))
-
 
 @dataclass(frozen=True)
 class JobPage:
-    items: tuple[Status, ...]
+    items: tuple
     next_cursor: str | None
 
 

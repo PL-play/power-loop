@@ -17,10 +17,8 @@ from power_loop.runtime.store.factory import _make_database
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_executor_drain_trees import stop_worker, wait_ready
-from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

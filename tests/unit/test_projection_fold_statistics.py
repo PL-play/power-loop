@@ -20,13 +20,10 @@ from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.projection_fold import OWNER_PREFIX, STATE_KEY, read_state
 from tests.unit.test_stateful_loop import _Scripted
 
-from .test_job_registry_192 import registry_store
-
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 
-__all__ = ['registry_store']
 
 
 @pytest.fixture

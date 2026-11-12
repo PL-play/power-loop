@@ -12,9 +12,6 @@ from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import AgentSpec, run_agent_spec
 from power_loop.tools.registry import ToolRegistry
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

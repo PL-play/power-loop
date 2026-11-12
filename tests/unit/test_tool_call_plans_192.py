@@ -9,12 +9,10 @@ from power_loop.runtime.pending_calls import retire_pending_runtime
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_call_plans import reconcile_pending
 
-from .test_job_registry_192 import registry_store
 from .test_managed_delivery_192 import consume_queued
 from .test_managed_delivery_192 import controller as _controller
 from .test_managed_effects_192 import scenario
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

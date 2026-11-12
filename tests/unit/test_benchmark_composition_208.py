@@ -8,9 +8,6 @@ from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinat
 from tests.design203_benchmark import batch
 from tests.run_design203_runtime_benchmark import SCENARIOS, composition
 
-from .test_job_registry_192 import registry_store
-
-__all__=['registry_store']
 pytestmark=[pytest.mark.unit,pytest.mark.asyncio]
 
 

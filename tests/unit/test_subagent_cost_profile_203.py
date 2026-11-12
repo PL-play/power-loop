@@ -19,12 +19,10 @@ from tests.runtime_fixture import RunningAgent
 from tests.write_meter import WriteMeter
 
 from .test_background_runtime_203 import BackgroundParent
-from .test_job_registry_192 import registry_store
 from .test_send_row_profile import _snapshot
 from .test_send_sql_profile import Profiled, _counts
 from .test_subagent_runtime_203 import ParentAndChild
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -9,10 +9,9 @@ import pytest
 
 from power_loop.runtime import task_query
 from power_loop.runtime.jobs import JobActor, JobError, JobManager, _json
+from tests.legacy_job_helpers import call, child, claimed, runtime
 
-from .test_job_registry_192 import call, child, claimed, registry_store, runtime
-
-__all__ = ["registry_store", "runtime"]
+__all__ = ["runtime"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

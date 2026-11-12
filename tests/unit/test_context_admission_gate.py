@@ -20,12 +20,11 @@ from power_loop.runtime.session_controls import ControlTransaction
 from power_loop.runtime.store.factory import _make_database
 
 from .test_executor_drain_trees import stop_worker, wait_ready
-from .test_job_registry_192 import registry_store
 from .test_root_context_192 import NAMESPACE, root_case
 from .test_root_control_192 import PAYLOAD, send, stop
 from .test_send_sql_profile import Profiled, _counts
 
-__all__ = ['registry_store', 'root_case']
+__all__ = ['root_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

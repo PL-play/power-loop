@@ -15,6 +15,8 @@ from power_loop.runtime.store.schema import (
 )
 from power_loop.runtime.store.store import SessionStore
 
+from .session_native_fixture import new_session
+
 pytestmark = pytest.mark.unit
 
 
@@ -84,27 +86,11 @@ async def test_provisioning_ddl_shape():
 
 async def test_append_message_bumps_next_seq():
     s = await SessionStore.open(":memory:")
-    sid = await s.create_session(session_id="s")
+    sid = (await new_session(s, "s")).session_id
     before = (await s.get_state(sid)).next_seq
     await s.append_message(sid, role="user", content="x")
     after = (await s.get_state(sid)).next_seq
     assert after == before + 1
-    await s.close()
-
-
-async def test_record_compaction_bumps_next_seq():
-    """A fold allocates the compact_note's seq from the per-session counter, so it bumps
-    next_seq — which is what lets the loop's window cache detect a fold and invalidate."""
-    s = await SessionStore.open(":memory:")
-    sid = await s.create_session(session_id="s")
-    seqs = [await s.append_message(sid, role="user", content=f"m{i}") for i in range(3)]
-    before = (await s.get_state(sid)).next_seq
-    await s.record_compaction(
-        sid, from_seq=min(seqs), to_seq=max(seqs), note_content="n",
-        before_tokens=1, after_tokens=1, round_index=0, fold_seqs=seqs, order_key=seqs[0],
-    )
-    after = (await s.get_state(sid)).next_seq
-    assert after > before
     await s.close()
 
 
@@ -113,7 +99,7 @@ async def test_record_compaction_bumps_next_seq():
 
 async def test_load_active_after_seq_returns_only_the_tail():
     s = await SessionStore.open(":memory:")
-    sid = await s.create_session(session_id="s")
+    sid = (await new_session(s, "s")).session_id
     seqs = [await s.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
     full = [r.seq for r in await s.load_active_messages(sid)]
     assert full == seqs
@@ -132,3 +118,37 @@ def test_table_prefix_length_is_capped() -> None:
     assert validate_table_prefix("a" * _MAX_TABLE_PREFIX_LEN) == "a" * _MAX_TABLE_PREFIX_LEN  # at limit
     with pytest.raises(ValueError, match="too long"):
         validate_table_prefix("a" * (_MAX_TABLE_PREFIX_LEN + 1))
+
+
+async def test_schema17_has_no_legacy_tables_and_enforces_owner_state():
+    from power_loop.runtime.store.session_native_ddl import FORBIDDEN_TABLES
+
+    store = await SessionStore.open(":memory:")
+    rows = await store._db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")
+    names = {row["name"] for row in rows}
+    assert not {store.table_prefix + table for table in FORBIDDEN_TABLES} & names
+    with pytest.raises(Exception):
+        await store._db.execute(
+            f"INSERT INTO {store.t.session_state}(session_id,execution_state,active_send_index) "
+            "VALUES ('bad','running',1)"
+        )
+    await store.close()
+
+
+@pytest.mark.parametrize("column,value", (("version", 16), ("protocol_version", 42)))
+async def test_old_schema_or_protocol_is_rejected(tmp_path, column, value):
+    path = str(tmp_path / (column + ".db"))
+    store = await SessionStore.open(path)
+    await store._db.execute(f"UPDATE pl_schema_migrations SET {column}=? WHERE id=1", (value,))
+    await store.close()
+    with pytest.raises(StoreSchemaError):
+        await SessionStore.open(path, schema="verify")
+
+
+async def test_recovery_index_is_verified(tmp_path):
+    path = str(tmp_path / "index.db")
+    store = await SessionStore.open(path)
+    await store._db.execute("DROP INDEX pl_idx_session_recovery")
+    await store.close()
+    with pytest.raises(StoreSchemaError, match="idx_session_recovery"):
+        await SessionStore.open(path, schema="verify")

@@ -5,10 +5,9 @@ import pytest
 
 from power_loop.runtime.jobs import JobError
 
-from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import finish, jobs, managed
 
-__all__ = ['registry_store', 'managed']
+__all__ = ['managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -8,10 +8,9 @@ import pytest
 
 from power_loop.runtime import session_obligations as obligations
 from power_loop.runtime.jobs import JobManager
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
-
-__all__ = ["registry_store", "runtime"]
+__all__ = ["runtime"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

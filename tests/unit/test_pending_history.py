@@ -16,10 +16,9 @@ from power_loop.runtime.task_inspection import list_open_roots
 
 from .test_executor_lifecycle_192 import host
 from .test_executor_registry_192 import boot
-from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled
 
-__all__ = ['registry_store', 'boot', 'host']
+__all__ = ['boot', 'host']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

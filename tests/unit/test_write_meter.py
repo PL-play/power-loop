@@ -1,7 +1,6 @@
 """Prove cumulative accounting cannot be replaced by before/after net rows."""
 import pytest
 
-from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
 from tests.write_meter import WriteMeter
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]

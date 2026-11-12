@@ -6,10 +6,9 @@ import pytest
 from power_loop.runtime.jobs import JobError, _json
 from power_loop.runtime.pending_calls import retire_pending_runtime
 
-from .test_job_registry_192 import registry_store
 from .test_pending_call_disposition_192 import original_pending
 
-__all__ = ['registry_store', 'original_pending']
+__all__ = ['original_pending']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from power_loop.runtime.jobs import JobManager
 
-from .runtime_store import RuntimeInputStore, now_ms, quiet_cancel_event
+from .runtime_store import RuntimeInputStore, now_ms
 from .runtime_transport import SubscriptionSpec, TransportPacket
 from .runtime_types import (
     CapacityError,
@@ -28,6 +28,10 @@ from .runtime_types import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def quiet_cancel_event(job_id):
+    return "cancel_quiet:" + job_id
 
 
 class RuntimeClient:

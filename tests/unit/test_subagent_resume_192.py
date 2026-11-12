@@ -10,11 +10,10 @@ from power_loop import InputRef, JobRef, RuntimeRequestError
 from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.jobs import JobLease
 
-from .test_job_registry_192 import registry_store
 from .test_nudge_runtime_192 import issue_nudge
 from .test_task_runtime_192 import finish, managed, receipt
 
-__all__ = ['registry_store', 'managed']
+__all__ = ['managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

@@ -20,12 +20,10 @@ from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 from tests.runtime_fixture import RunningAgent
 from tests.unit._workflow_fixture_203 import Model, leaf
-from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_send_row_profile import _snapshot
 from tests.unit.test_send_sql_profile import _LEGACY_SQL_COLUMNS, Profiled, _category, _counts
 from tests.write_meter import WriteMeter
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 OUT = os.environ.get("P0_BASELINE_OUT")
 

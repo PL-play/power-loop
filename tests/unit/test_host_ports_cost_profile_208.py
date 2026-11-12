@@ -21,12 +21,9 @@ from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinat
 from power_loop.runtime.store.process_guard import ProcessStoreGuard
 from tests.write_meter import WriteMeter
 
-from .test_job_registry_192 import registry_store
 from .test_runtime_messaging_203 import fixture
 from .test_send_row_profile import _snapshot
 from .test_send_sql_profile import Profiled, _counts
-
-__all__ = ['registry_store']
 
 
 class NativeConnection:

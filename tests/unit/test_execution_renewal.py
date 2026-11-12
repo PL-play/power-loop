@@ -22,10 +22,8 @@ from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinat
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_runtime_messaging_203 import fixture
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

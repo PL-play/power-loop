@@ -21,9 +21,6 @@ from power_loop import (
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.runtime.pricing import Free
-from tests.unit.test_job_registry_192 import registry_store
-
-__all__ = ["registry_store"]
 
 
 @dataclass

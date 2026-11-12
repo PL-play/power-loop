@@ -14,10 +14,7 @@ import pytest
 
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from power_loop.core.state import ContextManager
-from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_request_sanitize import StrictModel
-
-__all__ = ["registry_store"]
 
 
 @dataclass

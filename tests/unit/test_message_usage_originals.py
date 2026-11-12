@@ -8,10 +8,8 @@ import pytest
 
 from power_loop.agent.sink import SQLiteSink
 
-from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 USAGE = dict(prompt_tokens=7, completion_tokens=5, total_tokens=12, cached_tokens=3, model='fixture')
 

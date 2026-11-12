@@ -6,12 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_retention import NOW, OLD, insert, root
 from tests.unit.test_send_sql_profile import Profiled, _counts
 from tests.write_meter import WriteMeter
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

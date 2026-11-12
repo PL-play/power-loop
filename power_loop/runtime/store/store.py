@@ -308,9 +308,11 @@ class SessionStore:
         self._schema_version = version
         from .task_schema import TASK_SCHEMA_VERSION
         if version == TASK_SCHEMA_VERSION:
-            row = await self._db.fetchone(f"SELECT store_id FROM {self.table_prefix}task_store WHERE id=1")
+            row = await self._db.fetchone(
+                f"SELECT store_id FROM {self.table_prefix}schema_migrations WHERE id=1"
+            )
             if row is None:
-                raise ValueError("task store identity missing")
+                raise ValueError("session store identity missing")
             self.store_id = str(row["store_id"])
 
     @property
@@ -368,65 +370,62 @@ class SessionStore:
     # ── sessions ────────────────────────────────────────────────────────────
     async def create_session(
         self,
+        descriptor,
         *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        config: dict[str, Any] | None = None,
+        actor,
         parent_session_id: str | None = None,
-        spawn_tool_call_id: str | None = None,
-        kind: SessionKind = SessionKind.ROOT,
-        lifecycle: SubagentLifecycle = SubagentLifecycle.EPHEMERAL,
-        metadata: dict[str, Any] | None = None,
+        created_by_session_id: str | None = None,
+        result_route: dict[str, Any] | None = None,
+        cancel_propagation: str = "linked",
         session_id: str | None = None,
+        creation_identity_hash: str | None = None,
+        creation_call_ref: dict[str, Any] | None = None,
+        creation_tool_call_id: str | None = None,
+        start_input_message_id: str | None = None,
     ) -> str:
-        spawn_depth = 0
-        if parent_session_id is not None:
-            parent = await self.get_session(parent_session_id)
-            if parent is None:
-                raise ValueError(f"parent session not found: {parent_session_id}")
-            spawn_depth = parent.spawn_depth + 1
-            if spawn_depth > self.max_spawn_depth:
-                raise ValueError(f"spawn depth {spawn_depth} exceeds max {self.max_spawn_depth}")
-            kind = SessionKind.SUBAGENT
+        from power_loop.agent.runtime_types import canonical, plain, sha256_canonical
 
         sid = session_id or _new_session_id()
         now = _now_ms()
+        descriptor_json = canonical(descriptor)
+        descriptor_hash = sha256_canonical(descriptor)
+        identity = creation_identity_hash or sha256_canonical([
+            self.store_id, parent_session_id, plain(creation_call_ref),
+            creation_tool_call_id, descriptor, start_input_message_id,
+        ])
         async with self._db.transaction() as tx:
-            await self._create_session_tx(tx, sid, now, system_prompt=system_prompt, model=model,
-                config=config, kind=kind, parent_session_id=parent_session_id,
-                spawn_tool_call_id=spawn_tool_call_id, spawn_depth=spawn_depth,
-                lifecycle=lifecycle, metadata=metadata)
+            if parent_session_id is not None:
+                parent = await tx.fetchone(
+                    f"SELECT tenant_id,principal_id,lifecycle FROM {self.t.sessions} WHERE session_id=?",
+                    (parent_session_id,),
+                )
+                if parent is None:
+                    from power_loop.agent.runtime_types import RuntimeRequestError
+                    raise RuntimeRequestError("not_found", "parent session")
+                if parent["lifecycle"] != "open":
+                    from power_loop.agent.runtime_types import RuntimeRequestError
+                    raise RuntimeRequestError("session_closed")
+                if (parent["tenant_id"], parent["principal_id"]) != (
+                    actor.tenant_id, actor.principal_id
+                ):
+                    from power_loop.agent.runtime_types import RuntimeRequestError
+                    raise RuntimeRequestError("forbidden")
+            await tx.execute(
+                f"INSERT INTO {self.t.sessions} ("
+                "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
+                "descriptor_hash,creation_identity_hash,creation_call_ref_json,creation_tool_call_id,"
+                "start_input_message_id,tenant_id,principal_id,result_route_json,cancel_propagation,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    sid, parent_session_id, created_by_session_id, descriptor.kind, descriptor_json,
+                    descriptor_hash, identity, canonical(creation_call_ref) if creation_call_ref else None,
+                    creation_tool_call_id, start_input_message_id, actor.tenant_id, actor.principal_id,
+                    canonical(result_route) if result_route is not None else None,
+                    cancel_propagation, now, now,
+                ),
+            )
+            await tx.execute(f"INSERT INTO {self.t.session_state} (session_id) VALUES (?)", (sid,))
         return sid
-
-    async def _create_session_tx(self, tx, sid, now, *, system_prompt=None, model=None,
-                                 config=None, kind=SessionKind.SUBAGENT, parent_session_id=None,
-                                 spawn_tool_call_id=None, spawn_depth=1,
-                                 lifecycle=SubagentLifecycle.LINKED, metadata=None):
-        """Allocate an independently executable session in its admission transaction."""
-        if parent_session_id is not None:
-            changed = await tx.execute(f"UPDATE {self.t.session_state} SET inbox_version=inbox_version+1 "
-                "WHERE session_id=? AND lifecycle='open'", (parent_session_id,))
-            if not changed:
-                from power_loop.agent.runtime_types import RuntimeRequestError
-                raise RuntimeRequestError('session_closed')
-        await tx.execute(
-            f"INSERT INTO {self.t.sessions} ("
-            "session_id, created_at, updated_at, system_prompt, model, config_json, "
-            "status, kind, parent_session_id, spawn_tool_call_id, spawn_depth, "
-            "lifecycle, metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                sid, now, now, system_prompt, model, _dumps(config or {}),
-                SessionStatus.ACTIVE.value, kind.value, parent_session_id,
-                spawn_tool_call_id, spawn_depth, lifecycle.value, _dumps(metadata or {}),
-            ),
-        )
-        await tx.execute(
-            f"INSERT INTO {self.t.session_state} (session_id) VALUES (?)", (sid,)
-        )
-        if self.store_id is not None:
-            # The first context-bearing send uses this existing row as its
-            # short admission gate;its version remains derived from writes.
-            await tx.execute(f'INSERT INTO {self.table_prefix}session_controls (session_id,version) VALUES (?,?)', (sid, 0))
 
     async def get_session(self, session_id: str) -> SessionRow | None:
         holding = self._holding(session_id)

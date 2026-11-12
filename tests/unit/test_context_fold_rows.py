@@ -6,10 +6,8 @@ from power_loop.runtime.fold import LLMSummaryFold
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.projection_fold import read_state
 
-from .test_job_registry_192 import registry_store
 from .test_stateful_loop import _Scripted
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

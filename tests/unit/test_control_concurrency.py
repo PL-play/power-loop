@@ -10,11 +10,11 @@ import pytest
 from power_loop import AgentLoopConfig, ExecutionEnvironment, LLMResponse, LLMService, RegistryRuntimeFactory, Runtime
 from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.jobs import JobError, JobManager
+from tests.legacy_job_helpers import runtime
 
-from .test_job_registry_192 import registry_store, runtime
 from .test_runtime_messaging_203 import fixture
 
-__all__=['registry_store','runtime']
+__all__=['runtime']
 
 
 async def test_separate_default_processes_never_dispatch_two_models(registry_store):

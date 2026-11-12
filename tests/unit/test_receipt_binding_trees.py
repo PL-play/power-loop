@@ -15,10 +15,8 @@ from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.session_controls import ControlTransaction
 
 from .test_executor_drain_trees import stop_worker
-from .test_job_registry_192 import registry_store
 from .test_stop_request_trees import cross_control
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit,pytest.mark.asyncio]
 
 

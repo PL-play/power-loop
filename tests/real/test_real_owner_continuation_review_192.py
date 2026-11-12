@@ -6,9 +6,7 @@ import json
 import pytest
 
 from power_loop.runtime import delegation
-from tests.unit.test_job_registry_192 import registry_store
 
-__all__ = ["registry_store"]
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 

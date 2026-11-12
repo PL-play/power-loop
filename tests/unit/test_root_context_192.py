@@ -23,9 +23,7 @@ from power_loop.runtime import root_context
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store', 'root_case']
+__all__ = ['root_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 NAMESPACE = "deeptalk.agent-run.v1"
 

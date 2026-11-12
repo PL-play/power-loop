@@ -11,12 +11,6 @@ import pytest
 from power_loop import AgentLoopConfig, JobRef, ToolDefinition
 from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.background import encode_results, load_record
-from tests.runtime_fixture import RunningAgent
-
-from .test_job_registry_192 import registry_store
-from .test_timers import _Scripted, _tool_resp
-
-__all__ = ["registry_store"]
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.runtime.tool_contracts import (
@@ -29,6 +23,9 @@ from power_loop.runtime.tool_contracts import (
 )
 from power_loop.tools import create_default_tool_registry
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
+
+from .test_timers import _Scripted, _tool_resp
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 

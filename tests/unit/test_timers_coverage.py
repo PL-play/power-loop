@@ -3,10 +3,8 @@ import time
 
 import pytest
 
-from .test_job_registry_192 import registry_store
 from .test_timers import timers
 
-__all__ = ["registry_store"]
 pytestmark = pytest.mark.unit
 
 async def test_recurring_rearm_collapses_missed_periods(registry_store):

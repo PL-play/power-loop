@@ -20,10 +20,7 @@ from power_loop.tools.spawn_agent import register_spawn_agent
 from power_loop.workflow.facade import register_workflow_tool
 from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store
 from .test_managed_delivery_192 import consume_notice
-
-__all__=['registry_store']
 
 
 def call(name,args,identity):

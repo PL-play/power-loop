@@ -7,10 +7,8 @@ from power_loop import AgentLoopConfig, ToolDefinition
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
-from .test_job_registry_192 import registry_store
 from .test_pass_turn_builtin import _call, _Script
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

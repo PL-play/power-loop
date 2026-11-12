@@ -5,10 +5,10 @@ from power_loop import LLMRequest
 from power_loop.runtime.model_calls import ModelCalls
 from power_loop.runtime.task_runtime import _SEND
 
-from .test_fold_calls_192 import SummaryModel, fold_case, registry_store
+from .test_fold_calls_192 import SummaryModel, fold_case
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
-__all__ = ['fold_case', 'registry_store']
+__all__ = ['fold_case']
 
 
 async def test_auxiliary_call_uses_normal_llm_accounting(fold_case):

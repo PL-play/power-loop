@@ -24,9 +24,6 @@ from power_loop.agent.runtime_types import plain
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import _SEND
 
-from .test_job_registry_192 import registry_store
-
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

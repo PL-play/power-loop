@@ -9,13 +9,13 @@ import pytest
 
 from power_loop.runtime import execution_membership, root_context, task_sessions
 from power_loop.runtime.jobs import JobManager
+from tests.legacy_job_helpers import call
+from tests.legacy_job_helpers import runtime as registry_runtime
 
-from .test_job_registry_192 import call, registry_store
-from .test_job_registry_192 import runtime as registry_runtime
 from .test_root_context_192 import root_case
 from .test_send_sql_profile import Profiled
 
-__all__ = ['registry_store', 'registry_runtime', 'root_case']
+__all__ = ['registry_runtime', 'root_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

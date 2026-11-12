@@ -10,11 +10,9 @@ from power_loop.runtime.pending_calls import SNAPSHOT, retire_pending_runtime
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.result_revisions import result_id
 
-from .test_job_registry_192 import registry_store
 from .test_managed_delivery_192 import consume_queued, controller
 from .test_managed_effects_192 import scenario
 
-__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

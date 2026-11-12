@@ -21,13 +21,13 @@ from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.legacy_job_helpers import child, runtime
 from tests.runtime_fixture import RunningAgent
 
 from .test_executor_activation_trees import observe
 from .test_executor_drain_trees import stop_worker
-from .test_job_registry_192 import child, registry_store, runtime
 
-__all__ = ['registry_store', 'runtime']
+__all__ = ['runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
