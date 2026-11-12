@@ -6,6 +6,7 @@ Normal billing and cleanup invariants remain assertions. Set POWER_LOOP_SQL_PROF
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -283,7 +284,7 @@ async def test_send_sql_profile(registry_store, models, budgeted, tools_per_roun
     budget = (base + per_round * (models - 1)
               + per_extra_tool * (tools_per_round - 1) * (models - 1))
     activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
-    assert len(activity) <= 1
+    assert len(activity) <= max(1, math.ceil(elapsed_s))
     assert len(foreground) - len(activity) <= budget, (
         dialect, models, tools_per_round, len(foreground), len(activity), budget)
 

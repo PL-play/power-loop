@@ -133,6 +133,8 @@ def main():
         args.output.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n")
     if args.check:
         saved = json.loads(args.check.read_text())
+        assert saved["source_heads"] == current["source_heads"], (
+            "jobs import source_heads differ", saved["source_heads"], current["source_heads"])
         assert saved["entries"] == current["entries"], "jobs import manifest differs from AST scan"
         assert saved["count"] == current["count"] == len(current["entries"])
         assert saved["counts"] == current["counts"]
