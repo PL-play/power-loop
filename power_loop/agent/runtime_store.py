@@ -389,6 +389,43 @@ class RuntimeInputStore:
             ref = context.get("refs", (None,))[0]
             raise StoreError(ref) from exc
 
+    async def release_claim(self, batch: ClaimedBatch):
+        """Atomically return a claimed batch to queued/pending before loop execution."""
+        self.check_store(batch.target)
+        ids = [ref.message_id for ref in batch.input_refs]
+        async with self.db.transaction() as tx:
+            state = await self.db.dialect.lock_state(tx, self.state, batch.target.session_id)
+            if (
+                state["execution_state"] != "running"
+                or state["active_send_index"] != batch.send_index
+                or state["owner_epoch"] != batch.owner_epoch
+                or state["owner_token"] != batch.owner_token
+            ):
+                raise SessionLeaseLost(batch.target.session_id)
+            restored = await tx.execute(
+                f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+                "delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
+                f"AND delivered_send_index=? AND item_id IN ({','.join('?' for _ in ids)})",
+                (batch.target.session_id, batch.send_index, *ids),
+            )
+            if restored != len(ids):
+                raise SessionLeaseLost(batch.target.session_id)
+            await tx.execute(
+                f"DELETE FROM {self.store.t.messages} WHERE session_id=? AND seq=? "
+                "AND role='user' AND send_index=?",
+                (batch.target.session_id, batch.message_seq, batch.send_index),
+            )
+            changed = await tx.execute(
+                f"UPDATE {self.state} SET execution_state='queued',active_send_index=NULL,"
+                "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+                "cancel_send_index=NULL,cancel_reason=NULL "
+                "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
+                "AND owner_epoch=? AND owner_token=?",
+                (batch.target.session_id, batch.send_index, batch.owner_epoch, batch.owner_token),
+            )
+            if changed != 1:
+                raise SessionLeaseLost(batch.target.session_id)
+
     @staticmethod
     def merge_batch(rows):
         from .follow_up import session_batch_content

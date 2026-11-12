@@ -136,7 +136,7 @@ async def test_command_factory_does_not_claim_or_fail(registry_store):
         return ExecutionEnvironment(model, None, AgentLoopConfig(max_rounds=4, compactor=None),
                                     command=("host_command", {}))
 
-    factory.register("test.agent@215", build)
+    factory.register("test.agent@215", build, can_execute=lambda descriptor: False)
     await _assert_incapable_leaves_input_pending(store, factory, model)
 
 
@@ -152,7 +152,10 @@ async def test_build_failure_does_not_claim_or_fail(registry_store, code):
     async def build(descriptor, context):
         raise RuntimeRequestError(code, "node cannot execute this descriptor")
 
-    factory.register("test.agent@215", build)
+    def can_execute(descriptor):
+        raise RuntimeRequestError(code, "node cannot execute this descriptor")
+
+    factory.register("test.agent@215", build, can_execute=can_execute)
     await _assert_incapable_leaves_input_pending(store, factory, model)
 
 
@@ -168,7 +171,10 @@ async def test_capable_node_completes_after_incapable_node_leaves_input(registry
     async def bad_build(descriptor, context):
         raise RuntimeRequestError("capability_unavailable", "no executor")
 
-    incapable.register("test.agent@215", bad_build)
+    def can_execute(descriptor):
+        raise RuntimeRequestError("capability_unavailable", "no executor")
+
+    incapable.register("test.agent@215", bad_build, can_execute=can_execute)
     node_a = Runtime(store=store, factory=incapable, node_id="A", boot_id="A",
                      recovery_interval_s=None, timers_enabled=False)
     try:
@@ -190,6 +196,132 @@ async def test_capable_node_completes_after_incapable_node_leaves_input(registry
         result = await node_b.client.wait(InputRef(store.store_id, root.session_id, "m1"),
                                           actor=ACTOR, deadline_ms=None)
         assert result.status == "completed" and result.final_text == "done"
+    finally:
+        await node_b.worker.shutdown(timeout_s=2)
+        await node_b.client.aclose()
+        await node_b.transport.aclose()
+
+
+async def test_build_uses_claimed_execution_context(registry_store):
+    """The only build happens after claim and receives the real execution identity."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    model = CountingModel()
+    contexts = []
+    factory = RegistryRuntimeFactory()
+
+    async def build(descriptor, context):
+        contexts.append((context.input_ref, context.send_index,
+                         context.owner_epoch, context.owner_token))
+        return ExecutionEnvironment(
+            model, None, AgentLoopConfig(max_rounds=4, compactor=None))
+
+    factory.register("test.agent@215", build)
+    runtime = Runtime(store=store, factory=factory, node_id="claimed", boot_id="b",
+                      recovery_interval_s=None, timers_enabled=False)
+    try:
+        await runtime.worker.start()
+        await runtime.worker.recover()
+        ref = InputRef(store.store_id, root.session_id, "m1")
+        result = await asyncio.wait_for(
+            runtime.client.wait(ref, actor=ACTOR, deadline_ms=None), 10)
+        assert result.status == "completed" and result.send_index == 1
+        assert len(contexts) == 1
+        built_ref, send_index, owner_epoch, owner_token = contexts[0]
+        assert (built_ref, send_index, owner_epoch) == (ref, 1, 1)
+        assert owner_token
+        assert model.calls == 1
+    finally:
+        await runtime.worker.shutdown(timeout_s=2)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
+async def test_factory_requiring_input_ref_completes(registry_store):
+    """A legitimate factory may require the InputRef allocated by claim."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    factory = RegistryRuntimeFactory()
+    builds = 0
+
+    async def build(descriptor, context):
+        nonlocal builds
+        builds += 1
+        assert context.input_ref is not None
+        return ExecutionEnvironment(
+            CountingModel(), None, AgentLoopConfig(max_rounds=4, compactor=None))
+
+    factory.register("test.agent@215", build)
+    runtime = Runtime(store=store, factory=factory, node_id="input-ref", boot_id="b",
+                      recovery_interval_s=None, timers_enabled=False)
+    try:
+        await runtime.worker.start()
+        await runtime.worker.recover()
+        ref = InputRef(store.store_id, root.session_id, "m1")
+        result = await asyncio.wait_for(
+            runtime.client.wait(ref, actor=ACTOR, deadline_ms=None), 10)
+        assert result.status == "completed" and result.final_text == "done"
+        assert builds == 1
+        assert not runtime.worker.capability_missing
+    finally:
+        await runtime.worker.shutdown(timeout_s=2)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
+async def test_claim_release_after_build_failure(registry_store):
+    """A build-only capability failure rolls back its claim for the next capable node."""
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    model = CountingModel()
+    contexts = []
+    factory = RegistryRuntimeFactory()
+
+    async def build(descriptor, context):
+        contexts.append((context.input_ref, context.send_index, context.owner_epoch))
+        raise RuntimeRequestError("resource_unavailable", "only available on another node")
+
+    factory.register("test.agent@215", build)
+    node_a = Runtime(store=store, factory=factory, node_id="A", boot_id="A",
+                     recovery_interval_s=None, timers_enabled=False)
+    ref = InputRef(store.store_id, root.session_id, "m1")
+    try:
+        await node_a.worker.start()
+        await node_a.worker.recover()
+        while node_a.worker._tasks:
+            await asyncio.wait(tuple(node_a.worker._tasks))
+        assert contexts == [(ref, 1, 1)]
+        status = await port.inspect(ref, actor=ACTOR)
+        assert status.input_state == "pending" and status.terminal_status is None
+        state = await store._db.fetchone(
+            f"SELECT execution_state,active_send_index,owner_token FROM {store.t.session_state} "
+            "WHERE session_id=?", (root.session_id,))
+        assert state == {"execution_state": "queued", "active_send_index": None, "owner_token": None}
+        messages = await store._db.fetchall(
+            f"SELECT role FROM {store.t.messages} WHERE session_id=?", (root.session_id,))
+        assert messages == []
+        assert model.calls == 0
+        assert "test.agent@215" in node_a.worker.capability_missing
+    finally:
+        await node_a.worker.shutdown(timeout_s=2)
+        await node_a.client.aclose()
+        await node_a.transport.aclose()
+
+    node_b = Runtime(store=store, factory=_factory(), node_id="B", boot_id="B",
+                     recovery_interval_s=None, timers_enabled=False)
+    try:
+        await node_b.worker.start()
+        await node_b.worker.recover()
+        result = await asyncio.wait_for(
+            node_b.client.wait(ref, actor=ACTOR, deadline_ms=None), 10)
+        assert result.status == "completed" and result.send_index == 2
     finally:
         await node_b.worker.shutdown(timeout_s=2)
         await node_b.client.aclose()

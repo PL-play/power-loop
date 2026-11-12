@@ -276,9 +276,23 @@ class RuntimeWorker:
             if state is None:
                 return
 
-            # Capability filter BEFORE claim: an incapable node never takes ownership,
-            # never claims and never fails the input (design 215 §9.4).
-            if descriptor.kind != "agent" or not self._can_build(descriptor):
+            # Capability predicates and descriptor declarations are cheap checks only:
+            # execution resources and their claimed identity are built after ownership.
+            if descriptor.kind != "agent":
+                self.capability_missing.add(descriptor.definition_ref)
+                return
+            try:
+                capable = self._can_build(descriptor)
+            except Exception as exc:
+                code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
+                self.last_error = {"code": code, "message": str(exc)[:500],
+                                   "definition_ref": descriptor.definition_ref}
+                self.capability_missing.add(descriptor.definition_ref)
+                return
+            if not capable:
+                self.last_error = {"code": "capability_unavailable",
+                                   "message": "factory rejected descriptor",
+                                   "definition_ref": descriptor.definition_ref}
                 self.capability_missing.add(descriptor.definition_ref)
                 return
 
@@ -297,40 +311,6 @@ class RuntimeWorker:
                     f"SELECT * FROM {store.t.session_state} WHERE session_id=?", (sid,))
                 exec_state = state["execution_state"]
             if exec_state != "queued":
-                return
-
-            # Probe executor capability BEFORE claim by attempting the build. A node that
-            # cannot execute this descriptor — host command, or a capability/resource/
-            # definition failure from build — leaves the input pending and the session
-            # queued for a capable node. It never claims and never terminalizes the input
-            # (P0-R2 contract §2 capability_unavailable; design 215 §9.4). The built env is
-            # reused for the run; if the claim is lost to another node, finally closes it.
-            from power_loop.core.execution_context import ExecutionContext
-            probe_options = RequestOptions(**{
-                k: v for k, v in descriptor.config.items() if k in RequestOptions.__dataclass_fields__
-            })
-            probe_context = ExecutionContext(
-                store.store_id, sid, r.node_id, r.boot_id, actor=actor,
-                options=probe_options, host_context=descriptor.host_context,
-            )
-            try:
-                with _bind_execution_context(lambda: probe_context, r.host_context_fields):
-                    env = await r.factory.build(descriptor, probe_context)
-            except Exception as exc:
-                code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
-                self.last_error = {"code": code, "message": str(exc)[:500],
-                                   "definition_ref": descriptor.definition_ref}
-                self.capability_missing.add(descriptor.definition_ref)
-                return
-            if env.command is not None:
-                # Host command executor is not available in P2; this node cannot run the
-                # send. Leave it queued/pending for a capable node — do not claim or fail.
-                self.last_error = {"code": "capability_unavailable",
-                                   "message": "host command executor is not available in P2",
-                                   "definition_ref": descriptor.definition_ref}
-                self.capability_missing.add(descriptor.definition_ref)
-                await env.aclose()
-                env = None
                 return
 
             batch = await self.inputs.claim(
@@ -358,6 +338,19 @@ class RuntimeWorker:
 
             with _bind_execution_context(ctx.snapshot, r.host_context_fields):
                 await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
+                try:
+                    env = await r.factory.build(descriptor, ctx.snapshot())
+                    if env.command is not None:
+                        raise RuntimeRequestError(
+                            "capability_unavailable", "host command executor is not available in P2")
+                except Exception as exc:
+                    code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
+                    self.last_error = {"code": code, "message": str(exc)[:500],
+                                       "definition_ref": descriptor.definition_ref}
+                    self.capability_missing.add(descriptor.definition_ref)
+                    await self.inputs.release_claim(batch)
+                    batch = None
+                    return
                 config = self._config(env, descriptor)
                 bus = env.event_bus if env.event_bus is not None else AgentEventBus()
 
@@ -443,7 +436,12 @@ class RuntimeWorker:
                 self._activate(sid)
 
     def _can_build(self, descriptor):
+        if descriptor.config.get("host_command"):
+            return False
         factory = self.runtime.factory
+        can_execute = getattr(factory, "can_execute", None)
+        if can_execute is not None:
+            return can_execute(descriptor)
         supports = getattr(factory, "supports", None)
         if supports is not None:
             return supports(descriptor)

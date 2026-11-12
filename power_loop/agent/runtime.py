@@ -45,6 +45,8 @@ class RuntimeFactory(Protocol):
 
     Builders receive the frozen request options; a missing referenced profile
     must raise definition_unavailable rather than silently use another profile.
+    A factory may also expose a synchronous ``can_execute(descriptor)`` predicate
+    for capability checks that must not construct execution resources.
     """
     async def preflight(self, required_profiles: frozenset[str]) -> None: ...
     async def build(self, descriptor, execution_context) -> ExecutionEnvironment: ...
@@ -53,6 +55,7 @@ class RuntimeFactory(Protocol):
 class RegistryRuntimeFactory:
     def __init__(self):
         self._builders = {}
+        self._capabilities = {}
         self.profiles = {"builtin.none@1", "builtin.empty@1"}
         self._preflights = {}
 
@@ -68,13 +71,20 @@ class RegistryRuntimeFactory:
         if preflight is not None:
             self._preflights[name] = preflight
 
-    def register(self, name, builder, *, profiles=()):
+    def register(self, name, builder, *, profiles=(), can_execute=None):
         if not name or "@" not in name:
             raise ValueError("a versioned definition name is required")
         if name in self._builders:
             raise ValueError("definition already registered: " + name)
         self._builders[name] = builder
+        self._capabilities[name] = can_execute
         self.profiles.update((name, *profiles))
+
+    def can_execute(self, descriptor):
+        predicate = self._capabilities.get(descriptor.definition_ref)
+        if descriptor.definition_ref not in self._builders:
+            return False
+        return True if predicate is None else predicate(descriptor)
 
     async def preflight(self, required_profiles):
         missing = set(required_profiles) - self.profiles
