@@ -122,6 +122,28 @@ class GatedToolModel(LLMService):
         pass
 
 
+async def test_render_batch_text_single_item_markers():
+    """P2-R1-3: a single urgent or non-user item keeps the deterministic ID/source/priority
+    header; a single ordinary user input stays plain text (no regression)."""
+    from power_loop.agent.follow_up import render_batch_text
+
+    def batch(*items):
+        return {"version": 1, "items": list(items)}
+
+    normal = {"message_id": "m1", "priority": "normal", "kind": "user", "content": "hello"}
+    urgent = {"message_id": "m2", "priority": "urgent", "kind": "user", "content": "stop now"}
+    result = {"message_id": "m3", "priority": "normal", "kind": "agent_result", "content": "child done"}
+    # Single ordinary user: plain body, unchanged.
+    assert render_batch_text(batch(normal)) == "hello"
+    # Single urgent: header carries message_id and priority.
+    assert render_batch_text(batch(urgent)) == "[user · m2 · urgent]\n\nstop now"
+    # Single non-user kind: header carries source kind.
+    assert render_batch_text(batch(result)) == "[agent_result · m3 · normal]\n\nchild done"
+    # Multi-item: every item keeps its header (unchanged).
+    multi = render_batch_text(batch(normal, urgent))
+    assert "[user · m1 · normal]" in multi and "[user · m2 · urgent]" in multi
+
+
 async def test_busy_followup_is_read_at_next_boundary_not_one_round_late(registry_store):
     """design 215 §7.4: the boundary reads the CURRENT inbox version, so an input
     committed after the assistant write is seen by the very next model call."""
@@ -149,10 +171,14 @@ async def test_busy_followup_is_read_at_next_boundary_not_one_round_late(registr
         release.set()
         result = await sending
         assert result.status == "completed"
-        # The second model request must already contain the follow-up (not one round late).
+        # The second model request must already contain the follow-up (not one round late),
+        # AND a single urgent item keeps its deterministic ID/priority header (P2-R1-3).
         second = model.requests[1]
         texts = [m.get("content") for m in second.messages if m.get("role") == "user"]
-        assert any("urgent redirect" in (t if isinstance(t, str) else str(t)) for t in texts), texts
+        joined = "\n".join(t if isinstance(t, str) else str(t) for t in texts)
+        assert "urgent redirect" in joined, texts
+        assert "follow" in joined and "urgent" in joined, texts  # message_id + priority mark
+        assert "[user · follow · urgent]" in joined, texts
         # One send_index, one merged follow-up user row, both inputs terminal completed.
         rows = await store.load_all_messages(agent.target.session_id)
         assert all(r.send_index == 1 for r in rows)

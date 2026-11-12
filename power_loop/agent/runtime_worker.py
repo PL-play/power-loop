@@ -299,6 +299,40 @@ class RuntimeWorker:
             if exec_state != "queued":
                 return
 
+            # Probe executor capability BEFORE claim by attempting the build. A node that
+            # cannot execute this descriptor — host command, or a capability/resource/
+            # definition failure from build — leaves the input pending and the session
+            # queued for a capable node. It never claims and never terminalizes the input
+            # (P0-R2 contract §2 capability_unavailable; design 215 §9.4). The built env is
+            # reused for the run; if the claim is lost to another node, finally closes it.
+            from power_loop.core.execution_context import ExecutionContext
+            probe_options = RequestOptions(**{
+                k: v for k, v in descriptor.config.items() if k in RequestOptions.__dataclass_fields__
+            })
+            probe_context = ExecutionContext(
+                store.store_id, sid, r.node_id, r.boot_id, actor=actor,
+                options=probe_options, host_context=descriptor.host_context,
+            )
+            try:
+                with _bind_execution_context(lambda: probe_context, r.host_context_fields):
+                    env = await r.factory.build(descriptor, probe_context)
+            except Exception as exc:
+                code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
+                self.last_error = {"code": code, "message": str(exc)[:500],
+                                   "definition_ref": descriptor.definition_ref}
+                self.capability_missing.add(descriptor.definition_ref)
+                return
+            if env.command is not None:
+                # Host command executor is not available in P2; this node cannot run the
+                # send. Leave it queued/pending for a capable node — do not claim or fail.
+                self.last_error = {"code": "capability_unavailable",
+                                   "message": "host command executor is not available in P2",
+                                   "definition_ref": descriptor.definition_ref}
+                self.capability_missing.add(descriptor.definition_ref)
+                await env.aclose()
+                env = None
+                return
+
             batch = await self.inputs.claim(
                 target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
             if batch is None:
@@ -324,20 +358,6 @@ class RuntimeWorker:
 
             with _bind_execution_context(ctx.snapshot, r.host_context_fields):
                 await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
-                try:
-                    env = await r.factory.build(descriptor, ctx.snapshot())
-                except Exception as exc:
-                    code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
-                    self.last_error = {"code": code, "message": str(exc)[:500],
-                                       "definition_ref": descriptor.definition_ref}
-                    await self._final_failed(batch, code, str(exc)[:500])
-                    return
-                if env.command is not None:
-                    # Host commands are a P3 executor; this node claimed an agent send it
-                    # cannot run as a command. Terminalize visibly so the next send continues.
-                    await self._final_failed(batch, "capability_unavailable", "host commands are implemented in P3")
-                    return
-
                 config = self._config(env, descriptor)
                 bus = env.event_bus if env.event_bus is not None else AgentEventBus()
 

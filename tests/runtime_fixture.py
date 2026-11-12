@@ -29,7 +29,9 @@ class RunningAgent:
         self.execution_started = asyncio.Condition()
         factory = RegistryRuntimeFactory()
         async def build(descriptor, context):
-            self.executions[context.input_ref] = asyncio.current_task()
+            # Keyed by session_id: the worker probes capability (build) BEFORE claim, so
+            # input_ref/send_index are not yet assigned at build time.
+            self.executions[context.session_id] = asyncio.current_task()
             async with self.execution_started:
                 self.execution_started.notify_all()
             return ExecutionEnvironment(model, registry, self.config, hooks=self.hooks, task_runtime=task_runtime,
@@ -62,18 +64,19 @@ class RunningAgent:
         return result
 
     async def finish(self, input_ref, *, failed=False):
-        task = self.executions.pop(input_ref, None)
+        task = self.executions.pop(input_ref.session_id, None)
         if task:
             await asyncio.gather(task, return_exceptions=failed)
 
     async def drain(self, *, after_input=None):
         if after_input is not None:
+            sid = after_input.session_id
             async with asyncio.timeout(15), self.execution_started:
-                await self.execution_started.wait_for(lambda: after_input in self.executions)
+                await self.execution_started.wait_for(lambda: sid in self.executions)
             await self.finish(after_input)
         while self.runtime.worker._tasks:
             await asyncio.wait(tuple(self.runtime.worker._tasks))
-        self.executions = {ref: task for ref, task in self.executions.items() if not task.done()}
+        self.executions = {sid: task for sid, task in self.executions.items() if not task.done()}
 
     async def aclose(self):
         await self.runtime.worker.shutdown(timeout_s=2, cancel_running=True)

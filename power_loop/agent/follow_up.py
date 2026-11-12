@@ -123,21 +123,34 @@ def _batch_item_text(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False)
 
 
+def _batch_header(item: Mapping[str, Any]) -> str:
+    return (f"[{item.get('kind') or 'user'} · {item.get('message_id')} · "
+            f"{item.get('priority') or 'normal'}]")
+
+
 def render_batch_text(merged: Mapping[str, Any]) -> str:
     """Deterministic text rendering of a merged batch for text providers (design 215 §7.3).
 
     Every item keeps its ID, kind, priority and boundary; a child result is never
     disguised as a human turn. The canonical JSON body stays in the raw message for
     audit; this is the equivalent text the model actually reads.
+
+    A single ordinary user input renders as plain text (the common chat case, unchanged).
+    A single urgent or non-user item carries the same deterministic header as a multi-item
+    batch, so its ID/source/priority stay visible to the model (design 215 §7.4 urgent mark).
     """
     items = merged.get("items") or []
     if len(items) == 1:
         only = items[0]
-        return _batch_item_text(only.get("content"))
+        kind = only.get("kind") or "user"
+        priority = only.get("priority") or "normal"
+        body = _batch_item_text(only.get("content"))
+        if kind == "user" and priority == "normal":
+            return body
+        return _batch_header(only) + "\n\n" + body
     lines = []
     for item in items:
-        header = f"[{item.get('kind') or 'user'} · {item.get('message_id')} · {item.get('priority') or 'normal'}]"
-        lines.append(header)
+        lines.append(_batch_header(item))
         lines.append(_batch_item_text(item.get("content")))
     return "\n\n".join(lines)
 

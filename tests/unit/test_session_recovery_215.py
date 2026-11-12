@@ -182,6 +182,7 @@ async def test_projection_write_failure_does_not_fail_send(registry_store, monke
     from power_loop import AgentLoopConfig
     from power_loop.agent import stateful_loop as sl
     from tests.runtime_fixture import RunningAgent
+
     from .test_session_send_215 import EchoModel
     store, _ = registry_store
 

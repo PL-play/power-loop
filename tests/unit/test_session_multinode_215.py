@@ -74,6 +74,128 @@ async def test_incapable_node_does_not_claim_or_fail_input(registry_store):
         await runtime.transport.aclose()
 
 
+class CountingModel(LLMService):
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, request, **kwargs):
+        self.calls += 1
+        return LLMResponse(raw_text="done", tool_calls=None,
+                           token_usage=LLMTokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2))
+
+    def stream(self, request):
+        raise AssertionError("nonstream fixture")
+
+    async def close(self):
+        pass
+
+
+async def _assert_incapable_leaves_input_pending(store, factory, model):
+    """A node that cannot execute must NOT claim/terminalize: input stays pending, session
+    queued, capability_missing records the definition, and the model is never called."""
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    runtime = Runtime(store=store, factory=factory, node_id="incapable", boot_id="b",
+                      recovery_interval_s=None, timers_enabled=False)
+    try:
+        await runtime.worker.start()
+        await runtime.worker.recover()
+        await asyncio.sleep(0.2)
+        state = await store._db.fetchone(
+            f"SELECT execution_state,active_send_index,owner_token FROM {store.t.session_state} "
+            "WHERE session_id=?", (root.session_id,))
+        assert state["execution_state"] == "queued"
+        assert state["active_send_index"] is None and state["owner_token"] is None
+        status = await port.inspect(InputRef(store.store_id, root.session_id, "m1"), actor=ACTOR)
+        assert status.input_state == "pending" and status.terminal_status is None
+        row = await store._db.fetchone(
+            f"SELECT status,terminal_status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id='m1'", (root.session_id,))
+        assert row["status"] == "pending" and row["terminal_status"] is None
+        assert "test.agent@215" in runtime.worker.capability_missing
+        assert model.calls == 0  # never executed
+        # No merged user message was written (never claimed).
+        messages = await store._db.fetchall(
+            f"SELECT role FROM {store.t.messages} WHERE session_id=?", (root.session_id,))
+        assert messages == []
+    finally:
+        await runtime.worker.shutdown(timeout_s=2)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
+async def test_command_factory_does_not_claim_or_fail(registry_store):
+    """P2-R1-1: a factory returning a host command is incapable in P2; the worker must
+    detect this BEFORE claim and leave the input pending/queued (not delivered/failed)."""
+    store, _ = registry_store
+    model = CountingModel()
+    factory = RegistryRuntimeFactory()
+
+    async def build(descriptor, context):
+        return ExecutionEnvironment(model, None, AgentLoopConfig(max_rounds=4, compactor=None),
+                                    command=("host_command", {}))
+
+    factory.register("test.agent@215", build)
+    await _assert_incapable_leaves_input_pending(store, factory, model)
+
+
+@pytest.mark.parametrize("code", ["capability_unavailable", "resource_unavailable"])
+async def test_build_failure_does_not_claim_or_fail(registry_store, code):
+    """P2-R1-1: a factory whose build raises capability/resource unavailability is detected
+    BEFORE claim; the input stays pending/queued for a capable node, never failed."""
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    store, _ = registry_store
+    model = CountingModel()
+    factory = RegistryRuntimeFactory()
+
+    async def build(descriptor, context):
+        raise RuntimeRequestError(code, "node cannot execute this descriptor")
+
+    factory.register("test.agent@215", build)
+    await _assert_incapable_leaves_input_pending(store, factory, model)
+
+
+async def test_capable_node_completes_after_incapable_node_leaves_input(registry_store):
+    """The input an incapable node left pending is still claimable by a capable node."""
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    incapable = RegistryRuntimeFactory()
+
+    async def bad_build(descriptor, context):
+        raise RuntimeRequestError("capability_unavailable", "no executor")
+
+    incapable.register("test.agent@215", bad_build)
+    node_a = Runtime(store=store, factory=incapable, node_id="A", boot_id="A",
+                     recovery_interval_s=None, timers_enabled=False)
+    try:
+        await node_a.worker.start()
+        await node_a.worker.recover()
+        await asyncio.sleep(0.1)
+        assert (await port.inspect(InputRef(store.store_id, root.session_id, "m1"),
+                                   actor=ACTOR)).terminal_status is None
+    finally:
+        await node_a.worker.shutdown(timeout_s=2)
+        await node_a.client.aclose()
+        await node_a.transport.aclose()
+    # A capable node now takes the still-pending input and completes it.
+    node_b = Runtime(store=store, factory=_factory(), node_id="B", boot_id="B",
+                     recovery_interval_s=None, timers_enabled=False)
+    try:
+        await node_b.worker.start()
+        await node_b.worker.recover()
+        result = await node_b.client.wait(InputRef(store.store_id, root.session_id, "m1"),
+                                          actor=ACTOR, deadline_ms=None)
+        assert result.status == "completed" and result.final_text == "done"
+    finally:
+        await node_b.worker.shutdown(timeout_s=2)
+        await node_b.client.aclose()
+        await node_b.transport.aclose()
+
+
 async def test_worker_discovers_and_takes_over_expired_run(registry_store):
     store, _ = registry_store
     port = RuntimeInputStore(store)
