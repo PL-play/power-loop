@@ -66,6 +66,18 @@ _LEGACY_MODULES = (
     "runtime.child_completion", "runtime.completion_windows", "runtime.result_notices",
     "runtime.operation_records", "runtime.host_send_steps", "workflow.control", "workflow.resume",
 )
+_LEGACY_SQL_COLUMNS = (
+    "target_job_id", "expected_job_generation", "delivered_job_id", "delivered_job_generation",
+    "claim_token", "claim_owner_epoch",
+)
+_LEGACY_RUNTIME_STORE_CALLS = (
+    "agent.runtime_store:accept_input", "agent.runtime_store:claim_inputs",
+    "agent.runtime_store:bind_input_job", "agent.runtime_store:resolve_job",
+    "agent.runtime_store:execution_input", "agent.runtime_store:result_input",
+    "agent.runtime_store:discard_cancelled_result", "agent.runtime_store:fail_start",
+    "agent.runtime_store:commit_result_and_parent_ref", "agent.runtime_store:_lock_result_sessions",
+    "agent.runtime_store:_commit_result", "agent.runtime_store:poll_notifications",
+)
 
 
 def _periodic(chain):
@@ -82,7 +94,11 @@ def _category(chain, sql=""):
     normalized = sql.lower()
     if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _LEGACY_TABLES):
         return "legacy_job_control"
-    if any(c.startswith(_LEGACY_MODULES) for c in chain):
+    if any(re.search(rf"(?<![a-z0-9]){column}(?![a-z0-9])", normalized)
+           for column in _LEGACY_SQL_COLUMNS):
+        return "legacy_job_control"
+    if any(c.startswith(_LEGACY_MODULES) or c.startswith("runtime.child_tasks:")
+           or c in _LEGACY_RUNTIME_STORE_CALLS for c in chain):
         return "legacy_job_control"
     if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _MESSAGE_TABLES):
         return "message"
@@ -234,18 +250,21 @@ class _Tx:
 
 
 @pytest.mark.parametrize("models", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("tools_per_round", [1, 4])
 @pytest.mark.parametrize("budgeted", [False, True])
-async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=False):
+async def test_send_sql_profile(registry_store, models, budgeted, tools_per_round, *, paid_tools=False):
     store, _ = registry_store
     records, transactions, tx_sites, elapsed_s, tx_categories = await _measure(
-        store, models, budgeted, paid_tools=paid_tools)
+        store, models, budgeted, tools_per_round=tools_per_round, paid_tools=paid_tools)
     dialect = store._db.dialect.name
     target = os.environ.get("POWER_LOOP_SQL_PROFILE")
     if target:
         os.makedirs(target, exist_ok=True)
         suffix = '-paid' if paid_tools else ''
-        with open(os.path.join(target, f"send-{dialect}-m{models}-b{int(budgeted)}{suffix}.json"), "w") as f:
-            json.dump({"models": models, "tools": models - 1, "budgeted": budgeted, "paid_tools": paid_tools,
+        filename = f"send-{dialect}-m{models}-k{tools_per_round}-b{int(budgeted)}{suffix}.json"
+        with open(os.path.join(target, filename), "w") as f:
+            json.dump({"models": models, "tools": (models - 1) * tools_per_round,
+                       "tools_per_round": tools_per_round, "budgeted": budgeted, "paid_tools": paid_tools,
                        "transactions": transactions, "tx_sites": tx_sites, "elapsed_s": elapsed_s,
                        "records": records}, f)
     counts = _counts(records, tx_sites, tx_categories)
@@ -255,21 +274,26 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
                   and not any(site.startswith("runtime.timers:") for site in r["chain"])]
     assert counts["billing"] == 0
     assert counts["control_tx"] <= 3
-    # Design 215 P0 / option A: accept/claim/final are three control
-    # transactions. One latest inbox_version read is required per loop boundary.
-    # The original pre-change failures are recorded separately in the P0 baseline.
+    # Design 215 P0-R1 / option A: three control transactions and one latest
+    # inbox_version read per loop boundary. MySQL needs one LAST_INSERT_ID read
+    # per inserted assistant/tool message, so each extra tool costs three SQL.
     base = 24 if dialect == "mysql" else 22
     per_round = 7 if dialect == "mysql" else 5
+    per_extra_tool = 3 if dialect == "mysql" else 2
+    budget = (base + per_round * (models - 1)
+              + per_extra_tool * (tools_per_round - 1) * (models - 1))
     activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
     assert len(activity) <= 1
-    assert len(foreground) - len(activity) <= base + per_round * (models - 1), (
-        dialect, models, len(foreground), len(activity))
+    assert len(foreground) - len(activity) <= budget, (
+        dialect, models, tools_per_round, len(foreground), len(activity), budget)
 
 
 
 @pytest.mark.parametrize('models', [1, 2, 4, 8, 16, 32])
-async def test_paid_tool_send_sql_profile(registry_store, models):
-    await test_send_sql_profile(registry_store, models, True, paid_tools=True)
+@pytest.mark.parametrize('tools_per_round', [1, 4])
+async def test_paid_tool_send_sql_profile(registry_store, models, tools_per_round):
+    await test_send_sql_profile(
+        registry_store, models, True, tools_per_round, paid_tools=True)
 
 
 @pytest.mark.parametrize("budgeted", [False, True])
@@ -296,7 +320,7 @@ def _executor_heartbeat(chain):
     return 'runtime.executor_registry:heartbeat' in chain
 
 
-async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
+async def _measure(store, models, budgeted, history=0, *, tools_per_round=1, paid_tools=False):
     from tests.write_meter import WriteMeter
 
     original = store._db
@@ -317,8 +341,9 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
 
         async def complete(self, request, **kwargs):
             self.calls += 1
-            tools = ([{"id": f"call-{self.calls}", "type": "function",
-                       "function": {"name": "echo", "arguments": '{"text":"ok"}'}}]
+            tools = ([{"id": f"call-{self.calls}-{index}", "type": "function",
+                       "function": {"name": "echo", "arguments": '{"text":"ok"}'}}
+                      for index in range(tools_per_round)]
                      if self.calls < models else None)
             return LLMResponse(raw_text="done" if tools is None else "", tool_calls=tools,
                                token_usage=LLMTokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5))

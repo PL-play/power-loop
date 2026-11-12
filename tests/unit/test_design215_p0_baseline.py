@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -21,7 +22,7 @@ from tests.runtime_fixture import RunningAgent
 from tests.unit._workflow_fixture_203 import Model, leaf
 from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_send_row_profile import _snapshot
-from tests.unit.test_send_sql_profile import Profiled, _counts
+from tests.unit.test_send_sql_profile import _LEGACY_SQL_COLUMNS, Profiled, _category, _counts
 from tests.write_meter import WriteMeter
 
 __all__ = ["registry_store"]
@@ -68,8 +69,15 @@ async def measure(store, scenario, params, operation):
                    after.get(name, (0, 0))[1] - before.get(name, (0, 0))[1]]
             for name in names if after.get(name) != before.get(name)
         }
+        legacy_column_sql = [
+            {"sql": record["sql"], "category": _category(record["chain"], record["sql"])}
+            for record in records
+            if any(re.search(rf"(?<![a-z0-9]){column}(?![a-z0-9])", record["sql"].lower())
+                   for column in _LEGACY_SQL_COLUMNS)
+        ]
+        assert all(item["category"] == "legacy_job_control" for item in legacy_column_sql)
         report = {
-            "baseline": "design215-P0-B",
+            "baseline": "design215-P0-R1-B",
             "db": original.dialect.name,
             "scenario": scenario,
             **params,
@@ -77,6 +85,7 @@ async def measure(store, scenario, params, operation):
             "transactions": profiled.transactions,
             "sql": _counts(records, tx_sites, tx_categories),
             "transaction_categories": dict(sorted(Counter(tx_categories).items())),
+            "legacy_column_sql": legacy_column_sql,
             "writes": writes,
             "net_residual": {
                 "rows": sum(value[0] for value in delta.values()),
