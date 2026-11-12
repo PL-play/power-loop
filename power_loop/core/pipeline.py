@@ -538,6 +538,19 @@ class AgentPipeline:
         # delivered in the same transaction as this transcript row.
         message = dict(msg)
         inbox = message.pop("_inbox", None)
+        persisted_seq = message.pop("_persisted_seq", None)
+        if persisted_seq is not None:
+            # design 215 §7.4: a batch follow-up was already written atomically by the
+            # claim transaction (merged user message + delivered inputs). It enters the
+            # in-memory history and the sink's seq/projection maps WITHOUT a second write.
+            self.history.append(message)
+            if self._tok_len == len(self.history) - 1:
+                self._tok_total += estimate_message_tokens(message)
+                self._tok_len = len(self.history)
+            note = getattr(self.sink, "note_persisted", None)
+            if note is not None:
+                note(persisted_seq, message, round_index=round_index, send_index=self.send_index)
+            return True
         ctx = MessageAppendCtx(
             round_index=round_index or 0,
             message=message,
@@ -639,7 +652,8 @@ class AgentPipeline:
                 if policy_deadline and not work.done():
                     from power_loop.runtime.task_runtime import _SEND
                     binding = _SEND.get()
-                    binding.runtime.track_task(work, job_id=binding.lease.job_id)
+                    if binding is not None:
+                        binding.runtime.track_task(work, job_id=binding.lease.job_id)
             raise
         for w in waiters.values():
             if w not in done:
@@ -1872,6 +1886,14 @@ class AgentPipeline:
                          else self._drain_follow_ups)
                 drained = await drain()
                 drained_count = await self._append_drained(drained, round_index=round_idx)
+
+            # design 215 §7.4/§10.3: the boundary drain is the cancel checkpoint. If it
+            # observed a matching cancel marker it cancelled the token; stop here BEFORE
+            # the next model call (an instant provider must not race the stop waiter).
+            if _is_cancelled(self.cancel_token):
+                await self._finalize("cancelled")
+                return self._make_result("cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]",
+                                         rounds=round_idx)
 
             # ── pass_turn：上一轮调了 → 这一轮开始前硬停（design/188，不再调模型）──
             if self._pass_state and self._pass_state.get("passed"):

@@ -34,6 +34,11 @@ class ExecutionContext:
     resources: object = None
     cancel_token: object = None
     host_context: Mapping = field(default_factory=lambda: MappingProxyType({}))
+    #: design 215 session-native identity: the claimed send index and direct parent
+    #: session. job_ref/parent_job_id/root_job_id remain only for unmigrated modules
+    #: and are None on the session path (removed with them in P7).
+    send_index: int | None = None
+    parent_session_id: str | None = None
 
 
 _CURRENT_EXECUTION = ContextVar("power_loop_execution_context", default=None)

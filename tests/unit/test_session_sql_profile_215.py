@@ -27,7 +27,9 @@ async def test_session_storage_sql_profile(registry_store):
     try:
         await port.accept(root, "one", message_id="one", actor=ACTOR)
         batch = await port.claim(root, node_id="a", boot_id="a")
-        await port.final(batch, final_text="done", usage={"total_tokens": 1})
+        # Explicit consumed (the worker passes original + boundary follow-up refs): final
+        # stamps exactly these inputs without a resolution read, keeping the fixed budget.
+        await port.final(batch, consumed=batch.input_refs, final_text="done", usage={"total_tokens": 1})
         counts = _counts(profiled.records, profiled.tx_sites, profiled.tx_categories)
         writes = await meter.report()
         assert counts["legacy_job_control"] == 0

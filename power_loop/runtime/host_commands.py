@@ -26,6 +26,7 @@ from .task_runtime import _SEND
 
 
 async def run(loop, ctx, start, command, send_index):
+    raise RuntimeRequestError("capability_unavailable", "host commands are implemented in P3")
     name, arguments = command
     registered = loop.tool_registry.get(name)
     if registered is None or ctx.options.tools is not None and name not in ctx.options.tools:

@@ -161,18 +161,23 @@ async def _advance(store, tx, sid, state, projector, policy, new_rows, send_inde
 
 
 async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi, projector_version,
-                  projector=None, policy=None):
-    """Atomically append projections and advance/invalidate statistics under a short session lock."""
+                  projector=None, policy=None, ownership=None):
+    """Atomically append projections and advance/invalidate statistics under a short session lock.
+
+    ``ownership`` (design 215 §8.2): when the writer holds a session owner fence, the
+    derived rows are only written after the same transaction verifies epoch/token, so a
+    stale owner's late projection cannot clobber the new owner's rebuild."""
     from .store import _dumps, _nul_safe
 
     new_rows = [ProjectMessageRow(
         session_id=sid, send_index=send_index, kind=kind, content=json.loads(_dumps(content if content is not None else {})),
         rendered_text=_nul_safe(text), source_seq_lo=source_seq_lo, source_seq_hi=source_seq_hi,
         compact_from_send=None, compact_to_send=None, projector_version=projector_version,
-        token_estimate=None, created_at=0,
+        token_estimate=None, created_at=0, completed_through_send_index=send_index,
     ) for kind, content, text in rows]
     async with store._db.transaction() as tx:
         await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+        await store.fence_owner_tx(tx, sid, ownership)
         state = await read_state(store, tx, sid)
         compact = await tx.fetchone(
             f"SELECT compact_to_send FROM {store.t.project_messages} WHERE session_id=? AND kind='compact' "
@@ -198,6 +203,7 @@ async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi,
                 tx, sid, send_index=send_index, kind=row.kind, content=row.content,
                 rendered_text=row.rendered_text, source_seq_lo=source_seq_lo, source_seq_hi=source_seq_hi,
                 projector_version=projector_version, now=time.time_ns() // 1_000_000,
+                completed_through_send_index=send_index,
             )
         if updated is None:
             updated = _invalid(state)
@@ -313,11 +319,12 @@ async def _rebuild(store, sid, projector, policy, snapshot, obsolete):
     return None
 
 
-async def prepare(store, sid, *, projector, keep_last_sends, threshold, row_threshold=None, **projection):
+async def prepare(store, sid, *, projector, keep_last_sends, threshold, row_threshold=None,
+                  ownership=None, **projection):
     """Persist this send; read historical bodies only after a positive gate or during repair."""
     provider = getattr(projector, "fold_statistics_policy", None)
     policy = provider() if provider is not None else None
-    state = await persist(store, sid, projector=projector, policy=policy, **projection)
+    state = await persist(store, sid, projector=projector, policy=policy, ownership=ownership, **projection)
     if provider is not None and provider() != policy:
         async with store._db.transaction() as tx:
             await store._db.dialect.lock_state(tx, store.t.session_state, sid)

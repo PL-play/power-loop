@@ -236,6 +236,10 @@ class ProjectMessageRow:
     token_estimate: int | None
     created_at: int
     id: int | None = None  # absent on legacy stores; never fabricate external coordinates
+    #: Coverage triple member (design 215 §8.2): the highest send this projection row
+    #: was completed through. Paired with projector_version + source_seq_hi it lets a
+    #: cold reader decide whether the derived row is usable or must be rebuilt from raw.
+    completed_through_send_index: int = 0
 
 
 @dataclass

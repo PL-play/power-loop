@@ -35,7 +35,7 @@ class RunningAgent:
             return ExecutionEnvironment(model, registry, self.config, hooks=self.hooks, task_runtime=task_runtime,
                 runtime_env=runtime_env, process_control=process_control, event_bus=event_bus,
                 command=command if "child_spec" not in descriptor.config else None)
-        factory.register('fixture.agent@1', build)
+        factory.register('fixture.agent@215', build)
         self.runtime = Runtime(store=store, factory=factory, node_id='fixture', boot_id='boot',
                                capacity=capacity, recovery_interval_s=None, coordinator=coordinator, transport=transport)
         self.loop = StatefulAgentLoop(runtime=self.runtime)
@@ -43,10 +43,8 @@ class RunningAgent:
                                   task_runtime.principal_id if task_runtime else 'host', None)
         options = {f.name: getattr(self.config, f.name) for f in fields(RequestOptions)
                    if hasattr(self.config, f.name)}
-        if options.get('model'):
-            options['allowed_models'] = allowed_models if allowed_models is not None else [options['model']]
-        self.descriptor = RuntimeDescriptor(1, 'agent', 'fixture.agent@1', None,
-            'fixture.tools@1', 'fixture.hooks@1', 'fixture.resources@1', plain(options), {})
+        self.descriptor = RuntimeDescriptor(2, 'agent', 'fixture.agent@215', None,
+            'fixture.tools@215', 'fixture.hooks@215', 'fixture.resources@215', plain(options), {})
         self.counter = 0
 
     async def start(self, *, target=None):
@@ -54,10 +52,10 @@ class RunningAgent:
         self.target = target if target is not None else await self.loop.new_session(self.descriptor, actor=self.actor)
         return self
 
-    async def send(self, body, *, options=None, message_id=None):
+    async def send(self, body, *, options=None, message_id=None, priority="normal"):
         self.counter += 1
         result = await self.loop.send(self.target, body, message_id=message_id or f'm{self.counter}',
-                                     actor=self.actor, deadline_ms=now_ms() + 120000, options=options)
+                                     actor=self.actor, deadline_ms=now_ms() + 120000, priority=priority)
         # Include resource close, ownership release and final activation check in
         # performance measurements, not just the result transaction.
         await self.finish(result.input_ref, failed=result.status in {"failed", "unknown", "cancelled"})

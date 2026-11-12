@@ -104,9 +104,8 @@ async def stored(manager, reader, actor, event, request, *, action, completion=N
 async def accept(manager, actor, request, target, *, action, authorize):
     """Commit a source-only permission plus its pending index, never a target."""
     ref, caller = _call_ref(action, request), JobLease(**request["caller"])
-    from .lightweight_send import ensure
-    from .task_runtime import _SEND
-    await ensure(_SEND.get())
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("capability_unavailable", "job control upgrade is implemented in P3")
     key = _origin(manager, actor, request, action)
     event_id = identity(action, key)
     async with manager.tree_write(caller.job_id) as tx:

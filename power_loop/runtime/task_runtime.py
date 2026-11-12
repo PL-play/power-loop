@@ -34,6 +34,48 @@ _OWNER: ContextVar[Execution | None] = ContextVar("power_loop_task_owner", defau
 _TASK_OWNERS: ContextVar[tuple] = ContextVar("power_loop_task_owners", default=())
 
 
+@dataclass
+class SessionSend:
+    """The session-native execution identity of one running send (design 215).
+
+    No job, generation, lease upgrade or supervision: the claim transaction already
+    installed the owner fence, and ``final`` writes the result message plus the input
+    terminal states. The loop only appends messages and advances this in-memory record.
+    """
+
+    store: object
+    target: object
+    batch: object
+    ownership: object
+    stop_renewal: asyncio.Event = field(default_factory=asyncio.Event, compare=False, repr=False)
+    consumed_inputs: list = field(default_factory=list, compare=False, repr=False)
+    usage_totals: dict = field(default_factory=dict, compare=False, repr=False)
+    error_code: str | None = field(default=None, compare=False, repr=False)
+    resource_evidence: dict = field(default_factory=dict, compare=False, repr=False)
+
+    @property
+    def session_id(self):
+        return self.target.session_id
+
+    @property
+    def send_index(self):
+        return self.batch.send_index
+
+
+_SESSION_SEND: ContextVar[SessionSend | None] = ContextVar("power_loop_session_send", default=None)
+
+
+def current_session_send(store=None, session_id=None) -> SessionSend | None:
+    send = _SESSION_SEND.get()
+    if send is None:
+        return None
+    if store is not None and send.store is not store:
+        return None
+    if session_id is not None and send.session_id != session_id:
+        return None
+    return send
+
+
 def _check_task_owner(runtime):
     task = asyncio.current_task()
     for task_ref, owner in _TASK_OWNERS.get():
@@ -61,6 +103,10 @@ def reject_unregistered_adapter(name: str, loop=None) -> None:
 
 
 async def check_dispatch(session_id: str | None, *, invocation=None) -> None:
+    # A live session send trusts its own committed writes; ownership is enforced by
+    # the conditional message/state writes, not a per-dispatch read (AGENTS.md 热路径).
+    if current_session_send(session_id=session_id) is not None:
+        return
     execution = _SEND.get()
     if execution is not None and execution.actor.session_id == session_id:
         execution.runtime.check_local_admission()
@@ -153,12 +199,19 @@ def mark_unconfirmed_resource() -> None:
 
 def preserve_model_usage(session_id, usage):
     """Retain this pipeline's counters even when a later checkpoint raises."""
+    send = current_session_send(session_id=session_id)
+    if send is not None:
+        send.usage_totals = dict(usage)
     execution = _SEND.get()
     if execution is not None and execution.actor.session_id == session_id:
         execution.resource_evidence["model_usage_totals"] = dict(usage)
 
 
 def atomic_pending_required(store, sid):
+    # A store-backed session send always records assistant tool_calls and their
+    # pending ids in one atomic append (design 215 §8.3); no job binding is needed.
+    if current_session_send(store, sid) is not None:
+        return True
     execution = _SEND.get()
     return (execution is not None and execution.runtime.manager.store is store
             and execution.actor.session_id == sid)
@@ -169,7 +222,10 @@ def tool_receipt_required(store, sid: str, assistant_seq: int | None, call_id: s
 
     A missing in-memory operation list is uncertain (for example a failed return
     checkpoint), so retain the durable marker until the receipt lookup finishes.
+    Session-native sends have no job operations: the tool message clears pending.
     """
+    if current_session_send(store, sid) is not None:
+        return False
     execution = _SEND.get()
     if (execution is None or execution.runtime.manager.store is not store
             or execution.actor.session_id != sid or assistant_seq is None):
@@ -178,6 +234,8 @@ def tool_receipt_required(store, sid: str, assistant_seq: int | None, call_id: s
 
 
 async def bind_tool_receipt(store, sid: str, assistant_seq: int | None, call_id: str, receipt_seq: int) -> None:
+    if current_session_send(store, sid) is not None:
+        return
     execution = _SEND.get()
     if (
         execution is None
@@ -459,187 +517,6 @@ class TaskRuntime:
                 variable.reset(token)
                 _TASK_OWNERS.reset(owner_token)
 
-    @asynccontextmanager
-    async def model_send(self, loop, sid: str, send_index: int, *, input_start, cancel_token=None, round_limit=None):
-        owner_token = _enter_task_owner(self)
-        trust_token = self.manager._trust_own_writes.set(True)
-        local = None
-        try:
-            await self.ensure_started()
-            local = {"task": asyncio.current_task(), "cancel_token": cancel_token, "signalled": False}
-            self._model_executions[id(local)] = local
-            async with self._model_send(loop, sid, send_index, cancel_token=cancel_token, round_limit=round_limit,
-                                        input_start=input_start) as evidence:
-                yield evidence
-        finally:
-            if local is not None:
-                self._model_executions.pop(id(local), None)
-            self.manager._trust_own_writes.reset(trust_token)
-            _TASK_OWNERS.reset(owner_token)
-
-    @asynccontextmanager
-    async def _model_send(self, loop, sid: str, send_index: int, *, input_start, cancel_token=None, round_limit=None):
-        from .execution_roles import session_role
-
-        if (type(self.require_host_send_steps) is not bool
-                or self.require_host_send_steps != self._original_host_step_requirement):
-            raise JobError("host_send_step_configuration_changed")
-        if await loop.ensure_store() is not self.manager.store:
-            raise JobError("task_store_mismatch")
-        actor = self.actor(sid)
-        owner = _OWNER.get()
-        registering_actor = actor
-        if owner is not None and (owner.runtime is not self or owner.actor.session_id != sid):
-            owner = None
-        if owner is None and not input_start.child_job_id:
-            role = getattr(loop, "_known_session_role", None)
-            if role is None:
-                role = await session_role(self.manager.store, sid)
-            if role != "main":
-                raise JobError("task_owner_required")
-        from power_loop.agent.runtime_types import plain
-        request = {"input_ref": plain(input_start.context.input_ref), "send_index": send_index}
-        system_key = "input:" + input_start.context.input_ref.message_id
-        original_round_limit = None
-        if owner is not None:
-            from .original_owner_review import enabled
-            async with self.manager._write() as tx:
-                owning_row = await self.manager._authorize(tx,owner.actor,owner.lease.job_id)
-                declared = await enabled(self.manager,tx,owning_row)
-            if declared is not None:
-                original_round_limit = loop.config.max_rounds if round_limit is None else round_limit
-                if type(original_round_limit) is not int or not 0 <= original_round_limit <= 1000000:
-                    raise JobError('original_owner_round_limit_invalid')
-                request['original_round_limit'] = original_round_limit
-                request['owner_abort_review_protocol'] = 1
-        if owner is None:
-            from .root_context import for_send
-            provenance = for_send(self, sid)
-            if provenance is not None:
-                request["host_context"] = provenance
-            from .host_send_steps import FIELD
-            from .host_send_steps import for_send as step_for_send
-            step = step_for_send(self, sid)
-            if step is None and self.require_host_send_steps:
-                raise JobError("host_send_step_required")
-            if step is not None:
-                request[FIELD] = step
-        from .model_attempts import enable
-
-        await self.ensure_started()
-        self.check_local_admission()
-        lightweight = (owner is None and not input_start.child_job_id
-                       and input_start.record.meta["operation"] == "send")
-        if lightweight:
-            from .lightweight_send import open_lightweight
-            binding = open_lightweight(self, actor, sid, input_start.context.input_ref.message_id)
-            loop._lightweight_turn = True
-            input_start.lightweight = True
-            async with self.manager._write() as tx:
-                await input_start.prepare(tx)
-                await input_start.bind(tx, binding)
-        else:
-            # Registration, claim and control admission commit together or not at all.
-            async with self.manager.joined_write():
-                tx = self.manager._joined_write.get()
-                await input_start.prepare(tx)
-                if input_start.child_job_id:
-                    owner = await input_start.claim_owner(self, tx)
-                from .executor_registry import ExecutorIdentity, admit_unbudgeted
-                await admit_unbudgeted(self.manager, tx,
-                    ExecutorIdentity(self.tenant_id, self.principal_id, self.executor_id, self.boot_id),
-                    required=self._lifecycle is not None)
-                registration = await self.manager.register_job(
-                    registering_actor,
-                    kind="send",
-                    session_id=sid,
-                    parent=owner.lease if owner else None,
-                    system_key=system_key,
-                    request=request,
-                    fresh=True,
-                )
-                if registration.replayed:
-                    # No automatic replay of a possibly side-effecting pending attempt.
-                    raise JobError("task_send_requires_reconciliation")
-                binding = await self.claim(actor, registration)
-                await input_start.bind(tx, binding)
-                binding.resource_evidence["_control_registered_payload"] = registration.operation.result
-                if input_start.record.meta["operation"] == "resume":
-                    binding.resource_evidence["explicit_resume"] = True
-                await enable(binding)
-        input_start.committed()
-        evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
-        failure = None
-        try:
-            async with self.execution(binding, cancel_token=cancel_token, initialize_model=True):
-                yield evidence
-        except BaseException as exc:
-            failure = exc
-            evidence["exit"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
-            if isinstance(exc, JobError) and exc.code == "cancel_requested":
-                evidence["exit"] = "cancelled"
-            if input_start.context.shutdown_interrupted:
-                evidence["exit"] = "interrupted"
-            evidence["error_type"] = type(exc).__name__
-            evidence.setdefault("usage", dict(binding.resource_evidence.get("model_usage_totals", {})))
-            raise
-        finally:
-            from .session_ownership import require_current_ownership
-            require_current_ownership(self.manager.store)
-            if binding.resource_evidence.get("model_attempts_inflight"):
-                binding.resource_evidence["resource_state"] = "unknown"
-            last = await self.manager.store.last_assistant_ref(sid, send_index)
-            if last is not None:
-                evidence["last_assistant_ref"] = last.to_dict()
-            consumed = ()
-            if binding.resource_evidence.get("lightweight"):
-                from .lightweight_send import remember_result
-                public = input_start.public_result(evidence)
-                remember_result(loop, input_start.context.input_ref, public, evidence)
-                for extra in input_start.context.joined_inputs:
-                    remember_result(loop, extra, public, evidence)
-            consumed = []
-            if evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
-                from .result_consumption import finish
-                consumed = await finish(binding)
-            if binding.resource_evidence.get("lightweight") and not binding.resource_evidence.get("upgraded"):
-                finalized = True
-            else:
-                async with self.manager.joined_write() as tx:
-                    await input_start.prepare_finish(tx)
-                    if binding.resource_evidence.get("_runtime_error_code") is not None:
-                        evidence["error_code"] = binding.resource_evidence["_runtime_error_code"]
-                    public = input_start.public_result(evidence)
-                    from dataclasses import replace
-
-                    from power_loop.agent.runtime_types import plain
-                    evidence["_public_result"] = plain(replace(public, job_ref=input_start.model_ref,
-                        input_ref=None if input_start.owner else public.input_ref))
-                    await self.manager.close_model_execution(
-                        actor, binding.lease, evidence=evidence,
-                        resource_state=binding.resource_evidence.get("resource_state", "stopped"))
-                    evidence.pop("_public_result", None)
-                    await input_start.finish(tx, binding, evidence)
-                    from .finalization import try_finalize
-                    await try_finalize(self.manager, actor, binding.lease.job_id, binding.lease.generation)
-                    finalized = not owner and not consumed
-            await input_start.notify_finished()
-            from .finalization import after_send
-
-            try:
-                if not finalized and not (binding.resource_evidence.get("lightweight")
-                                           and not binding.resource_evidence.get("upgraded")):
-                    await after_send(self.manager, actor, binding.lease, consumed=consumed)
-            except Exception:
-                # The model exit is already durable. A failed mechanical
-                # close leaves supervision open for reconciliation; it must
-                # not turn that completed business send into a retry.
-                logging.getLogger(__name__).exception(
-                    "supervision remains open after model exit: %s", binding.lease.job_id
-                )
-            if failure is not None:
-                from .original_owner_review import remember
-                remember(binding,owner,failure,original_round_limit)
 
     async def record_scope(self, binding: Execution, result: dict) -> dict:
         try:

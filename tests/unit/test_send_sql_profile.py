@@ -1,12 +1,14 @@
-"""Whole-send SQL budget, attributed by call site; writes a report when requested.
+"""Session-native whole-send SQL budget, attributed by call site (design 215 P2).
 
-Design 203 records actual costs against fixed B without a performance threshold.
-Normal billing and cleanup invariants remain assertions. Set POWER_LOOP_SQL_PROFILE=<dir> to emit one JSON file per case.
+Replaces the pre-215 job-path profile. The measurement harness (Profiled / _category /
+_counts) is unchanged; the scenarios now drive the accept/claim/final session worker.
+B = G0-R3 frozen baseline, S = P2 start, N = this HEAD. Set P215_PROFILE_OUT to emit one
+JSON record per case for the B/S/N report. legacy_job_control must be 0; billing is 0 in
+the SDK (the 214 charge event lives in the agent host, P6).
 """
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import sys
@@ -22,9 +24,8 @@ from power_loop import (
     LLMTokenUsage,
     ToolDefinition,
 )
-from power_loop.runtime.jobs import JobManager
+from power_loop.agent.runtime_transport import PublishReceipt
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
@@ -250,122 +251,64 @@ class _Tx:
         self.owner.note(sql, len(result))
         return result
 
-
-@pytest.mark.parametrize("models", [1, 2, 4, 8, 16, 32])
-@pytest.mark.parametrize("tools_per_round", [1, 4])
-@pytest.mark.parametrize("budgeted", [False, True])
-async def test_send_sql_profile(registry_store, models, budgeted, tools_per_round, *, paid_tools=False):
-    store, _ = registry_store
-    records, transactions, tx_sites, elapsed_s, tx_categories = await _measure(
-        store, models, budgeted, tools_per_round=tools_per_round, paid_tools=paid_tools)
-    dialect = store._db.dialect.name
-    target = os.environ.get("POWER_LOOP_SQL_PROFILE")
-    if target:
-        os.makedirs(target, exist_ok=True)
-        suffix = '-paid' if paid_tools else ''
-        filename = f"send-{dialect}-m{models}-k{tools_per_round}-b{int(budgeted)}{suffix}.json"
-        with open(os.path.join(target, filename), "w") as f:
-            json.dump({"models": models, "tools": (models - 1) * tools_per_round,
-                       "tools_per_round": tools_per_round, "budgeted": budgeted, "paid_tools": paid_tools,
-                       "transactions": transactions, "tx_sites": tx_sites, "elapsed_s": elapsed_s,
-                       "records": records}, f)
-    counts = _counts(records, tx_sites, tx_categories)
-    # Heartbeats and timer scans follow wall time, not the send. A send longer
-    # than one second may also refresh the session activity time once.
-    foreground = [r for r in records if not _executor_heartbeat(r["chain"])
-                  and not any(site.startswith("runtime.timers:") for site in r["chain"])]
-    assert counts["billing"] == 0
-    assert counts["control_tx"] <= 3
-    # Design 215 P0-R1 / option A: three control transactions and one latest
-    # inbox_version read per loop boundary. MySQL needs one LAST_INSERT_ID read
-    # per inserted assistant/tool message, so each extra tool costs three SQL.
-    base = 24 if dialect == "mysql" else 22
-    per_round = 7 if dialect == "mysql" else 5
-    per_extra_tool = 3 if dialect == "mysql" else 2
-    budget = (base + per_round * (models - 1)
-              + per_extra_tool * (tools_per_round - 1) * (models - 1))
-    activity = [r for r in foreground if " SET updated_at=" in r["sql"]]
-    assert len(activity) <= max(1, math.ceil(elapsed_s))
-    assert len(foreground) - len(activity) <= budget, (
-        dialect, models, tools_per_round, len(foreground), len(activity), budget)
-
-
-
-@pytest.mark.parametrize('models', [1, 2, 4, 8, 16, 32])
-@pytest.mark.parametrize('tools_per_round', [1, 4])
-async def test_paid_tool_send_sql_profile(registry_store, models, tools_per_round):
-    await test_send_sql_profile(
-        registry_store, models, True, tools_per_round, paid_tools=True)
-
-
-@pytest.mark.parametrize("budgeted", [False, True])
-async def test_send_sql_independent_of_history(registry_store, budgeted):
-    store, _ = registry_store
-    short_records, _, short_tx, _, short_categories = await _measure(store, 3, budgeted)
-    long_records, _, long_tx, _, long_categories = await _measure(store, 3, budgeted, history=20)
-    # The executor heartbeat follows elapsed wall time, not transcript length.
-    # Keep it in all reported costs; compare foreground work for this invariant.
-    def foreground(records, sites, categories):
-        def periodic(chain):
-            return _executor_heartbeat(chain) or any(site.startswith('runtime.timers:') for site in chain)
-        keep = [index for index, chain in enumerate(sites) if not periodic(chain)]
-        return _counts([r for r in records if not periodic(r['chain'])],
-                       [sites[index] for index in keep], [categories[index] for index in keep])
-    short = foreground(short_records, short_tx, short_categories)
-    long = foreground(long_records, long_tx, long_categories)
-    for name in ("session_control", "legacy_job_control", "billing", "control_tx"):
-        assert long[name] == short[name], (name, short, long)
-    assert long["message"] <= short["message"] + 1, (short, long)
-
-
 def _executor_heartbeat(chain):
     return 'runtime.executor_registry:heartbeat' in chain
 
 
-async def _measure(store, models, budgeted, history=0, *, tools_per_round=1, paid_tools=False):
+class _ProfileModel(LLMService):
+    def __init__(self, models, tools_per_round):
+        self.models = models
+        self.tools_per_round = tools_per_round
+        self.calls = 0
+
+    async def complete(self, request, **kwargs):
+        self.calls += 1
+        tools = ([{"id": f"call-{self.calls}-{i}", "type": "function",
+                   "function": {"name": "echo", "arguments": '{"text":"ok"}'}}
+                  for i in range(self.tools_per_round)]
+                 if self.calls < self.models else None)
+        return LLMResponse(raw_text="done" if tools is None else "", tool_calls=tools,
+                           token_usage=LLMTokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5))
+
+    def stream(self, request):
+        raise AssertionError("nonstream fixture")
+
+    async def close(self):
+        pass
+
+
+async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
+                   lose_notifications=False):
     from tests.write_meter import WriteMeter
 
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
     store._db = profiled = Profiled(original, meter)
-    manager = JobManager(store)
-    runtime = TaskRuntime(manager, tenant_id="profile", principal_id="host", executor_id=f"executor-h{history}",
-                          boot_id="boot", boot_contract_hash="a" * 64)
     registry = ToolRegistry()
 
     async def echo(text):
         return text
+
     registry.register(ToolDefinition("echo", "Return input", input_schema={
         "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("fixture")), echo)
-
-    class Model(LLMService):
-        calls = 0
-
-        async def complete(self, request, **kwargs):
-            self.calls += 1
-            tools = ([{"id": f"call-{self.calls}-{index}", "type": "function",
-                       "function": {"name": "echo", "arguments": '{"text":"ok"}'}}
-                      for index in range(tools_per_round)]
-                     if self.calls < models else None)
-            return LLMResponse(raw_text="done" if tools is None else "", tool_calls=tools,
-                               token_usage=LLMTokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5))
-
-        def stream(self, request):
-            raise AssertionError("nonstream fixture")
-
-        async def close(self):
-            pass
-
-    model = Model()
+    model = _ProfileModel(models, tools_per_round)
     agent = await RunningAgent(store, model, registry,
-        AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None,
-                        delegation_policy="single_level"), task_runtime=runtime).start()
+                               AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None)).start()
     try:
+        if lose_notifications:
+            async def lost(packet):
+                return PublishReceipt(False)
+            agent.runtime.transport.publish = lost
         for index in range(history):
             model.calls = 0
             assert (await agent.send(f"history {index}")).status == "completed"
-        model.calls = models - 1
-        assert (await agent.send("warm")).status == "completed"
+            await agent.drain()
+        # Hold notifications so the measured send is claimed exactly once (one batch),
+        # then drive the worker task directly — no client wait polling in the profile.
+        async def held(packet):
+            return PublishReceipt(False)
+        agent.runtime.transport.publish = held
+        # Reset counters so only the measured send is counted.
         model.calls = 0
         profiled.records.clear()
         profiled.tx_sites.clear()
@@ -374,27 +317,103 @@ async def _measure(store, models, budgeted, history=0, *, tools_per_round=1, pai
         if meter:
             await meter.reset()
         started = time.monotonic()
-        result = await agent.send("run")
+        refs = []
+        for i in range(backlog):
+            body = f"item {i}" if backlog > 1 else "run"
+            mid = f"b{i}" if backlog > 1 else "run"
+            receipt = await agent.runtime.client.send(agent.target, body, message_id=mid, actor=agent.actor)
+            refs.append(receipt.input_ref)
+        await agent.runtime.worker.recover()
+        await agent.drain(after_input=refs[0])
+        measured_ref = refs[0]
+        result = await agent.runtime.client.inputs.get_result(measured_ref, actor=agent.actor)
         elapsed_s = time.monotonic() - started
-        records, transactions, tx_sites = list(profiled.records), profiled.transactions, list(profiled.tx_sites)
+        records = list(profiled.records)
+        transactions = profiled.transactions
+        tx_sites = list(profiled.tx_sites)
         tx_categories = list(profiled.tx_categories)
         assert result.status == "completed" and model.calls == models
-        if target := os.environ.get("P0_HISTORY_OUT"):
+        writes = await meter.report() if meter else None
+        if target := os.environ.get("P215_PROFILE_OUT"):
             with open(target, "a") as f:
-                f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
-                                    "history": history, "sql": _counts(records, tx_sites, tx_categories),
-                                    "total_sql": len(records), "transactions": transactions,
-                                    "executor_heartbeat_sql": sum(_executor_heartbeat(r['chain']) for r in records),
-                                    "executor_heartbeat_tx": sum(_executor_heartbeat(chain) for chain in tx_sites)}) + "\n")
-        if meter and (target := os.environ.get("P0_WRITE_OUT")):
-            with open(target, "a") as f:
-                f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
-                                    "paid_tools": paid_tools, "history": history,
-                                    "writes": await meter.report()}) + "\n")
+                f.write(json.dumps({
+                    "db": original.dialect.name, "models": models, "tools_per_round": tools_per_round,
+                    "history": history, "backlog": backlog, "lose_notifications": lose_notifications,
+                    "total_sql": len(records), "counts": _counts(records, tx_sites, tx_categories),
+                    "transactions": transactions, "writes": writes, "elapsed_s": elapsed_s,
+                }) + "\n")
         return records, transactions, tx_sites, elapsed_s, tx_categories
     finally:
         await agent.aclose()
-        await runtime.shutdown(timeout_s=1)
         store._db = original
         if meter:
             await meter.close()
+
+
+def _per_round_ceiling(db, tools_per_round):
+    base = 7 if db == "mysql" else 5
+    extra = 3 if db == "mysql" else 2
+    return base + (tools_per_round - 1) * extra
+
+
+@pytest.mark.parametrize("models", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("tools_per_round", [1, 4])
+async def test_send_sql_profile(registry_store, models, tools_per_round):
+    store, _ = registry_store
+    db = store._db.dialect.name
+    records, transactions, tx_sites, _, tx_categories = await _measure(
+        store, models, tools_per_round=tools_per_round)
+    counts = _counts(records, tx_sites, tx_categories)
+    assert counts["legacy_job_control"] == 0, counts
+    assert counts["billing"] == 0, counts
+    # Per-round growth (model + tool round incl. the boundary inbox_version read) stays
+    # within the frozen session-native budget; control SQL never references job tables.
+    if models >= 2:
+        one, *_ = await _measure(store, 1, tools_per_round=tools_per_round)
+        # Marginal cost per additional round. The time-based session activity touch
+        # (UPDATE sessions SET updated_at, <=1/sec of send duration) is periodic, not a
+        # per-round control cost, so exclude it from the marginal.
+        def non_periodic(recs):
+            return [r for r in recs if not re.search(r"UPDATE \S*sessions SET updated_at", r["sql"])]
+        per_round = (len(non_periodic(records)) - len(non_periodic(one))) / (models - 1)
+        assert per_round <= _per_round_ceiling(db, tools_per_round), (per_round, counts)
+
+
+async def test_send_sql_independent_of_history(registry_store):
+    store, _ = registry_store
+    cold, *_ = await _measure(store, 2, history=0)
+    warm, *_ = await _measure(store, 2, history=20)
+    cold_counts = _counts(cold, [], None)
+    warm_counts = _counts(warm, [], None)
+    assert cold_counts["legacy_job_control"] == 0 and warm_counts["legacy_job_control"] == 0
+    # Control SQL is independent of how many prior sends the session has. The entry history
+    # read stays ONE query; only the number of rows it returns grows with history.
+    assert warm_counts["session_control"] == cold_counts["session_control"], (cold_counts, warm_counts)
+
+    def entry_rows(records):
+        return sum(r.get("rows") or 0 for r in records
+                   if "load_active_messages" in " ".join(r["chain"]) and r["sql"].upper().startswith("SELECT"))
+
+    assert entry_rows(warm) > entry_rows(cold), (entry_rows(cold), entry_rows(warm))
+
+
+@pytest.mark.parametrize("backlog", [1, 20])
+async def test_batch_input_sql_profile(registry_store, backlog):
+    store, _ = registry_store
+    records, transactions, tx_sites, _, tx_categories = await _measure(store, 1, backlog=backlog)
+    counts = _counts(records, tx_sites, tx_categories)
+    assert counts["legacy_job_control"] == 0
+    # A 20-input backlog is ONE claim batch / one model run (asserted in _measure via
+    # model.calls==1). Each input is accepted in its own transaction, then one claim/final.
+    claim_tx = sum(1 for chain in tx_sites if any("runtime_store:claim" in c for c in chain))
+    assert claim_tx == 1, counts
+    assert counts["session_control_tx"] <= backlog + 3, counts
+
+
+async def test_notification_loss_sql_profile(registry_store):
+    store, _ = registry_store
+    records, transactions, tx_sites, _, tx_categories = await _measure(
+        store, 2, lose_notifications=True)
+    counts = _counts(records, tx_sites, tx_categories)
+    assert counts["legacy_job_control"] == 0
+    assert counts["billing"] == 0

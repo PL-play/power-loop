@@ -311,7 +311,7 @@ class JobPage:
 @dataclass(frozen=True)
 class ShutdownResult:
     drained: bool
-    interrupted_jobs: tuple[JobRef, ...] = ()
+    interrupted_inputs: tuple[InputRef, ...] = ()
 
 
 @dataclass(frozen=True)

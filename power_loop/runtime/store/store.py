@@ -627,6 +627,24 @@ class SessionStore:
         arguments = (*values, session_id, *condition_values, *lease_arguments)
         return statement, arguments, bool(guard)
 
+    async def fence_owner_tx(self, tx, session_id, ownership):
+        """Owner fence for a derived write (design 215 §8.2), inside its transaction.
+
+        A conditional locking read: the row is locked AND the epoch/token must match in
+        the same statement, so a stale owner's late projection/journal/state write is
+        rejected before any derived row is touched. No read-then-compare race.
+        """
+        if ownership is None:
+            return
+        suffix = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
+        row = await tx.fetchone(
+            f"SELECT 1 AS ok FROM {self.t.session_state} WHERE session_id=? "
+            "AND owner_epoch=? AND owner_token=?" + suffix,
+            (session_id, ownership.epoch, ownership.token),
+        )
+        if row is None:
+            raise SessionLeaseLost(session_id)
+
     async def last_assistant_ref(self, session_id: str, send_index: int):
         """Reuse this send's committed append; recovery reads its stored tail."""
         from ..message_ref import MessageRef
@@ -1193,6 +1211,7 @@ class SessionStore:
         compact_to_send: int | None = None,
         projector_version: int = 0,
         token_estimate: int | None = None,
+        completed_through_send_index: int = 0,
     ) -> None:
         """Upsert one projection row on an OPEN transaction (so several rows + a compact fold can
         share one atomic, lockable transaction). See :meth:`upsert_project_message`."""
@@ -1202,6 +1221,7 @@ class SessionStore:
             (
                 "content_json", "rendered_text", "source_seq_lo", "source_seq_hi",
                 "compact_from_send", "compact_to_send", "projector_version", "token_estimate",
+                "completed_through_send_index",
             ),
             insert_only_cols=("created_at",),
         )
@@ -1211,7 +1231,7 @@ class SessionStore:
                 session_id, int(send_index), kind,
                 _dumps(content if content is not None else {}), _nul_safe(rendered_text),
                 source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
-                int(projector_version), token_estimate, now,
+                int(projector_version), token_estimate, int(completed_through_send_index), now,
             ),
         )
 
@@ -1229,6 +1249,8 @@ class SessionStore:
         compact_to_send: int | None = None,
         projector_version: int = 0,
         token_estimate: int | None = None,
+        ownership=None,
+        completed_through_send_index: int = 0,
     ) -> None:
         """Insert (or replace, by ``(session_id, send_index, kind)``) one projection row.
         Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
@@ -1240,6 +1262,7 @@ class SessionStore:
             suffix = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
             await tx.fetchone(f"SELECT next_seq FROM {self.t.session_state} WHERE session_id=?" + suffix,
                               (session_id,))
+            await self.fence_owner_tx(tx, session_id, ownership)
             from .projection_fold import invalidate
             await invalidate(self, tx, session_id)
             await self._upsert_project_message_tx(
@@ -1248,6 +1271,7 @@ class SessionStore:
                 source_seq_hi=source_seq_hi, compact_from_send=compact_from_send,
                 compact_to_send=compact_to_send, projector_version=projector_version,
                 token_estimate=token_estimate, now=_now_ms(),
+                completed_through_send_index=completed_through_send_index,
             )
 
     async def _query_project_messages(
@@ -1309,6 +1333,7 @@ class SessionStore:
         source_seq_hi: int | None,
         projector_version: int,
         load_snapshot: bool = True,
+        ownership=None,
     ) -> tuple[ProjectMessageRow | None, list[ProjectMessageRow]]:
         """Atomically persist one send; the optional fenced snapshot is read OUTSIDE locks.
 
@@ -1319,7 +1344,7 @@ class SessionStore:
         from .projection_fold import persist, read_snapshot
 
         await persist(self, session_id, send_index=send_index, rows=rows, source_seq_lo=source_seq_lo,
-                      source_seq_hi=source_seq_hi, projector_version=projector_version)
+                      source_seq_hi=source_seq_hi, projector_version=projector_version, ownership=ownership)
         if not load_snapshot:
             return None, []
         for _ in range(3):
@@ -1332,6 +1357,7 @@ class SessionStore:
         self, session_id: str, *, send_index: int, rows: list[tuple[str, Any, str | None]],
         source_seq_lo: int | None, source_seq_hi: int | None, projector_version: int,
         projector: Any, keep_last_sends: int, threshold: int, row_threshold: float | None = None,
+        ownership=None,
     ):
         """Persist projections and statistics; return a fenced fold candidate only when needed.
 
@@ -1344,6 +1370,7 @@ class SessionStore:
             self, session_id, send_index=send_index, rows=rows, source_seq_lo=source_seq_lo,
             source_seq_hi=source_seq_hi, projector_version=projector_version, projector=projector,
             keep_last_sends=keep_last_sends, threshold=threshold, row_threshold=row_threshold,
+            ownership=ownership,
         )
 
     async def commit_projection_fold(
@@ -1357,6 +1384,7 @@ class SessionStore:
         projector_version: int,
         expected_prior_to_send: int | None,
         expected_projection_revision: str | None = None,
+        ownership=None,
     ) -> bool:
         """Persist a ``compact`` fold computed OUTSIDE the lock, under OPTIMISTIC CONCURRENCY: re-take
         the session lock, re-read the latest compact, and UPSERT the new compact ONLY if the cursor
@@ -1368,6 +1396,7 @@ class SessionStore:
         now = _now_ms()
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self.fence_owner_tx(tx, session_id, ownership)
             from .projection_fold import invalidate, read_state
             if expected_projection_revision is not None:
                 state = await read_state(self, tx, session_id)
@@ -1391,6 +1420,7 @@ class SessionStore:
                 tx, session_id, send_index=to_send, kind="compact", content=content,
                 rendered_text=rendered_text, compact_from_send=from_send,
                 compact_to_send=to_send, projector_version=projector_version, now=now,
+                completed_through_send_index=to_send,
             )
         return True
 
@@ -2306,55 +2336,19 @@ class SessionStore:
     async def import_session(
         self, data: Mapping[str, Any], *, new_session_id: str | None = None
     ) -> str:
-        """Insert a session previously produced by :meth:`export_session` under a new
-        (or supplied) id, in one transaction. Returns the new ``session_id``.
+        """Unsupported under schema 17 (design 215). Raises ``capability_unavailable``.
 
-        Refuses an export whose ``schema_version`` is newer than this build supports, or
-        a target id that already exists. Columns absent from an older export default.
-
-        An imported session is an INDEPENDENT root: its lineage columns
-        (``parent_session_id`` / ``spawn_tool_call_id`` / ``spawn_depth`` / ``kind``)
-        are reset rather than copied from the source. Otherwise a re-imported subagent
-        would stay linked to the source's *original* parent and be silently
-        cascade-deleted when that unrelated parent is closed — destroying the
-        just-restored session (C2)."""
-        version = int(data.get("schema_version", 0))
-        if version > self.schema_version:
-            raise ValueError(
-                f"export schema_version {version} is newer than this power_loop build "
-                f"supports (max {self.schema_version})"
-            )
-        tables = data["tables"]
-        new_id = new_session_id or _new_session_id()
-        async with self._db.transaction() as tx:
-            if await tx.fetchone(
-                f"SELECT 1 FROM {self.t.sessions} WHERE session_id=?", (new_id,)
-            ):
-                raise ValueError(f"session already exists: {new_id}")
-            for logical, physical, cols in _EXPORT_TABLES:
-                for raw_row in tables.get(logical, []):
-                    row = dict(raw_row)
-                    row["session_id"] = new_id
-                    if logical == "sessions":
-                        # Detach lineage so the import is an independent root (see
-                        # docstring), never silently re-linked to the source's parent.
-                        row["parent_session_id"] = None
-                        row["spawn_tool_call_id"] = None
-                        row["spawn_depth"] = 0
-                        row["kind"] = SessionKind.ROOT.value
-                    # Only insert columns the export actually carries (an older export
-                    # may omit columns added later); the rest take their schema defaults.
-                    present = [c for c in cols if c in row]
-                    collist = ",".join(present)
-                    placeholders = ",".join("?" * len(present))
-                    await tx.execute(
-                        f"INSERT INTO {physical(self.t)} ({collist}) "
-                        f"VALUES ({placeholders})",
-                        [row[c] for c in present],
-                    )
-            await tx.execute(f"UPDATE {self.t.session_state} SET inbox_version=inbox_version+1, "
-                             "background_version=background_version+1,runtime_version=runtime_version+1 WHERE session_id=?", (new_id,))
-        return new_id
+        ``export_session`` remains available for audit; a schema-native import is a
+        later-phase concern and is not silently emulated with the old id-copying logic."""
+        # Schema 17 exports carry the raw messages.id and the session-native lineage
+        # columns; the pre-215 import copied ids verbatim (UNIQUE conflict) and reset
+        # spawn columns that no longer exist. Cross-store import is not part of the
+        # session-native main path; it is explicitly unsupported rather than silently
+        # producing a corrupt restore (design 215 G1-R1 residual).
+        from power_loop.agent.runtime_types import RuntimeRequestError
+        raise RuntimeRequestError(
+            "capability_unavailable", "import_session is not supported by schema 17"
+        )
 
 # ── row converters (dict rows; backend-agnostic) ────────────────────────────────
 
@@ -2391,6 +2385,9 @@ def _row_to_project_message(row: Row) -> ProjectMessageRow:
         compact_from_send=row["compact_from_send"], compact_to_send=row["compact_to_send"],
         projector_version=row["projector_version"], token_estimate=row["token_estimate"],
         created_at=row["created_at"], id=int(row["id"]) if "id" in row.keys() else None,
+        completed_through_send_index=(
+            row["completed_through_send_index"] if "completed_through_send_index" in row.keys() else 0
+        ),
     )
 
 

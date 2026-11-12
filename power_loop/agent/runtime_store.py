@@ -51,6 +51,7 @@ class ClaimedBatch:
     owner_token: str
     owner_node_id: str
     owner_boot_id: str
+    inbox_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -323,6 +324,10 @@ class RuntimeInputStore:
                 state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
                 if state["execution_state"] != "queued":
                     return None
+                # Repair any unresolved tool calls from an interrupted prior run BEFORE
+                # the new merged user message, stamped with that run's send_index.
+                repaired = await self._repair_pending_tx(
+                    tx, target.session_id, int(state["send_index"]), state)
                 snapshot = await tx.fetchone(
                     f"SELECT COALESCE(MAX(id),0) AS id FROM {self.q} "
                     "WHERE session_id=? AND status='pending'", (target.session_id,),
@@ -338,7 +343,7 @@ class RuntimeInputStore:
                 context["refs"] = refs
                 token = uuid.uuid4().hex
                 send_index = int(state["send_index"]) + 1
-                seq = int(state["next_seq"])
+                seq = int(state["next_seq"]) + repaired
                 epoch = int(state["owner_epoch"]) + 1
                 database_now = await self._db_now(tx)
                 deadline = database_now + int(ttl_s * 1000)
@@ -351,7 +356,7 @@ class RuntimeInputStore:
                     "AND active_send_index IS NULL AND owner_token IS NULL",
                     (
                         send_index, send_index, epoch, token, node_id, boot_id, deadline,
-                        target.session_id, state["send_index"], state["next_seq"],
+                        target.session_id, state["send_index"], seq,
                     ),
                 )
                 if changed != 1:
@@ -373,6 +378,7 @@ class RuntimeInputStore:
                     raise SessionLeaseLost(target.session_id)
                 batch = ClaimedBatch(
                     target, send_index, seq, refs, epoch, token, node_id, boot_id,
+                    int(state["inbox_version"]),
                 )
                 context.update(batch=batch, message_id=message_id)
                 return batch
@@ -387,6 +393,144 @@ class RuntimeInputStore:
     def merge_batch(rows):
         from .follow_up import session_batch_content
         return session_batch_content(rows)
+
+    async def boundary(self, target):
+        """One current-version read at a loop boundary (design 215 §7.4).
+
+        Returns the live ``session_state`` control fields so the caller can detect new
+        inbox input, a matching cancellation, or a lost owner fence. This is the fixed
+        per-boundary control cost; the inbox batch is only read when the version moved.
+        """
+        self.check_store(target)
+        return await self.db.fetchone(
+            f"SELECT execution_state,active_send_index,owner_epoch,owner_token,"
+            f"inbox_version,cancel_send_index,cancel_reason FROM {self.state} WHERE session_id=?",
+            (target.session_id,),
+        )
+
+    async def claim_follow_up(self, batch: ClaimedBatch):
+        """Atomically claim the pending inbox snapshot into the RUNNING send.
+
+        Same atomic boundary as :meth:`claim` but fenced on the live owner: lock the
+        state, verify running + active_send_index + epoch/token, snapshot MAX(id), write
+        one merged user message and bind every input to this send_index. Returns
+        ``(refs, seq, merged)`` or ``None`` when nothing is pending or the fence moved.
+        """
+        self.check_store(batch.target)
+        async with self.db.transaction() as tx:
+            state = await self.db.dialect.lock_state(tx, self.state, batch.target.session_id)
+            if (
+                state["execution_state"] != "running"
+                or state["active_send_index"] != batch.send_index
+                or state["owner_epoch"] != batch.owner_epoch
+                or state["owner_token"] != batch.owner_token
+            ):
+                raise SessionLeaseLost(batch.target.session_id)
+            snapshot = await tx.fetchone(
+                f"SELECT COALESCE(MAX(id),0) AS id FROM {self.q} "
+                "WHERE session_id=? AND status='pending'", (batch.target.session_id,),
+            )
+            if not int(snapshot["id"]):
+                return None
+            rows = await tx.fetchall(
+                f"SELECT * FROM {self.q} WHERE session_id=? AND status='pending' AND id<=? "
+                "ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,id",
+                (batch.target.session_id, snapshot["id"]),
+            )
+            refs = tuple(
+                InputRef(batch.target.store_id, batch.target.session_id, row["item_id"])
+                for row in rows
+            )
+            seq = int(state["next_seq"])
+            database_now = await self._db_now(tx)
+            merged = self.merge_batch(rows)
+            changed = await tx.execute(
+                f"UPDATE {self.state} SET next_seq=next_seq+1,inbox_version=inbox_version "
+                "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
+                "AND owner_epoch=? AND owner_token=? AND next_seq=?",
+                (batch.target.session_id, batch.send_index, batch.owner_epoch,
+                 batch.owner_token, seq),
+            )
+            if changed != 1:
+                raise SessionLeaseLost(batch.target.session_id)
+            await self._insert_message(
+                tx, batch.target.session_id, seq, "user", canonical(merged),
+                {"content_encoding": "json", "input_refs": [plain(ref) for ref in refs]},
+                batch.send_index, database_now,
+            )
+            ids = [int(row["id"]) for row in rows]
+            delivered = await tx.execute(
+                f"UPDATE {self.q} SET status='delivered',delivered_at=?,delivered_seq=?,"
+                f"delivered_send_index=? WHERE session_id=? AND status='pending' "
+                f"AND id IN ({','.join('?' for _ in ids)})",
+                (database_now, seq, batch.send_index, batch.target.session_id, *ids),
+            )
+            if delivered != len(ids):
+                raise SessionLeaseLost(batch.target.session_id)
+            version = int(state["inbox_version"])
+        # The merged follow-up row consumed a seq outside SessionStore.append_message;
+        # advance the live send's in-memory cursor so its next conditional append matches
+        # (otherwise the stale next_seq fence would reject the loop's own next write).
+        from power_loop.runtime.store import send_reads
+        holding = send_reads.current(self.store, batch.target.session_id)
+        if holding is not None:
+            holding.next_seq = seq + 1
+            holding.change_snapshot = None
+        return refs, seq, merged, version
+
+    async def _repair_pending_tx(self, tx, session_id, send_index, state):
+        """Synthesize unknown tool results for unresolved calls (design 215 §8.3).
+
+        Runs inside the caller's fenced transaction. Only ids without a stored result
+        get a fixed interrupted marker; existing results are never duplicated and no
+        unknown tool is replayed. The synthetic rows carry the interrupted run's
+        send_index. Returns the number of rows appended (so the caller can advance its
+        seq cursor). pending_json is cleared in the same transaction.
+        """
+        pending = json.loads(state["pending_json"]) if state["pending_json"] else None
+        if not pending:
+            return 0
+        tool_calls = pending.get("tool_calls") or [
+            {"id": cid} for cid in pending.get("tool_call_ids", [])
+        ]
+        if not tool_calls:
+            await tx.execute(
+                f"UPDATE {self.state} SET pending_json=NULL WHERE session_id=?", (session_id,)
+            )
+            return 0
+        assistant_seq = pending.get("assistant_seq")
+        round_index = pending.get("round_index")
+        replied = set()
+        if assistant_seq is not None:
+            rows = await tx.fetchall(
+                f"SELECT tool_call_id FROM {self.store.t.messages} WHERE session_id=? "
+                "AND role='tool' AND send_index=? AND seq>? AND tool_call_id IS NOT NULL",
+                (session_id, send_index, assistant_seq),
+            )
+            replied = {row["tool_call_id"] for row in rows}
+        names = {str(tc.get("id") or ""): (tc.get("function", {}) or {}).get("name")
+                 if "function" in tc else tc.get("name") for tc in tool_calls}
+        seq = int(state["next_seq"])
+        database_now = await self._db_now(tx)
+        appended = 0
+        for tc in tool_calls:
+            cid = str(tc.get("id") or "")
+            if not cid or cid in replied:
+                continue
+            await tx.execute(
+                f"INSERT INTO {self.store.t.messages} (session_id,seq,role,name,content,"
+                "tool_call_id,round_index,state,meta_json,send_index,created_at) "
+                "VALUES (?,?, 'tool', ?, ?, ?, ?, 'active', ?, ?, ?)",
+                (session_id, seq, names.get(cid), "<aborted: 执行中断，结果未知>", cid,
+                 round_index, canonical({"interrupted": True}), send_index, database_now),
+            )
+            seq += 1
+            appended += 1
+        await tx.execute(
+            f"UPDATE {self.state} SET pending_json=NULL,next_seq=? WHERE session_id=?",
+            (seq, session_id),
+        )
+        return appended
 
     async def _insert_message(self, tx, session_id, seq, role, content, meta, send_index, created_at):
         sql = (
@@ -428,19 +572,22 @@ class RuntimeInputStore:
 
     async def final(
         self, batch: ClaimedBatch, *, consumed=None, status="completed", final_text="",
-        usage=None, structured_output=None, error=None, error_code=None,
+        usage=None, structured_output=None, error=None, error_code=None, result_seq=None,
     ) -> FinalBatch:
-        consumed = tuple(batch.input_refs if consumed is None else consumed)
-        unknown = set(consumed) - set(batch.input_refs)
-        if unknown:
-            raise RuntimeRequestError("invalid_options", "consumed input outside claimed batch")
+        # consumed=None means "every input delivered to this send" — including follow-ups
+        # claimed at loop boundaries, which share send_index but are not in the original
+        # ClaimedBatch.input_refs (design 215 §3.4/§7.4). An explicit consumed narrows it.
+        if consumed is not None:
+            consumed = tuple(consumed)
+            if any(ref.session_id != batch.target.session_id for ref in consumed):
+                raise RuntimeRequestError("invalid_options", "consumed input outside this session")
         if status not in {"completed", "failed", "cancelled", "interrupted"}:
             raise RuntimeRequestError("invalid_options", "terminal status")
         try:
             async with self.db.transaction() as tx:
                 return await self._final_tx(
                     tx, batch, consumed, status, final_text, usage or {},
-                    structured_output, error, error_code,
+                    structured_output, error, error_code, result_seq,
                 )
         except (RuntimeRequestError, SessionLeaseLost):
             raise
@@ -448,11 +595,11 @@ class RuntimeInputStore:
             recovered = await self._final_after_unknown(batch, consumed)
             if recovered is not None:
                 return recovered
-            raise StoreError(consumed[0] if consumed else None) from exc
+            raise StoreError(consumed[0] if consumed else batch.input_refs[0]) from exc
 
     async def _final_tx(
         self, tx, batch, consumed, status, final_text, usage, structured_output,
-        error, error_code,
+        error, error_code, result_seq=None,
     ):
         session = await self._session(tx, batch.target.session_id)
         route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
@@ -465,13 +612,29 @@ class RuntimeInputStore:
         state = states[batch.target.session_id]
         if state["cancel_send_index"] == batch.send_index:
             status, error = "cancelled", state["cancel_reason"] or "cancelled"
+        if consumed is None:
+            delivered = await tx.fetchall(
+                f"SELECT item_id FROM {self.q} WHERE session_id=? AND status='delivered' "
+                "AND delivered_send_index=? AND terminal_status IS NULL",
+                (batch.target.session_id, batch.send_index),
+            )
+            consumed = tuple(
+                InputRef(batch.target.store_id, batch.target.session_id, row["item_id"])
+                for row in delivered
+            )
         consumed_ids = [ref.message_id for ref in consumed]
         unconsumed_ids = [ref.message_id for ref in batch.input_refs if ref not in consumed]
-        result_ref, delivery_error, result_seq = None, None, None
+        result_ref, delivery_error = None, None
         database_now = await self._db_now(tx)
-        write_message = status == "completed"
+        # The running loop appends assistant turns in real time and passes the seq of its
+        # LAST assistant row as ``result_seq``: that row IS the result message (design 215
+        # §5.3), so final stamps its meta instead of writing a duplicate. A storage-only
+        # final (no loop, result_seq=None) inserts the result message itself; a failure with
+        # no assistant row leaves result_seq NULL and is expressed by the input terminal.
+        write_message = result_seq is None and status == "completed"
         if write_message:
             result_seq = int(state["next_seq"])
+        reuse_message = result_seq is not None and not write_message
         if consumed and route is not None:
             route_result = Result(
                 consumed[0], batch.target, status, batch.send_index, result_seq,
@@ -501,15 +664,27 @@ class RuntimeInputStore:
         )
         if changed != 1:
             raise SessionLeaseLost(batch.target.session_id)
+        result_meta = {
+            "usage": plain(usage), "structured_output": plain(structured_output),
+            "error": error, "error_code": error_code,
+            "result_delivery_error": delivery_error,
+        }
         if write_message:
             await self._insert_message(
                 tx, batch.target.session_id, result_seq, "assistant", final_text,
-                {
-                    "usage": plain(usage), "structured_output": plain(structured_output),
-                    "error": error, "error_code": error_code,
-                    "result_delivery_error": delivery_error,
-                },
-                batch.send_index, database_now,
+                result_meta, batch.send_index, database_now,
+            )
+        elif reuse_message:
+            # Merge into the loop's assistant row, preserving reasoning/round-usage meta.
+            row = await tx.fetchone(
+                f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
+                (batch.target.session_id, result_seq),
+            )
+            meta = json.loads(row["meta_json"] or "{}") if row is not None else {}
+            meta.update(result_meta)
+            await tx.execute(
+                f"UPDATE {self.store.t.messages} SET meta_json=? WHERE session_id=? AND seq=?",
+                (canonical(meta), batch.target.session_id, result_seq),
             )
         if unconsumed_ids:
             await tx.execute(
@@ -624,6 +799,16 @@ class RuntimeInputStore:
         )
         if not state or state["execution_state"] not in {"idle", "queued"}:
             return None
+        if consumed is None:
+            rows = await self.db.fetchall(
+                f"SELECT item_id FROM {self.q} WHERE session_id=? AND result_send_index=? "
+                "AND terminal_status IS NOT NULL",
+                (batch.target.session_id, batch.send_index),
+            )
+            consumed = tuple(
+                InputRef(batch.target.store_id, batch.target.session_id, row["item_id"])
+                for row in rows
+            )
         results = []
         for ref in consumed:
             record = await self.input(self.db, ref)
@@ -708,6 +893,9 @@ class RuntimeInputStore:
                 )
             if changed != 1:
                 return None
+            # Repair unresolved tool calls of the interrupted run before its terminal
+            # state, stamped with the interrupted active_send_index (design 215 §9.3).
+            await self._repair_pending_tx(tx, target.session_id, active, own_state)
             rows = await tx.fetchall(
                 f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
                 "AND delivered_send_index=? AND terminal_status IS NULL",

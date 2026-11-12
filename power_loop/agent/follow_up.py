@@ -99,6 +99,53 @@ def session_batch_content(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _batch_item_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Mapping):
+        inner = content.get("content")
+        if inner is not None:
+            return _batch_item_text(inner)
+        return json.dumps(content, ensure_ascii=False)
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+                else:
+                    parts.append(f"[{block.get('type') or 'block'}]")
+            else:
+                parts.append(str(block))
+        return "\n".join(p for p in parts if p)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def render_batch_text(merged: Mapping[str, Any]) -> str:
+    """Deterministic text rendering of a merged batch for text providers (design 215 §7.3).
+
+    Every item keeps its ID, kind, priority and boundary; a child result is never
+    disguised as a human turn. The canonical JSON body stays in the raw message for
+    audit; this is the equivalent text the model actually reads.
+    """
+    items = merged.get("items") or []
+    if len(items) == 1:
+        only = items[0]
+        return _batch_item_text(only.get("content"))
+    lines = []
+    for item in items:
+        header = f"[{item.get('kind') or 'user'} · {item.get('message_id')} · {item.get('priority') or 'normal'}]"
+        lines.append(header)
+        lines.append(_batch_item_text(item.get("content")))
+    return "\n\n".join(lines)
+
+
+def is_batch_content(content: Any) -> bool:
+    return isinstance(content, Mapping) and content.get("version") == 1 and isinstance(content.get("items"), list)
+
+
 def _merge_plain(payloads: list[str | LoopMessage]) -> LoopMessage | None:
     """Like :func:`merge_follow_up_inputs` but WITHOUT the ``<follow_up>`` envelope — the input
     of a fresh send is the send's own input, not steering into someone else's run."""

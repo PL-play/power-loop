@@ -140,6 +140,34 @@ class SQLiteSink:
         self._history_seqs: list[int | None] = []
         self._history_ord: list[int | None] = []
         self._input_messages: dict[int, dict] = {}
+        # design 215 §8.1/§P2.4: the raw rows this send appends, kept in memory so the
+        # end-of-send projection is built from them directly — never a re-read of the
+        # current send's messages. Seeded by the loop with the claim's merged user row.
+        self.send_rows: list[Any] = []
+        # The seq of the last assistant turn written; the worker passes it to final() as
+        # the result message so final stamps that row instead of writing a duplicate.
+        self.last_assistant_seq: int | None = None
+
+    def _capture_row(self, seq, role, message, round_index, send_index):
+        from power_loop.runtime.store.types import MessageRow, MessageState
+        text, structured = _encode_content(message.get("content"))
+        meta = _meta_with_content_encoding(message.get("meta"), structured=structured)
+        self.send_rows.append(MessageRow(
+            session_id=self.session_id, seq=seq, role=role, name=message.get("name"),
+            content=text, tool_calls=list(message["tool_calls"]) if message.get("tool_calls") else None,
+            tool_call_id=message.get("tool_call_id"), round_index=round_index,
+            state=MessageState.ACTIVE, meta=meta or {}, created_at=0, send_index=send_index,
+        ))
+
+    def note_persisted(self, seq, message, *, round_index=None, send_index=None):
+        """Record a row the claim transaction already persisted (a batch follow-up).
+
+        It enters the in-memory history index and the projection capture WITHOUT a second
+        write: the merged user message is durable iff its inputs are delivered (one txn)."""
+        self._history_seqs.append(seq)
+        self._history_ord.append(seq)
+        self._capture_row(seq, str(message.get("role") or "user"), message, round_index, send_index)
+        self.remember_input(seq, message.get("role"), message.get("content"), message.get("meta"))
 
     def remember_input(self, seq, role, content, meta):
         inbox = (meta or {}).get("inbox", {})
@@ -217,6 +245,7 @@ class SQLiteSink:
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
+            self._capture_row(seq, "tool", message, round_index, message.get("send_index"))
             if usage:
                 self._usage_written.add(round_index)
             assistant_seq = self._assistant_seq
@@ -253,6 +282,8 @@ class SQLiteSink:
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
+            self._capture_row(seq, "assistant", message, round_index, message.get("send_index"))
+            self.last_assistant_seq = seq
             if usage:
                 self._usage_written.add(round_index)
             if tool_calls:
@@ -289,6 +320,7 @@ class SQLiteSink:
             raise
         self._history_seqs.append(seq)
         self._history_ord.append(seq)
+        self._capture_row(seq, str(role or "user"), message, round_index, message.get("send_index"))
         self.remember_input(seq, role, message.get("content"), meta)
         if usage:
             self._usage_written.add(round_index)
@@ -317,6 +349,11 @@ class SQLiteSink:
         seq = self._assistant_seq if self._assistant_seq is not None else assistant_seq
         self._assistant_seq = seq
         self._tool_calls = list(tool_calls)
+        from power_loop.runtime.task_runtime import atomic_pending_required
+        if atomic_pending_required(self.store, self.session_id) and seq == self._assistant_seq:
+            # The assistant append already persisted pending atomically with the row
+            # (design 215 §8.3); a second set_pending would be a redundant control write.
+            return
         pending = {"assistant_seq": seq, "round_index": round_index, "tool_call_ids": ids,
                    "tool_calls": list(tool_calls)}
         known = getattr(self.store, "known_pending", None)
@@ -442,6 +479,11 @@ class SQLiteSink:
     async def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
     ) -> None:
+        from power_loop.runtime.task_runtime import current_session_send
+        if current_session_send(self.store, self.session_id) is not None:
+            # Session-native usage rides in the assistant message meta (one write); there
+            # is no separate usage_rounds table in schema 17.
+            return
         if usage and round_index not in self._usage_written:
             await self.store.record_usage(
                 self.session_id,

@@ -9,7 +9,7 @@ from power_loop.agent.types import AgentLoopConfig
 
 from .runtime_client import RuntimeClient
 from .runtime_transport import MemoryMessageTransport
-from .runtime_types import RuntimeRequestError, TargetRef, identifier, plain
+from .runtime_types import RuntimeRequestError, identifier
 
 _PROCESS_BOOT_ID = uuid.uuid4().hex
 
@@ -157,13 +157,10 @@ class Runtime:
     async def open_session(self, descriptor, *, actor):
         self.client._require_open()
         if descriptor.kind != "agent":
-            raise RuntimeRequestError("feature_unavailable", descriptor.kind + " is not enabled")
+            raise RuntimeRequestError("capability_unavailable", descriptor.kind + " is not enabled in P2")
         if actor.session_id is not None:
             raise RuntimeRequestError("forbidden", "host identity required to open a root session")
-        sid = await self.store.create_session(metadata={
-            "tenant_id": actor.tenant_id, "principal_id": actor.principal_id,
-            "runtime_descriptor": plain(descriptor), "execution_role": "main"})
-        return TargetRef(self.store.store_id, sid)
+        return await self.client.create_session(descriptor, actor=actor)
 
     async def aclose(self, *, timeout_s=30.0, cancel_running=False):
         if self._closed:

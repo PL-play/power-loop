@@ -1,37 +1,31 @@
-"""Authenticated, ID-only submission, cancellation and result collection."""
+"""The unified session-native client (design 215 §5).
+
+One authenticated surface: create_session / send / cancel / inspect / wait / messages /
+list_children. ``send`` is idle→new round or busy→follow-up through the same accept
+boundary; results are ordinary assistant messages plus input terminal states, so a
+detached client (or a reopened store) can wait without any in-memory result cache.
+There is no resume, list_jobs, append/nudge/steer or job generation.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
-from dataclasses import replace
-
-from power_loop.runtime.jobs import JobManager
 
 from .runtime_store import RuntimeInputStore, now_ms
+from .runtime_transport import PROTOCOL_VERSION as TRANSPORT_PROTOCOL
 from .runtime_transport import SubscriptionSpec, TransportPacket
 from .runtime_types import (
     CapacityError,
-    Command,
     InputRef,
-    JobPage,
-    JobRef,
     OutputItem,
     Receipt,
-    RequestOptions,
-    Result,
     RuntimeRequestError,
-    StoreError,
     TargetRef,
     WaitTimeout,
     plain,
 )
 
 log = logging.getLogger(__name__)
-
-
-def quiet_cancel_event(job_id):
-    return "cancel_quiet:" + job_id
 
 
 class RuntimeClient:
@@ -50,374 +44,98 @@ class RuntimeClient:
         if self._closed or (not reading and not self._accepting):
             raise RuntimeRequestError("session_closed")
 
-    async def send(self, target, body, *, message_id, actor, urgent=False, options=None, descriptor=None,
-                   deadline_ms=None):
-        """Start a job on an idle session, or join the running job at its next round.
+    # ── unified operations ────────────────────────────────────────────────────
 
-        ``target`` is a session ``TargetRef`` or a running ``JobRef``. ``urgent`` skips the
-        running job's not-yet-started tool calls so the message arrives one batch sooner.
-        ``options`` and ``descriptor`` apply only when this message starts the job.
-        """
-        if isinstance(target, JobRef):
-            if options is not None or descriptor is not None:
-                raise RuntimeRequestError("invalid_options", "a job input keeps its execution contract")
-            job = await self.inputs.resolve_job(self.inputs.db, target, actor)
-            if target.generation is None:
-                raise RuntimeRequestError("stale_generation")
-            return await self._submit(Command(message_id, TargetRef(target.store_id, job["session_id"], target.job_id),
-                "send", {"body": body}, urgent, expires_at_ms=deadline_ms,
-                expected_job_generation=target.generation), actor=actor)
-        if target.job_id is not None:
-            raise RuntimeRequestError("invalid_options", "address a job with its JobRef")
-        return await self._submit(Command(message_id, target, "send", {"body": body}, urgent,
-            options=plain(options or RequestOptions()), expires_at_ms=deadline_ms), actor=actor, descriptor=descriptor)
-
-    async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None, options=None):
-        if ref.generation is None or ref.generation == 0:
-            raise RuntimeRequestError("stale_generation")
-        job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
-        if job["kind"] not in {"subagent", "workflow_node"}:
-            raise RuntimeRequestError("invalid_options", "resume requires a child task")
-        import json
-        creation = await self.inputs.db.fetchone(f"SELECT payload_json FROM {self.inputs.events} "
-            "WHERE job_id=? AND action='create'", (ref.job_id,))
-        start_ref = InputRef(**json.loads(creation["payload_json"])["request"]["input_ref"])
-        start = await self.inputs.input(self.inputs.db, start_ref)
-        original = start.meta["options"]
-        narrowed = dict(original)
-        if options is not None:
-            if not isinstance(options, Mapping) or set(options) - {"tools", "max_rounds", "max_tokens", "max_tokens_per_run"}:
-                raise RuntimeRequestError("invalid_options", "resume only narrows tools and execution limits")
-            for key, value in options.items():
-                if key == "tools":
-                    if not isinstance(value, (list, tuple)) or any(not isinstance(name, str) for name in value):
-                        raise RuntimeRequestError("invalid_options", "resume tools")
-                    if original[key] is not None and set(value) - set(original[key]):
-                        raise RuntimeRequestError("forbidden", "resume tools exceed the original grant")
-                elif type(value) is not int or value < 1 or (original[key] is not None and value > original[key]):
-                    raise RuntimeRequestError("invalid_options", "resume cannot increase " + key)
-                narrowed[key] = value
-        from .runtime_types import RuntimeDescriptor
-        return await self._submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
-            "resume", {"body": body or "Continue the original task using saved results. Do not replay unknown external actions."},
-            options=narrowed, expires_at_ms=deadline_ms,
-            expected_job_generation=ref.generation), actor=actor,
-            descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
-
-    async def workflow(self, target, spec, *, message_id, actor, descriptor=None, options=None):
-        from power_loop.workflow.runner import submit
-        return await submit(self, target, spec, message_id=message_id, actor=actor,
-                            descriptor=descriptor, options=options)
-
-    async def submit(self, command, *, actor):
-        if command.operation == "resume":
-            raise RuntimeRequestError("invalid_options", "resume requires its dedicated control port")
-        if command.operation == "cancel":
-            if (set(command.payload) - {"input_ref", "reason"} or "reason" not in command.payload
-                    or not isinstance(command.payload["reason"], str) or command.options
-                    or command.descriptor_ref is not None or command.expires_at_ms is not None):
-                raise RuntimeRequestError("invalid_options", "cancel payload")
-            if "input_ref" in command.payload:
-                value = command.payload["input_ref"]
-                if (not isinstance(value, Mapping) or set(value) != {"store_id", "session_id", "message_id"}
-                        or command.target.job_id is not None or command.expected_job_generation is not None):
-                    raise RuntimeRequestError("invalid_options", "cancel input reference")
-                ref = InputRef(**value)
-                if (ref.store_id, ref.session_id) != (command.target.store_id, command.target.session_id):
-                    raise RuntimeRequestError("invalid_options", "cancel target does not match input")
-            else:
-                if command.target.job_id is None or command.expected_job_generation is None:
-                    raise RuntimeRequestError("invalid_options", "cancel requires an exact job generation")
-                ref = JobRef(command.target.store_id, command.target.job_id, command.expected_job_generation)
-            return await self._cancel(ref, actor=actor, scope=command.scope,
-                                      reason=command.payload["reason"], target=command.target)
-        return await self._submit(command, actor=actor)
-
-    async def _submit(self, command, *, actor, descriptor=None):
+    async def create_session(self, descriptor, *, actor, parent=None, result_route=None,
+                             cancel_propagation="linked", options=None) -> TargetRef:
         self._require_open()
-        if set(command.payload) != {"body"} or command.descriptor_ref is not None:
-            raise RuntimeRequestError("invalid_options")
-        body = command.payload["body"]
-        if not isinstance(body, str) and (not isinstance(body, Mapping) or "content" not in body):
-            raise RuntimeRequestError("invalid_options", "body must be text or a message")
-        if command.scope != "self":
-            raise RuntimeRequestError("invalid_options", "ordinary inputs have self scope")
-        if command.operation == "send" and command.target.job_id is not None and (command.options or descriptor):
-            raise RuntimeRequestError("invalid_options", "a job input keeps its execution contract")
-        try:
-            async with self.inputs.db.transaction() as tx:
-                receipt = await self.inputs.accept_input(tx, command, actor, descriptor=descriptor)
-        except RuntimeRequestError:
-            raise
-        except Exception as exc:
-            raise StoreError(InputRef(command.target.store_id, command.target.session_id,
-                                      command.message_id)) from exc
+        return await self.inputs.create_session(
+            descriptor, actor=actor, parent=parent, result_route=result_route,
+            cancel_propagation=cancel_propagation, options=options,
+        )
+
+    async def send(self, target, body, *, message_id, actor, priority="normal",
+                   deadline_ms=None) -> Receipt:
+        """Accept an input: idle starts a new round, busy joins the next loop boundary.
+
+        The durable accept is the authority; the activation notification is a best-effort
+        latency optimization. A lost notification never loses the input (the worker's
+        periodic unfinished scan and the running loop's boundary read both pick it up).
+        """
+        self._require_open()
+        receipt = await self.inputs.accept(
+            target, body, message_id=message_id, actor=actor, priority=priority,
+            deadline_ms=deadline_ms,
+        )
         if receipt.newly_accepted:
             from power_loop.contracts.hooks import HookPoint
             from power_loop.core.execution_notifications import notify
             await notify(self.hooks, HookPoint.MESSAGE_ACCEPTED, {"receipt": receipt}, timeout_s=self.hook_timeout_s)
-        if receipt.state not in {"accepted"}:
+        if receipt.state != "accepted":
             return receipt
-        channels = ["work", "activation"]
-        if command.urgent:
-            channels.insert(0, "control")
-        published = await self._notify(receipt.target, receipt.message_id, receipt.input_ref, channels)
+        published = await self._notify(receipt.target, receipt.message_id, receipt.input_ref,
+                                       ["work", "activation"])
+        from dataclasses import replace
         return replace(receipt, notification="published" if published else "failed",
                        reason=None if published else "wake_pending")
 
-    async def _notify(self, target, message_id, input_ref, channels, payload=None):
-        success = True
-        for channel in channels:
-            try:
-                sent = await self.transport.publish(TransportPacket(42, self.namespace, message_id,
-                    target, channel, input_ref, payload))
-                success = sent.accepted and success
-            except Exception:
-                log.warning("input saved; %s notification failed for %s", channel, message_id, exc_info=True)
-                success = False
-        return success
-
-    async def cancel(self, ref, *, actor, scope="self", reason="cancelled", notify_parent=True):
-        """Stop a job (or void an undelivered input).
-
-        A stopped child reports its cancelled result to its parent like a completion;
-        ``notify_parent=False`` suppresses that report for the job addressed here.
-        """
-        return await self._cancel(ref, actor=actor, scope=scope, reason=reason, notify_parent=notify_parent)
-
-    async def _cancel(self, ref, *, actor, scope, reason, target=None, notify_parent=True):
+    async def cancel(self, ref, *, actor, scope="self", reason="cancelled") -> Receipt:
         self._require_open()
-        if scope not in {"self", "subtree"}:
-            raise RuntimeRequestError("invalid_options")
-        manager = JobManager(self.store)
-        input_ref = ref if isinstance(ref, InputRef) else None
-        job_ref = ref if isinstance(ref, JobRef) else None
-        if target is None:
-            if input_ref:
-                target = TargetRef(ref.store_id, ref.session_id)
-            else:
-                row = await self.inputs.resolve_job(self.inputs.db, ref, actor)
-                target = TargetRef(ref.store_id, row["session_id"], ref.job_id)
-        parent_ref = None
-        stop_running = False
-        async with manager.joined_write() as tx:
-            await self.inputs.authorize(tx, target, actor)
-            result_route = None
-            if input_ref:
-                original = await self.inputs.input(tx, input_ref)
-                if original is None:
-                    raise RuntimeRequestError("not_found")
-                if original.row["delivered_job_id"] is not None:
-                    job_ref = JobRef(ref.store_id, original.row["delivered_job_id"],
-                                     original.row["delivered_job_generation"])
-            if job_ref is not None:
-                result_route = await self.inputs._lock_result_sessions(tx, job_ref)
-            else:
-                await self.inputs.db.dialect.lock_state(tx, self.inputs.state, target.session_id)
-            if input_ref:
-                record = await self.inputs.input(tx, input_ref)
-                if record is None:
-                    raise RuntimeRequestError("not_found")
-                if record.row["delivered_job_id"] is None:
-                    if record.row["status"] == "delivered":
-                        stop_running = True
-                        receipt = self.inputs.receipt(record)
-                    else:
-                        receipt = await self.inputs.void_unbound(tx, input_ref, reason=reason, status="cancelled")
-                else:
-                    job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], record.row["delivered_job_generation"])
-            if job_ref is not None:
-                row = await manager._row(tx, job_ref.job_id)
-                # Lightweight tasks don't have job rows
-                if row is None:
-                    # For lightweight tasks, just void the input and notify
-                    if input_ref:
-                        await tx.execute(f"UPDATE {self.inputs.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
-                            "WHERE session_id=? AND item_id=? AND status IN ('pending','claimed','delivered')",
-                            (target.session_id, input_ref.message_id))
-                        receipt = Receipt(input_ref, target, input_ref.message_id, False, job_ref, "applied", "not_needed", reason)
-                        success = await self._notify(target, receipt.message_id, input_ref, ["control"],
-                            {"cancelled": True, "reason": reason})
-                        return replace(receipt, notification='published' if success else 'failed')
-                    else:
-                        raise RuntimeRequestError("not_found")
-                if job_ref.generation is None or row["generation"] != job_ref.generation:
-                    raise RuntimeRequestError("stale_generation")
-                reason = row["cancel_reason"] or reason
-                if row["cancel_requested_at"] is None and row["supervision_status"] != "closed":
-                    await tx.write_job(job_ref.job_id,
-                        f"UPDATE {manager.jobs} SET cancel_requested_at=?,cancel_reason=?,intake='closed',version=version+1 "
-                        "WHERE job_id=? AND generation=? AND version=?",
-                        (now_ms(), reason, job_ref.job_id, job_ref.generation, row["version"]))
-                    if not notify_parent:
-                        await tx.append_event(("event_id", "job_id", "event_type", "job_version", "payload_json",
-                            "delivery_status", "created_at"), (quiet_cancel_event(job_ref.job_id), job_ref.job_id,
-                            "cancel_quiet", row["version"] + 1, "{}", "none", now_ms()), ignore=True)
-                    if job_ref.generation == 0:
-                        await tx.write_job(job_ref.job_id,
-                            f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',resource_state='stopped',"
-                            "supervision_status=?,result_status='available',version=version+1 WHERE job_id=? AND generation=0",
-                            ("open" if row["kind"] in {"subagent", "background_tool", "background_command"} and result_route["parent_session_id"] else "closed", job_ref.job_id))
-                        await tx.execute(f"UPDATE {self.inputs.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
-                            "WHERE session_id=? AND delivered_job_id=? AND delivered_job_generation=0 AND status IN ('pending','claimed')",
-                            (target.session_id, job_ref.job_id))
-                        parent_ref = await self.inputs._commit_result(tx, job_ref,
-                            Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
-                receipt = Receipt(input_ref, target, input_ref.message_id if input_ref else
-                    f"cancel:{job_ref.job_id}:{job_ref.generation}", False, job_ref, "applied", "not_needed", reason)
-        if job_ref is None:
-            if stop_running:
-                success = await self._notify(target, receipt.message_id, input_ref, ["control"],
-                    {"cancelled": True, "reason": reason})
-            else:
-                success = await self._notify(target, receipt.message_id, input_ref, ['output'], {'kind': 'completed'})
-            return replace(receipt, notification='published' if success else 'failed')
-        success = await self._notify(TargetRef(target.store_id, target.session_id, job_ref.job_id),
-            receipt.message_id, input_ref, ["control"], {"generation": job_ref.generation, "cancelled": True})
-        if parent_ref:
-            success = await self._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
-                parent_ref.message_id, parent_ref, ["work", "activation"]) and success
-        if scope == "subtree":
-            cursor = ""
-            while True:
-                rows = await self.inputs.db.fetchall(
-                    f"WITH RECURSIVE descendants(job_id) AS (SELECT job_id FROM {self.inputs.jobs} WHERE parent_job_id=? "
-                    f"UNION ALL SELECT j.job_id FROM {self.inputs.jobs} j JOIN descendants d ON j.parent_job_id=d.job_id) "
-                    f"SELECT j.job_id,j.generation FROM {self.inputs.jobs} j JOIN descendants d ON j.job_id=d.job_id "
-                    "WHERE j.job_id>? AND j.supervision_status<>'closed' ORDER BY j.job_id LIMIT 100", (job_ref.job_id, cursor))
-                for row in rows:
-                    child = await self.cancel(JobRef(job_ref.store_id, row["job_id"], row["generation"]),
-                                              actor=actor, reason=reason)
-                    success = child.notification != "failed" and success
-                if len(rows) < 100:
-                    break
-                cursor = rows[-1]["job_id"]
-        return replace(receipt, notification="published" if success else "failed")
+        receipt = await self.inputs.cancel(ref, actor=actor, scope=scope, reason=reason)
+        target = receipt.target
+        # Wake the owner so it can observe the cancel marker at its next checkpoint; the
+        # marker itself is durable and is also read at every loop boundary.
+        await self._notify(target, receipt.message_id or "cancel", receipt.input_ref,
+                           ["activation", "work"], {"cancelled": True, "reason": reason})
+        return receipt
 
     async def inspect(self, ref, *, actor):
         self._require_open(reading=True)
-        return (await self.inputs.read(ref, actor))[0]
+        return await self.inputs.inspect(ref, actor=actor)
 
-    async def messages(self, ref, *, actor, source="messages", limit=20, preview_chars=500, max_chars=8000,
-                       seq=None, char_offset=None):
-        """Latest ``limit`` messages of an authorized job, each shortened to ``preview_chars``.
-
-        ``source="projection"`` lists the compact projected history. ``seq`` (messages) reads one
-        record in full in ``max_chars`` chunks continued by ``char_offset``. Returns the same
-        JSON-compatible page as the agent ``jobs get view=messages`` tool.
-        """
-        from power_loop.runtime.jobs import JobActor, JobError
-        from power_loop.runtime.task_history import read_history
-
+    async def messages(self, target, *, actor, after_seq=None, limit=20):
         self._require_open(reading=True)
-        row = await self.inputs.resolve_job(self.inputs.db, ref, actor)
-        try:
-            return await read_history(JobManager(self.store),
-                JobActor(row["tenant_id"], row["principal_id"], row["session_id"]), ref.job_id, source=source,
-                seq=seq if source == "messages" else None, id=seq if source == "projection" else None,
-                char_offset=char_offset, limit=limit, latest=True, preview_chars=preview_chars, max_chars=max_chars)
-        except JobError as exc:
-            raise RuntimeRequestError("invalid_options", exc.code) from exc
+        return await self.inputs.messages(target, actor=actor, after_seq=after_seq, limit=limit)
 
-    async def list_jobs(self, target, *, actor, scope="self", unfinished=True, cursor=None, limit=100):
+    async def list_children(self, target, *, actor, cursor=None, limit=100):
         self._require_open(reading=True)
-        if scope not in {"self", "subtree"} or not 1 <= limit <= 1000:
-            raise RuntimeRequestError("invalid_options")
-        await self.inputs.authorize(self.inputs.db, target, actor)
-        params = [target.session_id]
-        prefix = ""
-        condition = "session_id=?"
-        if scope == "subtree":
-            prefix = (f"WITH RECURSIVE descendants(session_id) AS (SELECT session_id FROM {self.store.t.sessions} "
-                      f"WHERE session_id=? UNION ALL SELECT s.session_id FROM {self.store.t.sessions} s "
-                      "JOIN descendants d ON s.parent_session_id=d.session_id) ")
-            condition = "session_id IN (SELECT session_id FROM descendants)"
-        if target.job_id:
-            if scope == "subtree":
-                prefix = (f"WITH RECURSIVE descendants(job_id) AS (SELECT job_id FROM {self.inputs.jobs} WHERE job_id=? "
-                          f"UNION ALL SELECT j.job_id FROM {self.inputs.jobs} j JOIN descendants d ON j.parent_job_id=d.job_id) ")
-                condition = "job_id IN (SELECT job_id FROM descendants)"
-                params = []
-            else:
-                condition += " AND job_id=?"
-            params.append(target.job_id)
-        if unfinished:
-            condition += " AND supervision_status<>'closed'"
-        rows = await self.inputs.db.fetchall(prefix + f"SELECT job_id FROM {self.inputs.jobs} WHERE {condition} "
-            "AND job_id>? ORDER BY job_id LIMIT ?", (*params, cursor or "", limit))
-        items = tuple([await self.inspect(JobRef(target.store_id, row["job_id"]), actor=actor) for row in rows])
-        return JobPage(items, rows[-1]["job_id"] if len(rows) == limit else None)
+        return await self.inputs.list_children(target, actor=actor, cursor=cursor, limit=limit)
 
-    async def wait(self, ref, *, actor, deadline_ms):
-        from power_loop.core.agent_context import get_current_loop
-        loop = get_current_loop()
-        worker = getattr(loop, "_runtime_worker", None)
-        if worker is not None and worker.runtime.client is self:
-            async with worker.idle(loop._runtime_worker_context):
-                return await self._wait(ref, actor=actor, deadline_ms=deadline_ms)
-        return await self._wait(ref, actor=actor, deadline_ms=deadline_ms)
-
-    async def _wait(self, ref, *, actor, deadline_ms):
+    async def wait(self, input_ref, *, actor, deadline_ms=None):
+        """Wait for an input's terminal result. Detached-safe: reads the durable input
+        terminal state + result message, never an in-memory result cache."""
         self._require_open(reading=True)
         if self._slots >= 1024:
             raise CapacityError()
         self._slots += 1
         task = asyncio.current_task()
         self._waiters.add(task)
-        original = ref
         subscription = None
         try:
-            # Subscribe first, then inspect. A completion in either window is visible.
-            local_key = None
-            if isinstance(ref, InputRef):
-                local_key = (ref.session_id, ref.message_id)
-                store = self.inputs.store
-                local = (local_key in getattr(store, "lightweight_accepted", {})
-                         or local_key in getattr(store, "lightweight_results", {}))
-                if not local:
-                    target = TargetRef(ref.store_id, ref.session_id)
-                    await self.inputs.authorize(self.inputs.db, target, actor)
-                subscription = await self.transport.subscribe(SubscriptionSpec(
-                    self.namespace, ref.store_id, "output", "client", ref.session_id))
-                await subscription.ready()
-            announced = False
+            target = TargetRef(input_ref.store_id, input_ref.session_id)
+            await self.inputs.authorize(self.inputs.db, target, actor)
+            subscription = await self.transport.subscribe(SubscriptionSpec(
+                self.namespace, input_ref.store_id, "output", "client", input_ref.session_id))
+            await subscription.ready()
             while True:
-                if local_key is not None:
-                    remembered = getattr(self.inputs.store, "lightweight_results", {}).get(local_key)
-                    if remembered is not None and remembered[1] is not None:
-                        return replace(remembered[1], input_ref=original)
-                    if not announced and local_key in getattr(self.inputs.store, "lightweight_accepted", {}):
-                        announced = True
-                        remaining = 30.0 if deadline_ms is None else (deadline_ms - now_ms()) / 1000
-                        if remaining <= 0:
-                            raise WaitTimeout(str(original))
-                        try:
-                            delivery = await asyncio.wait_for(anext(subscription), min(30.0, remaining))
-                            await delivery.ack()
-                        except TimeoutError:
-                            pass
-                        continue
-                _, result, selected = await self.inputs.read(ref, actor)
-                if result:
-                    return replace(result, input_ref=original if isinstance(original, InputRef) else None)
-                ref = selected
+                result = await self.inputs.get_result(input_ref, actor=actor)
+                if result is not None:
+                    return result
                 remaining = 30.0 if deadline_ms is None else (deadline_ms - now_ms()) / 1000
                 if remaining <= 0:
-                    raise WaitTimeout(str(original))
-                if subscription is None:
-                    await asyncio.sleep(min(0.05, remaining))
-                else:
-                    try:
-                        delivery = await asyncio.wait_for(anext(subscription), min(30.0, remaining))
-                        await delivery.ack()
-                    except TimeoutError:
-                        # A lost notification is not a lost durable result.
-                        # Recheck once before the deadline decision above.
-                        continue
+                    raise WaitTimeout(str(input_ref))
+                try:
+                    # Notifications only shorten latency; a short poll keeps a lost
+                    # notification from stalling the durable result read.
+                    delivery = await asyncio.wait_for(anext(subscription), min(0.2, remaining))
+                    await delivery.ack()
+                except TimeoutError:
+                    # A lost notification is not a lost durable result; re-check above.
+                    continue
         finally:
             self._slots -= 1
             self._waiters.discard(task)
-            if subscription:
+            if subscription is not None:
                 await subscription.aclose()
 
     async def subscribe_output(self, ref, *, actor, before_send=False):
@@ -427,16 +145,10 @@ class RuntimeClient:
         self._slots += 1
         subscription = None
         try:
-            if before_send:
-                # The trusted ingress may subscribe to its imminent request after
-                # authorizing the session. A guessed ID alone grants nothing.
-                if not isinstance(ref, InputRef) or actor.session_id is not None:
-                    raise RuntimeRequestError("forbidden")
-                await self.inputs.authorize(self.inputs.db, TargetRef(ref.store_id, ref.session_id), actor)
-                if await self.inputs.input(self.inputs.db, ref) is not None:
-                    await self.inputs.read(ref, actor)
-            else:
-                await self.inputs.read(ref, actor)
+            target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
+            await self.inputs.authorize(self.inputs.db, target, actor)
+            if isinstance(ref, InputRef) and await self.inputs.input(self.inputs.db, ref) is not None:
+                await self.inputs.inspect(ref, actor=actor)
             self._require_open(reading=True)
             subscription = await self.transport.subscribe(SubscriptionSpec(
                 self.namespace, ref.store_id, "output", "client", ref.session_id))
@@ -447,9 +159,23 @@ class RuntimeClient:
             return output
         except BaseException:
             self._slots -= 1
-            if subscription:
+            if subscription is not None:
                 await subscription.aclose()
             raise
+
+    # ── notifications ─────────────────────────────────────────────────────────
+
+    async def _notify(self, target, message_id, input_ref, channels, payload=None):
+        success = True
+        for channel in channels:
+            try:
+                sent = await self.transport.publish(TransportPacket(
+                    TRANSPORT_PROTOCOL, self.namespace, message_id, target, channel, input_ref, payload))
+                success = sent.accepted and success
+            except Exception:
+                log.warning("input saved; %s notification failed for %s", channel, message_id, exc_info=True)
+                success = False
+        return success
 
     async def aclose(self):
         self._closed = True
@@ -462,12 +188,13 @@ class RuntimeClient:
 
 
 class OutputSubscription:
+    """A lossy observation stream; the durable result is always re-read from the store."""
+
     def __init__(self, client, ref, actor, subscription):
         self.client, self.ref, self.actor, self.subscription = client, ref, actor, subscription
         self.sequence = 0
         self.closed = False
         self.initial = True
-        self.job_ref = None
 
     async def ready(self):
         await self.subscription.ready()
@@ -476,6 +203,7 @@ class OutputSubscription:
         return self
 
     async def __anext__(self):
+        input_ref = self.ref if isinstance(self.ref, InputRef) else None
         while not self.closed:
             payload = None
             if not self.initial:
@@ -485,28 +213,25 @@ class OutputSubscription:
                     await self.aclose()
                     raise
                 await delivery.ack()
-                if (isinstance(self.ref, InputRef) and delivery.packet.input_ref is not None
-                        and delivery.packet.input_ref != self.ref):
+                if input_ref is not None and delivery.packet.input_ref is not None \
+                        and delivery.packet.input_ref != input_ref:
                     continue
                 payload = delivery.packet.payload or {}
                 if payload.get("kind") == "delta":
-                    if self.job_ref is None:
-                        status = await self.client.inspect(self.ref, actor=self.actor)
-                        self.job_ref = status.job_ref
-                    if plain(self.job_ref) != plain(payload.get("job_ref")):
-                        continue
                     self.sequence += 1
-                    return OutputItem(self.ref, self.job_ref, self.sequence, "delta", plain(payload))
-            status, result, _ = await self.client.inputs.read(self.ref, self.actor)
-            self.job_ref = status.job_ref
-            if result:
-                self.sequence += 1
-                await self.aclose()
-                return OutputItem(self.ref, result.job_ref, self.sequence, "completed", plain(result))
-            if self.initial or payload.get("kind") in {"gap", "error"}:
+                    return OutputItem(self.ref, None, self.sequence, "delta", plain(payload))
+            if input_ref is not None:
+                result = await self.client.inputs.get_result(input_ref, actor=self.actor)
+                if result is not None:
+                    self.sequence += 1
+                    await self.aclose()
+                    return OutputItem(self.ref, None, self.sequence, "completed", plain(result))
+            await self.client.inspect(self.ref, actor=self.actor)
+            if self.initial or (payload and payload.get("kind") in {"gap", "error"}):
                 self.initial = False
                 self.sequence += 1
-                return OutputItem(self.ref, status.job_ref, self.sequence, payload.get("kind", "gap") if payload else "gap", plain(payload or {}))
+                kind = payload.get("kind", "gap") if payload else "gap"
+                return OutputItem(self.ref, None, self.sequence, kind, plain(payload or {}))
         raise StopAsyncIteration
 
     async def aclose(self):
