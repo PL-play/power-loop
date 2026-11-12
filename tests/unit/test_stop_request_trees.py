@@ -210,7 +210,7 @@ async def spawn_stop(c, tmp_path, mode, *, label="stop", caller=None, target=Non
     context = {"actor": asdict(c.actor), "caller": asdict(caller or c.caller),
         "target": target or c.target.job.job_id, "ref": (ref or c.ref).to_dict(), "call_id": call_id,
         "now": c.manager.now()}
-    process = await asyncio.create_subprocess_exec(sys.executable, "-m", "tests.unit._stop_request_worker",
+    process = await asyncio.create_subprocess_exec(sys.executable, "-m", "tests.legacy_stop_request_worker",
         dsn, c.manager.prefix, json.dumps(context), mode, str(ready), str(release), str(output),
         cwd=Path(__file__).resolve().parents[2], stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     return process, ready, release, output

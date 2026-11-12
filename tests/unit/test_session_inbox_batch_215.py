@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -34,7 +35,8 @@ async def test_accept_is_idempotent_without_touching_idle_or_version(registry_st
     assert state == {"execution_state": "queued", "inbox_version": 1}
     await port.cancel(first.input_ref, actor=ACTOR)
     idle_duplicate = await port.accept(root, "one", message_id="m1", actor=ACTOR)
-    assert idle_duplicate.state == "voided"
+    assert idle_duplicate.state == "accepted"
+    assert not idle_duplicate.newly_accepted and idle_duplicate.notification == "not_needed"
     state = await store._db.fetchone(
         f"SELECT execution_state,inbox_version FROM {store.t.session_state} WHERE session_id=?",
         (root.session_id,),
@@ -93,12 +95,21 @@ async def test_atomic_snapshot_has_one_merged_message_and_late_input_stays_pendi
         await release.wait()
         return await original(*args, **kwargs)
 
+    late_started = asyncio.Event()
+    transaction = other._db.transaction
+
+    @asynccontextmanager
+    async def signaled_transaction():
+        late_started.set()
+        async with transaction() as tx:
+            yield tx
+
+    other._db.transaction = signaled_transaction
     monkeypatch.setattr(port, "_insert_message", paused_insert)
     claiming = asyncio.create_task(port.claim(root, node_id="a", boot_id="boot-a"))
     await inserted.wait()
     late_task = asyncio.create_task(other_port.accept(root, "late", message_id="late", actor=ACTOR))
-    await asyncio.sleep(0)
-    assert not late_task.done()
+    await late_started.wait()
     release.set()
     batch = await claiming
     await late_task
@@ -133,22 +144,31 @@ async def test_final_only_completes_consumed_and_never_claims_at_final_boundary(
     for message_id in ("one", "two"):
         await port.accept(root, message_id, message_id=message_id, actor=ACTOR)
     batch = await port.claim(root, node_id="a", boot_id="a")
-    original = port._final_tx
-    entered, release = asyncio.Event(), asyncio.Event()
+    original_lock = store._db.dialect.lock_state
+    entered, release, accept_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
-    async def paused_final(*args, **kwargs):
+    async def paused_lock(*args, **kwargs):
+        row = await original_lock(*args, **kwargs)
         entered.set()
         await release.wait()
-        return await original(*args, **kwargs)
+        return row
 
-    port._final_tx = paused_final
+    store._db.dialect.lock_state = paused_lock
+    transaction = other.store._db.transaction
+
+    @asynccontextmanager
+    async def signaled_transaction():
+        accept_started.set()
+        async with transaction() as tx:
+            yield tx
+
+    other.store._db.transaction = signaled_transaction
     finishing = asyncio.create_task(port.final(
         batch, consumed=(batch.input_refs[0],), final_text="first result"
     ))
     await entered.wait()
     accepting = asyncio.create_task(other.accept(root, "late", message_id="late", actor=ACTOR))
-    await asyncio.sleep(0)
-    assert not accepting.done()
+    await accept_started.wait()
     release.set()
     final = await finishing
     await accepting

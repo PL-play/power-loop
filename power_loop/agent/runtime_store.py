@@ -160,11 +160,12 @@ class RuntimeInputStore:
             raise RuntimeRequestError("forbidden")
         if actor.session_id is not None:
             sid, expected = target.session_id, actor.session_id
+            ancestor = session
             while sid != expected:
-                if session["parent_session_id"] is None:
+                if ancestor["parent_session_id"] is None:
                     raise RuntimeRequestError("forbidden")
-                sid = session["parent_session_id"]
-                session = await self._session(reader, sid)
+                sid = ancestor["parent_session_id"]
+                ancestor = await self._session(reader, sid)
         return session
 
     def record(self, row):
@@ -184,7 +185,7 @@ class RuntimeInputStore:
     def receipt(self, record, *, new=False, state=None, reason=None):
         row = record.row
         if state is None:
-            state = "voided" if row["status"] == "void" else "accepted"
+            state = "accepted"
         return Receipt(
             record.ref, TargetRef(self.store.store_id, record.ref.session_id),
             record.ref.message_id, new, state,
@@ -923,6 +924,29 @@ class RuntimeInputStore:
             "AND execution_state IN ('idle','queued')",
             (batch.target.session_id, batch.owner_epoch, batch.owner_token),
         ))
+
+    async def close(self, target, *, actor):
+        from power_loop.contracts.errors import SessionBusy
+
+        self.check_store(target)
+        async with self.db.transaction() as tx:
+            await self.authorize(tx, target, actor)
+            state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
+            if state["execution_state"] in {"running", "recovering"}:
+                raise SessionBusy(target.session_id)
+            pending = await tx.fetchone(
+                f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
+                "AND status IN ('pending','waiting_continuation')", (target.session_id,),
+            )
+            if int(pending["n"]):
+                raise SessionBusy(target.session_id)
+            changed = await tx.execute(
+                f"UPDATE {self.store.t.sessions} SET lifecycle='closed',updated_at=? "
+                "WHERE session_id=? AND lifecycle='open'",
+                (now_ms(), target.session_id),
+            )
+            if changed != 1:
+                raise RuntimeRequestError("session_closed")
 
     async def inspect(self, ref, *, actor):
         target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)

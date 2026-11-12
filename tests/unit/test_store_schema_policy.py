@@ -120,11 +120,20 @@ def test_table_prefix_length_is_capped() -> None:
         validate_table_prefix("a" * (_MAX_TABLE_PREFIX_LEN + 1))
 
 
-async def test_schema17_has_no_legacy_tables_and_enforces_owner_state():
+async def test_schema17_has_no_legacy_tables_and_enforces_owner_state(registry_store):
     from power_loop.runtime.store.session_native_ddl import FORBIDDEN_TABLES
 
-    store = await SessionStore.open(":memory:")
-    rows = await store._db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")
+    store, _ = registry_store
+    if store._db.dialect.name == "sqlite":
+        rows = await store._db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")
+    elif store._db.dialect.name == "postgres":
+        rows = await store._db.fetchall(
+            "SELECT tablename AS name FROM pg_tables WHERE schemaname=current_schema()"
+        )
+    else:
+        rows = await store._db.fetchall(
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema=DATABASE()"
+        )
     names = {row["name"] for row in rows}
     assert not {store.table_prefix + table for table in FORBIDDEN_TABLES} & names
     with pytest.raises(Exception):
@@ -132,23 +141,24 @@ async def test_schema17_has_no_legacy_tables_and_enforces_owner_state():
             f"INSERT INTO {store.t.session_state}(session_id,execution_state,active_send_index) "
             "VALUES ('bad','running',1)"
         )
-    await store.close()
 
 
 @pytest.mark.parametrize("column,value", (("version", 16), ("protocol_version", 42)))
-async def test_old_schema_or_protocol_is_rejected(tmp_path, column, value):
-    path = str(tmp_path / (column + ".db"))
-    store = await SessionStore.open(path)
-    await store._db.execute(f"UPDATE pl_schema_migrations SET {column}=? WHERE id=1", (value,))
-    await store.close()
+async def test_old_schema_or_protocol_is_rejected(registry_store, column, value):
+    store, connect = registry_store
+    await store._db.execute(
+        f"UPDATE {store.table_prefix}schema_migrations SET {column}=? WHERE id=1", (value,)
+    )
     with pytest.raises(StoreSchemaError):
-        await SessionStore.open(path, schema="verify")
+        await connect(schema="verify")
 
 
-async def test_recovery_index_is_verified(tmp_path):
-    path = str(tmp_path / "index.db")
-    store = await SessionStore.open(path)
-    await store._db.execute("DROP INDEX pl_idx_session_recovery")
-    await store.close()
+async def test_session_indexes(registry_store):
+    store, connect = registry_store
+    index = store.table_prefix + "idx_session_recovery"
+    statement = f"DROP INDEX {index}"
+    if store._db.dialect.name == "mysql":
+        statement += f" ON {store.t.session_state}"
+    await store._db.execute(statement)
     with pytest.raises(StoreSchemaError, match="idx_session_recovery"):
-        await SessionStore.open(path, schema="verify")
+        await connect(schema="verify")

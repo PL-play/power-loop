@@ -17,7 +17,16 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_inspection import CONSTRAINTS, inspect_tasks
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.jobs import register_jobs_tools
-from tests.unit.test_task_inspection_192 import POLICY, registry_runtime, runtime, troubled
+from tests.legacy_job_helpers import (
+    POLICY,
+    troubled,
+)
+from tests.legacy_job_helpers import (
+    inspection_runtime as runtime,
+)
+from tests.legacy_job_helpers import (
+    runtime as registry_runtime,
+)
 
 from ._bounded import BoundedProvider
 from ._live_fixture import BorrowedProvider

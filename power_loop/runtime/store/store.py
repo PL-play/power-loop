@@ -157,31 +157,33 @@ class _Tables:
 # the live store where it is written), not an oversight.
 _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
     ("sessions", lambda t: t.sessions, (
-        "session_id", "created_at", "updated_at", "system_prompt", "model", "config_json",
-        "status", "kind", "parent_session_id", "spawn_tool_call_id", "spawn_depth",
-        "lifecycle", "metadata_json")),
+        "session_id", "parent_session_id", "created_by_session_id", "session_kind",
+        "descriptor_json", "descriptor_hash", "creation_identity_hash",
+        "creation_call_ref_json", "creation_tool_call_id", "start_input_message_id",
+        "tenant_id", "principal_id", "result_route_json", "cancel_propagation",
+        "lifecycle", "created_at", "updated_at")),
     ("session_state", lambda t: t.session_state, (
-        "session_id", "next_seq", "round_index", "last_compact_seq", "pending_json")),
+        "session_id", "next_seq", "send_index", "active_send_index", "execution_state",
+        "owner_epoch", "owner_token", "owner_node_id", "owner_boot_id",
+        "owner_lease_until_ms", "inbox_version", "pending_json", "cancel_send_index",
+        "cancel_reason", "round_index", "last_compact_seq", "background_version",
+        "runtime_version")),
     ("messages", lambda t: t.messages, (
-        "session_id", "seq", "role", "name", "content", "tool_calls_json", "tool_call_id",
-        "round_index", "state", "meta_json", "send_index", "created_at")),
-    ("compactions", lambda t: t.compactions, (
-        "session_id", "compact_seq", "note_seq", "from_seq", "to_seq", "before_tokens",
-        "after_tokens", "round_index", "created_at")),
-    ("usage_rounds", lambda t: t.usage_observations, (
-        "session_id", "send_index", "round_index", "prompt_tokens", "completion_tokens", "total_tokens",
-        "cached_tokens", "model", "created_at")),
+        "id", "session_id", "seq", "role", "name", "content", "tool_calls_json",
+        "tool_call_id", "round_index", "state", "meta_json", "send_index", "created_at")),
+    ("follow_up_queue", lambda t: t.follow_up_queue, (
+        "id", "session_id", "item_id", "kind", "priority", "status", "content_json",
+        "meta_json", "request_hash", "result_kind", "created_at", "expires_at",
+        "delivered_at", "delivered_seq", "delivered_send_index", "terminal_status",
+        "result_seq", "result_send_index", "error_code", "error_detail",
+        "result_delivery_error", "completed_at", "continuation_of", "continuation_index")),
     ("session_runtime_state", lambda t: t.session_runtime_state, (
         "session_id", "state_key", "value_json", "updated_at")),
-    ("timers", lambda t: t.timers, (
-        "session_id", "timer_id", "due_at", "note", "status", "interval_s", "fire_count",
-        "last_fired_at", "created_at", "updated_at")),
-    ("notes", lambda t: t.notes, (
-        "session_id", "note_id", "content", "pinned", "created_at", "updated_at")),
-    ("session_stats", lambda t: t.session_stats, (
-        "session_id", "sends", "rounds", "llm_calls", "tool_calls", "prompt_tokens",
-        "completion_tokens", "total_tokens", "cached_tokens", "first_send_at", "last_send_at",
-        "updated_at")),
+    ("project_messages", lambda t: t.project_messages, (
+        "id", "session_id", "send_index", "kind", "content_json", "rendered_text",
+        "source_seq_lo", "source_seq_hi", "completed_through_send_index",
+        "compact_from_send", "compact_to_send", "projector_version", "token_estimate",
+        "created_at")),
 )
 
 

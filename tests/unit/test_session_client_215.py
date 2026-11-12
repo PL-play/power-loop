@@ -141,6 +141,36 @@ async def test_pending_child_cancel_routes_one_unstarted_result_atomically(regis
     assert [row["item_id"] for row in rows] == [result_ref.message_id]
 
 
+async def test_parent_actor_uses_target_lifecycle_and_child_result_route(registry_store):
+    from power_loop.agent.runtime_types import TrustedActor
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    parent = await target(port, "actor-parent")
+    parent_actor = TrustedActor("tenant", "host", parent.session_id)
+    start = InputRef(store.store_id, "actor-child", "start")
+    child = await port.create_session(
+        DESCRIPTOR, actor=parent_actor, parent=parent,
+        result_route={"target": parent, "input_ref": start, "result_kind": "agent_result"},
+        options={"session_id": "actor-child"},
+    )
+    await port.accept(child, "run", message_id="start", actor=parent_actor)
+    await port.cancel(start, actor=parent_actor, reason="parent cancels child")
+    result_ref = InputRef(
+        store.store_id, parent.session_id,
+        result_message_id(child, start, None, "agent_result"),
+    )
+    assert (await port.inspect(result_ref, actor=ACTOR)).input_state == "pending"
+
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET lifecycle='closed' WHERE session_id=?",
+        (child.session_id,),
+    )
+    with pytest.raises(RuntimeRequestError) as error:
+        await port.accept(child, "closed", message_id="closed", actor=parent_actor)
+    assert error.value.code == "session_closed"
+
+
 async def test_result_address_and_descriptor_version_are_frozen(registry_store):
     store, _ = registry_store
     port = RuntimeInputStore(store)
@@ -181,3 +211,78 @@ async def test_read_scope_and_wrong_store_are_explicit(registry_store):
             InputRef(store.store_id, root.session_id, "missing"), actor=ACTOR, scope="subtree"
         )
     assert input_subtree_error.value.code == "invalid_options"
+
+
+async def test_void_and_close(registry_store):
+    from power_loop.contracts.errors import SessionBusy
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    receipt = await port.accept(root, "pending", message_id="pending", actor=ACTOR)
+    with pytest.raises(SessionBusy):
+        await port.close(root, actor=ACTOR)
+    await port.cancel(receipt.input_ref, actor=ACTOR)
+    await port.close(root, actor=ACTOR)
+    with pytest.raises(RuntimeRequestError) as error:
+        await port.accept(root, "closed", message_id="closed", actor=ACTOR)
+    assert error.value.code == "session_closed"
+
+
+async def test_inspect_during_cancel_uses_read_snapshot(registry_store, monkeypatch):
+    import asyncio
+
+    store, connect = registry_store
+    writer = RuntimeInputStore(store)
+    reader = RuntimeInputStore(await connect(schema="verify"))
+    root = await target(writer)
+    receipt = await writer.accept(root, "run", message_id="run", actor=ACTOR)
+    await writer.claim(root, node_id="a", boot_id="a")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = writer._cancel_input_tx
+
+    async def paused_cancel(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(writer, "_cancel_input_tx", paused_cancel)
+    cancelling = asyncio.create_task(writer.cancel(receipt.input_ref, actor=ACTOR, reason="stop"))
+    await entered.wait()
+    status = await asyncio.wait_for(reader.inspect(receipt.input_ref, actor=ACTOR), 5)
+    assert status.input_state == "delivered" and status.terminal_status is None
+    release.set()
+    assert (await cancelling).state == "cancel_requested"
+
+
+async def test_message_rows_pagination_scope_export(registry_store):
+    import json
+
+    from power_loop.agent.runtime_types import TrustedActor
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port, "history")
+    other = await target(port, "other")
+    receipt = await port.accept(
+        root, {"content": "原请求"}, message_id="history-input", actor=ACTOR,
+    )
+    batch = await port.claim(root, node_id="a", boot_id="a")
+    await port.final(batch, final_text="ORIGINAL-42", usage={"total_tokens": 4})
+    await port.accept(other, "OTHER-PRIVATE", message_id="other", actor=ACTOR)
+    first = await port.messages(root, actor=ACTOR, limit=1)
+    assert first.items[0].id > 0 and first.items[0].seq == 1 and first.next_after_seq == 1
+    tail = await port.messages(root, actor=ACTOR, after_seq=first.next_after_seq)
+    assert [row.content for row in tail.items] == ["ORIGINAL-42"]
+    with pytest.raises(RuntimeRequestError) as error:
+        await port.messages(root, actor=TrustedActor("foreign", "host", None))
+    assert error.value.code == "forbidden"
+
+    exported = await store.export_session(root.session_id)
+    assert exported["schema_version"] == 17
+    assert json.loads(json.dumps(exported, ensure_ascii=False))["session_id"] == root.session_id
+    assert [row["content"] for row in exported["tables"]["messages"]] == [
+        first.items[0].content, "ORIGINAL-42"
+    ]
+    assert exported["tables"]["follow_up_queue"][0]["item_id"] == receipt.input_ref.message_id
+    assert "OTHER-PRIVATE" not in json.dumps(exported, ensure_ascii=False)

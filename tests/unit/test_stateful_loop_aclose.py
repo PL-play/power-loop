@@ -6,9 +6,8 @@ import pytest
 from power_loop import AgentEvent, AgentEventBus, AgentEventType, StatefulAgentLoop
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.runtime_types import RuntimeRequestError
+from tests.legacy_job_helpers import _Gate, _wait_calls, store
 from tests.runtime_fixture import RunningAgent
-
-from .test_inbox import _Gate, _wait_calls, store
 
 __all__ = ['store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]

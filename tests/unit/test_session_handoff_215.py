@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from power_loop.agent.runtime_store import RuntimeInputStore
+from power_loop.agent.runtime_types import InputRef
 from power_loop.contracts.errors import SessionLeaseLost
 
 from .session_native_fixture import ACTOR, fail_next_commit, target
@@ -36,66 +37,6 @@ async def test_claim_claim_has_one_owner_and_one_merged_message(registry_store):
     assert state == {"execution_state": "running", "owner_epoch": 1, "send_index": 1}
     assert len((await port_a.messages(root, actor=ACTOR)).items) == 1
     assert batch is not None
-
-
-async def test_accept_then_final_and_final_then_accept_have_no_sleep_window(
-    registry_store, monkeypatch,
-):
-    for order in ("accept-first", "final-first"):
-        store, connect = registry_store
-        other = await connect(schema="verify")
-        port_a, port_b = RuntimeInputStore(store), RuntimeInputStore(other)
-        root = await target(port_a, session_id="root_" + order.replace("-", "_"))
-        await port_a.accept(root, "old", message_id="old_" + order, actor=ACTOR)
-        batch = await port_a.claim(root, node_id="a", boot_id="a")
-        if order == "accept-first":
-            entered, release = asyncio.Event(), asyncio.Event()
-            original = port_b._accept_tx
-
-            async def paused_accept(*args, **kwargs):
-                receipt = await original(*args, **kwargs)
-                entered.set()
-                await release.wait()
-                return receipt
-
-            monkeypatch.setattr(port_b, "_accept_tx", paused_accept)
-            accepting = asyncio.create_task(port_b.accept(
-                root, "new", message_id="new_" + order, actor=ACTOR
-            ))
-            await entered.wait()
-            finishing = asyncio.create_task(port_a.final(batch, final_text="done"))
-            await asyncio.sleep(0)
-            assert not finishing.done()
-            release.set()
-            await accepting
-            final = await finishing
-        else:
-            entered, release = asyncio.Event(), asyncio.Event()
-            original = port_a._final_tx
-
-            async def paused_final(*args, **kwargs):
-                entered.set()
-                await release.wait()
-                return await original(*args, **kwargs)
-
-            monkeypatch.setattr(port_a, "_final_tx", paused_final)
-            finishing = asyncio.create_task(port_a.final(batch, final_text="done"))
-            await entered.wait()
-            accepting = asyncio.create_task(port_b.accept(
-                root, "new", message_id="new_" + order, actor=ACTOR
-            ))
-            await asyncio.sleep(0)
-            assert not accepting.done()
-            release.set()
-            final = await finishing
-            await accepting
-        assert final.execution_state == ("queued" if order == "accept-first" else "idle")
-        old_ref, new_ref = batch.input_refs[0], type(batch.input_refs[0])(
-            store.store_id, root.session_id, "new_" + order
-        )
-        assert (await port_b.inspect(old_ref, actor=ACTOR)).terminal_status == "completed"
-        assert (await port_b.inspect(new_ref, actor=ACTOR)).input_state == "pending"
-        monkeypatch.undo()
 
 
 async def test_claim_ack_loss_reuses_committed_batch_without_second_message(
@@ -175,21 +116,23 @@ async def test_expired_running_without_new_input_is_discovered_and_finished(regi
     assert result.status == "interrupted" and result.send_index == batch.send_index
 
 
-@pytest.mark.parametrize("race", ("accept-claim", "claim-accept"))
-async def test_accept_claim_commit_order_is_deterministic(registry_store, race):
+async def test_recover_honours_matching_active_cancellation(registry_store):
     store, connect = registry_store
-    first = RuntimeInputStore(store)
-    second = RuntimeInputStore(await connect(schema="verify"))
-    root = await target(first)
-    if race == "accept-claim":
-        receipt = await first.accept(root, "one", message_id="one", actor=ACTOR)
-        batch = await second.claim(root, node_id="b", boot_id="b")
-        assert batch and batch.input_refs == (receipt.input_ref,)
-    else:
-        assert await second.claim(root, node_id="b", boot_id="b") is None
-        await first.accept(root, "one", message_id="one", actor=ACTOR)
-        batch = await second.claim(root, node_id="b", boot_id="b")
-        assert batch is not None
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    receipt = await port.accept(root, "old", message_id="old", actor=ACTOR)
+    await port.claim(root, node_id="old", boot_id="old")
+    requested = await port.cancel(receipt.input_ref, actor=ACTOR, reason="stop old send")
+    assert requested.state == "cancel_requested"
+    await store._db.execute(
+        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        (root.session_id,),
+    )
+    new = RuntimeInputStore(await connect(schema="verify"))
+    recovered = await new.recover(root, node_id="new", boot_id="new")
+    assert recovered.execution_state == "idle"
+    result = await new.get_result(receipt.input_ref, actor=ACTOR)
+    assert result.status == "cancelled" and result.error == "stop old send"
 
 
 async def test_two_real_processes_hand_off_on_shared_server_db(registry_store, tmp_path):
@@ -250,3 +193,138 @@ async def test_two_real_processes_hand_off_on_shared_server_db(registry_store, t
             if process.returncode is None:
                 process.kill()
             await process.wait()
+
+
+def process_args(store, root, role):
+    backend = store._db.dialect.name
+    dsn = os.environ["POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
+    return [
+        sys.executable, "-m", "tests.unit._session_handoff_worker_215",
+        dsn, store.table_prefix, root.session_id, role,
+    ]
+
+
+async def process_event(process):
+    line = await asyncio.wait_for(process.stdout.readline(), 20)
+    assert line, (await process.stderr.read()).decode()[-3000:]
+    return json.loads(line)
+
+
+async def process_command(process, value):
+    process.stdin.write((value + "\n").encode())
+    await process.stdin.drain()
+
+
+async def launch_process(store, root, role):
+    return await asyncio.create_subprocess_exec(
+        *process_args(store, root, role), cwd=Path(__file__).resolve().parents[2],
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def stop_processes(processes):
+    for process in processes:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+
+
+@pytest.mark.parametrize("order", ("accept-first", "final-first"))
+async def test_two_process_accept_final_linearization(registry_store, order):
+    store, _ = registry_store
+    if store._db.dialect.name == "sqlite":
+        pytest.skip("requires a shared server DB")
+    port = RuntimeInputStore(store)
+    root = await target(port, "process-accept-final-" + order)
+    await port.accept(root, "old", message_id="old", actor=ACTOR)
+    owner, acceptor = await launch_process(store, root, "owner"), None
+    processes = [owner]
+    try:
+        assert (await process_event(owner))["event"] == "claimed"
+        if order == "accept-first":
+            acceptor = await launch_process(store, root, "accept_hold")
+            processes.append(acceptor)
+            assert (await process_event(acceptor))["event"] == "accept_locked"
+            await process_command(owner, "final")
+            await process_command(acceptor, "release")
+            assert (await process_event(acceptor))["event"] == "accepted"
+            expected = "queued"
+        else:
+            await process_command(owner, "final_hold")
+            assert (await process_event(owner))["event"] == "final_locked"
+            acceptor = await launch_process(store, root, "accept")
+            processes.append(acceptor)
+            assert (await process_event(acceptor))["event"] == "accept_started"
+            await process_command(owner, "release")
+            expected = "idle"
+        assert await process_event(owner) == {"event": "final", "execution_state": expected}
+        if order == "final-first":
+            assert (await process_event(acceptor))["event"] == "accepted"
+        old_status = await port.inspect(
+            InputRef(store.store_id, root.session_id, "old"), actor=ACTOR,
+        )
+        new_status = await port.inspect(
+            InputRef(store.store_id, root.session_id, "new"), actor=ACTOR,
+        )
+        assert old_status.terminal_status == "completed"
+        assert new_status.input_state == "pending" and new_status.terminal_status is None
+        assert (await port.inspect(root, actor=ACTOR)).execution_state == "queued"
+        for process in processes:
+            await asyncio.wait_for(process.wait(), 20)
+            assert process.returncode == 0, (await process.stderr.read()).decode()[-3000:]
+    finally:
+        await stop_processes(processes)
+
+
+async def test_two_process_claim_claim_has_single_winner(registry_store):
+    store, _ = registry_store
+    if store._db.dialect.name == "sqlite":
+        pytest.skip("requires a shared server DB")
+    port = RuntimeInputStore(store)
+    root = await target(port, "process-claim-claim")
+    await port.accept(root, "one", message_id="one", actor=ACTOR)
+    first = await launch_process(store, root, "claim_hold")
+    second = None
+    processes = [first]
+    try:
+        assert (await process_event(first))["event"] == "claim_locked"
+        second = await launch_process(store, root, "claim")
+        processes.append(second)
+        assert (await process_event(second))["event"] == "claim_started"
+        await process_command(first, "release")
+        winner = await process_event(first)
+        loser = await process_event(second)
+        assert winner["event"] == "claim" and winner["batch"]["send_index"] == 1
+        assert loser == {"event": "claim", "batch": None}
+        assert len((await port.messages(root, actor=ACTOR)).items) == 1
+        for process in processes:
+            await asyncio.wait_for(process.wait(), 20)
+            assert process.returncode == 0, (await process.stderr.read()).decode()[-3000:]
+    finally:
+        await stop_processes(processes)
+
+
+async def test_two_process_accept_claim_linearization(registry_store):
+    store, _ = registry_store
+    if store._db.dialect.name == "sqlite":
+        pytest.skip("requires a shared server DB")
+    port = RuntimeInputStore(store)
+    root = await target(port, "process-accept-claim")
+    acceptor = await launch_process(store, root, "accept_hold")
+    claimant = None
+    processes = [acceptor]
+    try:
+        assert (await process_event(acceptor))["event"] == "accept_locked"
+        await process_command(acceptor, "release")
+        assert (await process_event(acceptor))["event"] == "accepted"
+        claimant = await launch_process(store, root, "claim")
+        processes.append(claimant)
+        assert (await process_event(claimant))["event"] == "claim_started"
+        claimed = await process_event(claimant)
+        assert claimed["event"] == "claim" and claimed["batch"]["input_ids"] == ["new"]
+        for process in processes:
+            await asyncio.wait_for(process.wait(), 20)
+            assert process.returncode == 0, (await process.stderr.read()).decode()[-3000:]
+    finally:
+        await stop_processes(processes)
