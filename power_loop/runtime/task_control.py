@@ -236,9 +236,7 @@ async def _recover_stop(manager, actor, request):
 
 @verify_stored
 async def reconcile_stop_request(manager, actor, request_id):
-    """Host-only completion of an already accepted stop; no callback or model."""
-    from .managed_completion import _host_only
-    _host_only()
+    """Completion of an already accepted stop; no callback or model."""
     async with manager._read() as reader:
         event = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='task_control_request'", (request_id,))
         if event is None:

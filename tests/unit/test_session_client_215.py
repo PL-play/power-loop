@@ -203,9 +203,8 @@ async def test_read_scope_and_wrong_store_are_explicit(registry_store):
     with pytest.raises(RuntimeRequestError) as error:
         await port.inspect(root, actor=TrustedActor("tenant", "host", "unrelated"))
     assert error.value.code == "forbidden"
-    with pytest.raises(RuntimeRequestError) as subtree_error:
-        await port.cancel(root, actor=ACTOR, scope="subtree")
-    assert subtree_error.value.code == "capability_unavailable"
+    subtree = await port.cancel(root, actor=ACTOR, scope="subtree")
+    assert subtree.state == "already_finished"
     with pytest.raises(RuntimeRequestError) as input_subtree_error:
         await port.cancel(
             InputRef(store.store_id, root.session_id, "missing"), actor=ACTOR, scope="subtree"

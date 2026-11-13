@@ -229,8 +229,6 @@ async def accept(manager, actor, target, *, caller, call_ref, tool_call_id, sess
 
 @verify_stored
 async def reconcile_request(manager, actor, request_id):
-    from .managed_completion import _host_only
-    _host_only()
     async with manager._read() as reader:
         event = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='task_control_request'", (request_id,))
         if event is None:

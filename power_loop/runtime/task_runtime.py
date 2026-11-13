@@ -8,7 +8,6 @@ adapters fail closed until they participate in the same durable protocol.
 from __future__ import annotations
 
 import asyncio
-import logging
 import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -174,24 +173,13 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
 
 
 async def observe_model_inputs(pipeline, messages, round_index, *, provider_call=True):
-    execution = _SEND.get()
-    if execution is None or execution.actor.session_id != pipeline.session_id or not provider_call:
-        return
-    # Hooks may copy message dictionaries without changing what the provider
-    # receives. Credit the original input only when its actual text is sent.
-    included = {(message.get("role"), message["content"]) for message in messages
-        if isinstance(message.get("content"), str)}
-    sources = getattr(pipeline.sink, "_input_messages", {})
-    actual = [sources[seq] for message, seq in zip(pipeline.history,
-        getattr(pipeline.sink, "_history_seqs", []), strict=False)
-        if seq in sources and (sources[seq]["role"], sources[seq]["content"]) in included
-        and message.get("role") == sources[seq]["role"] and message.get("content") == sources[seq]["content"]]
-    if actual:
-        from .result_consumption import observe
-        await observe(execution, actual, round_index=round_index, send_index=pipeline.send_index)
+    return
 
 
 def mark_unconfirmed_resource() -> None:
+    send = current_session_send()
+    if send is not None:
+        send.resource_evidence["resource_state"] = "unknown"
     execution = _SEND.get()
     if execution is not None:
         execution.resource_evidence["resource_state"] = "unknown"
@@ -294,16 +282,6 @@ class TaskRuntime:
         self.executor_id, self.boot_id, self.lease_ms = executor_id, boot_id, lease_ms
         self._local_executions: dict = {}
         self._model_executions: dict = {}
-        from .managed_completion import CompletionCache
-
-        self._managed_completions = CompletionCache(self)
-        from .native_returns import ReturnCache
-        self._native_returns = ReturnCache(self)
-        from .controller_retirement import RetirementCache
-
-        self._controller_retirements = RetirementCache(self)
-        from .controller_task_exit import TaskExitCache
-        self._controller_task_exits = TaskExitCache(self)
         from .executor_lifecycle import ExecutorLifecycle
 
         self._lifecycle = ExecutorLifecycle(self, boot_contract_hash) if boot_contract_hash is not None else None
@@ -313,46 +291,22 @@ class TaskRuntime:
         require_current_ownership(self.manager.store)
         if self._lifecycle is not None:
             self._lifecycle.check_admission()
-        self._controller_retirements.check()
-        if self._controller_retirements.failed_count():
-            raise JobError("controller_retirement_requires_reconciliation")
-        if self._controller_task_exits.failed_count():
-            raise JobError("controller_task_exit_requires_reconciliation")
-        if self._managed_completions.claim_exit_count():
-            raise JobError("managed_claim_exit_requires_reconciliation")
-        if self._native_returns.failed_count():
-            raise JobError("native_return_requires_reconciliation")
 
     async def ensure_started(self):
         if self._lifecycle is not None:
             self._lifecycle.check_admission()
         async with asyncio.timeout(2):
             await self._flush_owned_checkpoints(failed_only=True)
-            await self._controller_retirements.flush()
-            await self._controller_task_exits.flush()
-            from .native_returns import flush_local as flush_native
-            await flush_native(self, failed_only=True)
         if self._lifecycle is not None:
             await self._lifecycle.start()
 
     async def flush_control_checkpoints(self, *, timeout_s=2):
-        """Mechanical retry, including after shutdown; no execution admission."""
-        from .managed_completion import _host_only
-        _host_only()
         if type(timeout_s) not in (int, float) or not 0 <= timeout_s <= 60:
             raise JobError("invalid_controller_checkpoint_timeout")
         if timeout_s:
             async with asyncio.timeout(timeout_s):
                 await self._flush_owned_checkpoints()
-                await self._controller_retirements.flush()
-                await self._controller_task_exits.flush()
-                from .managed_claim import flush_local
-                await flush_local(self)
-                from .native_returns import flush_local as flush_native
-                await flush_native(self)
-        return {"execution_checkpoint_pending": self._owned_checkpoint_pending(),
-                "controller_retirement_pending": len(self._controller_retirements.pending),
-                "controller_task_exit_pending": len(self._controller_task_exits.slots)}
+        return {"execution_checkpoint_pending": self._owned_checkpoint_pending()}
 
     def _owned_checkpoint_pending(self):
         from .control_runtime import current
@@ -373,42 +327,13 @@ class TaskRuntime:
     async def shutdown(self, *, timeout_s=30.0, grace_s=1.0, reason="host shutdown"):
         if self._lifecycle is None:
             raise JobError("executor_lifecycle_not_configured")
-        started = asyncio.get_running_loop().time()
         result = await self._lifecycle.shutdown(timeout_s=timeout_s, grace_s=grace_s, reason=reason)
-        remaining = max(0, timeout_s - (asyncio.get_running_loop().time() - started))
-        if remaining:
-            try:
-                async with asyncio.timeout(min(2, remaining)):
-                    await self._flush_owned_checkpoints()
-                    await self._controller_retirements.flush()
-                    await self._controller_task_exits.flush()
-                    from .managed_claim import flush_local
-                    await flush_local(self)
-                    from .native_returns import flush_local as flush_native
-                    await flush_native(self)
-            except Exception as exc:
-                logging.getLogger(__name__).warning(
-                    "Controller intake closure remains pending at shutdown: %s", type(exc).__name__)
         return self._completion_status(result)
 
     def _completion_status(self, result):
         result['execution_checkpoint_pending'] = self._owned_checkpoint_pending()
         if result['execution_checkpoint_pending']:
             result['store_safe_to_close'] = False
-        result['native_return_pending'] = self._native_returns.pending_count()
-        if result['native_return_pending']:
-            result['store_safe_to_close'] = False
-        result["controller_task_exit_pending"] = len(self._controller_task_exits.slots)
-        writer = self._controller_task_exits._writer
-        result["controller_task_exit_writer_pending"] = writer is not None and not writer.done()
-        if result["controller_task_exit_pending"] or result["controller_task_exit_writer_pending"]:
-            result["store_safe_to_close"] = False
-        result["controller_retirement_pending"] = len(self._controller_retirements.pending)
-        if result["controller_retirement_pending"]:
-            result["store_safe_to_close"] = False
-        result["managed_completion_pending"] = self._managed_completions.pending_count()
-        if result["managed_completion_pending"]:
-            result["store_safe_to_close"] = False
         return result
 
     async def executor_status(self):
@@ -465,8 +390,7 @@ class TaskRuntime:
                 or (binding.actor.tenant_id, binding.actor.principal_id) != (self.tenant_id, self.principal_id)
                 or (binding.lease.executor_id, binding.lease.boot_id) != (self.executor_id, self.boot_id)):
             raise JobError("execution_binding_mismatch")
-        if (owner or context is not None) and (
-                binding.stop_renewal.is_set() or self._controller_retirements.contains(binding.lease)):
+        if (owner or context is not None) and binding.stop_renewal.is_set():
             raise JobError("controller_execution_exited")
         await self.ensure_started()
         self.check_local_admission()
@@ -487,35 +411,9 @@ class TaskRuntime:
             self._local_executions[local_key] = local
             yield binding
         finally:
-            try:
-                from .session_ownership import current_ownership, ownership_lost
-                if ((owner or context is not None) and self._local_executions.get(local_key) is local
-                        and not ownership_lost(current_ownership())):
-                    binding.stop_renewal.set()
-                    # Capture before the first await: cancellation or SQL rollback
-                    # cannot erase the fact that this local controller exited.
-                    slot = self._controller_retirements.capture(binding, local)
-                    try:
-                        from .controller_retirement import retire
-                        async with asyncio.timeout(2):
-                            await retire(self, binding, local)
-                    except BaseException as exc:
-                        from power_loop.contracts.errors import SessionLeaseLost
-                        if isinstance(exc, SessionLeaseLost):
-                            self._controller_retirements.discard(slot)
-                            self._controller_task_exits.exclude(binding.lease)
-                            raise
-                        slot.failed = True
-                        if not isinstance(exc, Exception):
-                            raise
-                        logging.getLogger(__name__).warning(
-                            "Controller intake closure requires reconciliation: %s", type(exc).__name__)
-                    else:
-                        self._controller_retirements.discard(slot)
-            finally:
-                self._local_executions.pop(local_key, None)
-                variable.reset(token)
-                _TASK_OWNERS.reset(owner_token)
+            self._local_executions.pop(local_key, None)
+            variable.reset(token)
+            _TASK_OWNERS.reset(owner_token)
 
 
     async def record_scope(self, binding: Execution, result: dict) -> dict:
@@ -533,9 +431,6 @@ class TaskRuntime:
         # A slow compatibility write must not renew a finished lease or turn a
         # successful canonical result into a spurious heartbeat failure.
         binding.stop_renewal.set()
-        from .original_owner_review import require_ready
-        async with self.manager._write() as tx:
-            await require_ready(self.manager,tx,await self.manager._authorize(tx,binding.actor,binding.lease.job_id))
         result = dict(result)
         recorded_usage = await self.manager.execution_usage(
             binding.actor, binding.lease.job_id, generation=binding.lease.generation

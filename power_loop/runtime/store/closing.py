@@ -17,8 +17,6 @@ async def busy(store, tx, session_id):
     for condition in ("supervision_status<>'closed'", "resource_state<>'stopped'"):
         if await tx.fetchone(f'SELECT job_id FROM {p}jobs WHERE session_id=? AND {condition} LIMIT 1', (session_id,)):
             return True
-    if await tx.fetchone(f'SELECT source_id FROM {p}session_obligations WHERE session_id=? LIMIT 1', (session_id,)):
-        return True
     return False
 
 

@@ -17,7 +17,7 @@ class ShellTool(RuntimeTool):
         from power_loop.core.agent_context import get_current_loop
         loop = get_current_loop()
         ctx = getattr(loop, "_runtime_worker_context", None)
-        if ctx is not None and ctx.descriptor.kind in {"background_tool", "background_command"}:
+        if ctx is not None and ctx.descriptor.kind == "background":
             from .background_shell import execute
             return execute(**arguments)
         # Keep the built-in shell's synchronous registry API.

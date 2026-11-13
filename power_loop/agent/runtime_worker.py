@@ -40,14 +40,16 @@ log = logging.getLogger(__name__)
 class _SessionExecution:
     """The local context of one running send (no job identity)."""
 
-    def __init__(self, runtime, sid, descriptor, batch, actor):
+    def __init__(self, runtime, sid, descriptor, batch, actor, parent_session_id=None):
         self.runtime = runtime
         self.store_id = runtime.store.store_id
         self.session_id = sid
+        self.parent_session_id = parent_session_id
         self.node_id = runtime.node_id
         self.boot_id = runtime.boot_id
         self.descriptor = descriptor
         self.batch = batch
+        self.ownership = None
         self.input_ref = batch.input_refs[0]
         self.actor = actor
         self.stop = CancellationToken()
@@ -56,9 +58,14 @@ class _SessionExecution:
         self.closing = False
         self.shutdown_interrupted = False
         self.output: asyncio.Queue = asyncio.Queue(maxsize=256)
+        option_values = descriptor.config.get("child_options", descriptor.config)
         self.options = RequestOptions(**{
-            k: v for k, v in descriptor.config.items() if k in RequestOptions.__dataclass_fields__
+            k: v for k, v in option_values.items() if k in RequestOptions.__dataclass_fields__
         })
+
+    @property
+    def send_index(self):
+        return self.batch.send_index
 
     def snapshot(self):
         from power_loop.core.execution_context import ExecutionContext
@@ -68,6 +75,7 @@ class _SessionExecution:
             owner_token=self.batch.owner_token, actor=self.actor, options=self.options,
             cancel_token=self.stop, host_context=self.descriptor.host_context,
             send_index=self.batch.send_index,
+            parent_session_id=self.parent_session_id,
         )
 
 
@@ -278,7 +286,7 @@ class RuntimeWorker:
 
             # Capability predicates and descriptor declarations are cheap checks only:
             # execution resources and their claimed identity are built after ownership.
-            if descriptor.kind != "agent":
+            if descriptor.kind not in {"agent", "background"}:
                 self.capability_missing.add(descriptor.definition_ref)
                 return
             try:
@@ -330,8 +338,11 @@ class RuntimeWorker:
             for cache in ("_next_seqs", "_cached_sessions", "_send_indexes", "_change_versions"):
                 getattr(store, cache, {}).pop(sid, None)
 
-            ctx = _SessionExecution(r, sid, descriptor, batch, actor)
+            ctx = _SessionExecution(
+                r, sid, descriptor, batch, actor, session_row["parent_session_id"]
+            )
             ctx.task = asyncio.current_task()
+            ctx.ownership = ownership
             self._active[sid] = ctx
             ownership.on_lost = lambda: ctx.stop.cancel("session ownership lost")
             renewal = asyncio.create_task(self._renew(sid, batch, ownership, ctx), context=contextvars.Context())
@@ -340,9 +351,6 @@ class RuntimeWorker:
                 await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
                 try:
                     env = await r.factory.build(descriptor, ctx.snapshot())
-                    if env.command is not None:
-                        raise RuntimeRequestError(
-                            "capability_unavailable", "host command executor is not available in P2")
                 except Exception as exc:
                     code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
                     self.last_error = {"code": code, "message": str(exc)[:500],
@@ -351,7 +359,22 @@ class RuntimeWorker:
                     await self.inputs.release_claim(batch)
                     batch = None
                     return
+                if ctx.options.tools is not None and env.tool_registry is not None:
+                    env.tool_registry = env.tool_registry.subset(ctx.options.tools)
                 config = self._config(env, descriptor)
+                if descriptor.kind == "background":
+                    if "managed_effect" in descriptor.config:
+                        from power_loop.runtime.managed_effects import run_session
+                    else:
+                        from power_loop.runtime.background_execution import run_session
+                    result = await run_session(self, ctx, env, config)
+                    final_batch = await self.inputs.final(
+                        batch, status=result.status, final_text=result.final_text,
+                        usage=dict(result.usage or {}), structured_output=result.structured_output,
+                        error=result.error, error_code=result.error_code, result_seq=None,
+                    )
+                    await self._notify_results(final_batch)
+                    return
                 bus = env.event_bus if env.event_bus is not None else AgentEventBus()
 
                 def on_delta(event):
@@ -383,18 +406,31 @@ class RuntimeWorker:
                 ctx.loop = loop
 
                 consumed = list(batch.input_refs)
-                result = await loop._run_session_send(
-                    sid, batch=batch, ownership=ownership, config=config,
-                    tool_registry=env.tool_registry, hooks=env.hooks, event_bus=bus,
-                    stop_event=ctx.stop, system_prompt=config.system_prompt,
-                    max_rounds=ctx.options.max_rounds, response_format=ctx.options.response_format,
-                    with_history=ctx.options.history,
-                    boundary=self._boundary(batch, ownership, ctx, consumed),
-                )
+                if env.command is not None:
+                    from power_loop.runtime.host_commands import run_session
+                    result = await run_session(loop, ctx, env.command)
+                    consumed = None
+                else:
+                    result = await loop._run_session_send(
+                        sid, batch=batch, ownership=ownership, config=config,
+                        tool_registry=env.tool_registry, hooks=env.hooks, event_bus=bus,
+                        stop_event=ctx.stop, system_prompt=config.system_prompt,
+                        max_rounds=ctx.options.max_rounds, response_format=ctx.options.response_format,
+                        with_history=ctx.options.history,
+                        boundary=self._boundary(batch, ownership, ctx, consumed),
+                    )
                 status, error, error_code = self._map_result(result, ctx)
+                structured = None
+                if ctx.options.response_format and status == "completed":
+                    from power_loop.runtime.structured import StructuredOutputError, parse_structured
+                    schema = ctx.options.response_format.get("json_schema", {}).get("schema")
+                    try:
+                        structured = parse_structured(result.final_text, schema=schema)
+                    except StructuredOutputError as exc:
+                        status, error, error_code = "failed", f"structured_output: {exc}", "structured_output"
                 final_batch = await self.inputs.final(
                     batch, consumed=consumed, status=status, final_text=result.final_text,
-                    usage=dict(result.usage or {}),
+                    usage=dict(result.usage or {}), structured_output=structured,
                     error=error, error_code=error_code, result_seq=result.result_seq,
                 )
                 await self._notify_results(final_batch)
@@ -436,8 +472,6 @@ class RuntimeWorker:
                 self._activate(sid)
 
     def _can_build(self, descriptor):
-        if descriptor.config.get("host_command"):
-            return False
         factory = self.runtime.factory
         can_execute = getattr(factory, "can_execute", None)
         if can_execute is not None:
@@ -453,9 +487,10 @@ class RuntimeWorker:
     def _config(self, env, descriptor):
         config = env.config
         overrides = {}
+        option_values = descriptor.config.get("child_options", descriptor.config)
         for field_name in ("model", "temperature", "max_tokens", "max_rounds", "max_tokens_per_run",
                            "system_prompt", "response_format"):
-            value = descriptor.config.get(field_name)
+            value = option_values.get(field_name)
             if value is not None:
                 overrides[field_name] = value
         overrides["delegation_policy"] = "single_level"
@@ -562,6 +597,12 @@ class RuntimeWorker:
                 result.target, result.input_ref.message_id, result.input_ref, ["output"],
                 {"kind": "completed", "session_id": result.target.session_id,
                  "send_index": result.send_index},
+            )
+        if final_batch.result_activation is not None:
+            target = final_batch.result_activation
+            ref = final_batch.result_ref
+            await self.runtime.client._notify(
+                target, ref.message_id, ref, ["work", "activation"]
             )
 
     async def _has_pending(self, sid):

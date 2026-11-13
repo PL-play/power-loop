@@ -83,8 +83,6 @@ def ready_condition(prefix):
     return ("root.supervision_status='closed' AND NOT EXISTS ("
         f'SELECT 1 FROM {prefix}jobs j WHERE j.root_job_id=root.job_id AND ('
         "j.supervision_status<>'closed' OR j.resource_state<>'stopped' OR j.intake<>'closed')) "
-        f'AND NOT EXISTS (SELECT 1 FROM {prefix}jobs j JOIN {prefix}session_obligations o ON o.job_id=j.job_id '
-        'WHERE j.root_job_id=root.job_id) '
         f'AND NOT EXISTS (SELECT 1 FROM {prefix}jobs j JOIN {prefix}job_events e ON e.job_id=j.job_id '
         f'JOIN {prefix}follow_up_queue q ON q.session_id=root.session_id AND q.item_id=e.event_id '
         "WHERE j.root_job_id=root.job_id AND e.event_type='task_alert' AND q.status IN ('pending','claimed'))")
@@ -139,8 +137,7 @@ async def delete_tree(store, tx, root_id, limit, counts):
     where = (f'delivered_job_id IN ({jobs}) OR target_job_id IN ({jobs})')
     specs = [(store.t.follow_up_queue, 'follow_up_queue', ('id',), where, (root_id, root_id))]
     for table, keys in (
-        ('job_events', ('event_id',)), ('execution_checkpoints', ('job_id','generation')),
-        ('session_obligations', ('session_id','kind','source_id'))):
+        ('job_events', ('event_id',)), ('execution_checkpoints', ('job_id','generation'))):
         specs.append((p+table, table, keys, f'job_id IN ({jobs})', (root_id,)))
     for table, category, keys, where, params in specs:
         if not remaining:
@@ -275,8 +272,7 @@ async def _descriptors(store, cutoff, remaining, counts):
                    else "JSON_EXTRACT(metadata_json,'$.runtime_descriptor')")
         where = (f"kind='subagent' AND updated_at<? AND {present} IS NOT NULL "
             f'AND NOT EXISTS (SELECT 1 FROM {p}jobs j WHERE j.session_id={table}.session_id) '
-            f'AND NOT EXISTS (SELECT 1 FROM {store.t.follow_up_queue} q WHERE q.session_id={table}.session_id) '
-            f'AND NOT EXISTS (SELECT 1 FROM {p}session_obligations o WHERE o.session_id={table}.session_id)')
+            f'AND NOT EXISTS (SELECT 1 FROM {store.t.follow_up_queue} q WHERE q.session_id={table}.session_id)')
         rows = await store._db.fetchall(f'SELECT session_id FROM {table} WHERE {where} ORDER BY updated_at,session_id LIMIT ?',
                                        (cutoff['runtime'], remaining//2))
         for row in rows:

@@ -143,11 +143,7 @@ def _summary(row, *, context=False, processing=None):
 
 
 async def _processing_view(manager, tx, row):
-    if row['kind'] == 'send':
-        from .abort_outcomes import review_view
-        return await review_view(manager, tx, row)
-    from .managed_delivery import negative_review_view
-    return await negative_review_view(manager, tx, row)
+    return None
 
 
 async def _index(manager, tx, row):

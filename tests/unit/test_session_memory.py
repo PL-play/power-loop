@@ -10,7 +10,7 @@ from power_loop.agent.stateful_loop import _SESSION_SYNC
 from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
-from tests.unit.test_subagent import _Scripted
+from tests.runtime_fixture import ScriptedModel as _Scripted
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 

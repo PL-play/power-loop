@@ -354,14 +354,12 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                 selected = await select_native_target(loop.task_runtime, sid, job, options)
                 node = await manager.get_job(actor, selected, include_result=False)
                 if action == "logs":
-                    from power_loop.tools.jobs import MESSAGES_LIMIT, MESSAGES_MAX_LIMIT, MESSAGES_PREVIEW_CHARS
-
                     value = await task_history.read_history(manager, actor, selected, **{
                         key: options[key] for key in ("source", "message_id", "message_ids", "seq", "id",
                             "send_index", "cursor", "char_offset", "max_chars", "output_file")
                         if key in options
-                    }, limit=min(options.get("limit", MESSAGES_LIMIT), MESSAGES_MAX_LIMIT),
-                        preview_chars=options.get("preview_chars", MESSAGES_PREVIEW_CHARS),
+                    }, limit=min(options.get("limit", 20), 50),
+                        preview_chars=options.get("preview_chars", 500),
                         latest=options.get("cursor") is None)
                 else:
                     _, trusted = await tool_actor(loop)

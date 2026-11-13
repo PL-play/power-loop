@@ -198,8 +198,6 @@ async def record(manager, actor, target, *, caller, action, call_ref, tool_call_
 
 @verify_stored
 async def reconcile_request(manager, actor, request_id):
-    from .managed_completion import _host_only
-    _host_only()
     async with manager._read() as reader:
         original = await reader.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=? AND event_type=?',
             (request_id, 'task_control_request'))

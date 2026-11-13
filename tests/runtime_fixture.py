@@ -1,6 +1,8 @@
 """Test composition of the public message runtime; no direct execution entry."""
 import asyncio
-from dataclasses import fields
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field, fields
+from typing import Any
 
 from power_loop import (
     AgentHooks,
@@ -13,8 +15,38 @@ from power_loop import (
     StatefulAgentLoop,
     TrustedActor,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.runtime_types import plain
+
+
+@dataclass
+class ScriptedModel(LLMService):
+    responses: list[LLMResponse] = field(default_factory=list)
+    _idx: int = 0
+
+    async def complete(
+        self,
+        request: LLMRequest,
+        *,
+        on_chunk_delta_text: Callable[[str], Any] | None = None,
+        on_chunk_think: Callable[[str], Any] | None = None,
+        on_stream_end: Callable[[LLMResponse], Any] | None = None,
+    ) -> LLMResponse:
+        if self._idx >= len(self.responses):
+            return LLMResponse(raw_text="done")
+        response = self.responses[self._idx]
+        self._idx += 1
+        return response
+
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def empty() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+        return empty()
+
+    async def close(self) -> None:
+        return None
 
 
 class RunningAgent:

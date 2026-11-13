@@ -5,7 +5,6 @@ from collections.abc import Sequence
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.pricing import Free
-from power_loop.tools.jobs import JOBS_DEFINITION
 
 DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(pricing=Free("local"),
@@ -433,9 +432,6 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
 
 # Indexed lookup for selective registration.
 DEFAULT_TOOL_DEFINITIONS_MAP: dict[str, ToolDefinition] = {d.name: d for d in DEFAULT_TOOL_DEFINITIONS}
-
-# Explicitly selectable built-in; do not widen existing presets or role lists.
-DEFAULT_TOOL_DEFINITIONS_MAP["jobs"] = JOBS_DEFINITION
 
 # ---------------------------------------------------------------------------
 # Tool presets (matching zero-code's BASE_TOOLS / EXPLORE_TOOLS categories)

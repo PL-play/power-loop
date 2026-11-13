@@ -26,7 +26,6 @@ from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchP
 from power_loop.tools.background_contract import BackgroundTool
 from power_loop.tools.command_policy import command_policy_reason
 from power_loop.tools.command_rules import CommandRules, dangerous_command_reason
-from power_loop.tools.jobs import JOBS_HANDLER
 from power_loop.tools.shell_contract import ShellTool
 from power_loop.tools.skill_contract import SkillTool
 
@@ -1889,5 +1888,4 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "recall_send": _h_recall_send,
     "view_image": lambda **kw: run_view_image(kw["path"], kw.get("question") or ""),
     "background_run": _h_background_run,
-    "jobs": JOBS_HANDLER,
 }

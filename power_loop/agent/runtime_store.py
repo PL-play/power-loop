@@ -59,6 +59,7 @@ class FinalBatch:
     execution_state: str
     results: tuple[Result, ...]
     result_ref: InputRef | None = None
+    result_activation: TargetRef | None = None
 
 
 class RuntimeInputStore:
@@ -125,6 +126,100 @@ class RuntimeInputStore:
             ),
         )
         return TargetRef(self.store.store_id, sid)
+
+    async def create_child(
+        self, descriptor: RuntimeDescriptor, *, parent: TargetRef, actor, call_ref,
+        tool_call_id: str, body, cancel_propagation="linked", result_kind="agent_result",
+        require_assistant_call=True,
+    ):
+        """Atomically create the deterministic child and accept its original start input."""
+        from power_loop.contracts.errors import CancellationRequested
+
+        self.check_store(parent)
+        if actor.session_id != parent.session_id:
+            raise RuntimeRequestError("forbidden", "child creation requires the direct parent actor")
+        if cancel_propagation not in {"linked", "independent"}:
+            raise RuntimeRequestError("invalid_options", "cancel_propagation")
+        if result_kind not in {"agent_result", "background_result", "managed_effect_result"}:
+            raise RuntimeRequestError("invalid_options", "result_kind")
+        session_id = "ses_" + sha256_canonical([
+            "child", parent.store_id, parent.session_id, call_ref.to_dict(), tool_call_id,
+        ])[:56]
+        start = InputRef(
+            parent.store_id, session_id,
+            "inp_" + sha256_canonical(["child_start", parent.store_id, session_id])[:56],
+        )
+        target = TargetRef(parent.store_id, session_id)
+        route = self._result_route(
+            parent,
+            {"target": parent, "input_ref": start, "result_kind": result_kind},
+            session_id,
+        )
+        identity = sha256_canonical([
+            parent.store_id, parent.session_id, call_ref.to_dict(), tool_call_id,
+            descriptor, start,
+        ])
+        async with self.db.transaction() as tx:
+            parent_session = await self.authorize(tx, parent, actor)
+            existing = await tx.fetchone(
+                f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,)
+            )
+            lock_ids = {parent.session_id}
+            if existing is not None:
+                lock_ids.add(session_id)
+            states = {}
+            for sid in sorted(lock_ids):
+                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
+            parent_state = states[parent.session_id]
+            if parent_state["cancel_send_index"] is not None:
+                raise CancellationRequested(parent_state["cancel_reason"] or "cancelled")
+            if existing is None:
+                if require_assistant_call:
+                    call = await tx.fetchone(
+                        f"SELECT tool_calls_json FROM {self.store.t.messages} "
+                        "WHERE session_id=? AND seq=? AND role='assistant'",
+                        (parent.session_id, call_ref.seq),
+                    )
+                    calls = json.loads(call["tool_calls_json"] or "[]") if call is not None else []
+                    if not any(item.get("id") == tool_call_id for item in calls):
+                        raise RuntimeRequestError("forbidden", "original assistant tool call not found")
+                database_now = await self._db_now(tx)
+                await tx.execute(
+                    f"INSERT INTO {self.store.t.sessions} ("
+                    "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
+                    "descriptor_hash,creation_identity_hash,creation_call_ref_json,creation_tool_call_id,"
+                    "start_input_message_id,tenant_id,principal_id,result_route_json,cancel_propagation,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        session_id, parent.session_id, actor.session_id, descriptor.kind,
+                        canonical(descriptor), sha256_canonical(descriptor), identity,
+                        canonical(call_ref.to_dict()), tool_call_id, start.message_id,
+                        parent_session["tenant_id"], parent_session["principal_id"],
+                        canonical(route), cancel_propagation, database_now, database_now,
+                    ),
+                )
+                await tx.execute(
+                    f"INSERT INTO {self.state} (session_id) VALUES (?)", (session_id,)
+                )
+            else:
+                expected = {
+                    "parent_session_id": parent.session_id,
+                    "descriptor_hash": sha256_canonical(descriptor),
+                    "creation_identity_hash": identity,
+                    "creation_call_ref_json": canonical(call_ref.to_dict()),
+                    "creation_tool_call_id": tool_call_id,
+                    "start_input_message_id": start.message_id,
+                    "result_route_json": canonical(route),
+                    "cancel_propagation": cancel_propagation,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise RuntimeRequestError("creation_conflict")
+            receipt = await self._accept_tx(
+                tx, target, body, start, self.request_hash(target, body, "normal"),
+                canonical(body), actor=actor, priority="normal", deadline_ms=None,
+                kind="user", result_kind=None,
+            )
+        return target, start, receipt
 
     def _result_route(self, parent, route, child_id):
         if route is None:
@@ -289,30 +384,21 @@ class RuntimeInputStore:
         return self.receipt(InputRecord(ref, row, {}), new=True)
 
     async def accept_result(self, child_target, result: Result, *, result_kind):
-        """Trusted delivery using the child's frozen direct-parent route."""
-        session = await self._session(self.db, child_target.session_id)
-        if not session["result_route_json"]:
-            return None
-        route = json.loads(session["result_route_json"])
-        target = TargetRef(**route["target"])
-        start = InputRef(**route["input_ref"])
-        message_id = result_message_id(child_target, start, result.send_index, result_kind)
-        body = {
-            "child_target": plain(child_target), "input_ref": plain(result.input_ref),
-            "status": result.status, "final_text": result.final_text,
-            "usage": plain(result.usage), "structured_output": plain(result.structured_output),
-            "error": result.error, "error_code": result.error_code,
-            "result_seq": result.result_seq,
-        }
-        # Public actor authorization is deliberately not used for this trusted route.
-        actor = type("TrustedResultActor", (), {
-            "tenant_id": session["tenant_id"], "principal_id": session["principal_id"],
-            "session_id": None,
-        })()
-        return await self.accept(
-            target, body, message_id=message_id, actor=actor,
-            kind=result_kind, result_kind=result_kind,
-        )
+        """Trusted delivery using only the child's frozen direct-parent route."""
+        self.check_store(child_target)
+        async with self.db.transaction() as tx:
+            session = await self._session(tx, child_target.session_id)
+            if not session["result_route_json"]:
+                return None
+            route = json.loads(session["result_route_json"])
+            target = TargetRef(**route["target"])
+            for sid in sorted({child_target.session_id, target.session_id}):
+                await self.db.dialect.lock_state(tx, self.state, sid)
+            activations = []
+            ref, error = await self._route_result_tx(
+                tx, session, route, result, result_kind, await self._db_now(tx), activations,
+            )
+            return ref, error, activations[0] if activations else None
 
     async def claim(self, target, *, node_id, boot_id, ttl_s=30.0) -> ClaimedBatch | None:
         self.check_store(target)
@@ -563,6 +649,20 @@ class RuntimeInputStore:
             replied = {row["tool_call_id"] for row in rows}
         names = {str(tc.get("id") or ""): (tc.get("function", {}) or {}).get("name")
                  if "function" in tc else tc.get("name") for tc in tool_calls}
+        call_ref = None
+        if assistant_seq is not None:
+            from power_loop.runtime.message_ref import MessageRef
+            assistant = await tx.fetchone(
+                f"SELECT id,seq,role,tool_call_id,send_index,round_index FROM {self.store.t.messages} "
+                "WHERE session_id=? AND seq=? AND role='assistant'",
+                (session_id, assistant_seq),
+            )
+            if assistant is not None:
+                call_ref = MessageRef(
+                    self.store.store_id, session_id, assistant["id"], assistant["seq"],
+                    assistant["role"], assistant["tool_call_id"], assistant["send_index"],
+                    assistant["round_index"],
+                )
         seq = int(state["next_seq"])
         database_now = await self._db_now(tx)
         appended = 0
@@ -570,12 +670,30 @@ class RuntimeInputStore:
             cid = str(tc.get("id") or "")
             if not cid or cid in replied:
                 continue
+            content = "<aborted: 执行中断，结果未知>"
+            meta = {"interrupted": True}
+            if call_ref is not None:
+                child = await tx.fetchone(
+                    f"SELECT session_id,start_input_message_id FROM {self.store.t.sessions} "
+                    "WHERE parent_session_id=? AND creation_call_ref_json=? AND creation_tool_call_id=?",
+                    (session_id, canonical(call_ref.to_dict()), cid),
+                )
+                if child is not None and child["start_input_message_id"] is not None:
+                    child_target = TargetRef(self.store.store_id, child["session_id"])
+                    start = InputRef(self.store.store_id, child["session_id"], child["start_input_message_id"])
+                    content = canonical({
+                        "creation_result_uncertain": True,
+                        "target_ref": plain(child_target),
+                        "input_ref": plain(start),
+                        "status": "accepted",
+                    })
+                    meta["creation_result_uncertain"] = True
             await tx.execute(
                 f"INSERT INTO {self.store.t.messages} (session_id,seq,role,name,content,"
                 "tool_call_id,round_index,state,meta_json,send_index,created_at) "
                 "VALUES (?,?, 'tool', ?, ?, ?, ?, 'active', ?, ?, ?)",
-                (session_id, seq, names.get(cid), "<aborted: 执行中断，结果未知>", cid,
-                 round_index, canonical({"interrupted": True}), send_index, database_now),
+                (session_id, seq, names.get(cid), content, cid,
+                 round_index, canonical(meta), send_index, database_now),
             )
             seq += 1
             appended += 1
@@ -678,6 +796,7 @@ class RuntimeInputStore:
         consumed_ids = [ref.message_id for ref in consumed]
         unconsumed_ids = [ref.message_id for ref in batch.input_refs if ref not in consumed]
         result_ref, delivery_error = None, None
+        activations = []
         database_now = await self._db_now(tx)
         # The running loop appends assistant turns in real time and passes the seq of its
         # LAST assistant row as ``result_seq``: that row IS the result message (design 215
@@ -695,6 +814,7 @@ class RuntimeInputStore:
             )
             result_ref, delivery_error = await self._route_result_tx(
                 tx, session, route, route_result, route["result_kind"], database_now,
+                activations,
             )
         next_seq = int(state["next_seq"]) + int(write_message)
         next_state = "idle"
@@ -766,11 +886,17 @@ class RuntimeInputStore:
             )
             for ref in consumed
         )
-        return FinalBatch(next_state, results, result_ref)
+        return FinalBatch(
+            next_state, results, result_ref,
+            activations[0] if activations else None,
+        )
 
-    async def _route_result_tx(self, tx, child_session, route, result, result_kind, database_now):
+    async def _route_result_tx(
+        self, tx, child_session, route, result, result_kind, database_now, activations=None,
+    ):
         child_target = TargetRef(self.store.store_id, child_session["session_id"])
-        start = InputRef(**route["input_ref"])
+        route_start = InputRef(**route["input_ref"])
+        start = result.input_ref if result.send_index is None else route_start
         target = TargetRef(**route["target"])
         message_id = result_message_id(child_target, start, result.send_index, result_kind)
         body = {
@@ -793,6 +919,10 @@ class RuntimeInputStore:
                 raise RuntimeRequestError("session_closed" if parent_session["lifecycle"] != "open" else "forbidden")
             digest = self.request_hash(target, body, "normal")
             old = await self.input(tx, ref)
+            parent_state = await tx.fetchone(
+                f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
+            )
+            execution_state = parent_state["execution_state"]
             if old is None:
                 count = await tx.fetchone(
                     f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
@@ -816,10 +946,6 @@ class RuntimeInputStore:
                 size = int((await tx.fetchone(size_sql, (target.session_id,)))["n"])
                 if size + len(content.encode()) + len(meta.encode()) > self.inbox_byte_limit:
                     raise CapacityError()
-                parent_state = await tx.fetchone(
-                    f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
-                )
-                execution_state = parent_state["execution_state"]
                 next_state = "queued" if execution_state == "idle" else execution_state
                 if (
                     execution_state == "running"
@@ -841,6 +967,8 @@ class RuntimeInputStore:
                 )
             elif old.row["request_hash"] != digest:
                 raise RuntimeRequestError("request_conflict")
+            if activations is not None and execution_state == "idle":
+                activations.append(target)
             return ref, None
         except (RuntimeRequestError, CapacityError) as exc:
             code = exc.code if isinstance(exc, RuntimeRequestError) else "capacity_exceeded"
@@ -959,6 +1087,7 @@ class RuntimeInputStore:
             detail = own_state["cancel_reason"] if cancelled else "execution owner lost"
             delivery_error = None
             result_ref = None
+            activations = []
             if rows and route is not None:
                 first = self.record(rows[0])
                 route_result = Result(
@@ -967,6 +1096,7 @@ class RuntimeInputStore:
                 )
                 result_ref, delivery_error = await self._route_result_tx(
                     tx, session, route, route_result, route["result_kind"], database_now,
+                    activations,
                 )
             if rows:
                 await tx.execute(
@@ -1001,7 +1131,10 @@ class RuntimeInputStore:
                 )
                 for row in rows
             )
-            return FinalBatch(next_state, results, result_ref)
+            return FinalBatch(
+                next_state, results, result_ref,
+                activations[0] if activations else None,
+            )
 
     async def discover_unfinished(self, *, limit=100):
         if not 1 <= limit <= 1000:
@@ -1015,14 +1148,13 @@ class RuntimeInputStore:
         )
         return tuple(TargetRef(self.store.store_id, row["session_id"]) for row in rows)
 
-    async def cancel(self, ref, *, actor, scope="self", reason="cancelled"):
+    async def cancel(self, ref, *, actor, scope="self", reason="cancelled", _with_activation=False):
         if scope not in {"self", "subtree"}:
             raise RuntimeRequestError("invalid_options", "scope")
         if isinstance(ref, InputRef) and scope == "subtree":
             raise RuntimeRequestError("invalid_options", "InputRef subtree")
-        if scope == "subtree":
-            raise RuntimeRequestError("capability_unavailable", "subtree cancellation is implemented in P3")
         target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
+        activations = []
         async with self.db.transaction() as tx:
             session = await self.authorize(tx, target, actor)
             route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
@@ -1038,63 +1170,130 @@ class RuntimeInputStore:
                 record = await self.input(tx, ref)
                 if record is None:
                     raise RuntimeRequestError("not_found")
-                return await self._cancel_input_tx(tx, session, state, record, reason, database_now)
-            if state["execution_state"] in {"running", "recovering"}:
+                receipt = await self._cancel_input_tx(
+                    tx, session, state, record, reason, database_now, activations,
+                )
+            elif state["execution_state"] in {"running", "recovering"}:
                 active = state["active_send_index"]
                 await tx.execute(
                     f"UPDATE {self.state} SET cancel_send_index=?,cancel_reason=? "
                     "WHERE session_id=? AND active_send_index=?",
                     (active, reason, target.session_id, active),
                 )
-                return Receipt(None, target, None, False, "cancel_requested", active, "not_needed", reason)
-            pending_rows = await tx.fetchall(
-                f"SELECT * FROM {self.q} WHERE session_id=? AND status='pending'",
+                receipt = Receipt(None, target, None, False, "cancel_requested", active, "not_needed", reason)
+            else:
+                pending_rows = await tx.fetchall(
+                    f"SELECT * FROM {self.q} WHERE session_id=? AND status='pending' ORDER BY id",
+                    (target.session_id,),
+                )
+                changed = 0
+                for row in pending_rows:
+                    record = self.record(row)
+                    delivery_error = None
+                    if route is not None:
+                        cancelled = Result(
+                            record.ref, target, "cancelled", None, None,
+                            error=reason, error_code="cancelled",
+                        )
+                        _result_ref, delivery_error = await self._route_result_tx(
+                            tx, session, route, cancelled, route["result_kind"], database_now,
+                            activations,
+                        )
+                    changed += await tx.execute(
+                        f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
+                        "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
+                        "WHERE session_id=? AND item_id=? AND status='pending'",
+                        (reason, delivery_error, database_now, target.session_id, record.ref.message_id),
+                    )
+                if not pending_rows and route is not None:
+                    start = await self.input(tx, InputRef(**route["input_ref"]))
+                    if start is not None and start.row["terminal_status"] is not None:
+                        await self._route_stored_result_tx(
+                            tx, session, route, start, database_now, activations,
+                        )
+                if state["execution_state"] == "queued":
+                    await tx.execute(
+                        f"UPDATE {self.state} SET execution_state='idle' WHERE session_id=? "
+                        "AND execution_state='queued' AND owner_token IS NULL", (target.session_id,)
+                    )
+                receipt = Receipt(
+                    None, target, None, False, "voided" if changed else "already_finished",
+                    None, "not_needed", reason if changed else None,
+                )
+        if scope == "subtree":
+            rows = await self.db.fetchall(
+                f"SELECT session_id FROM {self.store.t.sessions} "
+                "WHERE parent_session_id=? AND cancel_propagation='linked' ORDER BY session_id",
                 (target.session_id,),
             )
-            delivery_error = None
-            if pending_rows and route is not None:
-                cancelled = Result(
-                    InputRef(**route["input_ref"]), target, "cancelled", None, None,
-                    error=reason, error_code="cancelled",
+            for row in rows:
+                child = TargetRef(self.store.store_id, row["session_id"])
+                _receipt, child_activations = await self.cancel(
+                    child, actor=actor, scope="subtree", reason=reason, _with_activation=True,
                 )
-                _result_ref, delivery_error = await self._route_result_tx(
-                    tx, session, route, cancelled, route["result_kind"], database_now,
-                )
-            changed = await tx.execute(
-                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
-                "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
-                "WHERE session_id=? AND status='pending'",
-                (reason, delivery_error, database_now, target.session_id),
-            )
-            if state["execution_state"] == "queued":
-                await tx.execute(
-                    f"UPDATE {self.state} SET execution_state='idle' WHERE session_id=? "
-                    "AND execution_state='queued' AND owner_token IS NULL", (target.session_id,)
-                )
-            return Receipt(
-                None, target, None, False, "voided" if changed else "already_finished",
-                None, "not_needed", reason if changed else None,
-            )
+                activations.extend(child_activations)
+        if _with_activation:
+            return receipt, activations
+        return receipt
 
-    async def _cancel_input_tx(self, tx, session, state, record, reason, database_now):
+    async def _stored_result_tx(self, tx, record):
+        row = record.row
+        final_text, usage, structured = "", {}, None
+        if row["result_seq"] is not None:
+            message = await tx.fetchone(
+                f"SELECT content,meta_json FROM {self.store.t.messages} "
+                "WHERE session_id=? AND seq=? AND send_index=?",
+                (record.ref.session_id, row["result_seq"], row["result_send_index"]),
+            )
+            if message is not None:
+                final_text = message["content"] or ""
+                meta = json.loads(message["meta_json"] or "{}")
+                usage = meta.get("usage") or {}
+                structured = meta.get("structured_output")
+        return Result(
+            record.ref, TargetRef(self.store.store_id, record.ref.session_id),
+            row["terminal_status"], row["result_send_index"], row["result_seq"],
+            final_text, usage, structured, row["error_detail"], row["error_code"],
+            row["result_delivery_error"],
+        )
+
+    async def _route_stored_result_tx(
+        self, tx, session, route, record, database_now, activations=None,
+    ):
+        existing = await self._stored_result_tx(tx, record)
+        result_ref, delivery_error = await self._route_result_tx(
+            tx, session, route, existing, route["result_kind"], database_now, activations,
+        )
+        row = record.row
+        if delivery_error != row["result_delivery_error"]:
+            await tx.execute(
+                f"UPDATE {self.q} SET result_delivery_error=? WHERE session_id=? AND item_id=?",
+                (delivery_error, record.ref.session_id, record.ref.message_id),
+            )
+            if row["result_seq"] is not None:
+                message = await tx.fetchone(
+                    f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
+                    (record.ref.session_id, row["result_seq"]),
+                )
+                meta = json.loads(message["meta_json"] or "{}") if message is not None else {}
+                meta["result_delivery_error"] = delivery_error
+                await tx.execute(
+                    f"UPDATE {self.store.t.messages} SET meta_json=? WHERE session_id=? AND seq=?",
+                    (canonical(meta), record.ref.session_id, row["result_seq"]),
+                )
+        return result_ref, delivery_error
+
+    async def _cancel_input_tx(
+        self, tx, session, state, record, reason, database_now, activations=None,
+    ):
         row = record.row
         ref = record.ref
         route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
         if row["terminal_status"] is not None:
             if route is not None:
-                existing = Result(
-                    ref, TargetRef(self.store.store_id, ref.session_id), row["terminal_status"],
-                    row["result_send_index"], row["result_seq"], error=row["error_detail"],
-                    error_code=row["error_code"],
+                await self._route_stored_result_tx(
+                    tx, session, route, record, database_now, activations,
                 )
-                _result_ref, delivery_error = await self._route_result_tx(
-                    tx, session, route, existing, route["result_kind"], database_now,
-                )
-                if delivery_error != row["result_delivery_error"]:
-                    await tx.execute(
-                        f"UPDATE {self.q} SET result_delivery_error=? WHERE session_id=? AND item_id=?",
-                        (delivery_error, ref.session_id, ref.message_id),
-                    )
             return self.receipt(record, state="already_finished")
         if row["status"] == "pending":
             delivery_error = None
@@ -1105,6 +1304,7 @@ class RuntimeInputStore:
                 )
                 _result_ref, delivery_error = await self._route_result_tx(
                     tx, session, route, cancelled, route["result_kind"], database_now,
+                    activations,
                 )
             changed = await tx.execute(
                 f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
@@ -1180,6 +1380,14 @@ class RuntimeInputStore:
                 "AND status IN ('pending','waiting_continuation')", (target.session_id,),
             )
             if int(pending["n"]):
+                raise SessionBusy(target.session_id)
+            linked_child = await tx.fetchone(
+                f"SELECT session_id FROM {self.store.t.sessions} "
+                "WHERE parent_session_id=? AND cancel_propagation='linked' "
+                "AND lifecycle='open' LIMIT 1",
+                (target.session_id,),
+            )
+            if linked_child is not None:
                 raise SessionBusy(target.session_id)
             changed = await tx.execute(
                 f"UPDATE {self.store.t.sessions} SET lifecycle='closed',updated_at=? "
@@ -1286,3 +1494,41 @@ class RuntimeInputStore:
             )
         items = tuple(TargetRef(self.store.store_id, row["session_id"]) for row in rows)
         return SessionPage(items, items[-1].session_id if len(items) == limit else None)
+
+    async def poll_notifications(self, binding, *, cursor=None, limit=100):
+        """Bounded shared-store discovery; notifications never become a second ledger."""
+        from .runtime_transport import PROTOCOL_VERSION, TransportPacket
+
+        if binding.channel in {"work", "activation"}:
+            refs = await self.discover_unfinished(limit=limit)
+            packets = [
+                TransportPacket(
+                    PROTOCOL_VERSION, binding.namespace, ref.session_id, ref,
+                    binding.channel, None, {"kind": "unfinished"},
+                )
+                for ref in refs
+                if binding.session_id is None or ref.session_id == binding.session_id
+            ]
+            return packets, None
+        if binding.channel != "output":
+            return [], cursor
+        rows = await self.db.fetchall(
+            f"SELECT session_id,item_id,terminal_status,result_send_index,completed_at "
+            f"FROM {self.q} WHERE terminal_status IS NOT NULL AND completed_at>? "
+            "ORDER BY completed_at,id LIMIT ?",
+            (cursor or 0, limit),
+        )
+        packets = []
+        next_cursor = cursor
+        for row in rows:
+            if binding.session_id is not None and row["session_id"] != binding.session_id:
+                continue
+            ref = InputRef(self.store.store_id, row["session_id"], row["item_id"])
+            packets.append(TransportPacket(
+                PROTOCOL_VERSION, binding.namespace, row["item_id"],
+                TargetRef(self.store.store_id, row["session_id"]), "output", ref,
+                {"kind": "completed", "session_id": row["session_id"],
+                 "send_index": row["result_send_index"], "status": row["terminal_status"]},
+            ))
+            next_cursor = int(row["completed_at"])
+        return packets, next_cursor

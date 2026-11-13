@@ -9,7 +9,6 @@ from typing import Any
 from power_loop.runtime.env import RuntimeEnv, get_runtime_env, runtime_env_context
 from power_loop.tools.default_manifest import get_tool_definitions
 from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-from power_loop.tools.jobs import JOBS_DEFINITION, register_jobs_tools
 from power_loop.tools.registry import ToolRegistry, build_registry
 
 _WORKSPACE_TOOL_NAMES = {
@@ -156,6 +155,4 @@ __all__ = [
     "create_default_tool_registry",
     "get_tool_definitions",
     "DEFAULT_TOOL_HANDLERS",
-    "JOBS_DEFINITION",
-    "register_jobs_tools",
 ]

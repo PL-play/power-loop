@@ -62,7 +62,7 @@ _LEGACY_MODULES = (
     "runtime.managed_completion", "runtime.managed_delivery", "runtime.original_owner_review",
     "runtime.pending_owner", "runtime.nudges", "runtime.node_inputs", "runtime.task_control",
     "runtime.task_events", "runtime.task_inspection", "runtime.task_query", "runtime.task_sessions",
-    "runtime.child_completion", "runtime.completion_windows", "runtime.result_notices",
+    "runtime.completion_windows", "runtime.result_notices",
     "runtime.operation_records", "runtime.host_send_steps", "workflow.control", "workflow.resume",
 )
 _LEGACY_SQL_COLUMNS = (
@@ -96,8 +96,7 @@ def _category(chain, sql=""):
     if any(re.search(rf"(?<![a-z0-9]){column}(?![a-z0-9])", normalized)
            for column in _LEGACY_SQL_COLUMNS):
         return "legacy_job_control"
-    if any(c.startswith(_LEGACY_MODULES) or c.startswith("runtime.child_tasks:")
-           or c in _LEGACY_RUNTIME_STORE_CALLS for c in chain):
+    if any(c.startswith(_LEGACY_MODULES) or c in _LEGACY_RUNTIME_STORE_CALLS for c in chain):
         return "legacy_job_control"
     if "agent.runtime_store:_db_now" in chain:
         return "session_control"

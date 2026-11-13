@@ -36,14 +36,14 @@ def execute(command, timeout=None, **kwargs):
     argv, cwd, launch_env = backend.launch_argv(workspace), backend.launch_cwd(workspace), backend.launch_env(workspace)
     target = bind_shell_control(backend, workspace, argv=argv, cwd=cwd, env=launch_env, factory=env.process_control)
     process = OwnedProcess(argv, cwd=cwd, env=launch_env)
-    tag = context.job_ref.job_id + "_" + str(context.job_ref.generation)
-    payload = "exec env POWER_LOOP_BACKGROUND_JOB=" + tag + " /bin/bash --norc --noprofile -c " + shlex.quote(command) + "\n"
+    tag = context.session_id + "_" + str(context.send_index)
+    payload = "exec env POWER_LOOP_BACKGROUND_SESSION=" + tag + " /bin/bash --norc --noprofile -c " + shlex.quote(command) + "\n"
     deadline = time.monotonic() + (env.background_timeout_s if timeout is None else timeout)
     try:
         while True:
             if token.is_cancelled() or time.monotonic() >= deadline:
                 process.request_stop()
-                stopped = stop_shell_target(target, tag, variable="POWER_LOOP_BACKGROUND_JOB", grace_s=0.1)
+                stopped = stop_shell_target(target, tag, variable="POWER_LOOP_BACKGROUND_SESSION", grace_s=0.1)
                 if not stopped.confirmed:
                     from power_loop.runtime.task_runtime import mark_unconfirmed_resource
                     mark_unconfirmed_resource()

@@ -5,7 +5,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore
 from tests.runtime_fixture import RunningAgent
-from tests.unit.test_subagent import _Scripted
+from tests.runtime_fixture import ScriptedModel as _Scripted
 
 pytestmark = pytest.mark.unit
 
@@ -21,7 +21,12 @@ def test_synchronous_host_reuses_one_runner_for_start_requests_and_close(tmp_pat
                 result = runner.run(agent.send(body))
                 assert result.status == 'completed'
             rows = runner.run(agent.runtime.store.load_active_messages(agent.target.session_id))
-            assert [row.content for row in rows if row.role == 'user'] == ['one', 'two', 'three']
+            import json
+            contents = [
+                json.loads(row.content)['items'][0]['content'] if row.content.startswith('{') else row.content
+                for row in rows if row.role == 'user'
+            ]
+            assert contents == ['one', 'two', 'three']
         finally:
             runner.run(agent.aclose())
             runner.run(agent.runtime.store.close())

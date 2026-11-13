@@ -4,8 +4,9 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, AgentSpecError, JobRef, LLMResponse
+from power_loop import AgentLoopConfig, AgentSpec, AgentSpecError, LLMResponse
 from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import InputRef, TargetRef, result_message_id
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.spec import normalize_output_schema, output_response_format
 from power_loop.tools.registry import ToolRegistry
@@ -140,19 +141,23 @@ async def test_child_format_and_persisted_parent_completion(registry_store, repl
         await agent.send('classify')
         rows=await store.load_all_messages(agent.target.session_id)
         receipt=json.loads(next(r.content for r in rows if r.tool_call_id=='spawn'))
-        result=await agent.runtime.client.wait(JobRef(**receipt['job_ref']),actor=agent.actor,deadline_ms=now_ms()+10000)
+        start=InputRef(**receipt['input_ref'])
+        result=await agent.runtime.client.wait(start,actor=agent.actor,deadline_ms=now_ms()+10000)
         assert result.status==('completed' if expected is not None else 'failed')
         assert result.structured_output==expected and result.final_text==reply
         if expected is None:
             assert 'structured_output' in result.error
         response_format=model.child_requests[0].response_format['json_schema']
-        assert response_format['name']=='Label' and response_format['schema']==LABEL_SCHEMA
+        from power_loop.agent.runtime_types import plain
+        assert response_format['name']=='Label' and plain(response_format['schema'])==LABEL_SCHEMA
         assert response_format.get('strict',False) is strict
-        await agent.drain()
-        rows=await store.load_all_messages(agent.target.session_id)
-        notifications=[r.content for r in rows if '[subagent_result]' in str(r.content)]
-        assert len(notifications)==1
-        payload=json.loads(notifications[0].split('\n',1)[1])
+        parent_ref=InputRef(store.store_id,agent.target.session_id,
+            result_message_id(TargetRef(**receipt['target_ref']),start,result.send_index,'agent_result'))
+        await agent.drain(after_input=parent_ref)
+        routed=await store._db.fetchone(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (agent.target.session_id,parent_ref.message_id))
+        payload=json.loads(routed['content_json'])
         assert payload['structured_output']==expected and payload['status']==result.status
     finally:
         await agent.aclose()
@@ -175,27 +180,3 @@ async def test_invalid_child_contract_creates_no_child(registry_store,arguments,
         await agent.aclose()
 
 
-@pytest.mark.parametrize('strict',[False,True])
-async def test_workflow_worker_receives_schema_and_strict(registry_store,strict):
-    store,_=registry_store
-    class Model(_Scripted):
-        seen=[]
-        async def complete(self,request,**kwargs):
-            self.seen.append(request)
-            return LLMResponse(raw_text='{"label":"a"}')
-    model=Model()
-    model.seen=[]
-    agent=await RunningAgent(store,model,ToolRegistry()).start()
-    try:
-        spec=_node_spec({'name':'C','schema':LABEL_SCHEMA,'strict':strict})
-        handle=await agent.runtime.client.workflow(agent.target,spec,message_id='strict',actor=agent.actor)
-        result=await agent.runtime.client.wait(JobRef(store.store_id,handle.job_id,0),actor=agent.actor,deadline_ms=now_ms()+10000)
-        assert result.status=='completed',result
-        leaf_request=next(r for r in model.seen if r.response_format and r.response_format.get('type')=='json_schema')
-        assert leaf_request.response_format['json_schema'].get('strict',False) is strict
-        nodes=await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='workflow_node'")
-        assert len(nodes)==1
-        child=await agent.runtime.client.wait(JobRef(store.store_id,nodes[0]['job_id'],0),actor=agent.actor,deadline_ms=now_ms()+10000)
-        assert child.structured_output=={'label':'a'}
-    finally:
-        await agent.aclose()

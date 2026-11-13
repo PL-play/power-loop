@@ -59,7 +59,6 @@ class ControlTransaction(ControlReadView):
         self._executor_groups = manager.prefix + "task_executor_admissions"
         self._principal_admissions = manager.prefix + "task_principal_admissions"
         self._context_events = manager.prefix + "task_context_events"
-        self._obligations = manager.prefix + "session_obligations"
         self._dialect = manager.db.dialect
         self.jobs: set[str] = set()
         self.sessions: set[str] = set()
@@ -256,8 +255,6 @@ class ControlTransaction(ControlReadView):
 
     def note_event(self, event):
         self.touched_jobs.add(event["job_id"])
-        from .session_obligations import note
-        note(self, event)
         if event["event_type"] in OBLIGATION_EVENTS:
             self.jobs.add(event["job_id"])
             recipient = event.get("caller_session_id")

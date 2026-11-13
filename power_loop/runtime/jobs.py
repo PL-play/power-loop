@@ -266,8 +266,6 @@ class JobManager:
                         yield recorder
                     finally:
                         self._control_intents.reset(intent_token)
-                    from .session_obligations import refresh
-                    await refresh(self, recorder, recorder)
             except BaseException:
                 if outer_undo is None:
                     for hook in reversed(undo):
@@ -829,12 +827,7 @@ class JobManager:
             if row["kind"] in ("subagent", "workflow_node"):
                 from .completion_windows import admit
                 await admit(self, tx, await self._row(tx, job_id))
-                from .original_owner_review import admit as admit_review
-                await admit_review(self,tx,await self._row(tx,job_id))
-            lease = JobLease(job_id, executor_id, boot_id, generation)
-            from .managed_claim import capture
-            capture(self, actor, lease, expected_version)
-            return lease
+            return JobLease(job_id, executor_id, boot_id, generation)
 
     async def register_operation(self, actor: JobActor, lease: JobLease, *, action: str,
             caller: JobLease, call_ref: MessageRef, tool_call_id: str,
@@ -862,10 +855,8 @@ class JobManager:
             op = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=? AND event_type='operation'", (operation_id,))
             if op is None:
                 raise JobError("operation_not_found")
-            target = await self._authorize(tx, actor, op["job_id"])
-            from . import managed_effects
-            effect = target["kind"] == "background_tool" and await managed_effects.descriptor(self, tx, target) is not None
-            row = await self._validate_ref(tx, actor, receipt_ref, role="tool", metadata_only=effect)
+            await self._authorize(tx, actor, op["job_id"])
+            row = await self._validate_ref(tx, actor, receipt_ref, role="tool")
             call = json.loads(op["call_ref_json"]) if op["call_ref_json"] else None
             if (not call or op["caller_session_id"] != actor.session_id or
                     row["tool_call_id"] != op["tool_call_id"] or receipt_ref.seq <= int(call["seq"])):
@@ -877,8 +868,6 @@ class JobManager:
             encoded = _json(receipt_ref.to_dict())
             if op["receipt_ref_json"] and op["receipt_ref_json"] != encoded:
                 raise JobError("receipt_already_bound")
-            if effect:
-                await managed_effects.bind_receipt(self, tx, target, op, receipt_ref)
             await tx.update_event(op["job_id"], f"UPDATE {self.events} SET receipt_ref_json=? WHERE event_id=?", (encoded, operation_id), obligations=False)
             return _operation(await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (operation_id,)))
 
@@ -898,19 +887,11 @@ class JobManager:
                                          require_children_stopped=require_children_stopped)
 
     async def _require_scope_ready(self, tx, row):
-        from .managed_effects import require_owned_resolved
-        await require_owned_resolved(self, tx, row)
-        from .result_consumption import require_inputs_handled
-        await require_inputs_handled(self, tx, row)
         children = await tx.fetchall(f"SELECT * FROM {self.jobs} WHERE control_owner_job_id=?", (row["job_id"],))
         for child in children:
             if child["resource_state"] in ("running", "unknown") or (
                     child["resource_state"] == "not_started" and child["status"] != "cancelled"):
                 raise JobError("required_execution_unsettled")
-            if row["kind"] != "workflow_node" or child["kind"] != "subagent" or child["status"] == "cancelled":
-                continue
-            from .result_consumption import require_handled
-            await require_handled(self, tx, child)
 
     async def record_unstarted_result(self, actor: JobActor, job_id: str, *, outcome: str, result: Mapping[str, Any]) -> dict:
         """Close a provably unclaimed admission; an ambiguous claim never qualifies."""
@@ -962,11 +943,7 @@ class JobManager:
         row = await self._authorize(tx, actor, lease.job_id)
         self._check_proof(row, lease)
         if publication_proof is not None:
-            from .result_proof import ResultPublicationProof
-
-            if (not evidence_only or not isinstance(publication_proof, ResultPublicationProof)
-                    or await publication_proof.validate(self, tx, row, payload) is not True):
-                raise JobError("result_publication_evidence_invalid")
+            raise JobError("result_publication_evidence_invalid")
         old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (event_id,))
         if old:
             from .result_payloads import require_replay

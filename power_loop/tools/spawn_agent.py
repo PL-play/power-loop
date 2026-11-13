@@ -25,9 +25,9 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(pricing=Free("composite"),
     name="spawn_agent",
     description=(
         "Delegate work in an isolated child session, always asynchronously. create (default) "
-        "starts a task; send adds a message to the same child (urgent skips its not-yet-started tool calls). "
-        "Returns session_id/run_id and acceptance, not completion. Results arrive in your "
-        "task_done inbox with the original job reference, final_text, status and usage. "
+        "starts a child session; send adds a message to the same child (urgent joins its next boundary). "
+        "Returns target_ref/input_ref/session_id/run_id and acceptance, not completion. Results arrive "
+        "as ordinary agent_result inputs in your session inbox with final_text, status and usage. "
         "You may pass_turn while waiting; inspect the original session for additional context."
     ),
     input_schema={

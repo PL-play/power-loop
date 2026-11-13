@@ -1,36 +1,25 @@
-"""Canonical effective results retain the exact original submission for replay."""
+"""Stable result payload comparison retained only for unmigrated declarations."""
 from __future__ import annotations
 
-from .jobs import JobError, _hash
+from power_loop.agent.runtime_types import RuntimeRequestError, sha256_canonical
 
 
 def canonical(requested, outcome, result):
-    if outcome == requested["outcome"] and _hash(result) == _hash(requested["result"]):
+    if outcome == requested["outcome"] and sha256_canonical(result) == sha256_canonical(requested["result"]):
         return requested
     return {**requested, "outcome": outcome, "result": result, "requested": requested}
 
 
 def require_replay(stored, requested):
-    fields = {"outcome", "result", "resource_state"}
-    if (not isinstance(requested, dict) or not fields <= set(requested)
-            or set(requested) - fields - {"generation", "unstarted"}
-            or requested["outcome"] not in ("succeeded", "failed", "cancelled", "timed_out", "budget_exceeded", "interrupted")
-            or not isinstance(requested["result"], dict) or requested["resource_state"] not in ("stopped", "unknown")
-            or "unstarted" in requested and requested["unstarted"] is not True
-            or "generation" in requested and (type(requested["generation"]) is not int or not 1 < requested["generation"] < 2**63)):
-        raise JobError("result_conflict")
-    # Preserve historical v1 payloads exactly; no implicit event rewrite.
-    if _hash(stored) == _hash(requested):
+    if sha256_canonical(stored) == sha256_canonical(requested):
         return
-    if not isinstance(stored, dict) or _hash(stored.get("requested")) != _hash(requested):
-        raise JobError("result_conflict")
+    if sha256_canonical(stored.get("requested")) != sha256_canonical(requested):
+        raise RuntimeRequestError("request_conflict", "result payload changed")
     outcome = stored.get("outcome")
-    if outcome not in (requested["outcome"], "cancelled"):
-        raise JobError("result_conflict")
     effective = dict(requested["result"])
     if requested.get("unstarted") is True:
         effective["status"] = outcome
-    elif outcome == "cancelled" and "status" in effective and effective["status"] != "cancelled":
+    elif outcome == "cancelled" and effective.get("status") not in (None, "cancelled"):
         effective.update(execution_status=effective["status"], status="cancelled")
-    if _hash(stored) != _hash(canonical(requested, outcome, effective)):
-        raise JobError("result_conflict")
+    if sha256_canonical(stored) != sha256_canonical(canonical(requested, outcome, effective)):
+        raise RuntimeRequestError("request_conflict", "result payload changed")

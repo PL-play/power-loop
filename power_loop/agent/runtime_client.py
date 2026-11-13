@@ -81,12 +81,17 @@ class RuntimeClient:
 
     async def cancel(self, ref, *, actor, scope="self", reason="cancelled") -> Receipt:
         self._require_open()
-        receipt = await self.inputs.cancel(ref, actor=actor, scope=scope, reason=reason)
+        receipt, activations = await self.inputs.cancel(
+            ref, actor=actor, scope=scope, reason=reason, _with_activation=True,
+        )
         target = receipt.target
         # Wake the owner so it can observe the cancel marker at its next checkpoint; the
         # marker itself is durable and is also read at every loop boundary.
         await self._notify(target, receipt.message_id or "cancel", receipt.input_ref,
                            ["activation", "work"], {"cancelled": True, "reason": reason})
+        for parent in dict.fromkeys(activations):
+            result_ref = InputRef(parent.store_id, parent.session_id, "cancel-result")
+            await self._notify(parent, result_ref.message_id, result_ref, ["work", "activation"])
         return receipt
 
     async def inspect(self, ref, *, actor):

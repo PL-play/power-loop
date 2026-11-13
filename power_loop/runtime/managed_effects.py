@@ -1,37 +1,39 @@
-"""Trusted finite managed effects as required SDK background-tool children.
-
-Callbacks are trusted host code for one finite managed effect, not arbitrary paid
-tools, subprocesses or detached work. No import path is taken from saved/model
-data. External outcome resolution, local coroutine exit and fee settlement differ.
-"""
-
+"""Finite managed effects with durable preparation and query-only recovery."""
 from __future__ import annotations
 
 import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 
-from .invocation import current_invocation
-from .jobs import JobError, JobLease, _hash, _json
-from .jobs import verify_stored as _verify_stored
-from .tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
+from power_loop.agent.runtime_types import (
+    InputRef,
+    RuntimeRequestError,
+    TargetRef,
+    canonical,
+    plain,
+    sha256_canonical,
+)
+
+from .tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract, resolve
 
 FIELD = "managed_effect"
 _LIMIT = 65536
 
 
 def _document(value, limit=16384):
-    def invalid_constant(value):
+    def invalid_constant(_value):
         raise ValueError("non-finite JSON constant")
 
     try:
-        if type(value) is not dict or len(_json(value).encode()) > limit:
+        if not isinstance(value, Mapping) or len(canonical(value).encode()) > limit:
             raise ValueError()
-        return json.loads(_json(value), parse_constant=invalid_constant)
+        return json.loads(canonical(value), parse_constant=invalid_constant)
     except (ValueError, TypeError, RecursionError):
-        raise JobError("managed_effect_document_invalid") from None
+        raise RuntimeRequestError("invalid_options", "managed_effect_document_invalid") from None
 
 
 def _digest(value):
@@ -46,9 +48,9 @@ class ManagedToolResult:
 
     def __post_init__(self):
         if type(self.display) is not str or not self.display or "\x00" in self.display or len(self.display) > 4096:
-            raise JobError("managed_effect_result_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
         if self.resolution not in ("committed", "rejected", "not_dispatched"):
-            raise JobError("managed_effect_result_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
         object.__setattr__(self, "reference", _document(self.reference))
 
     def to_dict(self):
@@ -57,7 +59,7 @@ class ManagedToolResult:
     @classmethod
     def from_dict(cls, value):
         if type(value) is not dict or set(value) != {"display", "reference", "resolution"}:
-            raise JobError("managed_effect_result_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
         return cls(**value)
 
 
@@ -69,7 +71,7 @@ class ManagedToolPreparation:
     def __post_init__(self):
         object.__setattr__(self, "reference", _document(self.reference))
         if self.local_result is not None and type(self.local_result) is not ManagedToolResult:
-            raise JobError("managed_effect_preparation_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_preparation_invalid")
 
     def to_dict(self):
         return {
@@ -80,7 +82,7 @@ class ManagedToolPreparation:
     @classmethod
     def from_dict(cls, value):
         if type(value) is not dict or set(value) != {"reference", "local_result"}:
-            raise JobError("managed_effect_preparation_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_preparation_invalid")
         return cls(
             value["reference"],
             ManagedToolResult.from_dict(value["local_result"]) if value["local_result"] is not None else None,
@@ -89,13 +91,6 @@ class ManagedToolPreparation:
 
 @dataclass(frozen=True)
 class ManagedToolContract:
-    """Host-declared implementation identity and SDK resource capabilities.
-
-    This first resource model is finite and creates no untracked paid request
-    or detached work. Other resource models need their own SDK lifecycle and
-    admission implementation; a declaration alone cannot opt into them.
-    """
-
     key: str
     implementation_hash: str
     max_result_chars: int = 4096
@@ -113,7 +108,7 @@ class ManagedToolContract:
             or type(self.paid_requests) is not int
             or self.paid_requests != 0
         ):
-            raise JobError("managed_effect_adapter_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_adapter_invalid")
 
     def to_dict(self):
         return {"version": 1, **asdict(self)}
@@ -126,20 +121,11 @@ class ManagedToolContract:
             or type(value["version"]) is not int
             or value["version"] != 1
         ):
-            raise JobError("managed_effect_adapter_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_adapter_invalid")
         return cls(**{k: value[k] for k in cls.__dataclass_fields__})
 
 
 class ManagedTool(ABC):
-    """Platform-neutral implementation contract for a managed tool.
-
-    Implementations inherit this base and provide four things: a frozen
-    contract, preparation, one original execution, and query-only recovery.
-    Register ``tool.bind(runtime, definition)`` as the handler; the SDK then
-    owns admission, task tracking, cancellation and receipt checks. Neither
-    the implementation's class name nor a tool name grants permission.
-    """
-
     @property
     @abstractmethod
     def contract(self) -> ManagedToolContract:
@@ -147,17 +133,14 @@ class ManagedTool(ABC):
 
     @abstractmethod
     async def prepare(self, context, arguments) -> ManagedToolPreparation:
-        """Freeze local metadata/references; do not dispatch the effect here."""
         raise NotImplementedError()
 
     @abstractmethod
     async def execute(self, context, original_reference) -> ManagedToolResult:
-        """Execute the original finite action once, with cooperative cleanup."""
         raise NotImplementedError()
 
     @abstractmethod
     async def recover(self, context, original_reference) -> ManagedToolResult | None:
-        """Query the original outcome; never prepare or execute again."""
         raise NotImplementedError()
 
     def bind(self, runtime, definition):
@@ -166,8 +149,6 @@ class ManagedTool(ABC):
 
 @dataclass(frozen=True)
 class FunctionManagedTool(ManagedTool):
-    """Optional function-based implementation of the same public base."""
-
     descriptor: ManagedToolContract
     on_prepare: object = field(repr=False)
     on_execute: object = field(repr=False)
@@ -177,7 +158,7 @@ class FunctionManagedTool(ManagedTool):
         if type(self.descriptor) is not ManagedToolContract or any(
             not callable(f) for f in (self.on_prepare, self.on_execute, self.on_recover)
         ):
-            raise JobError("managed_effect_adapter_invalid")
+            raise RuntimeRequestError("invalid_options", "managed_effect_adapter_invalid")
 
     @property
     def contract(self):
@@ -197,49 +178,35 @@ class FunctionManagedTool(ManagedTool):
 class ManagedToolContext:
     runtime: object = field(repr=False)
     source_actor: object
-    source_lease: JobLease
     call_ref: object
     tool_call_id: str
-    job_id: str
-
-
-def _authority(runtime):
-    from .root_context import _authority
-
-    return _authority(runtime)
+    session_id: str
+    send_index: int | None
 
 
 def bind(runtime, definition, adapter):
     from power_loop.contracts.tools import ToolDefinition
 
-    from .task_runtime import _OWNER, _SEND
-
-    if _SEND.get() is not None or _OWNER.get() is not None:
-        raise JobError("managed_effect_binding_requires_host")
     if (
         not isinstance(adapter, ManagedTool)
         or type(adapter.contract) is not ManagedToolContract
         or type(definition) is not ToolDefinition
     ):
-        raise JobError("managed_effect_adapter_invalid")
+        raise RuntimeRequestError("invalid_options", "managed_effect_adapter_invalid")
     if definition.async_capable or definition.interrupt != "finish":
-        raise JobError("managed_effect_tool_policy_invalid")
+        raise RuntimeRequestError("invalid_options", "managed_effect_tool_policy_invalid")
     return _Handler(
-        runtime,
         definition,
         adapter,
-        _authority(runtime),
-        _hash(definition.to_openai_tool()),
-        _json(adapter.contract.to_dict()),
+        sha256_canonical(definition.to_openai_tool()),
+        canonical(adapter.contract.to_dict()),
     )
 
 
 @dataclass(frozen=True)
 class _Handler(RuntimeTool):
-    runtime: object = field(repr=False)
     definition: object = field(repr=False)
     adapter: ManagedTool = field(repr=False)
-    authority: tuple = field(repr=False)
     schema_hash: str
     contract_json: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
@@ -248,1142 +215,277 @@ class _Handler(RuntimeTool):
     def runtime_contract(self):
         return ToolRuntimeContract("managed-effect:" + self.adapter.contract.key, background_allowed=False)
 
-    def dispatch_policy(self, arguments, *, runtime=None):
-        self.check(runtime, self.definition.name, self.definition)
+    def dispatch_policy(self, arguments, *, runtime=None, definition=None):
+        self.check(definition or self.definition)
         return ToolDispatchPolicy(native_admitted=True)
 
     def format_result(self, result, max_chars):
-        # A compact SDK error must stay readable even below the normal display
-        # capacity. This is a view of the actual registered implementation,
-        # not a tool-name exception or a successful result acknowledgement.
         prefix = "Error: "
         if type(result) is str and result.startswith(prefix):
             code = result[len(prefix):]
             if (0 < len(code) <= 128 and code[0].isascii() and code[0].islower()
-                    and all(c.isascii() and (c.islower() or c.isdigit() or c == '_') for c in code)):
+                    and all(c.isascii() and (c.islower() or c.isdigit() or c == "_") for c in code)):
                 return result
         return None
 
     def pending_call_spec(self, arguments, *, runtime=None, definition=None):
-        self.check(runtime, definition.name, definition)
-        return {"kind": "managed_effect", "request": {FIELD: {
-            "version": 1, "adapter_key": self.adapter.contract.key,
+        self.check(definition or self.definition)
+        return {"kind": FIELD, "request": {FIELD: {
+            "version": 1,
+            "adapter_key": self.adapter.contract.key,
             "contract_hash": self.adapter.contract.implementation_hash,
-            "tool_name": definition.name, "schema_hash": self.schema_hash,
-            "arguments_hash": _hash(_document(arguments, 131072)),
+            "tool_name": self.definition.name,
+            "schema_hash": self.schema_hash,
+            "arguments_hash": sha256_canonical(_document(arguments, 131072)),
             "contract": self.adapter.contract.to_dict(),
         }}}
 
-    def check(self, runtime, tool_name, definition):
-        current = _authority(runtime)
+    def check(self, definition):
         if (
-            runtime is not self.runtime
-            or any(a is not b for a, b in zip(current[:3], self.authority[:3], strict=True))
-            or current[3:] != self.authority[3:]
-            or tool_name != self.definition.name
-            or _hash(definition.to_openai_tool()) != self.schema_hash
-            or _hash(self.definition.to_openai_tool()) != self.schema_hash
+            definition.name != self.definition.name
+            or sha256_canonical(definition.to_openai_tool()) != self.schema_hash
             or type(self.adapter.contract) is not ManagedToolContract
-            or _json(self.adapter.contract.to_dict()) != self.contract_json
+            or canonical(self.adapter.contract.to_dict()) != self.contract_json
         ):
-            raise JobError("managed_effect_binding_changed")
+            raise RuntimeRequestError("invalid_options", "managed_effect_binding_changed")
 
     async def __call__(self, **arguments):
         from power_loop.core.agent_context import get_current_loop
 
-        from .task_runtime import _SEND
+        from .child_tasks import tool_actor
+        from .task_runtime import current_session_send
 
-        execution = _SEND.get()
-        if execution is None:
-            raise JobError("managed_effect_original_send_required")
-        self.check(execution.runtime, self.definition.name, self.definition)
         loop = get_current_loop()
+        binding = current_session_send(loop.store, loop._runtime_worker_context.session_id)
+        if binding is None:
+            raise RuntimeRequestError("invalid_options", "managed_effect_original_send_required")
         capacity = getattr(getattr(loop, "config", None), "tool_result_max_chars", None)
         if capacity is not None and capacity < self.adapter.contract.max_result_chars:
-            raise JobError("managed_effect_result_capacity_unavailable")
+            raise RuntimeRequestError("invalid_options", "managed_effect_result_capacity_unavailable")
         arguments = _document(arguments, limit=131072)
         async with self.lock:
-            return await _invoke(self, execution, arguments)
+            _, actor = await tool_actor(loop)
+            descriptor = _managed_descriptor(loop, self, actor, arguments)
+            parent = TargetRef(loop.store.store_id, actor.session_id)
+            target, start, receipt = await loop._runtime_worker.inputs.create_child(
+                descriptor,
+                parent=parent,
+                actor=actor,
+                call_ref=actor.call_ref,
+                tool_call_id=actor.tool_call_id,
+                body={FIELD: descriptor.config[FIELD]},
+                result_kind="managed_effect_result",
+            )
+            await loop._runtime_worker.runtime.client._notify(
+                target, start.message_id, start, ["work", "activation"],
+            )
+            return canonical({
+                "target_ref": plain(target),
+                "input_ref": plain(start),
+                "status": "accepted",
+                "newly_accepted": receipt.newly_accepted,
+                "managed_effect_pending": True,
+            })
 
 
-def registration(request, *, kind, parent, call_ref, tool_call_id, session_id, independent):
-    if FIELD not in request:
-        return None
-    value = request[FIELD]
-    keys = {"version", "adapter_key", "contract_hash", "tool_name", "schema_hash", "arguments_hash", "contract"}
-    if (
-        kind != "background_tool"
-        or parent is None
-        or call_ref is None
-        or not tool_call_id
-        or session_id != call_ref.session_id
-        or independent
-        or type(value) is not dict
-        or set(value) != keys
-        or type(value["version"]) is not int
-        or value["version"] != 1
-        or any(not _digest(value[k]) for k in ("contract_hash", "schema_hash", "arguments_hash"))
-        or any(type(value[k]) is not str or not 0 < len(value[k]) <= 64 for k in ("adapter_key", "tool_name"))
-    ):
-        raise JobError("managed_effect_registration_invalid")
-    contract = ManagedToolContract.from_dict(value["contract"])
-    if (contract.key, contract.implementation_hash) != (value["adapter_key"], value["contract_hash"]):
-        raise JobError("managed_effect_registration_invalid")
-    return value
+def _managed_descriptor(loop, handler, actor, arguments):
+    from dataclasses import replace
 
-
-def job_id(manager, actor, call_ref, tool_call_id):
-    return (
-        "effect_"
-        + _hash(
-            [
-                manager.store.store_id,
-                actor.tenant_id,
-                actor.principal_id,
-                call_ref.session_id,
-                call_ref.id,
-                tool_call_id,
-            ]
-        )[:48]
-    )
-
-
-def _id(manager, kind, job, generation=1):
-    prefix = "mt_" + kind + "_"
-    return prefix + _hash([manager.store.store_id, job, generation])[:min(48, 64 - len(prefix))]
-
-
-async def _read_event(manager, tx, event_id, *, required=True):
-    length = (
-        "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
-    )
-    size = await tx.fetchone(f"SELECT {length} AS n FROM {manager.events} WHERE event_id=?", (event_id,))
-    if size is None:
-        if required:
-            raise JobError("managed_effect_evidence_missing")
-        return None
-    if size["n"] > _LIMIT:
-        raise JobError("managed_effect_evidence_too_large")
-    row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
-    try:
-        value = _document(json.loads(row["payload_json"]), _LIMIT)
-        if row["request_hash"] != _hash(value):
-            raise ValueError()
-        return row, value
-    except (ValueError, TypeError):
-        raise JobError("managed_effect_evidence_corrupt") from None
-
-
-async def _event(manager, tx, row, kind, value):
-    event_id = _id(manager, kind, row["job_id"], row["generation"])
-    old = await _read_event(manager, tx, event_id, required=False)
-    if old is not None:
-        if (
-            old[0]["job_id"] != row["job_id"]
-            or old[0]["event_type"] != "managed_effect_" + kind
-            or old[0]["delivery_status"] != "not_applicable"
-            or _hash(old[1]) != _hash(value)
-        ):
-            raise JobError("managed_effect_evidence_conflict")
-        return event_id
-    payload = _json(_document(value, _LIMIT))
-    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (
-            event_id,
-            row["job_id"],
-            "managed_effect_" + kind,
-            row["version"],
-            _hash(value),
-            payload,
-            "not_applicable",
-            manager.now(),
-        ))
-    return event_id
-
-
-async def validate_call(manager, tx, actor, lease, ref, call_id, name, arguments_hash):
-    source = await manager._fence(tx, actor, lease)
-    return await _verify_call(manager, tx, actor, source, ref, call_id, name, arguments_hash)
-
-
-async def _verify_call(manager, tx, actor, source, ref, call_id, name, arguments_hash):
-    seq = ref.seq
-    if source["kind"] != "send" or source["session_id"] != actor.session_id:
-        raise JobError("managed_effect_original_send_required")
-    length = (
-        "length(CAST(tool_calls_json AS BLOB))"
-        if manager.db.dialect.name == "sqlite"
-        else "octet_length(tool_calls_json)"
-    )
-    size = await tx.fetchone(
-        f"SELECT {length} AS n FROM {manager.store.t.messages} WHERE session_id=? AND seq=?", (actor.session_id, seq)
-    )
-    if size is None or size["n"] is None or size["n"] > 131072:
-        raise JobError("managed_effect_call_evidence_unavailable")
-    await manager._validate_ref(tx, actor, ref, role="assistant", metadata_only=True)
-    creates = await tx.fetchall(
-        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='create'",
-        (source["job_id"],),
-    )
-    if len(creates) != 1:
-        raise JobError("managed_effect_creation_missing")
-    size = await tx.fetchone(
-        f"SELECT {'length(CAST(payload_json AS BLOB))' if manager.db.dialect.name == 'sqlite' else 'octet_length(payload_json)'} AS n FROM {manager.events} WHERE event_id=?",
-        (creates[0]["event_id"],),
-    )
-    if size["n"] > _LIMIT:
-        raise JobError("managed_effect_evidence_too_large")
-    original = await tx.fetchone(
-        f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (creates[0]["event_id"],)
-    )
-    try:
-        index = json.loads(original["payload_json"])["request"]["send_index"]
-        if type(index) is not int or index != ref.send_index:
-            raise ValueError()
-    except (ValueError, TypeError, KeyError, RecursionError):
-        raise JobError("managed_effect_call_evidence_mismatch") from None
-    row = await tx.fetchone(
-        f"SELECT tool_calls_json FROM {manager.store.t.messages} WHERE session_id=? AND seq=?", (actor.session_id, seq)
-    )
-    try:
-        calls = json.loads(row["tool_calls_json"])
-        matches = [c for c in calls if type(c) is dict and c.get("id") == call_id]
-        if (
-            len(matches) != 1
-            or matches[0]["function"]["name"] != name
-            or _hash(json.loads(matches[0]["function"]["arguments"])) != arguments_hash
-        ):
-            raise ValueError()
-    except (ValueError, TypeError, KeyError, RecursionError):
-        raise JobError("managed_effect_call_evidence_mismatch") from None
-    return ref, call_id
-
-
-def _ref(value):
-    from .message_ref import MessageRef
-
-    try:
-        ref = MessageRef(
-            value["store_id"],
-            value["session_id"],
-            int(value["id"]),
-            int(value["seq"]),
-            value["role"],
-            value["tool_call_id"],
-            int(value["send_index"]),
-            value["round_index"],
-        )
-        if _json(ref.to_dict()) != _json(value):
-            raise ValueError()
-        return ref
-    except (ValueError, TypeError, KeyError):
-        raise JobError("managed_effect_evidence_corrupt") from None
-
-
-async def _original(manager, tx, row, creation, binding):
-    """Validate historical membership and raw coordinates without a live fence."""
-    from . import execution_membership
-    from .jobs import JobActor
-
-    ref = _ref(json.loads(creation["call_ref_json"]))
-    actor = JobActor(row["tenant_id"], row["principal_id"], ref.session_id)
-    source = await manager._authorize(tx, actor, row["parent_job_id"])
-    proof = JobLease(source["job_id"], source["executor_id"], source["boot_id"], source["generation"])
-    if (
-        row["created_by_session_id"] != ref.session_id
-        or creation["caller_session_id"] != ref.session_id
-        or source["root_job_id"] != row["root_job_id"]
-        or row["job_id"] != job_id(manager, actor, ref, creation["tool_call_id"])
-    ):
-        raise JobError("managed_effect_evidence_corrupt")
-    scope = await execution_membership.scope(manager, tx, source["job_id"], proof.generation)
-    if (
-        scope["lease"] != asdict(proof)
-        or scope["session_id"] != actor.session_id
-        or (scope["tenant_id"], scope["principal_id"]) != (actor.tenant_id, actor.principal_id)
-    ):
-        raise JobError("managed_effect_source_evidence_mismatch")
-    await _verify_call(
-        manager, tx, actor, source, ref, creation["tool_call_id"], binding["tool_name"], binding["arguments_hash"]
-    )
-    return actor, proof, ref
-
-
-def _proof(row):
-    return {key: row[key] for key in ("job_id", "executor_id", "boot_id", "generation")}
-
-
-async def _evidence(manager, tx, row, kind, *, required=True):
-    found = await _read_event(manager, tx, _id(manager, kind, row["job_id"], row["generation"]), required=required)
-    if found is None:
-        return None
-    event, value = found
-    fields = {
-        "prepared": {"adapter", "preparation"},
-        "dispatch": {"preparation_hash"},
-        "resource_exit": {"exit", "dispatch_started"},
-        "observation": {"adapter", "result"},
-        "tool_receipt": {"creation_id", "result_id", "result_hash", "receipt_ref", "display_hash"},
+    parent = loop._runtime_worker_context.descriptor
+    frozen = {
+        "tool": handler.definition.name,
+        "arguments": arguments,
+        "contract": handler.adapter.contract.to_dict(),
+        "call_ref": actor.call_ref.to_dict(),
+        "call_id": actor.tool_call_id,
     }
-    version = value.get("version")
-    if kind == "resource_exit" and type(version) is int and version == 2:
-        fields["resource_exit"] = fields["resource_exit"] | {"completion"}
-    if (
-        event["job_id"] != row["job_id"]
-        or event["event_type"] != "managed_effect_" + kind
-        or event["delivery_status"] != "not_applicable"
-        or set(value) != {"version", "lease", *fields[kind]}
-        or type(value["version"]) is not int
-        or value["version"] not in ((1, 2) if kind == "resource_exit" else (1,))
-        or _json(value["lease"]) != _json(_proof(row))
-    ):
-        raise JobError("managed_effect_evidence_corrupt")
-    if kind == "prepared":
-        ManagedToolPreparation.from_dict(value["preparation"])
-    elif kind == "observation":
-        ManagedToolResult.from_dict(value["result"])
-    elif kind == "dispatch" and not _digest(value["preparation_hash"]):
-        raise JobError("managed_effect_evidence_corrupt")
-    return found
-
-
-async def _observation(manager, tx, row, binding, *, required=True):
-    found = await _evidence(manager, tx, row, "observation", required=required)
-    if found is not None and _json(found[1]["adapter"]) != _json(binding):
-        raise JobError("managed_effect_binding_changed")
-    return found
-
-
-async def descriptor(manager, tx, row):
-    events = await tx.fetchall(
-        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='create'",
-        (row["job_id"],),
+    return replace(
+        parent,
+        kind="background",
+        config={**plain(parent.config), FIELD: frozen},
     )
-    if len(events) != 1:
-        raise JobError("managed_effect_creation_missing")
-    # Creation is an existing SDK operation, whose hash covers the full spec.
-    length = (
-        "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
+
+
+def _state_key(frozen):
+    return "managed_effect:" + sha256_canonical([frozen["call_ref"], frozen["call_id"]])[:80]
+
+
+def _context(store, actor, frozen, send_index):
+    from power_loop.runtime.message_ref import MessageRef
+    raw = frozen["call_ref"]
+    return ManagedToolContext(
+        store,
+        actor,
+        MessageRef(
+            raw["store_id"], raw["session_id"],
+            int(raw["id"]) if raw.get("id") is not None else None,
+            int(raw["seq"]), raw["role"], raw.get("tool_call_id"),
+            int(raw["send_index"]) if raw.get("send_index") is not None else None,
+            raw.get("round_index"),
+        ),
+        frozen["call_id"],
+        raw["session_id"],
+        send_index,
     )
-    size = await tx.fetchone(f"SELECT {length} AS n FROM {manager.events} WHERE event_id=?", (events[0]["event_id"],))
-    if size["n"] > _LIMIT:
-        raise JobError("managed_effect_evidence_too_large")
-    event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (events[0]["event_id"],))
-    try:
-        payload = json.loads(event["payload_json"])
-        request = payload.get("request", {})
-        if FIELD not in request:
-            return None
-        call = json.loads(event["call_ref_json"])
-        binding = request[FIELD]
-        if (
-            row["kind"] != "background_tool"
-            or not row["blocks_completion"]
-            or row["parent_job_id"] is None
-            or payload["job_id"] != row["job_id"]
-            or payload["status"] != "queued"
-            or event["request_hash"]
-            != _hash([row["kind"], row["title"], row["session_id"], row["parent_job_id"], False, request, call])
-            or type(binding["version"]) is not int
-            or binding["version"] != 1
-        ):
-            raise ValueError()
-        registration(
-            request,
-            kind=row["kind"],
-            parent=row["parent_job_id"],
-            call_ref=_ref(call),
-            tool_call_id=event["tool_call_id"],
-            session_id=row["session_id"],
-            independent=False,
+
+
+async def _write_state(store, session_id, key, value):
+    async with store._db.transaction() as tx:
+        sql = store._db.dialect.upsert(
+            store.t.session_runtime_state,
+            ("session_id", "state_key"),
+            ("value_json", "updated_at"),
         )
-        await _registered(manager, tx, row, event, binding)
-        await _original(manager, tx, row, event, binding)
-        return event, binding
-    except (ValueError, TypeError, KeyError):
-        raise JobError("managed_effect_evidence_corrupt") from None
+        await tx.execute(sql, (session_id, key, canonical(value), now_ms()))
 
 
-async def require_source_resolved(manager, tx, source, *, invocation=None):
-    rows = await tx.fetchall(
-        f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' ORDER BY job_id LIMIT 1001",
-        (source["job_id"],),
-    )
-    if len(rows) > 1000:
-        raise JobError("managed_effect_history_requires_compaction")
-    for row in rows:
-        found = await descriptor(manager, tx, row)
-        if found is None:
-            continue
-        if row["generation"] == 0:
-            from .tool_call_plans import queued_for_call
-            if await queued_for_call(manager, tx, row, source, invocation):
-                continue
-            await unstarted_references(manager, tx, row)
-            continue
-        if row["resource_state"] != "stopped":
-            raise JobError("managed_effect_pending")
-        await _require_resolved(manager, tx, row, found[1])
+async def run_session(worker, ctx, env, config):
+    from .background_execution import SessionToolResult
 
-
-async def _invoke(handler, execution, arguments):
-    seq, call_id = current_invocation(execution.actor.session_id)
-    slot = handler.runtime._managed_completions.reserve(execution.actor, seq, call_id)
-    try:
-        return await _invoke_original(handler, execution, arguments, slot)
-    finally:
-        handler.runtime._managed_completions.release_uncompleted(slot)
-
-
-async def _invoke_original(handler, execution, arguments, slot):
-    runtime, manager, actor = handler.runtime, handler.runtime.manager, execution.actor
-    seq, call_id = current_invocation(actor.session_id)
-    if seq is None or not call_id:
-        raise JobError("persisted_tool_call_required")
-    ref = await manager.store.message_ref(actor.session_id, seq)
-    if execution.resource_evidence.get("_control_state") is not None:
-        from .control_runtime import current
-        current(execution).managed_check = True
-    async with manager._write() as tx:
-        await require_source_resolved(manager, tx, await manager._row(tx, execution.lease.job_id), invocation=(seq, call_id))
-        await validate_call(
-            manager, tx, actor, execution.lease, ref, call_id, handler.definition.name, _hash(arguments)
+    frozen = ctx.descriptor.config[FIELD]
+    registered = env.tool_registry.get(frozen["tool"]) if env.tool_registry is not None else None
+    handler = resolve(registered)
+    if not isinstance(handler, _Handler) or canonical(
+        handler.adapter.contract.to_dict()
+    ) != canonical(frozen["contract"]):
+        return SessionToolResult(
+            "failed", error="definition_unavailable: managed adapter changed",
+            error_code="definition_unavailable",
         )
-    request = {
-        FIELD: {
-            "version": 1,
-            "adapter_key": handler.adapter.contract.key,
-            "contract_hash": handler.adapter.contract.implementation_hash,
-            "tool_name": handler.definition.name,
-            "schema_hash": handler.schema_hash,
-            "arguments_hash": _hash(arguments),
-            "contract": handler.adapter.contract.to_dict(),
-        }
-    }
-    from .tool_call_plans import adopt
-    async with manager._write() as tx:
-        source = await manager._fence(tx, actor, execution.lease)
-        registration = await adopt(manager, tx, source, ref, call_id, request)
-    if registration is None:
-        registration = await manager.register_job(
-            actor, kind="background_tool", title=handler.definition.name, session_id=actor.session_id,
-            parent=execution.lease, call_ref=ref, tool_call_id=call_id, request=request,
+    adapter = handler.adapter
+    key = _state_key(frozen)
+    existing = await worker.runtime.store.get_runtime_state(ctx.session_id, key)
+    if existing and existing.get("result") is not None:
+        result = ManagedToolResult.from_dict(existing["result"])
+        return SessionToolResult(
+            "completed", result.display, usage={}, structured_output=result.to_dict(),
         )
-    if registration.replayed:
-        raise JobError("managed_effect_original_requires_reconciliation")
-    from .managed_claim import claiming
-    from .managed_completion import _persist_local
+    actor = ctx.actor
+    context = _context(worker.runtime.store, actor, frozen, ctx.send_index)
     try:
-        with claiming(runtime._managed_completions, slot, registration):
-            binding = await runtime.claim(actor, registration)
-    except BaseException:
-        await _persist_local(runtime, actor, slot)
-        raise
-    context = ManagedToolContext(runtime, actor, execution.lease, ref, call_id, binding.lease.job_id)
-    prepared, result, error, dispatch_started = None, None, None, False
-    try:
-        async with runtime.execution(binding, owner=True):
-            prepared = await handler.adapter.prepare(context, json.loads(_json(arguments)))
-            handler.check(runtime, handler.definition.name, handler.definition)
-            if type(prepared) is not ManagedToolPreparation:
-                raise JobError("managed_effect_preparation_invalid")
-            prepared = ManagedToolPreparation(_document(prepared.reference), prepared.local_result)
-            async with manager._write() as tx:
-                row = await manager._fence(tx, actor, binding.lease)
-                await _event(
-                    manager,
-                    tx,
-                    row,
-                    "prepared",
-                    {
-                        "version": 1,
-                        "lease": asdict(binding.lease),
-                        "adapter": request[FIELD],
-                        "preparation": prepared.to_dict(),
-                    },
-                )
-            if prepared.local_result is not None:
-                result = prepared.local_result
-            else:
-                handler.check(runtime, handler.definition.name, handler.definition)
-                async with manager._write() as tx:
-                    row = await manager._fence(tx, actor, binding.lease)
-                    await _event(
-                        manager,
-                        tx,
-                        row,
-                        "dispatch",
-                        {"version": 1, "lease": asdict(binding.lease), "preparation_hash": _hash(prepared.to_dict())},
-                    )
-                dispatch_started = True
-                result = await handler.adapter.execute(context, _document(prepared.reference))
-            if type(result) is not ManagedToolResult or len(result.display) > handler.adapter.contract.max_result_chars:
-                raise JobError("managed_effect_result_invalid")
-            result = ManagedToolResult(result.display, result.reference, result.resolution)
-    except BaseException as exc:
-        error = exc
-        if type(result) is not ManagedToolResult or len(result.display) > handler.adapter.contract.max_result_chars:
-            result = None
-    # The owned finite callback coroutine has actually exited. Its business
-    # outcome may still be unknown; that separate obligation blocks closure.
-    binding.stop_renewal.set()
-    pending_display = (
-        "managed effect outcome is unresolved; the host must reconcile the original task " + binding.lease.job_id + "."
-    )
-    if len(pending_display) > handler.adapter.contract.max_result_chars:
-        pending_display = "Managed effect is pending."[: handler.adapter.contract.max_result_chars]
-    if error is not None and not dispatch_started:
+        prepared = await adapter.prepare(context, _document(frozen["arguments"], 131072))
+        if type(prepared) is not ManagedToolPreparation:
+            raise RuntimeRequestError("invalid_options", "managed_effect_preparation_invalid")
+        await _write_state(worker.runtime.store, ctx.session_id, key, {
+            "phase": "dispatched",
+            "preparation": prepared.to_dict(),
+            "contract": frozen["contract"],
+            "result": None,
+        })
+    except Exception as exc:
         result = ManagedToolResult(
-            "The managed effect was not dispatched because its preparation did not complete."[:handler.adapter.contract.max_result_chars],
-            {"decision": "not_dispatched", "job_id": binding.lease.job_id},
+            "The managed effect was not dispatched because preparation did not complete.",
+            {"decision": "not_dispatched", "error": str(exc)[:500]},
             "not_dispatched",
         )
-    payload = {
-        "status": "completed" if error is None else "interrupted",
-        "managed_effect_pending": error is not None and dispatch_started,
-        "managed_effect_result": result.to_dict() if result is not None else None,
-        "display": result.display if result is not None else pending_display,
-        "usage": {},
-    }
-    completion = {
-        "version": 2,
-        "lease": asdict(binding.lease),
-        "exit": "returned" if error is None else "cancelled" if isinstance(error, asyncio.CancelledError) else "raised",
-        "dispatch_started": dispatch_started,
-        "completion": {
-            "outcome": "succeeded" if error is None else "interrupted",
-            "result": payload,
-            "resource_state": "stopped",
-        },
-    }
-    handler.runtime._managed_completions.complete(slot, binding, completion)
-    from .managed_completion import _persist_local
-
-    await _persist_local(handler.runtime, actor, slot)
-    if isinstance(error, asyncio.CancelledError):
-        raise error
-    return payload["display"]
-
-
-async def record_registration(manager, tx, row, operation, binding):
-    event = await tx.fetchone(f"SELECT request_hash FROM {manager.events} WHERE event_id=?", (operation.operation_id,))
-    await _event(
-        manager,
-        tx,
-        row,
-        "registered",
-        {
-            "version": 1,
-            "binding": binding,
-            "creation_id": operation.operation_id,
-            "creation_hash": event["request_hash"],
-            "source_job_id": row["parent_job_id"],
-        },
-    )
-
-
-async def _registered(manager, tx, row, creation, binding):
-    found = await _read_event(manager, tx, _id(manager, "registered", row["job_id"], 0))
-    expected = {
-        "version": 1,
-        "binding": binding,
-        "creation_id": creation["event_id"],
-        "creation_hash": creation["request_hash"],
-        "source_job_id": row["parent_job_id"],
-    }
-    if (
-        found[0]["event_type"] != "managed_effect_registered"
-        or found[0]["job_id"] != row["job_id"]
-        or found[0]["delivery_status"] != "not_applicable"
-        or _hash(found[1]) != _hash(expected)
-    ):
-        raise JobError("managed_effect_evidence_corrupt")
-
-
-async def require_owned_resolved(manager, tx, owner):
-    rows = await tx.fetchall(
-        f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=? AND kind='background_tool' ORDER BY job_id LIMIT 1001",
-        (owner["job_id"],),
-    )
-    if len(rows) > 1000:
-        raise JobError("managed_effect_history_requires_compaction")
-    for row in rows:
-        found = await descriptor(manager, tx, row)
-        if found is None:
-            continue
-        if row["generation"] == 0:
-            await unstarted_references(manager, tx, row)
-            continue
-        await _require_resolved(manager, tx, row, found[1])
-
-
-async def _require_resolved(manager, tx, row, binding):
-    if row["resource_state"] != "stopped" or row["result_status"] != "handled":
-        raise JobError("managed_effect_pending")
-    from .result_revisions import result_id
-
-    identity = result_id(row["job_id"], row["generation"])
-    length = (
-        "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
-    )
-    size = await tx.fetchone(f"SELECT {length} AS n FROM {manager.events} WHERE event_id=?", (identity,))
-    if size is None or size["n"] is None or size["n"] > 65536:
-        raise JobError("managed_effect_result_missing")
-    event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (identity,))
-    payload = _document(json.loads(event["payload_json"]), 65536)
-    if (
-        event["job_id"] != row["job_id"]
-        or event["event_type"] != "result"
-        or event["delivery_status"] != "handled"
-        or payload.get("resource_state") != row["resource_state"]
-        or payload.get("outcome") != row["outcome"]
-        or type(payload.get("result")) is not dict
-        or type(payload["result"].get("managed_effect_pending")) is not bool
-        or _hash(payload.get("result")) != _hash(json.loads(row["result_json"] or "null"))
-    ):
-        raise JobError("managed_effect_result_mismatch")
-    if (
-        payload["result"].get("managed_effect_pending") is True
-        and await _observation(manager, tx, row, binding, required=False) is None
-    ):
-        raise JobError("managed_effect_pending")
-    await require_closed(manager, tx, row, event)
-
-
-async def _never_claimed(manager, tx, row):
-    if (
-        row["generation"] != 0
-        or row["executor_id"] is not None
-        or row["boot_id"] is not None
-    ):
-        raise JobError("managed_effect_unstarted_conflict")
-    history = await tx.fetchone(
-        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND (event_type IN ('execution_scope','execution_member') OR event_type LIKE 'managed_effect_%' AND event_type NOT IN ('managed_effect_registered','managed_effect_unstarted','managed_effect_raw_receipt','managed_effect_delivery')) LIMIT 1",
-        (row["job_id"],),
-    )
-    children = await tx.fetchone(
-        f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? OR control_owner_job_id=? LIMIT 1",
-        (row["job_id"], row["job_id"]),
-    )
-    # An admitted member edge is stored on its owner, independently of the
-    # child's mutable row and scope. Losing both cannot erase that first claim.
-    from .execution_membership import member_id
-
-    membership = await tx.fetchone(
-        f"SELECT event_id FROM {manager.events} WHERE event_id=?", (member_id(manager, row["job_id"], 1),)
-    )
-    if history is not None or children is not None or membership is not None:
-        raise JobError("managed_effect_unstarted_conflict")
-
-
-def _unstarted_payload(row):
-    result = ManagedToolResult(
-        "The original managed effect was cancelled before execution.",
-        {"job_id": row["job_id"], "decision": "not_dispatched"},
-        "not_dispatched",
-    )
-    return {
-        "outcome": "cancelled",
-        "resource_state": "stopped",
-        "unstarted": True,
-        "result": {
-            "status": "cancelled",
-            "managed_effect_pending": False,
-            "managed_effect_result": result.to_dict(),
-            "display": result.display,
-            "usage": {},
-        },
-    }
-
-
-async def unstarted_references(manager, tx, row):
-    """Original negative disposition, not a fabricated tool/model acknowledgement."""
-    found = await descriptor(manager, tx, row)
-    if found is None:
-        raise JobError("finalization_adapter_required")
-    await _never_claimed(manager, tx, row)
-    creation, binding = found
-    await raw_receipt(manager, tx, row, creation, binding, required=False)
-    payload = _unstarted_payload(row)
-    result_id = "result_" + row["job_id"]
-    result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id,))
-    terminal = await _read_event(manager, tx, _id(manager, "unstarted", row["job_id"], 0))
-    expected = {
-        "version": 1,
-        "decision": "never_claimed",
-        "creation_id": creation["event_id"],
-        "creation_hash": creation["request_hash"],
-        "binding": binding,
-        "result_id": result_id,
-        "result_hash": _hash(payload),
-    }
-    if (
-        row["resource_state"] != "stopped"
-        or row["intake"] != "closed"
-        or row["outcome"] != "cancelled"
-        or row["result_status"] != "suppressed"
-        or _hash(json.loads(row["result_json"] or "null")) != _hash(payload["result"])
-        or result is None
-        or result["job_id"] != row["job_id"]
-        or result["event_type"] != "result"
-        # Handling the separate review notice does not execute this action or
-        # change the canonical suppressed disposition on the job.
-        or result["delivery_status"] not in ("suppressed", "handled")
-        or _hash(json.loads(result["payload_json"])) != _hash(payload)
-        or terminal[0]["job_id"] != row["job_id"]
-        or terminal[0]["event_type"] != "managed_effect_unstarted"
-        or terminal[0]["delivery_status"] != "not_applicable"
-        or _hash(terminal[1]) != _hash(expected)
-    ):
-        raise JobError("managed_effect_unstarted_evidence_mismatch")
-    from .finalization import _reference
-
-    return [
-        await _reference(manager, tx, key)
-        for key in (
-            creation["event_id"],
-            _id(manager, "registered", row["job_id"], 0),
-            result_id,
-            terminal[0]["event_id"],
+        await _write_state(worker.runtime.store, ctx.session_id, key, {
+            "phase": "completed", "preparation": None, "contract": frozen["contract"],
+            "result": result.to_dict(),
+        })
+        return SessionToolResult(
+            "completed", result.display, usage={}, structured_output=result.to_dict(),
         )
-    ]
-
-
-async def terminate_unstarted(manager, actor, job):
-    """Cancel a provably unclaimed effect atomically; never invoke host callbacks."""
-    async with manager._write() as tx:
-        return await terminate_unstarted_tx(manager, tx, actor, job)
-
-
-async def terminate_unstarted_tx(manager, tx, actor, job):
-    """Same original negative closure, within an existing SDK control transaction."""
-    row = await manager._authorize(tx, actor, job)
-    found = await descriptor(manager, tx, row)
-    if found is None:
-        raise JobError("finalization_adapter_required")
-    await _never_claimed(manager, tx, row)
-    if row["resource_state"] == "stopped":
-        await unstarted_references(manager, tx, row)
-    else:
-        if (
-            row["resource_state"] != "not_started"
-            or row["status"] not in ("queued", "cancelled")
-            or row["intake"] not in ("open", "closed")
-        ):
-            raise JobError("managed_effect_unstarted_conflict")
-        if (
-            await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", ("result_" + job,))
-            is not None
-        ):
-            raise JobError("managed_effect_unstarted_evidence_mismatch")
-        creation, binding = found
-        payload = _unstarted_payload(row)
-        version = row["version"] + 1
-        await tx.write_job(job, f"UPDATE {manager.jobs} SET status='settling',outcome='cancelled',resource_state='stopped',intake='closed',result_status='suppressed',result_json=?,version=?,updated_at=? WHERE job_id=?", (_json(payload["result"]), version, manager.now(), job), obligations=True)
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), ("result_" + job, job, "result", version, _json(payload), "suppressed", manager.now()))
-        row = await manager._row(tx, job)
-        await _event(
-            manager,
-            tx,
-            row,
-            "unstarted",
-            {
-                "version": 1,
-                "decision": "never_claimed",
-                "creation_id": creation["event_id"],
-                "creation_hash": creation["request_hash"],
-                "binding": binding,
-                "result_id": "result_" + job,
-                "result_hash": _hash(payload),
-            },
+    if prepared.local_result is not None:
+        result = prepared.local_result
+        await _write_state(worker.runtime.store, ctx.session_id, key, {
+            "phase": "completed", "preparation": prepared.to_dict(),
+            "contract": frozen["contract"], "result": result.to_dict(),
+        })
+        return SessionToolResult(
+            "completed", result.display, usage={}, structured_output=result.to_dict(),
         )
-    from .finalization import _finish
-
-    reference = await _finish(manager, tx, row, set())
-    return {
-        "job_id": job,
-        "generation": 0,
-        "resolution": "not_dispatched",
-        "closure": reference,
-        "execution_authority": False,
-        "billing_settled": False,
-        "tool_receipt_written": False,
-    }
-
-async def _receipt_content(manager, tx, receipt_ref, job, tool_name):
-    from .jobs import JobActor
-
-    actor = JobActor(job["tenant_id"], job["principal_id"], receipt_ref.session_id)
-    await manager._validate_ref(tx, actor, receipt_ref, role="tool", metadata_only=True)
-    length = "length(CAST(content AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(content)"
-    size = await tx.fetchone(
-        f"SELECT {length} AS n FROM {manager.store.t.messages} WHERE session_id=? AND id=?",
-        (receipt_ref.session_id, receipt_ref.id),
-    )
-    if size is None or size["n"] is None or size["n"] > 16384:
-        raise JobError("managed_effect_receipt_too_large")
-    raw = await tx.fetchone(
-        f"SELECT content,name FROM {manager.store.t.messages} WHERE session_id=? AND id=?",
-        (receipt_ref.session_id, receipt_ref.id),
-    )
-    if raw["name"] != tool_name:
-        raise JobError("managed_effect_receipt_mismatch")
-    return raw["content"]
-
-
-async def raw_receipt(manager, tx, row, creation, binding, *, required=True):
-    found = await _read_event(manager, tx, _id(manager, "raw_receipt", row["job_id"], 0), required=required)
-    if found is None:
-        return None
-    event, value = found
     try:
-        ref = _ref(value["receipt_ref"])
-        call = _ref(json.loads(creation["call_ref_json"]))
-        if (
-            set(value)
-            != {
-                "version",
-                "creation_id",
-                "creation_hash",
-                "binding",
-                "receipt_ref",
-                "content_hash",
-                "acknowledges_result",
-            }
-            or type(value["version"]) is not int
-            or value["version"] != 1
-            or value["acknowledges_result"] is not False
-            or event["job_id"] != row["job_id"]
-            or event["event_type"] != "managed_effect_raw_receipt"
-            or event["delivery_status"] != "not_applicable"
-            or value["binding"] != binding
-            or value["creation_id"] != creation["event_id"]
-            or value["creation_hash"] != creation["request_hash"]
-            or (ref.session_id, ref.send_index, ref.tool_call_id)
-            != (call.session_id, call.send_index, creation["tool_call_id"])
-            or ref.seq <= call.seq
-            or json.loads(creation["receipt_ref_json"] or "null") != ref.to_dict()
-            or _hash(await _receipt_content(manager, tx, ref, row, binding["tool_name"])) != value["content_hash"]
-        ):
-            raise ValueError()
-    except (KeyError, ValueError, TypeError):
-        raise JobError("managed_effect_raw_receipt_mismatch") from None
-    return found
-
-
-async def read_raw_receipt(manager, actor, job):
-    """Read original call/response coordinates; this acknowledges no outcome."""
-    from .task_history import _snapshot
-
-    async with _snapshot(manager) as tx:
-        row = await manager._authorize(tx, actor, job)
-        found = await descriptor(manager, tx, row)
-        if found is None:
-            raise JobError("managed_effect_evidence_missing")
-        creation, binding = found
-        event, value = await raw_receipt(manager, tx, row, creation, binding)
-        return {
-            "job_id": job,
-            "call_ref": json.loads(creation["call_ref_json"]),
-            "receipt_ref": value["receipt_ref"],
-            "content_hash": value["content_hash"],
-            "observation_id": event["event_id"],
-            "observation_hash": event["request_hash"],
-            "acknowledges_result": False,
-            "execution_authority": False,
-            "resource_stop_confirmed": False,
-            "billing_settled": False,
-        }
-
-
-@_verify_stored
-async def reconcile_raw_receipt(manager, actor, job):
-    """Index one retained original tool row; never synthesize a row or execute."""
-    from .jobs import JobActor
-    from .task_history import _snapshot
-
-    async with _snapshot(manager) as tx:
-        row = await manager._authorize(tx, actor, job)
-        found = await descriptor(manager, tx, row)
-        if found is None:
-            raise JobError("managed_effect_evidence_missing")
-        creation, binding = found
-        call = _ref(json.loads(creation["call_ref_json"]))
-        if creation["receipt_ref_json"]:
-            ref = _ref(json.loads(creation["receipt_ref_json"]))
-        else:
-            rows = await tx.fetchall(
-                f"SELECT id,seq,role,tool_call_id,send_index,round_index FROM {manager.store.t.messages} WHERE session_id=? AND role='tool' AND tool_call_id=? AND send_index=? AND seq>? ORDER BY seq LIMIT 2",
-                (call.session_id, creation["tool_call_id"], call.send_index, call.seq),
-            )
-            if not rows:
-                return None
-            if len(rows) != 1:
-                raise JobError("managed_effect_receipt_ambiguous")
-            from .message_ref import MessageRef
-
-            item = rows[0]
-            ref = MessageRef(
-                manager.store.store_id,
-                call.session_id,
-                int(item["id"]),
-                int(item["seq"]),
-                item["role"],
-                item["tool_call_id"],
-                item["send_index"],
-                item["round_index"],
-            )
-        original_actor = JobActor(row["tenant_id"], row["principal_id"], call.session_id)
-        operation_id = creation["event_id"]
-    # The binding transaction rechecks original lineage, call/row coordinates
-    # and any concurrent binding. The historical source grants no execution.
-    await manager.reconcile_receipt(original_actor, operation_id, ref)
-    return await read_raw_receipt(manager, actor, job)
-
-
-async def bind_receipt(manager, tx, row, creation, receipt_ref):
-    found = await descriptor(manager, tx, row)
-    if found is None:
-        raise JobError("managed_effect_evidence_missing")
-    _, binding = found
-    content = await _receipt_content(manager, tx, receipt_ref, row, binding["tool_name"])
-    call = _ref(json.loads(creation["call_ref_json"]))
-    if (receipt_ref.session_id, receipt_ref.send_index, receipt_ref.tool_call_id) != (
-        call.session_id,
-        call.send_index,
-        creation["tool_call_id"],
-    ):
-        raise JobError("managed_effect_receipt_mismatch")
-    # Observation of a real tool row is separate from acknowledging a canonical
-    # effect result. Error rows can be indexed without inventing either result.
-    await _event(
-        manager,
-        tx,
-        {**row, "generation": 0},
-        "raw_receipt",
-        {
-            "version": 1,
-            "creation_id": creation["event_id"],
-            "creation_hash": creation["request_hash"],
-            "binding": binding,
-            "receipt_ref": receipt_ref.to_dict(),
-            "content_hash": _hash(content),
-            "acknowledges_result": False,
-        },
+        result = await adapter.execute(context, _document(prepared.reference))
+        if type(result) is not ManagedToolResult or len(result.display) > adapter.contract.max_result_chars:
+            raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
+    except Exception as exc:
+        await _write_state(worker.runtime.store, ctx.session_id, key, {
+            "phase": "unknown", "preparation": prepared.to_dict(),
+            "contract": frozen["contract"], "result": None,
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+        })
+        return SessionToolResult(
+            "interrupted",
+            "Managed effect outcome is unknown; query the original adapter to recover it.",
+            error="managed effect outcome is unknown",
+            error_code="interrupted",
+            structured_output={"managed_effect_pending": True},
+        )
+    await _write_state(worker.runtime.store, ctx.session_id, key, {
+        "phase": "completed", "preparation": prepared.to_dict(),
+        "contract": frozen["contract"], "result": result.to_dict(),
+    })
+    return SessionToolResult(
+        "completed", result.display, usage={}, structured_output=result.to_dict(),
     )
-    # Once the resolved outcome has its own main-inbox obligation, replaying
-    # the old tool receipt must not acknowledge that new responsibility.
-    delivery = await _read_event(manager, tx, _id(manager, "delivery", row["job_id"], row["generation"]), required=False)
-    if delivery is not None:
-        from .managed_delivery import read, result_event
-
-        await read(manager, tx, row, await result_event(manager, tx, row))
-        return
-    result = json.loads(row["result_json"] or "null")
-    if row["generation"] == 0 or type(result) is not dict or type(result.get("display")) is not str:
-        return
-    raw = {"content": content}
-    if raw["content"] != result["display"]:
-        return
-    from .result_revisions import result_id
-
-    result_event = await tx.fetchone(
-        f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'",
-        (result_id(row["job_id"], row["generation"]),),
-    )
-    if result_event is None or _hash(json.loads(result_event["payload_json"])["result"]) != _hash(result):
-        raise JobError("managed_effect_result_missing")
-    await _event(
-        manager,
-        tx,
-        row,
-        "tool_receipt",
-        {
-            "version": 1,
-            "lease": {
-                "job_id": row["job_id"],
-                "executor_id": row["executor_id"],
-                "boot_id": row["boot_id"],
-                "generation": row["generation"],
-            },
-            "creation_id": creation["event_id"],
-            "result_id": result_event["event_id"],
-            "result_hash": _hash(json.loads(result_event["payload_json"])),
-            "receipt_ref": receipt_ref.to_dict(),
-            "display_hash": _hash(raw["content"]),
-        },
-    )
-    await tx.update_event(row["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_event["event_id"],))
-    await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET result_status='handled' WHERE job_id=?", (row["job_id"],), obligations=True)
 
 
-async def resolved_execution(manager, tx, row, result_event):
-    found = await descriptor(manager, tx, row)
-    if found is None:
-        raise JobError("finalization_adapter_required")
-    creation, binding = found
-    await _registered(manager, tx, row, creation, binding)
-    from .finalization import _reference
-
-    refs = [
-        await _reference(manager, tx, creation["event_id"]),
-        await _reference(manager, tx, _id(manager, "registered", row["job_id"], 0)),
-    ]
-    prepared = await _evidence(manager, tx, row, "prepared", required=False)
-    exited = await _evidence(manager, tx, row, "resource_exit")
-    proof = {
-        "job_id": row["job_id"],
-        "executor_id": row["executor_id"],
-        "boot_id": row["boot_id"],
-        "generation": row["generation"],
-    }
-    if (
-        exited[0]["event_type"] != "managed_effect_resource_exit"
-        or exited[1].get("lease") != proof
-        or exited[1].get("exit") not in ("returned", "raised", "cancelled")
-        or type(exited[1].get("dispatch_started")) is not bool
-    ):
-        raise JobError("managed_effect_resource_exit_unconfirmed")
-    if exited[1]["version"] == 2:
-        from .managed_completion import validate_exit
-        from .result_payloads import require_replay
-
-        checkpoint = await validate_exit(manager, tx, row, found)
-        require_replay(json.loads(result_event["payload_json"]), checkpoint["completion"])
-        refs.append(await _reference(manager, tx, _id(manager, "completion", row["job_id"], row["generation"])))
-    result_payload = _document(json.loads(result_event["payload_json"]), 65536)
-    result = result_payload.get("result")
-    if (result_event["job_id"] != row["job_id"] or result_event["event_type"] != "result"
-            or result_payload.get("outcome") != row["outcome"]
-            or result_payload.get("resource_state") != "stopped" or row["resource_state"] != "stopped"
-            or type(result) is not dict or _hash(result) != _hash(json.loads(row["result_json"] or "null"))
-            or type(result.get("managed_effect_pending")) is not bool):
-        raise JobError("managed_effect_result_mismatch")
-    if prepared is not None:
-        if (
-            prepared[0]["event_type"] != "managed_effect_prepared"
-            or prepared[1].get("lease") != proof
-            or prepared[1].get("adapter") != binding
-        ):
-            raise JobError("managed_effect_evidence_corrupt")
-        refs.append(await _reference(manager, tx, prepared[0]["event_id"]))
-    if exited[1]["dispatch_started"]:
-        dispatched = await _evidence(manager, tx, row, "dispatch")
-        if (
-            prepared is None
-            or dispatched[0]["event_type"] != "managed_effect_dispatch"
-            or dispatched[1].get("lease") != proof
-            or dispatched[1].get("preparation_hash") != _hash(prepared[1]["preparation"])
-        ):
-            raise JobError("managed_effect_evidence_corrupt")
-        refs.append(await _reference(manager, tx, dispatched[0]["event_id"]))
-    if result.get("managed_effect_pending") is True:
-        observation = await _observation(manager, tx, row, binding)
-        if (
-            observation[0]["event_type"] != "managed_effect_observation"
-            or observation[1].get("lease") != proof
-            or observation[1].get("adapter") != binding
-        ):
-            raise JobError("managed_effect_evidence_corrupt")
-        observed_result = ManagedToolResult.from_dict(observation[1]["result"])
-        if prepared is None and observed_result.resolution != "not_dispatched":
-            raise JobError("managed_effect_evidence_missing")
-        refs.append(await _reference(manager, tx, observation[0]["event_id"]))
-    else:
-        observed_result = ManagedToolResult.from_dict(result["managed_effect_result"])
-        if prepared is None and (observed_result.resolution != "not_dispatched" or exited[1]["dispatch_started"]):
-            raise JobError("managed_effect_evidence_missing")
-    refs.append(await _reference(manager, tx, exited[0]["event_id"]))
-    return refs, observed_result, result, found
-
-
-async def require_closed(manager, tx, row, result_event):
-    refs, _, result, found = await resolved_execution(manager, tx, row, result_event)
-    creation, binding = found
-    from .finalization import _reference
-    from .managed_delivery import handled_references
-    from .managed_delivery import read as read_delivery
-
-    notice = await read_delivery(manager, tx, row, result_event, required=False)
-    if notice is not None:
-        refs.extend(await handled_references(manager, tx, row, result_event, notice))
-        observed_raw = await raw_receipt(manager, tx, row, creation, binding, required=creation["receipt_ref_json"] is not None)
-        if observed_raw is not None:
-            refs.append(await _reference(manager, tx, observed_raw[0]["event_id"]))
-        return refs
-    observed_raw = await raw_receipt(manager, tx, row, creation, binding)
-    refs.append(await _reference(manager, tx, observed_raw[0]["event_id"]))
-    receipt = await _evidence(manager, tx, row, "tool_receipt")
-    if (
-        receipt[0]["event_type"] != "managed_effect_tool_receipt"
-        or receipt[1].get("lease") != _proof(row)
-        or receipt[1].get("result_id") != result_event["event_id"]
-        or receipt[1].get("result_hash") != _hash(json.loads(result_event["payload_json"]))
-        or receipt[1].get("display_hash") != _hash(result["display"])
-        or json.loads(creation["receipt_ref_json"] or "null") != receipt[1].get("receipt_ref")
-        or row["result_status"] != "handled"
-        or result_event["delivery_status"] != "handled"
-    ):
-        raise JobError("managed_effect_receipt_mismatch")
-    refs.append(await _reference(manager, tx, receipt[0]["event_id"]))
-    return refs
-
-
-@_verify_stored
-async def reconcile(runtime, actor, job, adapter):
-    """Original observation only; never prepare/dispatch or claim a new lease."""
-    if not isinstance(adapter, ManagedTool) or type(adapter.contract) is not ManagedToolContract:
-        raise JobError("managed_effect_adapter_invalid")
-    manager = runtime.manager
-    from .task_history import _snapshot
-
-    contract_json = _json(adapter.contract.to_dict())
-
-    async with _snapshot(manager) as tx:
-        row = await manager._authorize(tx, actor, job)
-        found = await descriptor(manager, tx, row)
-        if found is None:
-            raise JobError("managed_effect_evidence_missing")
-        creation, descriptor_value = found
-        await _registered(manager, tx, row, creation, descriptor_value)
-        if _json(descriptor_value["contract"]) != contract_json:
-            raise JobError("managed_effect_binding_changed")
-        source_actor, source_proof, ref = await _original(manager, tx, row, creation, descriptor_value)
-        context = ManagedToolContext(runtime, source_actor, source_proof, ref, creation["tool_call_id"], job)
-        prepared = await _evidence(manager, tx, row, "prepared", required=False)
-        if prepared is not None and _json(prepared[1]["adapter"]) != _json(descriptor_value):
-            raise JobError("managed_effect_binding_changed")
-        reference = prepared[1]["preparation"]["reference"] if prepared is not None else None
-    result = await adapter.recover(context, reference)
+async def reconcile(store, actor, start: InputRef, adapter: ManagedTool, *, client=None):
+    """Query the original adapter and route a late result as a new ordinary send."""
+    port = RuntimeInputStore(store)
+    target = TargetRef(start.store_id, start.session_id)
+    session = await port.authorize(port.db, target, actor)
+    frozen = json.loads(session["descriptor_json"])["config"].get(FIELD)
+    if frozen is None or canonical(frozen["contract"]) != canonical(adapter.contract.to_dict()):
+        raise RuntimeRequestError("forbidden", "managed adapter or original call mismatch")
+    key = _state_key(frozen)
+    state = await store.get_runtime_state(target.session_id, key)
+    if state is None:
+        raise RuntimeRequestError("not_found", "managed preparation")
+    if state.get("result") is not None:
+        return ManagedToolResult.from_dict(state["result"])
+    if state.get("phase") != "unknown":
+        return None
+    original = await port.get_result(start, actor=actor)
+    if original is None or original.status != "interrupted":
+        return None
+    context = _context(store, actor, frozen, original.send_index)
+    result = await adapter.recover(context, _document(state["preparation"]["reference"]))
     if result is None:
         return None
-    if type(result) is not ManagedToolResult or len(result.display) > adapter.contract.max_result_chars:
-        raise JobError("managed_effect_result_invalid")
-    result = ManagedToolResult(result.display, result.reference, result.resolution)
-    if type(adapter.contract) is not ManagedToolContract or _json(adapter.contract.to_dict()) != contract_json:
-        raise JobError("managed_effect_binding_changed")
-    async with manager._write() as tx:
-        current = await manager._authorize(tx, actor, job)
-        if current["generation"] != row["generation"]:
-            raise JobError("managed_effect_generation_changed")
-        if await descriptor(manager, tx, current) != found:
-            raise JobError("managed_effect_binding_changed")
-        if await _evidence(manager, tx, current, "prepared", required=False) != prepared:
-            raise JobError("managed_effect_evidence_conflict")
-        await _event(
-            manager,
-            tx,
-            current,
-            "observation",
-            {
-                "version": 1,
-                "lease": {
-                    "job_id": current["job_id"],
-                    "executor_id": current["executor_id"],
-                    "boot_id": current["boot_id"],
-                    "generation": current["generation"],
-                },
-                "adapter": descriptor_value,
-                "result": result.to_dict(),
-            },
+    if type(result) is not ManagedToolResult:
+        raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
+    message_id = "inp_" + sha256_canonical([
+        "managed_recover", target.store_id, target.session_id, start.message_id,
+        original.send_index,
+    ])[:56]
+    receipt = await port.accept(
+        target,
+        {FIELD: "recovered", "result": result.to_dict()},
+        message_id=message_id,
+        actor=actor,
+    )
+    batch = await port.claim(target, node_id="managed-recovery", boot_id="managed-recovery")
+    final_batch = None
+    if batch is not None:
+        final_batch = await port.final(
+            batch,
+            final_text=result.display,
+            structured_output=result.to_dict(),
         )
+    if client is not None and final_batch is not None and final_batch.result_activation is not None:
+        parent = final_batch.result_activation
+        result_ref = final_batch.result_ref
+        await client._notify(parent, result_ref.message_id, result_ref, ["work", "activation"])
+    recovered = await port.get_result(receipt.input_ref, actor=actor)
+    if recovered is None or recovered.status != "completed":
+        return None
+    await _write_state(store, target.session_id, key, {
+        **state,
+        "phase": "completed",
+        "result": result.to_dict(),
+        "recovered_send_index": recovered.send_index,
+    })
     return result
+
+
+__all__ = [
+    "FunctionManagedTool",
+    "ManagedTool",
+    "ManagedToolContract",
+    "ManagedToolContext",
+    "ManagedToolPreparation",
+    "ManagedToolResult",
+    "bind",
+    "reconcile",
+]

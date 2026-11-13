@@ -16,25 +16,22 @@ def finite_delegation(loop) -> bool:
 
 
 async def session_role(store, sid: str) -> str:
-    row = await store.session_snapshot(sid)
+    row = await store._db.fetchone(
+        f"SELECT parent_session_id,session_kind,descriptor_json FROM {store.t.sessions} "
+        "WHERE session_id=?", (sid,),
+    )
     if row is None:
         raise ValueError("execution_role_unavailable")
-    meta = row.metadata or {}
-    role = meta.get("execution_role")
-    if meta.get("kind") == "wf_driver":
-        if role not in (None, "workflow"):
-            raise ValueError("execution_role_conflict")
+    if row["session_kind"] == "workflow_driver":
         return "workflow"
-    # Workflow driver cleanup reparents retained leaves to NULL. Their host
-    # role remains authoritative; a removed parent must never promote a leaf.
-    if role in ("workflow_node", "subagent"):
-        return role
-    if row.parent_session_id is None:
-        if meta.get("workflow_run_id") or meta.get("standalone_subagent"):
-            raise ValueError("execution_role_unavailable")
-        if role not in (None, "main"):
-            raise ValueError("execution_role_conflict")
+    if row["parent_session_id"] is None:
         return "main"
+    import json
+    config = json.loads(row["descriptor_json"]).get("config") or {}
+    if "child_spec" in config:
+        return "subagent"
+    if row["session_kind"] == "background":
+        return "subagent"
     raise ValueError("execution_role_unavailable")
 
 
