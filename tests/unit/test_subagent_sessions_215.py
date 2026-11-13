@@ -6,7 +6,13 @@ import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService
+from power_loop import (
+    AgentLoopConfig,
+    LLMResponse,
+    LLMService,
+    MemoryMessageTransport,
+    MemorySessionOwnershipCoordinator,
+)
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_types import (
     InputRef,
@@ -105,6 +111,103 @@ async def test_create_retry_wait_result_and_continue(registry_store):
         assert second_parent_result.message_id != parent_result.message_id
     finally:
         await runner.aclose()
+
+
+async def test_notifications_lost_still_runs_child_and_routes_result_by_polling(
+    registry_store, monkeypatch,
+):
+    store, connect = registry_store
+    other = await connect(schema="verify")
+    coordinator = MemorySessionOwnershipCoordinator()
+    transport = MemoryMessageTransport()
+    parent = await RunningAgent(
+        store, ParentAndChild(), ToolRegistry(), AgentLoopConfig(compactor=None), capacity=3,
+        coordinator=coordinator, transport=transport,
+    ).start()
+    child = await RunningAgent(
+        other, ParentAndChild(), ToolRegistry(), AgentLoopConfig(compactor=None), capacity=3,
+        coordinator=coordinator, transport=transport,
+    ).start()
+    register_spawn_agent(parent.registry)
+    register_spawn_agent(child.registry)
+
+    async def lost_notify(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(parent.runtime.client, "_notify", lost_notify)
+    monkeypatch.setattr(child.runtime.client, "_notify", lost_notify)
+    try:
+        initial = await parent.runtime.client.send(
+            parent.target, "delegate", message_id="delegate", actor=parent.actor,
+        )
+        await parent.runtime.worker.recover()
+        initial_result = await parent.runtime.client.wait(
+            initial.input_ref, actor=parent.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert initial_result.status == "completed"
+        await parent.finish(initial.input_ref)
+        rows = await store.load_all_messages(parent.target.session_id)
+        receipt = json.loads(next(row.content for row in rows if row.tool_call_id == "spawn"))
+        start = InputRef(**receipt["input_ref"])
+        child_target = TargetRef(**receipt["target_ref"])
+        assert (await child.runtime.client.inspect(start, actor=child.actor)).input_state == "pending"
+
+        await child.runtime.worker.recover()
+        child_result = await parent.runtime.client.wait(
+            start, actor=parent.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert child_result.status == "completed" and child_result.final_text == "child result"
+        await child.drain()
+
+        parent_ref = InputRef(
+            store.store_id, parent.target.session_id,
+            result_message_id(child_target, start, 1, "agent_result"),
+        )
+        await parent.runtime.worker.recover()
+        await parent.drain(after_input=parent_ref)
+        handled = await parent.runtime.client.wait(
+            parent_ref, actor=parent.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert handled.status == "completed" and handled.final_text == "parent handled child"
+        parent_rows = await store._db.fetchall(
+            f"SELECT item_id,terminal_status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='agent_result'",
+            (parent.target.session_id,),
+        )
+        assert parent_rows == [{"item_id": parent_ref.message_id, "terminal_status": "completed"}]
+    finally:
+        await child.aclose()
+        await parent.aclose()
+        await transport.aclose()
+
+
+async def test_follow_up_idempotence_preserves_text_and_running_session(registry_store):
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    running = await port.accept(root, "initial", message_id="initial", actor=ACTOR)
+    batch = await port.claim(root, node_id="a", boot_id="a")
+    body = "  NUDGED-42\n    keep indentation\n"
+    first = await port.accept(root, body, message_id="nudge", actor=ACTOR)
+    duplicate = await port.accept(root, body, message_id="nudge", actor=ACTOR)
+    assert first.newly_accepted and not duplicate.newly_accepted
+    assert duplicate.input_ref == first.input_ref
+
+    state = await store._db.fetchone(
+        f"SELECT execution_state,active_send_index,inbox_version FROM {store.t.session_state} "
+        "WHERE session_id=?",
+        (root.session_id,),
+    )
+    assert state == {"execution_state": "running", "active_send_index": 1, "inbox_version": 2}
+    row = await store._db.fetchone(
+        f"SELECT content_json,status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='nudge'",
+        (root.session_id,),
+    )
+    assert json.loads(row["content_json"]) == body and row["status"] == "pending"
+    assert await port.get_result(running.input_ref, actor=ACTOR) is None
+    await port.final(batch, final_text="original completed")
+    original = await port.get_result(running.input_ref, actor=ACTOR)
+    assert original.status == "completed" and original.send_index == 1
 
 
 async def test_same_tool_call_retries_one_child_and_grant_cannot_expand(registry_store):

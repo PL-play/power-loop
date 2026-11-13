@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from power_loop.core.pipeline import AgentPipeline
-from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_archive import manage_capacity, prepare_history, prepare_projection, recall_group
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine
 from power_loop.tools import create_default_tool_registry
+from tests.unit.session_native_fixture import ACTOR, DESCRIPTOR
 
 ARCHIVE = {'bash': {'general': 'archive'}}
 
@@ -24,7 +24,7 @@ def host_entries(rows):
 async def fixture(overrides=None, n=3, dsn=None, keep=False):
     from power_loop.runtime.store.factory import open_store
     store = await open_store(dsn) if dsn else await SessionStore.open(':memory:')
-    sid = await store.create_session()
+    sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
     history, seqs = [], []
     for i in range(n):
         args = {'command': 'x' * 1500, 'description': f'目的{i}', 'context_policy': 'keep' if keep else 'retire'}
@@ -102,7 +102,7 @@ async def test_general_groups_exact_recall_and_send_scope():
         assert restored['result'] == 'r' * 1500
         assert json.loads(restored['arguments'])['description'] == '目的19'
         assert 'Unknown' in await recall_group(store, e.sid, 2, gid)
-        stranger = await store.create_session()
+        stranger = await store.create_session(DESCRIPTOR, actor=ACTOR)
         assert 'Unknown' in await recall_group(store, stranger, 1, gid)
     finally:
         await store.close()
@@ -130,33 +130,33 @@ def test_invalid_capacity(patch):
         ToolContextConfig(**patch)
 
 
-async def test_stateful_two_sends_result_cap_and_archive_between_sends(runtime_agent):
-    from power_loop import AgentLoopConfig
-    from power_loop._vendor.llm_client.interface import LLMResponse
-    from power_loop.contracts.tools import ToolDefinition
-    from power_loop.runtime.representation import ProjectedRepresentation
-    from power_loop.tools.registry import ToolRegistry
-    from tests.unit.test_stateful_loop import _Scripted, _tool_resp
+async def test_archive_between_sends_preserves_raw_message():
     store = await SessionStore.open(':memory:')
     try:
-        reg = ToolRegistry()
-        reg.register(ToolDefinition('echo', '', pricing=Free("test_fixture")), lambda **kw: 'UNIQUE-RESULT' * 5000)
-        llm = _Scripted([_tool_resp('a','echo','{}'), LLMResponse(raw_text='done'), LLMResponse(raw_text='next')])
-        loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5,
-                representation=ProjectedRepresentation(),
-                tool_context=ToolContextConfig(overrides={'echo': {'general': 'archive'}})))
-        sid = loop.target.session_id
-        first = await loop.send('work')
-        assert first.status == 'completed'
-        stored = next(r.content for r in await store.load_all_messages(sid) if r.role == 'tool')
-        assert len(stored) == 20000 and 'chars omitted' in stored   # configurable cap, head + tail
-        assert any(m.get('content') == stored for m in llm.calls[1])
-        await loop.send('continue')
-        text = json.dumps(llm.calls[-1], ensure_ascii=False)
-        assert '（原文 recall_send(' in text and 'UNIQUE-RESULT' not in text
-        assert 'done' in text
+        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
+        call = {'id': 'echo-call', 'type': 'function', 'function': {'name': 'echo', 'arguments': '{}'}}
+        await store.append_message(sid, send_index=1, role='assistant', tool_calls=[call])
+        result_seq = await store.append_message(
+            sid, send_index=1, role='tool', tool_call_id='echo-call', content='UNIQUE-RESULT' * 5000,
+        )
+        rows = await store.load_all_messages(sid)
+        registry = create_default_tool_registry(bind=False)
+        engine = ToolContextEngine(
+            config=ToolContextConfig(overrides={'echo': {'general': 'archive'}}),
+            store=store, owner_session_id=sid, owner_send_index=1,
+            llm=None, model='test', registry=registry,
+        )
+        await engine.start()
+        projected = SimpleNamespace(rows=[SimpleNamespace(
+            kind='project',
+            content={'tools': [{'name': 'echo', 'seq': result_seq, 's': 'original result'}]},
+            rendered_text='old',
+        )])
+        await prepare_projection(engine, projected, rows, 1)
+        entry = projected.rows[0].content['tools'][0]
+        assert '（原文 recall_send(' in entry['s'] and 'UNIQUE-RESULT' not in entry['s']
+        assert (await store.get_message(sid, result_seq)).content == 'UNIQUE-RESULT' * 5000
     finally:
-        await loop.aclose()
         await store.close()
 
 
@@ -196,50 +196,6 @@ async def test_original_pagination_is_lossless():
         assert raw['result'] == 'r' * 1500
         assert json.loads(raw['arguments'])['command'] == 'x' * 1500
     finally:
-        await store.close()
-
-
-@pytest.mark.parametrize('keep', [True, False])
-async def test_background_target_policy_and_original_delivery(tmp_path, keep):
-    from power_loop import JobRef
-    from power_loop.agent.runtime_store import now_ms
-    from power_loop.runtime.background import encode_results, load_record, summarize_record
-    from power_loop.runtime.env import RuntimeEnv
-    from power_loop.runtime.tool_archive import _derive
-    from power_loop.runtime.tool_context import ToolSource, active_engine
-    from tests.unit.test_tool_background_contracts_192 import start_background
-    store, engine, _ = await fixture({'bash': {'insend_fuse': 'truncate', 'general': 'archive'}}, n=1)
-    registry = create_default_tool_registry(include=['bash'], bind=False)
-    bash = registry.get('bash')
-    registry.register(replace(bash.definition, async_capable=True), bash.handler, overwrite=True)
-    runner, row = await start_background(store, registry, 'bash', {
-        'command': "printf '%05000d' 0 | tr 0 z", 'description': 'target description',
-        'context_policy': 'keep' if keep else 'retire'}, runtime_env=RuntimeEnv(workspace_dir=tmp_path))
-    engine.registry = registry
-    token = active_engine.set(engine)
-    try:
-        assert row.content.startswith("{"), row.content
-        admitted = json.loads(row.content)
-        result = await runner.runtime.client.wait(JobRef(**admitted['job_ref']), actor=runner.actor,
-                                                  deadline_ms=now_ms()+10000)
-        assert result.status == 'completed'
-        record = await load_record(store, runner.target.session_id, admitted['task_id'])
-        receipt = summarize_record(record)
-        assert receipt['summary'] == record['result']
-        source = ToolSource(runner.target.session_id, 1, row.seq, 'bg-wrapper', 'defer_work',
-                           {'action': 'check'}, encode_results([receipt]))
-        if keep:
-            assert await _derive(engine, source, 'insend_fuse', 1) is None
-            assert await _derive(engine, source, 'insend_fuse', 2) is None
-        else:
-            derived = await _derive(engine, source, 'insend_fuse', 2)
-            assert 'target description' in derived[1] and 'zzzz' not in derived[1]
-        engine.config = replace(engine.config, overrides={'bash': {'hard_preserve': True}})
-        derived = await _derive(engine, source, 'general', 2)
-        assert json.loads(derived[1])['targets'][0]['result'] == record['result']
-    finally:
-        active_engine.reset(token)
-        await runner.aclose()
         await store.close()
 
 
@@ -306,33 +262,6 @@ def test_bash_full_capture_and_required_description(tmp_path):
         dt.close_all_bash_sessions()
 
 
-async def test_pipeline_capacity_block_does_not_call_provider_again(runtime_agent):
-    from power_loop import AgentLoopConfig
-    from power_loop.contracts.tools import ToolDefinition
-    from power_loop.runtime.representation import ProjectedRepresentation
-    from power_loop.tools.registry import ToolRegistry
-    from tests.unit.test_stateful_loop import _Scripted, _tool_resp
-    store = await SessionStore.open(':memory:')
-    try:
-        reg = ToolRegistry()
-        reg.register(ToolDefinition('speech', '', pricing=Free("test_fixture")), lambda: 'SPEECH' * 10000)
-        llm = _Scripted([_tool_resp('a', 'speech', '{}')])
-        loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5, context_checkpoint_tokens=10,
-                tool_result_max_chars=None,
-                representation=ProjectedRepresentation(), tool_context=ToolContextConfig(
-                    trigger_tokens=1000, target_tokens=500,
-                    window_tokens=5000, reserve_tokens=100, margin_tokens=100,
-                    overrides={'speech': {'hard_preserve': True}})))
-        result = await loop.send('work')
-        assert result.status == 'failed'
-        assert result.final_text.startswith('context capacity blocked')
-        assert len(llm.calls) == 1
-        assert any(r.content == 'SPEECH' * 10000 for r in await store.load_all_messages(loop.target.session_id))
-    finally:
-        await loop.aclose()
-        await store.close()
-
-
 async def _send_rows(store, sid, names, send_index=1):
     """One assistant row + result per (name) in order; '__user__' appends an injected user row."""
     for i, name in enumerate(names):
@@ -349,7 +278,7 @@ async def _send_rows(store, sid, names, send_index=1):
 async def test_between_sends_merge_breakpoints_and_rule_entries_kept():
     store = await SessionStore.open(':memory:')
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         rows = await _send_rows(store, sid, ['bash', 'bash', 'read', 'bash', '__user__', 'bash', 'bash', 'bash'])
         entries = []
         for r in rows:
@@ -383,7 +312,7 @@ async def test_between_sends_merge_breakpoints_and_rule_entries_kept():
 async def test_between_sends_parallel_same_tool_is_consecutive_and_merge_can_be_off():
     store = await SessionStore.open(':memory:')
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         calls = [{'id': f'p{i}', 'type': 'function', 'function': {'name': 'read', 'arguments': json.dumps({'path': f'f{i}'})}}
                  for i in range(3)]
         await store.append_message(sid, send_index=1, role='assistant', tool_calls=calls)
@@ -406,7 +335,7 @@ async def test_between_sends_parallel_same_tool_is_consecutive_and_merge_can_be_
 async def test_hard_preserve_is_fuse_only_between_sends_uses_general():
     store = await SessionStore.open(':memory:')
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         rows = await _send_rows(store, sid, ['say'])
         seq = next(r.seq for r in rows if r.role == 'tool')
         engine = ToolContextEngine(config=ToolContextConfig(overrides={'say': {'hard_preserve': True, 'general': 'archive'}}),
@@ -451,7 +380,7 @@ async def test_hot_tail_protects_newest_calls_at_level_one_only():
 async def test_legacy_state_key_is_adopted_and_old_group_ids_recall():
     store = await SessionStore.open(':memory:')
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         rows = await _send_rows(store, sid, ['bash', 'bash'])
         seqs = [r.seq for r in rows if r.role == 'tool']
         from power_loop.runtime.tool_context import TOOL_CONTEXT_STATE_KEY

@@ -1,6 +1,8 @@
 """Canonical SDK result addresses and atomic unstarted cancellation."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from power_loop.agent.runtime_store import RuntimeInputStore
@@ -93,6 +95,66 @@ async def test_unstarted_cancel_records_parent_closed_without_rollback(registry_
     assert result.status == "cancelled" and result.send_index is None
     assert result.result_delivery_error == "session_closed"
     assert (await port.inspect(start, actor=ACTOR)).result_delivery_error == "session_closed"
+
+
+@pytest.mark.parametrize("delivery", ["open", "closed", "full"])
+async def test_release_claim_matching_cancel_routes_result_once(registry_store, delivery):
+    store, _ = registry_store
+    port = RuntimeInputStore(store, inbox_item_limit=1)
+    parent, child, start = await _routed_child(port, "release-cancel-" + delivery)
+    await port.accept(child, "run", message_id="start", actor=ACTOR)
+    if delivery == "closed":
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET lifecycle='closed' WHERE session_id=?",
+            (parent.session_id,),
+        )
+    elif delivery == "full":
+        await port.accept(parent, "occupies capacity", message_id="parent-input", actor=ACTOR)
+
+    batch = await port.claim(child, node_id="A", boot_id="A")
+    receipt = await port.cancel(start, actor=ACTOR, reason="stop build")
+    assert receipt.state == "cancel_requested"
+    await port.release_claim(batch)
+
+    result = await port.get_result(start, actor=ACTOR)
+    expected_error = {
+        "open": None, "closed": "session_closed", "full": "capacity_exceeded",
+    }[delivery]
+    assert result.status == "cancelled" and result.send_index == 1
+    assert result.error == "stop build" and result.error_code == "cancelled"
+    assert result.result_delivery_error == expected_error
+    child_row = await store._db.fetchone(
+        f"SELECT status,terminal_status,error_detail,result_delivery_error "
+        f"FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='start'",
+        (child.session_id,),
+    )
+    assert child_row == {
+        "status": "delivered", "terminal_status": "cancelled",
+        "error_detail": "stop build", "result_delivery_error": expected_error,
+    }
+    state = await store._db.fetchone(
+        f"SELECT execution_state,active_send_index,cancel_send_index,owner_token "
+        f"FROM {store.t.session_state} WHERE session_id=?",
+        (child.session_id,),
+    )
+    assert state == {
+        "execution_state": "idle", "active_send_index": None,
+        "cancel_send_index": None, "owner_token": None,
+    }
+
+    result_id = result_message_id(child, start, 1, "agent_result")
+    assert (await port.cancel(start, actor=ACTOR, reason="duplicate")).state == "already_finished"
+    parent_rows = await store._db.fetchall(
+        f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='agent_result'",
+        (parent.session_id,),
+    )
+    if delivery == "open":
+        assert len(parent_rows) == 1
+        assert parent_rows[0]["item_id"] == result_id
+        assert json.loads(parent_rows[0]["content_json"])["status"] == "cancelled"
+    else:
+        assert parent_rows == []
 
 
 async def test_accept_result_uses_frozen_route_and_deduplicates(registry_store):

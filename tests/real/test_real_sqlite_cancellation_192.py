@@ -1,52 +1,59 @@
-"""Cancellation during an actual model response write retains observed usage."""
+"""Cancellation during a real response write rolls back without model replay."""
 import asyncio
 import threading
 
 import pytest
 
+from power_loop import RequestOptions
+
 from .test_real_model_attempts_192 import model_runtime
 
-__all__ = ['model_runtime']
+__all__ = ["model_runtime"]
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-async def test_real_response_write_cancellation_rolls_back_without_model_retry(model_runtime, monkeypatch):
-    store, manager, _runtime, provider, loop, sid = model_runtime
+async def test_real_response_write_cancellation_rolls_back_without_model_retry(
+    model_runtime, monkeypatch,
+):
+    store, provider, loop, _ = model_runtime
     db = store._db
     gate, release = threading.Event(), threading.Event()
     original = db._b_exec
+
     def blocked(sql, params):
         value = original(sql, params)
-        if sql.startswith(f'INSERT INTO {store.t.messages} ') and params[2] == 'assistant' and not gate.is_set():
+        if sql.startswith(f"INSERT INTO {store.t.messages} ") and params[2] == "assistant" and not gate.is_set():
             gate.set()
             assert release.wait(15)
         return value
-    monkeypatch.setattr(db, '_b_exec', blocked)
-    sending = asyncio.create_task(loop.send('Reply HELLO in plain assistant text without tools.', sid, tools=[]))
+
+    monkeypatch.setattr(db, "_b_exec", blocked)
+    sending = asyncio.create_task(loop.send(
+        "Reply HELLO in plain assistant text without tools.",
+        options=RequestOptions(tools=()),
+    ))
     try:
         async with asyncio.timeout(100):
             while not gate.is_set():
                 if sending.done():
                     await sending
-                    pytest.fail('actual assistant write not reached')
-                await asyncio.sleep(.01)
+                    pytest.fail("actual assistant write not reached")
+                await asyncio.sleep(0.01)
             sending.cancel()
-            await asyncio.sleep(.01)
+            await asyncio.sleep(0.01)
             sending.cancel()
-            await asyncio.sleep(.01)
+            await asyncio.sleep(0.01)
             assert not sending.done() and db._lock.locked()
             release.set()
             await asyncio.gather(sending, return_exceptions=True)
             assert sending.cancelled()
             assert provider.calls == len(provider.responses) == 1
             assert not db._conn.in_transaction
-            assert not any(row.role == 'assistant' for row in await store.load_all_messages(sid))
-            assert not await manager.db.fetchall(f'SELECT job_id FROM {manager.jobs}')
+            assert not any(row.role == "assistant" for row in await store.load_all_messages(loop.target.session_id))
             assert provider.responses[0].token_usage.total_tokens > 0
-            # Still usable after rollback, without replaying the paid request.
-            assert await db.fetchone('SELECT 1 AS value') == {'value': 1}
+            assert await db.fetchone("SELECT 1 AS value") == {"value": 1}
             assert provider.calls == 1
     finally:
         release.set()
         await asyncio.gather(sending, return_exceptions=True)
-        await loop.aclose(drain_timeout_s=.1)
+        await loop.aclose(drain_timeout_s=0.1)

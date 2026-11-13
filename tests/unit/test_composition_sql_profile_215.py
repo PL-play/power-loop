@@ -134,10 +134,11 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
             )
             receipts = [json.loads(row["content"]) for row in rows]
             assert len(receipts) == count
+            starts = [InputRef(**receipt["input_ref"]) for receipt in receipts]
             parent_send_indexes = set()
             for index, receipt in enumerate(receipts):
                 model.child_gates[index].set()
-                start = InputRef(**receipt["input_ref"])
+                start = starts[index]
                 child = await runner.runtime.client.wait(
                     start, actor=runner.actor, deadline_ms=now_ms() + 10000,
                 )
@@ -149,11 +150,16 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
                 handled = await runner.runtime.client.wait(
                     parent_ref, actor=runner.actor, deadline_ms=now_ms() + 10000,
                 )
-                await runner.drain()
+                await runner.finish(parent_ref)
                 assert handled.status == "completed"
+                assert handled.final_text == "parent handled results"
                 parent_send_indexes.add(handled.send_index)
             assert len(parent_send_indexes) == count
             assert len(model.handled_batches) == count
+            assert model.parent_calls == count + 2
+            for index, start in enumerate(starts):
+                assert sum(f"child {index} result" in batch for batch in model.handled_batches) == 1
+                assert sum(start.message_id in batch for batch in model.handled_batches) == 1
         await runner.drain()
         elapsed = time.monotonic() - started
         records, tx_sites = list(profiled.records), list(profiled.tx_sites)

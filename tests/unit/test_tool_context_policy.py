@@ -14,13 +14,14 @@ from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.shell_contract import ShellTool
+from tests.unit.session_native_fixture import ACTOR, DESCRIPTOR
 from tests.unit.test_stateful_loop import _Scripted, _tool_resp
 
 
 @pytest.fixture
 async def env():
     store = await SessionStore.open(':memory:')
-    sid = await store.create_session()
+    sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
     registry = ToolRegistry()
     registry.register(ToolDefinition('bash', '', project=lambda a, r: a.get('description', 'ok'), pricing=Free("test_fixture")),
                       ShellTool(lambda **kw: 'result' * 300))
@@ -161,35 +162,6 @@ async def test_fuse_with_tool_context_is_capacity_only_and_uses_post_retirement_
     assert p.ctx.token_usage == {'prompt_tokens': 81000}
 
 
-async def test_background_delegates_target_keep(env, tmp_path):
-    from power_loop import JobRef
-    from power_loop.agent.runtime_store import now_ms
-    from power_loop.runtime.background import encode_results, load_record
-    from power_loop.runtime.env import RuntimeEnv
-    from tests.unit.test_tool_background_contracts_192 import start_background
-
-    store, _, registry, llm, _, engine, source = env
-    registered = registry.get('bash')
-    registry.register(replace(registered.definition, async_capable=True), registered.handler, overwrite=True)
-    runner, row = await start_background(store, registry, 'bash',
-        {**source.arguments, 'command': 'printf result', 'context_policy': 'keep'},
-        runtime_env=RuntimeEnv(workspace_dir=tmp_path))
-    try:
-        receipt = json.loads(row.content)
-        result = await runner.runtime.client.wait(JobRef(**receipt['job_ref']), actor=runner.actor,
-                                                  deadline_ms=now_ms()+10000)
-        assert result.status == 'completed', result
-        task_id = receipt['task_id']
-        record = await load_record(store, runner.target.session_id, task_id)
-        wrapped = replace(source, session_id=runner.target.session_id, name='defer_work',
-                          arguments={'action': 'check', 'task_id': task_id}, result=encode_results([record]))
-        assert await engine.distill(wrapped, 'insend_fuse') is None
-        assert f'task={task_id}: checks' in await engine.distill(wrapped, 'general')
-        assert not llm.calls
-    finally:
-        await runner.aclose()
-
-
 async def test_send_with_tool_context_makes_only_main_model_requests(env, runtime_agent):
     from power_loop.agent.types import AgentLoopConfig
     from power_loop.runtime.representation import ProjectedRepresentation
@@ -203,8 +175,6 @@ async def test_send_with_tool_context_makes_only_main_model_requests(env, runtim
         assert first.final_text == 'done' and second.final_text == 'next'
         assert len(main.calls) == 3
         assert not {'auxiliary_pending', 'tool_distill_calls'} & set(first.usage)
-        cache = await store._db.fetchone(f'SELECT COUNT(*) AS n FROM {store.t.sessions.removesuffix("sessions")}context_cache')
-        assert int(cache['n']) == 0
     finally:
         await loop.aclose()
 

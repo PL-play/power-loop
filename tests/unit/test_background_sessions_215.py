@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -10,8 +11,12 @@ from power_loop import AgentLoopConfig, LLMResponse, LLMService
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.runtime_types import InputRef, TargetRef, result_message_id
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.background import encode_results, load_record, summarize_record
+from power_loop.runtime.env import RuntimeEnv
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.stop_policy import StopPolicy
+from power_loop.runtime.tool_archive import _derive
+from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource, active_engine
 from power_loop.tools import create_default_tool_registry
 from tests.runtime_fixture import RunningAgent
 
@@ -19,14 +24,15 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 class BackgroundParent(LLMService):
-    def __init__(self, command=None):
+    def __init__(self, command=None, arguments=None):
         self.sent = False
         self.command = command
+        self.arguments = arguments
 
     async def complete(self, request, **kwargs):
         if not self.sent:
             self.sent = True
-            arguments = (
+            arguments = self.arguments or (
                 {"action": "run", "command": self.command}
                 if self.command is not None
                 else {"action": "tool", "tool": "slow", "args": {}}
@@ -203,4 +209,78 @@ async def test_shell_process_tag_uses_session_and_send(registry_store, tmp_path)
         assert result.status == "completed", result.error
         assert f"{start.session_id}_1" in result.final_text
     finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("keep", [True, False])
+async def test_background_target_context_policy_and_original_delivery(
+    registry_store, tmp_path, keep,
+):
+    store, _ = registry_store
+    registry = create_default_tool_registry(
+        include=["bash", "background_run"], workspace_dir=str(tmp_path),
+    )
+    bash = registry.get("bash")
+    registry.register(
+        replace(bash.definition, async_capable=True), bash.handler, overwrite=True,
+    )
+    command = "printf '%05000d' 0 | tr 0 z"
+    runner = await RunningAgent(
+        store,
+        BackgroundParent(arguments={
+            "action": "tool",
+            "tool": "bash",
+            "args": {
+                "command": command,
+                "description": "target description",
+                "context_policy": "keep" if keep else "retire",
+            },
+        }),
+        registry,
+        AgentLoopConfig(compactor=None),
+        runtime_env=RuntimeEnv(workspace_dir=tmp_path),
+    ).start()
+    engine = ToolContextEngine(
+        config=ToolContextConfig(overrides={
+            "bash": {"insend_fuse": "truncate", "general": "archive"},
+        }),
+        store=store,
+        owner_session_id=runner.target.session_id,
+        owner_send_index=1,
+        llm=None,
+        model="test",
+        registry=registry,
+    )
+    await engine.start()
+    token = active_engine.set(engine)
+    try:
+        await runner.send("start background")
+        row = next(
+            row for row in await store.load_all_messages(runner.target.session_id)
+            if row.tool_call_id == "background"
+        )
+        admitted = json.loads(row.content)
+        result = await runner.runtime.client.wait(
+            InputRef(**admitted["input_ref"]), actor=runner.actor,
+            deadline_ms=now_ms() + 10000,
+        )
+        assert result.status == "completed", result
+        record = await load_record(store, runner.target.session_id, admitted["task_id"])
+        receipt = summarize_record(record)
+        assert receipt["summary"] == record["result"]
+        source = ToolSource(
+            runner.target.session_id, 1, row.seq, "background", "background_run",
+            {"action": "check", "task_id": admitted["task_id"]}, encode_results([receipt]),
+        )
+        if keep:
+            assert await _derive(engine, source, "insend_fuse", 1) is None
+            assert await _derive(engine, source, "insend_fuse", 2) is None
+        else:
+            derived = await _derive(engine, source, "insend_fuse", 2)
+            assert "target description" in derived[1] and "zzzz" not in derived[1]
+        engine.config = replace(engine.config, overrides={"bash": {"hard_preserve": True}})
+        derived = await _derive(engine, source, "general", 2)
+        assert json.loads(derived[1])["targets"][0]["result"] == record["result"]
+    finally:
+        active_engine.reset(token)
         await runner.aclose()

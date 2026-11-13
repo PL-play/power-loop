@@ -41,6 +41,8 @@ class Model(LLMService):
         if "agent_result" in latest:
             self.spawned = True
             return LLMResponse(raw_text="parent handled")
+        if any(message.get("tool_call_id") == "spawn-again" for message in request.messages):
+            return LLMResponse(raw_text="parent delegated again")
         if not self.spawned or latest == "delegate again":
             call_id = "spawn" if not self.spawned else "spawn-again"
             self.spawned = True
