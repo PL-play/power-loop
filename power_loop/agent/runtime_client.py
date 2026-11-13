@@ -46,6 +46,15 @@ class RuntimeClient:
 
     # ── unified operations ────────────────────────────────────────────────────
 
+    async def workflow(self, target, spec, *, message_id, actor, descriptor=None, options=None):
+        """Create a driver session and its start input through the same client port."""
+        from power_loop.workflow.runner import submit
+
+        return await submit(
+            self, target, spec, message_id=message_id, actor=actor,
+            descriptor=descriptor, options=options,
+        )
+
     async def create_session(self, descriptor, *, actor, parent=None, result_route=None,
                              cancel_propagation="linked", options=None) -> TargetRef:
         self._require_open()

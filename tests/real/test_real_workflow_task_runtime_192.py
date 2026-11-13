@@ -44,18 +44,25 @@ async def test_real_nested_child_continues_after_node_exit_without_replacement(r
         assert first.status=='completed' and len(accepted)==1
         await asyncio.wait_for(child_started.wait(),10)
         handle=accepted[0].handle
-        assert (await handle.wait(deadline_ms=now_ms()+120000)).status=='failed'
+        first_result = await handle.wait(deadline_ms=now_ms()+120000)
+        assert first_result.status=='failed'
         release.set()
         await agent.drain()
-        [child]=await store._db.fetchall(f"SELECT job_id,session_id FROM {store.table_prefix}jobs WHERE kind='subagent'")
+        [child]=await store._db.fetchall(
+            f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=?",
+            (first_result.results['calculate'].session_id,),
+        )
         original_child=await store.load_all_messages(child['session_id'])
         assert any(r.role=='assistant' and '42' in (r.content or '') for r in original_child)
-        resumed=await handle.resume(generation=1,node_id='calculate',message='Read the original child result and return its answer.',message_id='continue-original')
+        resumed=await handle.resume(node_id='calculate',message='Read the original child result and return its answer.',message_id='continue-original')
         result=await resumed.wait(deadline_ms=now_ms()+120000)
         assert result.status=='completed' and all('42' in result.results[n].text for n in ('calculate','review'))
         await agent.drain()
         assert await store.load_all_messages(child['session_id'])==original_child
-        assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {store.table_prefix}jobs WHERE kind='subagent'"))['n']==1
+        assert (await store._db.fetchone(
+            f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE parent_session_id=?",
+            (first_result.results['calculate'].session_id,),
+        ))['n']==1
     finally:
         release.set()
         provider.report(record_property)

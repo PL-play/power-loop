@@ -3,7 +3,7 @@
 from .api import Workflow, create_workflow
 from .engine import Executor, NodeRequest, WorkflowEngine, WorkflowFileIO, WorkflowRunError, in_workflow
 from .result import AgentResult, SharedBudget, WorkflowResult
-from .runner import WorkflowRunHandle
+from .runner import WorkflowRunHandle, resume_run
 from .spec import (
     AgentNode,
     BranchNode,
@@ -48,7 +48,6 @@ __all__ = [
 ]
 
 from .facade import WorkflowAdmission, WorkflowToolPorts, register_workflow_tool, submit_workflow, workflow_runtime_tool
-from .resume import resume_run
 
 __all__ += [
     "WorkflowAdmission",

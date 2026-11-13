@@ -87,6 +87,7 @@ class RuntimeWorker:
         self._bindings = []
         self._pending = {}
         self._active = {}
+        self._drivers = set()
         self._tasks = set()
         self._capacity = asyncio.Semaphore(runtime.capacity)
         self._wake = asyncio.Event()
@@ -219,9 +220,17 @@ class RuntimeWorker:
             self._wake.clear()
             if self._overflow and len(self._pending) < 924:
                 await self.recover()
-            while (self._pending and len(self._tasks) < 1024
-                   and len(self._tasks) < self.runtime.capacity and not self._closing):
-                sid = next(iter(self._pending))
+            while self._pending and len(self._tasks) < 1024 and not self._closing:
+                used = sum(
+                    1 for ctx in self._active.values()
+                    if ctx is None or ctx.descriptor.kind != "workflow_driver"
+                )
+                if used < self.runtime.capacity:
+                    sid = next(iter(self._pending))
+                else:
+                    sid = next((value for value in self._pending if value in self._drivers), None)
+                    if sid is None:
+                        break
                 self._pending.pop(sid)
                 self._active[sid] = None
                 task = asyncio.create_task(self._run_session(sid), context=contextvars.Context())
@@ -240,15 +249,13 @@ class RuntimeWorker:
         from .stateful_loop import _ExecutionLoop, _session_sync
         entry = _session_sync(sid)
         entry.users += 1
-        acquired = False
         try:
-            await self._capacity.acquire()
-            acquired = True
+            # _dispatch enforces capacity for LLM/background sessions. Non-LLM
+            # workflow drivers never take a model slot, including during recovery
+            # while all their healthy leaves are still running.
             async with entry.lock:
                 await self._run_session_owned(sid)
         finally:
-            if acquired:
-                self._capacity.release()
             entry.users -= 1
             _ExecutionLoop._release_idle_sync(sid)
 
@@ -267,6 +274,7 @@ class RuntimeWorker:
         target = TargetRef(store.store_id, sid)
         ctx = None
         env = None
+        env_ctx = None
         bus = None
         on_delta = None
         output_task = None
@@ -286,9 +294,11 @@ class RuntimeWorker:
 
             # Capability predicates and descriptor declarations are cheap checks only:
             # execution resources and their claimed identity are built after ownership.
-            if descriptor.kind not in {"agent", "background"}:
+            if descriptor.kind not in {"agent", "background", "workflow_driver"}:
                 self.capability_missing.add(descriptor.definition_ref)
                 return
+            if descriptor.kind == "workflow_driver":
+                self._drivers.add(sid)
             try:
                 capable = self._can_build(descriptor)
             except Exception as exc:
@@ -359,9 +369,23 @@ class RuntimeWorker:
                     await self.inputs.release_claim(batch)
                     batch = None
                     return
+                # The worker runs each session in a fresh context; honor the factory's
+                # runtime_env (workspace/home/sandbox) so file-backed tools such as
+                # workflow logs/export resolve paths inside this session's execution.
+                if env.runtime_env is not None:
+                    from power_loop.runtime.env import runtime_env_context
+                    env_ctx = runtime_env_context(env.runtime_env)
+                    env_ctx.__enter__()
                 if ctx.options.tools is not None and env.tool_registry is not None:
                     env.tool_registry = env.tool_registry.subset(ctx.options.tools)
                 config = self._config(env, descriptor)
+                if descriptor.kind == "workflow_driver":
+                    from power_loop.workflow.runner import run_driver
+                    final_batch = await run_driver(self, ctx, env)
+                    await self._notify_results(final_batch)
+                    if final_batch.execution_state == "queued":
+                        self._activate(sid)
+                    return
                 if descriptor.kind == "background":
                     if "managed_effect" in descriptor.config:
                         from power_loop.runtime.managed_effects import run_session
@@ -448,6 +472,8 @@ class RuntimeWorker:
             if batch is not None:
                 await self._final_failed(batch, "internal_error", "session send raised")
         finally:
+            if env_ctx is not None:
+                env_ctx.__exit__(None, None, None)
             if renewal is not None:
                 renewal.cancel()
                 await asyncio.gather(renewal, return_exceptions=True)

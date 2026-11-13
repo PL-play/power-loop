@@ -3,7 +3,7 @@ from collections import Counter
 
 import pytest
 
-from power_loop import AgentLoopConfig, JobRef, ToolRegistry
+from power_loop import AgentLoopConfig, InputRef, ToolRegistry
 from power_loop.agent.runtime_store import now_ms
 from power_loop.tools.spawn_agent import register_spawn_agent
 
@@ -35,13 +35,13 @@ async def test_real_resume_recomputes_review_and_assembly_with_current_answer(ru
         first=await handle.wait(deadline_ms=now_ms()+120000)
         assert first.status=='completed' and first.results['assembly'].text.strip()=='VERSION-42'
         await agent.drain()
-        resumed=await handle.resume(generation=1,node_id='calculate',message='Correction: return VERSION-43.',message_id='correction')
+        resumed=await handle.resume(node_id='calculate',message='Correction: return VERSION-43.',message_id='correction')
         second=await resumed.wait(deadline_ms=now_ms()+120000)
         assert second.status=='completed'
         assert all(second.results[n].text.strip()=='VERSION-43' for n in ('calculate','review','assembly'))
         assert second.results['sibling']==first.results['sibling'] and roles['SIBLING']==1
         assert second.results['calculate'].session_id==first.results['calculate'].session_id
-        assert second.results['review'].session_id!=first.results['review'].session_id
+        assert second.results['review'].session_id==first.results['review'].session_id
         assert roles['CALCULATE']==roles['REVIEW']==roles['ASSEMBLY']==2
         assert (await handle.wait(deadline_ms=now_ms()+1000)).results['assembly'].text.strip()=='VERSION-42'
     finally:
@@ -64,12 +64,13 @@ async def test_real_child_empty_pass_repairs_answer_in_original_session(runtime_
         store=agent.runtime.store
         [receipt]=[json.loads(r.content) for r in await store.load_all_messages(agent.target.session_id) if r.role=='tool' and r.name=='spawn_agent']
         provider.release_children.set()
-        result=await agent.runtime.client.wait(JobRef(**receipt['job_ref']),actor=agent.actor,deadline_ms=now_ms()+120000)
+        result=await agent.runtime.client.wait(InputRef(**receipt['input_ref']),actor=agent.actor,deadline_ms=now_ms()+120000)
         assert result.status=='completed' and result.final_text.strip()=='42' and result.usage['calls']>=2
-        rows=await store.load_all_messages(receipt['session_id'])
+        rows=await store.load_all_messages(receipt['input_ref']['session_id'])
         assert len([r for r in rows if r.role=='tool' and r.name=='pass_turn'])==1
         await agent.drain()
-        assert len(await store.list_children(agent.target.session_id))==1
+        children = await agent.runtime.client.list_children(agent.target, actor=agent.actor)
+        assert len(children.items)==1
     finally:
         provider.release_children.set()
         provider.report(record_property)

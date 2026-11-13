@@ -207,6 +207,7 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
     from .runner import submit
 
     binding, actor = await tool_actor(loop)
+    del binding
     client = loop._runtime_worker.runtime.client
     handle = await submit(
         client,
@@ -215,7 +216,6 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
         message_id="workflow:" + actor.tool_call_id,
         actor=actor,
         descriptor=loop._runtime_worker_context.descriptor,
-        parent=binding.lease,
         options=RequestOptions(tools=sorted(prepared.allowed_tools) if prepared.allowed_tools is not None else None),
     )
     receipt = {
@@ -223,10 +223,8 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
         "status": "accepted",
         "run_id": handle.run_id,
         "workflow": prepared.spec.name,
-        "job_id": handle.job_id,
-        "job_ref": plain(handle.job_ref),
+        "target_ref": plain(handle.target),
         "input_ref": plain(handle.input_ref),
-        "operation_id": handle.operation_id,
         "completion_delivery": "owner_inbox",
         "view_warnings": [warning] if warning else [],
     }
@@ -248,11 +246,10 @@ def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
         "input": {"type": "string"},
         "run_id": {"type": "string"},
         "node": {"type": "string"},
-        "node_job_id": {"type": "string"},
+        "node_session_id": {"type": "string"},
         "message": {"type": "string"},
         "urgent": {"type": "boolean"},
         "reason": {"type": "string"},
-        "expected_generation": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
         "cursor": {"type": "string"},
         "max_chars": {"type": "integer", "minimum": 1024, "maximum": 32000},
@@ -287,25 +284,130 @@ def _dump(value):
 
 
 async def _owned_native_workflow(loop, sid, run_id):
-    if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{8,64}", run_id):
+    if not isinstance(run_id, str) or not re.fullmatch(r"inp_[a-f0-9]{56}", run_id):
         raise WorkflowToolInputError("workflow_run_id_required")
-    manager = loop.task_runtime.manager
-    event = await manager.db.fetchone(
-        f"SELECT job_id FROM {manager.events} WHERE event_id=? AND action='create'", ("op_" + run_id,)
+    row = await loop.store._db.fetchone(
+        f"SELECT * FROM {loop.store.t.sessions} WHERE parent_session_id=? "
+        "AND session_kind='workflow_driver' AND start_input_message_id=?",
+        (sid, run_id),
     )
-    if event is None:
+    if row is None:
         raise WorkflowToolInputError("workflow_run_not_found")
-    job = await manager.get_job(loop.task_runtime.actor(sid), event["job_id"], include_result=False)
-    if job.kind != "workflow":
+    from . import journal
+
+    saved = await journal.read(loop.store, sid, run_id)
+    if saved is None:
         raise WorkflowToolInputError("workflow_run_not_found")
-    return job
+    from power_loop.agent.runtime_types import InputRef, TargetRef, TrustedActor
+
+    actor = TrustedActor(row["tenant_id"], row["principal_id"], sid)
+    target = TargetRef(loop.store.store_id, row["session_id"])
+    await loop._runtime_worker.runtime.client.inspect(
+        InputRef(target.store_id, target.session_id, run_id), actor=actor,
+    )
+    return row, saved, actor
+
+
+def _select_node(saved, options):
+    from power_loop.agent.runtime_types import TargetRef
+
+    has_name = options.get("node") is not None
+    has_session = options.get("node_session_id") is not None
+    if has_name and has_session:
+        raise WorkflowToolInputError("ambiguous_workflow_node_selector")
+    driver = TargetRef(**saved["driver_target"])
+    if not has_name and not has_session:
+        return driver, None
+    nodes = saved["nodes"]
+    if has_session:
+        matches = [entry for entry in nodes if entry["session_id"] == options["node_session_id"]]
+    else:
+        name = options["node"]
+        if not isinstance(name, str) or not name.strip():
+            raise WorkflowToolInputError("invalid_workflow_node")
+        matches = [entry for entry in nodes if entry["path"] == name]
+    targets = {entry["session_id"] for entry in matches}
+    if not targets:
+        raise WorkflowToolInputError("workflow_node_not_found")
+    if len(targets) != 1:
+        raise WorkflowToolInputError("workflow_node_ambiguous_choose_session")
+    session_id = next(iter(targets))
+    entry = max(matches, key=lambda item: (item["attempt"], item["continuation_index"]))
+    return TargetRef(saved["driver_target"]["store_id"], session_id), entry
+
+
+async def _read_logs(loop, target, actor, options):
+    """Bounded raw/projected session reads with no task/history authority."""
+    source = options.get("source", "messages")
+    if source not in {"messages", "projection"}:
+        raise WorkflowToolInputError("invalid_workflow_history_source")
+    limit = min(options.get("limit", 20), 50)
+    preview = options.get("preview_chars", 500)
+    client = loop._runtime_worker.runtime.client
+    await client.inspect(target, actor=actor)
+    store = loop.store
+    table = store.t.messages if source == "messages" else store.t.project_messages
+    coordinate = "seq" if source == "messages" else "id"
+    where, params = ["session_id=?"], [target.session_id]
+    for key, column in (("seq", "seq"), ("id", "id"), ("message_id", "id"), ("send_index", "send_index")):
+        if key in options:
+            where.append(column + "=?")
+            params.append(int(options[key]))
+    if "message_ids" in options:
+        ids = [int(value) for value in options["message_ids"]]
+        where.append("id IN (" + ",".join("?" for _ in ids) + ")")
+        params.extend(ids)
+    cursor = int(options.get("cursor") or 0)
+    latest = "cursor" not in options and not any(
+        key in options for key in ("seq", "id", "message_id", "message_ids")
+    )
+    upper = await store._db.fetchone(
+        f"SELECT MAX({coordinate}) AS value FROM {table} WHERE {' AND '.join(where)}", params,
+    )
+    if latest and upper["value"] is not None:
+        cursor = max(cursor, int(upper["value"]) - limit)
+    selected = [*where, coordinate + ">?", coordinate + "<=?"]
+    rows = await store._db.fetchall(
+        f"SELECT * FROM {table} WHERE {' AND '.join(selected)} ORDER BY {coordinate} LIMIT ?",
+        [*params, cursor, int(upper["value"] or 0), limit + 1],
+    )
+    records = []
+    for row in rows[:limit]:
+        item = dict(row)
+        for key in ("id", "seq", "send_index", "source_seq_lo", "source_seq_hi"):
+            if item.get(key) is not None:
+                item[key] = str(item[key])
+        if output := options.get("output_file"):
+            records.append(item)
+        else:
+            content = item.get("content") or item.get("content_json") or item.get("rendered_text")
+            records.append({
+                key: item[key] for key in ("id", "seq", "send_index", "role", "name", "kind")
+                if key in item
+            } | {"preview": str(content or "")[:preview]})
+    if output := options.get("output_file"):
+        from power_loop.runtime.env import RuntimeEnvError, get_runtime_env, safe_path
+
+        try:
+            path = safe_path(output, "w", env=get_runtime_env())
+        except (ValueError, RuntimeEnvError) as exc:
+            raise WorkflowToolInputError("workflow_export_path_invalid") from exc
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in records))
+        return {"status": "exported", "path": output, "records": len(records)}
+    return {
+        "status": "ok" if records else "unavailable",
+        "source": source,
+        "records": records,
+        "next_cursor": str(rows[limit - 1][coordinate]) if len(rows) > limit else None,
+    }
 
 
 async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
-    from power_loop.agent.runtime_types import JobRef, RuntimeRequestError, plain
-    from power_loop.runtime import task_history, task_query
+    from power_loop.agent.runtime_types import InputRef, RuntimeRequestError, plain, sha256_canonical
     from power_loop.runtime.child_tasks import tool_actor
-    from power_loop.runtime.jobs import JobError
+
+    from . import journal
 
     ports = ports or WorkflowToolPorts()
     options = dict(arguments or kwargs)
@@ -326,60 +428,52 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
 
             prepared = await prepare_workflow(options, ports)
             return _dump({"status": "valid", "summary": _spec_summary(prepared.spec)})
-        manager, actor = loop.task_runtime.manager, loop.task_runtime.actor(sid)
         if action == "list" or action == "status" and not options.get("run_id"):
-            value = await task_query.list_jobs(
-                manager,
-                actor,
-                kinds=["workflow"],
-                status="all",
-                limit=options.get("limit", 20),
-                cursor=options.get("cursor"),
-                max_chars=options.get("max_chars", 8000),
-            )
+            run_ids = await journal.list_run_ids(loop.store, sid)
+            offset = int(options.get("cursor") or 0)
+            limit = options.get("limit", 20)
+            selected = run_ids[offset:offset + limit]
+            value = {
+                "runs": [await journal.read(loop.store, sid, run_id) for run_id in selected],
+                "next_cursor": str(offset + len(selected)) if offset + len(selected) < len(run_ids) else None,
+            }
         else:
-            job = await _owned_native_workflow(loop, sid, options.get("run_id"))
+            _row, saved, actor = await _owned_native_workflow(loop, sid, options.get("run_id"))
             if action == "status":
-                value = await task_query.get_job(manager, actor, job.job_id, max_chars=options.get("max_chars", 8000))
+                value = saved
             elif action == "leaves":
-                rows = await manager.db.fetchall(
-                    f"SELECT job_id,session_id,generation,title,status,outcome FROM {manager.jobs} "
-                    "WHERE parent_job_id=? AND kind='workflow_node' ORDER BY job_id LIMIT 101",
-                    (job.job_id,),
-                )
-                value = {"nodes": rows[:100], "truncated": len(rows) > 100}
+                value = {"nodes": saved["nodes"][:100], "truncated": len(saved["nodes"]) > 100}
             else:
-                from .control import select_native_target
-
-                selected = await select_native_target(loop.task_runtime, sid, job, options)
-                node = await manager.get_job(actor, selected, include_result=False)
+                selected, entry = _select_node(saved, options)
+                client = loop._runtime_worker.runtime.client
                 if action == "logs":
-                    value = await task_history.read_history(manager, actor, selected, **{
-                        key: options[key] for key in ("source", "message_id", "message_ids", "seq", "id",
-                            "send_index", "cursor", "char_offset", "max_chars", "output_file")
-                        if key in options
-                    }, limit=min(options.get("limit", 20), 50),
-                        preview_chars=options.get("preview_chars", 500),
-                        latest=options.get("cursor") is None)
-                else:
-                    _, trusted = await tool_actor(loop)
-                    client = loop._runtime_worker.runtime.client
-                    ref = JobRef(loop.store.store_id, selected, options.get("expected_generation", node.generation))
-                    if action == "cancel":
-                        value = plain(
-                            await client.cancel(
-                                ref, actor=trusted, scope="subtree", reason=options.get("reason", "cancelled")
-                            )
-                        )
+                    value = await _read_logs(loop, selected, actor, options)
+                elif action == "cancel":
+                    if entry is None:
+                        ref = InputRef(**saved["start_input_ref"])
+                        value = plain(await client.cancel(
+                            ref, actor=actor, reason=options.get("reason", "cancelled"),
+                        ))
                     else:
-                        value = plain(
-                            await client.send(
-                                ref, options["message"], actor=trusted, urgent=options.get("urgent") is True,
-                                message_id="send:" + trusted.tool_call_id,
-                            )
-                        )
+                        value = plain(await client.cancel(
+                            selected, actor=actor, scope="subtree",
+                            reason=options.get("reason", "cancelled"),
+                        ))
+                else:
+                    if entry is None:
+                        raise WorkflowToolInputError("workflow_node_required")
+                    if not isinstance(options.get("message"), str):
+                        raise WorkflowToolInputError("workflow_message_required")
+                    _binding, trusted = await tool_actor(loop)
+                    message_id = "inp_" + sha256_canonical([
+                        "workflow_node_send", trusted.call_ref.to_dict(), trusted.tool_call_id,
+                    ])[:56]
+                    value = plain(await client.send(
+                        selected, options["message"], message_id=message_id, actor=trusted,
+                        priority="urgent" if options.get("urgent") is True else "normal",
+                    ))
         return _dump(value)
-    except (WorkflowToolInputError, WorkflowSpecError, JobError, RuntimeRequestError) as exc:
+    except (WorkflowToolInputError, WorkflowSpecError, RuntimeRequestError) as exc:
         return _dump({"error": {"code": getattr(exc, "code", str(exc))}})
 
 

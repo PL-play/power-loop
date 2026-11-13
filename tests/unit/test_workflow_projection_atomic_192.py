@@ -1,5 +1,4 @@
-"""Graph definition, driver job, session and start are admitted together."""
-
+"""Driver admission and graph-state writes use session-native atomic boundaries."""
 import pytest
 
 from power_loop import AgentLoopConfig
@@ -11,70 +10,50 @@ from ._workflow_fixture_203 import Model, leaf
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-async def test_driver_admission_rollback_has_no_orphan_job_or_input(registry_store, monkeypatch):
+async def test_driver_admission_rollback_has_no_orphan_session_or_input(registry_store, monkeypatch):
     store, _ = registry_store
     runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
     original = journal.put
 
-    async def fail(*args, **kwargs):
-        await original(*args, **kwargs)
+    async def fail(store, tx, sid, key, value):
+        await original(store, tx, sid, key, value)
         raise RuntimeError("journal write failed")
 
     try:
         monkeypatch.setattr(journal, "put", fail)
         with pytest.raises(RuntimeError, match="journal write failed"):
             await runner.runtime.client.workflow(
-                runner.target, {"name": "atomic", "root": leaf("A")}, message_id="run", actor=runner.actor
+                runner.target, {"name": "atomic", "root": leaf("A")}, message_id="run", actor=runner.actor,
             )
-        assert not await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs")
-        assert not await store._db.fetchall(f"SELECT item_id FROM {store.t.follow_up_queue}")
         sessions = await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions}")
-        assert [s["session_id"] for s in sessions] == [runner.target.session_id]
+        assert [row["session_id"] for row in sessions] == [runner.target.session_id]
+        assert not await store._db.fetchall(f"SELECT item_id FROM {store.t.follow_up_queue}")
+        assert not await store._db.fetchall(f"SELECT state_key FROM {store.t.session_runtime_state}")
     finally:
         await runner.aclose()
 
 
-async def test_final_job_and_inbox_schema(registry_store):
+async def test_graph_state_is_separate_from_messages_and_has_no_job_columns(registry_store):
     store, _ = registry_store
-    db = store._db
-
-    async def columns(table):
-        if db.dialect.name == "sqlite":
-            return {r["name"]: bool(r["notnull"]) for r in await db.fetchall(f"PRAGMA table_info({table})")}
-        scope = "current_schema()" if db.dialect.name == "postgres" else "DATABASE()"
-        rows = await db.fetchall(
-            f"SELECT column_name AS name,is_nullable AS nullable FROM information_schema.columns WHERE table_schema={scope} AND table_name=?",
-            (table,),
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    try:
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "schema", "root": leaf("A")}, message_id="schema", actor=runner.actor,
         )
-        return {r["name"]: r["nullable"] == "NO" for r in rows}
-
-    jobs = await columns(store.table_prefix + "jobs")
-    assert jobs["session_id"]
-    assert not {
-        "parent_generation",
-        "parent_executor_id",
-        "parent_boot_id",
-        "control_owner_generation",
-        "control_owner_executor_id",
-        "control_owner_boot_id",
-        "lease_until_ms",
-    }.intersection(jobs)
-    state = await columns(store.t.session_state)
-    assert {
-        "owner_epoch",
-        "owner_token",
-        "owner_node_id",
-        "owner_boot_id",
-        "owner_lease_until_ms",
-        "lifecycle",
-    } <= state.keys()
-    inbox = await columns(store.t.follow_up_queue)
-    assert inbox["meta_json"]
-    assert {
-        "target_job_id",
-        "expected_job_generation",
-        "expires_at",
-        "claim_owner_epoch",
-        "delivered_job_id",
-        "delivered_job_generation",
-    } <= inbox.keys()
+        assert (await handle.wait()).status == "completed"
+        state = await store._db.fetchall(
+            f"SELECT state_key,value_json FROM {store.t.session_runtime_state} WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert {tuple(row["state_key"].split(":", 2)[:2]) for row in state} == {
+            ("workflow", "run"), ("workflow", "node"),
+        }
+        assert all("job_id" not in row["value_json"] and "generation" not in row["value_json"] for row in state)
+        messages = await store._db.fetchall(
+            f"SELECT content,meta_json FROM {store.t.messages} WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert all("workflow:node:" not in (row["content"] or "") for row in messages)
+        assert all("workflow:run:" not in (row["content"] or "") for row in messages)
+    finally:
+        await runner.aclose()

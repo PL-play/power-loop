@@ -7,8 +7,6 @@ import json
 import pytest
 
 from power_loop import AgentLoopConfig, SessionStore
-from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
 
@@ -19,15 +17,13 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 async def test_real_facade_validation_admission_and_actual_result_after_caller_yields(tmp_path, record_property, runtime_agent):
     store = await SessionStore.open(str(tmp_path / "facade.db"), schema="tasks")
-    runtime = TaskRuntime(JobManager(store), tenant_id="real-facade", principal_id="host",
-        executor_id="executor", boot_id="boot")
     provider = BoundedProvider(limit=12)
     accepted = []
     async def on_accepted(admission):
         accepted.append(admission)
     registry = ToolRegistry()
     register_workflow_tool(registry, ports=WorkflowToolPorts(on_accepted=on_accepted))
-    loop = await runtime_agent(model=provider, store=store, task_runtime=runtime, registry=registry,
+    loop = await runtime_agent(model=provider, store=store, registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=6, max_tokens=2048,
             system_prompt="Follow the specified workflow tool order exactly. An accepted receipt is not the result. "
                 "Do not start replacement work or poll. After asynchronous completion, consume its result and "
@@ -45,15 +41,14 @@ async def test_real_facade_validation_admission_and_actual_result_after_caller_y
             assert initial.status == "completed"
             await asyncio.wait_for(provider.child_entered.wait(), 10)
             assert len(accepted) == 1
-            assert not (await loop.runtime.client.inspect(accepted[0].handle.job_ref, actor=loop.actor)).result_available
+            assert not (await loop.runtime.client.inspect(accepted[0].handle.input_ref, actor=loop.actor)).result_available
             rows = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "workflow"]
             assert len(rows) == 2
             validation, receipt = [json.loads(m.content) for m in rows]
             assert validation["status"] == "valid" and receipt["status"] == "accepted"
             assert receipt["run_id"] == accepted[0].handle.run_id
-            operation = await runtime.manager.get_operation(runtime.actor(sid), receipt["operation_id"])
-            assert operation.receipt_ref["id"] == str(rows[-1].id)
-            assert operation.call_ref["id"] != operation.receipt_ref["id"]
+            assert receipt["target_ref"]["session_id"] == receipt["input_ref"]["session_id"]
+            assert "job_ref" not in receipt and "operation_id" not in receipt
             provider.release_children.set()
             from power_loop.agent.runtime_store import now_ms
             result = await accepted[0].handle.wait(deadline_ms=now_ms()+90000)

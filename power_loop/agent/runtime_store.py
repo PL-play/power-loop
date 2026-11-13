@@ -140,7 +140,10 @@ class RuntimeInputStore:
             raise RuntimeRequestError("forbidden", "child creation requires the direct parent actor")
         if cancel_propagation not in {"linked", "independent"}:
             raise RuntimeRequestError("invalid_options", "cancel_propagation")
-        if result_kind not in {"agent_result", "background_result", "managed_effect_result"}:
+        if result_kind not in {
+            "agent_result", "background_result", "managed_effect_result",
+            "workflow_result", "workflow_node_result",
+        }:
             raise RuntimeRequestError("invalid_options", "result_kind")
         session_id = "ses_" + sha256_canonical([
             "child", parent.store_id, parent.session_id, call_ref.to_dict(), tool_call_id,
@@ -219,6 +222,87 @@ class RuntimeInputStore:
                 canonical(body), actor=actor, priority="normal", deadline_ms=None,
                 kind="user", result_kind=None,
             )
+        return target, start, receipt
+
+    async def create_workflow_session(
+        self, descriptor: RuntimeDescriptor, *, parent: TargetRef, actor,
+        target: TargetRef, start: InputRef, body, result_kind: str,
+        cancel_propagation="linked", run_journal=None,
+    ):
+        """Atomically align/create a deterministic workflow session and its start.
+
+        Node journals are deliberately written by the caller in a second transaction.
+        A driver run journal may be included here because its worker must never discover
+        a runnable driver without its frozen run coordinates.
+        """
+        from power_loop.contracts.errors import CancellationRequested
+
+        self.check_store(parent)
+        if (target.store_id, start.store_id, start.session_id) != (
+            self.store.store_id, self.store.store_id, target.session_id
+        ):
+            raise RuntimeRequestError("invalid_options", "workflow target/start mismatch")
+        if result_kind not in {"workflow_result", "workflow_node_result"}:
+            raise RuntimeRequestError("invalid_options", "result_kind")
+        route = self._result_route(
+            parent, {"target": parent, "input_ref": start, "result_kind": result_kind},
+            target.session_id,
+        )
+        identity = sha256_canonical([
+            "workflow_session", parent.store_id, parent.session_id,
+            target.session_id, descriptor, start,
+        ])
+        async with self.db.transaction() as tx:
+            await self.authorize(tx, parent, actor)
+            parent_state = await self.db.dialect.lock_state(tx, self.state, parent.session_id)
+            if parent_state["cancel_send_index"] is not None:
+                raise CancellationRequested(parent_state["cancel_reason"] or "cancelled")
+            existing = await tx.fetchone(
+                f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?",
+                (target.session_id,),
+            )
+            if existing is not None:
+                await self.db.dialect.lock_state(tx, self.state, target.session_id)
+            if existing is None:
+                database_now = await self._db_now(tx)
+                await tx.execute(
+                    f"INSERT INTO {self.store.t.sessions} ("
+                    "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
+                    "descriptor_hash,creation_identity_hash,creation_call_ref_json,creation_tool_call_id,"
+                    "start_input_message_id,tenant_id,principal_id,result_route_json,cancel_propagation,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        target.session_id, parent.session_id, actor.session_id, descriptor.kind,
+                        canonical(descriptor), sha256_canonical(descriptor), identity,
+                        canonical(actor.call_ref.to_dict()) if actor.call_ref is not None else None,
+                        actor.tool_call_id, start.message_id,
+                        actor.tenant_id, actor.principal_id, canonical(route), cancel_propagation,
+                        database_now, database_now,
+                    ),
+                )
+                await tx.execute(f"INSERT INTO {self.state} (session_id) VALUES (?)", (target.session_id,))
+            else:
+                expected = {
+                    "parent_session_id": parent.session_id,
+                    "descriptor_hash": sha256_canonical(descriptor),
+                    "creation_identity_hash": identity,
+                    "start_input_message_id": start.message_id,
+                    "result_route_json": canonical(route),
+                    "cancel_propagation": cancel_propagation,
+                }
+                if any(existing[key] != value for key, value in expected.items()):
+                    raise RuntimeRequestError("creation_conflict")
+            receipt = await self._accept_tx(
+                tx, target, body, start, self.request_hash(target, body, "normal"),
+                canonical(body), actor=actor, priority="normal", deadline_ms=None,
+                kind="user", result_kind=None,
+            )
+            if run_journal is not None and existing is None:
+                from power_loop.workflow import journal
+
+                await journal.put(
+                    self.store, tx, target.session_id, journal.run_key(start.message_id), run_journal,
+                )
         return target, start, receipt
 
     def _result_route(self, parent, route, child_id):
@@ -1077,6 +1161,11 @@ class RuntimeInputStore:
             # Repair unresolved tool calls of the interrupted run before its terminal
             # state, stamped with the interrupted active_send_index (design 215 §9.3).
             await self._repair_pending_tx(tx, target.session_id, active, own_state)
+            if session["session_kind"] == "workflow_driver":
+                return await self._recover_workflow_tx(
+                    tx, session, own_state, active, epoch, token, node_id, boot_id,
+                    ttl_s, database_now,
+                )
             rows = await tx.fetchall(
                 f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
                 "AND delivered_send_index=? AND terminal_status IS NULL",
@@ -1136,6 +1225,161 @@ class RuntimeInputStore:
                 activations[0] if activations else None,
             )
 
+    async def _continuation_child(self, reader, record):
+        return await reader.fetchone(
+            f"SELECT * FROM {self.q} WHERE session_id=? AND continuation_of=? "
+            "ORDER BY continuation_index DESC LIMIT 1",
+            (record.ref.session_id, record.ref.message_id),
+        )
+
+    async def _continuation_root(self, reader, record):
+        current = record
+        for _ in range(10000):
+            parent_id = current.row["continuation_of"]
+            if parent_id is None:
+                return current
+            parent = await self.input(
+                reader, InputRef(current.ref.store_id, current.ref.session_id, parent_id),
+            )
+            if parent is None:
+                raise RuntimeRequestError("workflow_continuation_broken")
+            current = parent
+        raise CapacityError("workflow continuation chain limit exceeded")
+
+    async def _latest_continuation(self, reader, record):
+        current = record
+        for _ in range(10000):
+            if current.row["status"] != "waiting_continuation":
+                return current
+            child = await self._continuation_child(reader, current)
+            if child is None:
+                return current
+            current = self.record(child)
+        raise CapacityError("workflow continuation chain limit exceeded")
+
+    async def _recover_workflow_tx(
+        self, tx, session, own_state, active, epoch, token, node_id, boot_id,
+        ttl_s, database_now,
+    ):
+        """Continue a non-LLM driver instead of interrupting its original start."""
+        rows = await tx.fetchall(
+            f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
+            "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id",
+            (session["session_id"], active),
+        )
+        target = TargetRef(self.store.store_id, session["session_id"])
+        if own_state["cancel_send_index"] == active:
+            origins = [self.record(row) for row in rows if row["kind"] in {"user", "workflow_continue"}]
+            if origins:
+                origin = origins[-1]
+                root = await self._continuation_root(tx, origin)
+                route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
+                delivery_error = None
+                activations = []
+                if route is not None:
+                    cancelled = Result(
+                        root.ref, target, "cancelled", active, None,
+                        error=own_state["cancel_reason"] or "cancelled", error_code="cancelled",
+                    )
+                    _ref, delivery_error = await self._route_result_tx(
+                        tx, session, route, cancelled, route["result_kind"], database_now, activations,
+                    )
+                reason = own_state["cancel_reason"] or "cancelled"
+                await tx.execute(
+                    f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
+                    "result_send_index=?,error_code='cancelled',error_detail=?,"
+                    "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                    "AND delivered_send_index=? AND terminal_status IS NULL",
+                    (active, reason, delivery_error, database_now, session["session_id"], active),
+                )
+                # Ancestors were bound to earlier sends. They still share the final
+                # continuation's terminal result, just like wait(original) does.
+                current = origin
+                ancestors = []
+                while current.row["continuation_of"] is not None:
+                    current = await self.input(tx, InputRef(
+                        current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
+                    ))
+                    ancestors.append(current.ref.message_id)
+                if ancestors:
+                    await tx.execute(
+                        f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
+                        "result_send_index=?,error_code='cancelled',error_detail=?,"
+                        "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                        f"AND item_id IN ({','.join('?' for _ in ancestors)})",
+                        (active, reason, delivery_error, database_now, session["session_id"], *ancestors),
+                    )
+                await tx.execute(
+                    f"UPDATE {self.state} SET execution_state='idle',active_send_index=NULL,"
+                    "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+                    "cancel_send_index=NULL,cancel_reason=NULL WHERE session_id=? "
+                    "AND execution_state='recovering' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
+                    (session["session_id"], active, epoch, token),
+                )
+                return FinalBatch(
+                    "idle", (), result_activation=activations[0] if activations else None,
+                )
+
+        # Result notifications from the interrupted send are reconsidered by the
+        # continuation. A committed journal/result consumption can never reach here.
+        await tx.execute(
+            f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+            "delivered_send_index=NULL WHERE session_id=? AND kind='workflow_node_result' "
+            "AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL",
+            (session["session_id"], active),
+        )
+        origins = [self.record(row) for row in rows if row["kind"] in {"user", "workflow_continue"}]
+        if not origins:
+            next_state = "queued" if rows else "idle"
+        else:
+            origin = origins[-1]
+            root = await self._continuation_root(tx, origin)
+            index = int(origin.row["continuation_index"] or 0) + 1
+            message_id = "wfc_" + sha256_canonical([
+                "workflow_continue", self.store.store_id, session["session_id"],
+                root.ref.message_id, index,
+            ])[:56]
+            continuation = InputRef(self.store.store_id, session["session_id"], message_id)
+            body = {
+                "workflow_continue": {
+                    "origin_input_ref": plain(root.ref),
+                    "previous_input_ref": plain(origin.ref),
+                    "continuation_index": index,
+                },
+            }
+            existing = await self.input(tx, continuation)
+            if existing is None:
+                await tx.execute(
+                    f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
+                    "meta_json,request_hash,created_at,continuation_of,continuation_index) "
+                    "VALUES (?,?,'workflow_continue','normal','pending',?,?,?,?,?,?)",
+                    (
+                        session["session_id"], message_id, canonical(body),
+                        canonical({"accepted_protocol": PROTOCOL_VERSION}),
+                        self.request_hash(target, body, "normal"), database_now,
+                        origin.ref.message_id, index,
+                    ),
+                )
+            elif existing.row["request_hash"] != self.request_hash(target, body, "normal"):
+                raise RuntimeRequestError("request_conflict")
+            await tx.execute(
+                f"UPDATE {self.q} SET status='waiting_continuation' WHERE session_id=? "
+                "AND item_id=? AND status='delivered' AND delivered_send_index=? "
+                "AND terminal_status IS NULL",
+                (session["session_id"], origin.ref.message_id, active),
+            )
+            next_state = "queued"
+        changed = await tx.execute(
+            f"UPDATE {self.state} SET execution_state=?,active_send_index=NULL,"
+            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+            "cancel_send_index=NULL,cancel_reason=NULL WHERE session_id=? "
+            "AND execution_state='recovering' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
+            (next_state, session["session_id"], active, epoch, token),
+        )
+        if changed != 1:
+            raise SessionLeaseLost(session["session_id"])
+        return FinalBatch(next_state, ())
+
     async def discover_unfinished(self, *, limit=100):
         if not 1 <= limit <= 1000:
             raise RuntimeRequestError("invalid_options", "limit")
@@ -1170,9 +1414,14 @@ class RuntimeInputStore:
                 record = await self.input(tx, ref)
                 if record is None:
                     raise RuntimeRequestError("not_found")
-                receipt = await self._cancel_input_tx(
-                    tx, session, state, record, reason, database_now, activations,
-                )
+                if record.row["kind"] == "workflow_continue" or record.row["status"] == "waiting_continuation":
+                    receipt = await self._cancel_workflow_input_tx(
+                        tx, session, state, record, reason, database_now, activations,
+                    )
+                else:
+                    receipt = await self._cancel_input_tx(
+                        tx, session, state, record, reason, database_now, activations,
+                    )
             elif state["execution_state"] in {"running", "recovering"}:
                 active = state["active_send_index"]
                 await tx.execute(
@@ -1235,6 +1484,82 @@ class RuntimeInputStore:
         if _with_activation:
             return receipt, activations
         return receipt
+
+    async def _cancel_workflow_input_tx(
+        self, tx, session, state, record, reason, database_now, activations,
+    ):
+        """Resolve cancel(original) to the newest continuation, then close its chain."""
+        root = await self._continuation_root(tx, record)
+        latest = await self._latest_continuation(tx, record)
+        target = TargetRef(self.store.store_id, record.ref.session_id)
+        if latest.row["terminal_status"] is not None:
+            return self.receipt(record, state="already_finished")
+        active = state["active_send_index"]
+        if (
+            latest.row["status"] == "delivered" and active is not None
+            and latest.row["delivered_send_index"] == active
+            and state["execution_state"] in {"running", "recovering"}
+        ):
+            await tx.execute(
+                f"UPDATE {self.state} SET cancel_send_index=?,cancel_reason=? "
+                "WHERE session_id=? AND active_send_index=? AND execution_state IN ('running','recovering')",
+                (active, reason, target.session_id, active),
+            )
+            return Receipt(
+                record.ref, target, record.ref.message_id, False, "cancel_requested",
+                active, "not_needed", reason,
+            )
+        if latest.row["status"] != "pending":
+            return self.receipt(record, state="already_finished")
+
+        route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
+        delivery_error = None
+        if route is not None:
+            cancelled = Result(
+                root.ref, target, "cancelled", None, None,
+                error=reason, error_code="cancelled",
+            )
+            _ref, delivery_error = await self._route_result_tx(
+                tx, session, route, cancelled, route["result_kind"], database_now, activations,
+            )
+        changed = await tx.execute(
+            f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
+            "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
+            "WHERE session_id=? AND item_id=? AND status='pending'",
+            (reason, delivery_error, database_now, target.session_id, latest.ref.message_id),
+        )
+        if changed != 1:
+            raise SessionLeaseLost(target.session_id)
+        ancestors = []
+        current = latest
+        while current.row["continuation_of"] is not None:
+            current = await self.input(tx, InputRef(
+                current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
+            ))
+            ancestors.append(current.ref.message_id)
+        if record.ref.message_id not in ancestors:
+            ancestors.append(record.ref.message_id)
+        if ancestors:
+            await tx.execute(
+                f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
+                "result_send_index=delivered_send_index,error_code='cancelled',error_detail=?,"
+                "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                f"AND item_id IN ({','.join('?' for _ in ancestors)}) "
+                "AND status='waiting_continuation' AND terminal_status IS NULL",
+                (reason, delivery_error, database_now, target.session_id, *ancestors),
+            )
+        remaining = await tx.fetchone(
+            f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
+            "AND status IN ('pending','waiting_continuation')",
+            (target.session_id,),
+        )
+        if not int(remaining["n"]) and state["execution_state"] == "queued":
+            await tx.execute(
+                f"UPDATE {self.state} SET execution_state='idle' WHERE session_id=? "
+                "AND execution_state='queued' AND owner_token IS NULL",
+                (target.session_id,),
+            )
+        return self.receipt(record, state="voided", reason=reason)
 
     async def _stored_result_tx(self, tx, record):
         row = record.row
@@ -1441,6 +1766,8 @@ class RuntimeInputStore:
             record = await self.input(reader, ref)
             if record is None:
                 raise RuntimeRequestError("not_found")
+            if record.row["status"] == "waiting_continuation" or record.row["kind"] == "workflow_continue":
+                record = await self._latest_continuation(reader, record)
             if record.row["terminal_status"] is None:
                 return None
             row = record.row

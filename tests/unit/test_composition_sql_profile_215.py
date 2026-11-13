@@ -13,10 +13,11 @@ from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.runtime_types import InputRef, TargetRef, result_message_id
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
+from power_loop.workflow import register_workflow_tool
 from tests.runtime_fixture import RunningAgent
 from tests.write_meter import WriteMeter
 
-from .test_send_sql_profile import Profiled, _counts
+from .test_send_sql_profile import Profiled, _category, _counts
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -185,6 +186,108 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
         model.parent_gate.set()
         for gate in model.child_gates:
             gate.set()
+        store._db = original
+        await runner.aclose()
+        if meter:
+            await meter.close()
+
+
+class WorkflowTreeModel(LLMService):
+    def __init__(self, count):
+        self.count = count
+        self.parent_calls = 0
+
+    async def complete(self, request, **kwargs):
+        if request.system_prompt.startswith("LEAF-"):
+            return LLMResponse(raw_text="done " + request.system_prompt)
+        self.parent_calls += 1
+        if self.parent_calls == 1:
+            branches = []
+            for index in range(self.count):
+                branches.append({
+                    "type": "agent", "id": f"N{index}", "input": f"work {index}",
+                    "spec": {"name": f"N{index}", "system_prompt": f"LEAF-{index}", "tools": []},
+                })
+            return LLMResponse(raw_text="", tool_calls=[{
+                "id": "workflow-profile", "type": "function", "function": {
+                    "name": "workflow", "arguments": json.dumps({
+                        "action": "create",
+                        "spec": {"name": "profile", "root": (
+                            branches[0] if self.count == 1 else {"type": "parallel", "branches": branches}
+                        )},
+                    }),
+                },
+            }])
+        latest = next((m.get("content", "") for m in reversed(request.messages)
+                       if m.get("role") == "user"), "")
+        if "workflow_result" not in latest:
+            return LLMResponse(raw_text="workflow accepted")
+        return LLMResponse(raw_text="caller handled workflow")
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+async def test_workflow_tree_sql_profile(registry_store, count):
+    store, _ = registry_store
+    model = WorkflowTreeModel(count)
+    registry = ToolRegistry()
+    register_workflow_tool(registry)
+    runner = await RunningAgent(
+        store, model, registry, AgentLoopConfig(compactor=None), capacity=5,
+    ).start()
+    original = store._db
+    meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
+    store._db = profiled = Profiled(original, meter)
+    started = time.monotonic()
+    try:
+        parent = await runner.send("create workflow")
+        assert parent.status == "completed"
+        rows = await original.fetchall(
+            f"SELECT content FROM {store.t.messages} WHERE session_id=? AND role='tool' "
+            "AND tool_call_id='workflow-profile'",
+            (runner.target.session_id,),
+        )
+        receipt = json.loads(rows[0]["content"])
+        start = InputRef(**receipt["input_ref"])
+        driver = TargetRef(**receipt["target_ref"])
+        result = await runner.runtime.client.wait(start, actor=runner.actor, deadline_ms=now_ms() + 15000)
+        assert result.status == "completed" and len(result.structured_output["results"]) == count
+        parent_ref = InputRef(
+            store.store_id, runner.target.session_id,
+            result_message_id(driver, start, 1, "workflow_result"),
+        )
+        await runner.runtime.worker.recover()
+        handled = await runner.runtime.client.wait(
+            parent_ref, actor=runner.actor, deadline_ms=now_ms() + 15000,
+        )
+        assert handled.status == "completed" and handled.final_text == "caller handled workflow"
+        await runner.drain()
+        elapsed = time.monotonic() - started
+        records, tx_sites = list(profiled.records), list(profiled.tx_sites)
+        counts = _counts(records, tx_sites, profiled.tx_categories)
+        assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+        journal_records = [record for record in records if "session_runtime_state" in record.get("sql", "")]
+        assert journal_records and all(
+            _category(record["chain"], record["sql"]) == "session_control" for record in journal_records
+        )
+        writes = await meter.report() if meter else None
+        if output := os.environ.get("P215_COMPOSITION_OUT"):
+            with open(output, "a") as stream:
+                stream.write(json.dumps({
+                    "db": original.dialect.name,
+                    "scenario": f"workflow_{count}",
+                    "leaves": count,
+                    "total_sql": len(records),
+                    "counts": counts,
+                    "transactions": profiled.transactions,
+                    "writes": writes,
+                    "elapsed_s": elapsed,
+                    "records": records,
+                    "tx_sites": tx_sites,
+                }) + "\n")
+    finally:
         store._db = original
         await runner.aclose()
         if meter:

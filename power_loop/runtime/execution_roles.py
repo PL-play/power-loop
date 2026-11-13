@@ -28,6 +28,8 @@ async def session_role(store, sid: str) -> str:
         return "main"
     import json
     config = json.loads(row["descriptor_json"]).get("config") or {}
+    if "workflow_node" in config:
+        return "workflow_node"
     if "child_spec" in config:
         return "subagent"
     if row["session_kind"] == "background":

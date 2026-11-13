@@ -70,7 +70,10 @@ async def test_graph_shapes_have_distinct_saved_nodes(registry_store, shape, exp
         )
         result = await handle.wait(deadline_ms=now_ms() + 15000)
         assert result.status == "completed", result
-        rows = await store._db.fetchall(f"SELECT session_id FROM {store.table_prefix}jobs WHERE kind='workflow_node'")
+        rows = await store._db.fetchall(
+            f"SELECT session_id,descriptor_json FROM {store.t.sessions} "
+            "WHERE descriptor_json LIKE '%workflow_node%'",
+        )
         assert len(rows) == expected and len({r["session_id"] for r in rows}) == expected
         assert "C" not in result.results
     finally:
@@ -117,18 +120,20 @@ async def test_model_submission_returns_receipt_and_delivers_to_parent(registry_
         messages = await store.load_all_messages(runner.target.session_id)
         receipt = json.loads(next(m.content for m in messages if m.tool_call_id == "workflow-call"))
         assert receipt["status"] == "accepted", receipt
+        assert receipt["target_ref"]["session_id"] == receipt["input_ref"]["session_id"]
+        assert "job_id" not in receipt and "job_ref" not in receipt
         result = await runner.runtime.client.wait(
             InputRef(**receipt["input_ref"]), actor=runner.actor, deadline_ms=now_ms() + 10000
         )
         assert result.status == "completed"
+        await runner.runtime.worker.recover()
         await runner.drain()
         notices = await store._db.fetchall(
-            f"SELECT meta_json FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='task_done'",
+            f"SELECT kind,terminal_status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result'",
             (runner.target.session_id,),
         )
-        assert len(notices) == 1
-        assert json.loads(notices[0]["meta_json"])["result_ref"]["job_id"] == receipt["job_id"]
-        assert not await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE supervision_status='open'")
+        assert len(notices) == 1 and notices[0]["terminal_status"] == "completed"
     finally:
         await runner.aclose()
 
@@ -183,9 +188,15 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
         result = await handle.wait(deadline_ms=now_ms() + 15000)
         assert result.status == "completed" and model.child_done, result
         children = await store._db.fetchall(
-            f"SELECT outcome,control_owner_job_id FROM {store.table_prefix}jobs WHERE kind='subagent'"
+            f"SELECT session_id,parent_session_id FROM {store.t.sessions} WHERE parent_session_id=?",
+            (result.results["A"].session_id,),
         )
-        assert len(children) == 1 and children[0]["outcome"] == "succeeded"
+        assert len(children) == 1
+        child_result = await store._db.fetchone(
+            f"SELECT terminal_status FROM {store.t.follow_up_queue} WHERE session_id=?",
+            (children[0]["session_id"],),
+        )
+        assert child_result["terminal_status"] == "completed"
     finally:
         await runner.aclose()
 
@@ -223,8 +234,10 @@ async def test_failure_policy_uses_new_attempt_and_keeps_usage(registry_store, p
         result = await handle.wait(deadline_ms=now_ms() + 10000)
         assert result.status == "completed", result
         assert result.usage["calls"] == model.calls
-        nodes = await store._db.fetchall(f"SELECT session_id FROM {store.table_prefix}jobs WHERE kind='workflow_node'")
-        assert len(nodes) == (1 if policy == "continue" else 2)
+        nodes = await store._db.fetchall(
+            f"SELECT session_id FROM {store.t.sessions} WHERE descriptor_json LIKE '%workflow_node%'",
+        )
+        assert len(nodes) == (2 if policy == "fallback" else 1)
         assert len({n["session_id"] for n in nodes}) == len(nodes)
     finally:
         await runner.aclose()
@@ -276,9 +289,12 @@ async def test_loop_reuses_sessions_and_renders_dependency_output(registry_store
         assert result.status == "completed", result
         assert result.usage["calls"] == 4 and calls == {"dev": 2, "review": 2}
         nodes = await store._db.fetchall(
-            f"SELECT title,session_id FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
+            f"SELECT session_id FROM {store.t.sessions} WHERE descriptor_json LIKE '%workflow_node%'",
         )
-        assert len(nodes) == 4 and len({n["session_id"] for n in nodes}) == 2
+        entries = await store._db.fetchall(
+            f"SELECT state_key FROM {store.t.session_runtime_state} WHERE state_key LIKE 'workflow:node:%'",
+        )
+        assert len(entries) == 4 and len(nodes) == 2 and len({n["session_id"] for n in nodes}) == 2
         assert result.results["review"].payload == {"pass": True}
     finally:
         await runner.aclose()

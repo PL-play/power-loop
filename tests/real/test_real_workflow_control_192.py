@@ -39,14 +39,17 @@ async def test_real_workflow_cancel_uses_original_admission_without_replacement_
             assert len(rows)==2
             creation,stopped=[json.loads(m.content) for m in rows]
             assert creation['run_id']==handle.run_id
-            assert stopped['job_ref']['job_id']==handle.job_id and stopped['state']=='applied'
+            assert stopped['target']['session_id']==handle.target.session_id
+            assert stopped['state'] in {'cancel_requested','voided'}
             assert 'resource_stop_confirmed' not in stopped
             saved=await handle.wait(deadline_ms=now_ms()+15000)
             assert saved.status=='cancelled'
             await agent.drain()
-            jobs=await agent.runtime.store._db.fetchall(f'SELECT kind FROM {agent.runtime.store.table_prefix}jobs')
-            assert sum(j['kind']=='workflow' for j in jobs)==1
-            assert sum(j['kind']=='workflow_node' for j in jobs)==1
+            store=agent.runtime.store
+            drivers=await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions} WHERE session_kind='workflow_driver'")
+            assert len(drivers)==1
+            nodes=await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=?", (handle.target.session_id,))
+            assert len(nodes)==1
             assert len(accepted)==1
     finally:
         provider.release_children.set()

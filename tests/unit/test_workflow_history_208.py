@@ -52,6 +52,9 @@ async def test_current_workflow_logs_preserve_selected_source_and_safe_export(re
         else:
             assert value['status']=='ok' and value['source']==view and 'ANSWER-42' in str(value)
         assert await store.load_all_messages(sid)==before
-        assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {store.table_prefix}jobs WHERE kind='workflow_node'"))['n']==1
+        nodes = await store._db.fetchall(
+            f"SELECT session_id FROM {store.t.sessions} WHERE descriptor_json LIKE '%workflow_node%'",
+        )
+        assert len(nodes) == 1
     finally:
         await agent.aclose()

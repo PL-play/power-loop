@@ -29,11 +29,11 @@ async def test_real_current_workflow_history_projection_and_export(runtime_agent
         handle=await agent.runtime.client.workflow(agent.target,{'name':'history','root':root},message_id='original',actor=agent.actor)
         assert (await handle.wait(deadline_ms=now_ms()+120000)).status=='completed'
         await agent.drain()
-        nodes=await store._db.fetchall(f"SELECT job_id,session_id FROM {store.table_prefix}jobs WHERE kind='workflow_node' ORDER BY job_id")
+        nodes=await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? ORDER BY session_id", (handle.target.session_id,))
         originals={n['session_id']:await store.load_all_messages(n['session_id']) for n in nodes}
         node=nodes[0]
         for source,output in [('messages',None),('projection',None),('messages','audit/node.jsonl')]:
-            options={'action':'logs','run_id':handle.run_id,'node_job_id':node['job_id'],'source':source,'limit':20}
+            options={'action':'logs','run_id':handle.run_id,'node_session_id':node['session_id'],'source':source,'limit':20}
             if output:
                 options['output_file']=output
             result=await agent.send('Call workflow exactly once with '+json.dumps(options)+'. Then report the returned history or export path. No other tools.')
@@ -49,6 +49,6 @@ async def test_real_current_workflow_history_projection_and_export(runtime_agent
                 assert value['status']=='ok' and value['source']==source and '42' in str(value)
         for sid,history in originals.items():
             assert await store.load_all_messages(sid)==history
-        assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {store.table_prefix}jobs WHERE kind='workflow_node'"))['n']==len(nodes)
+        assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE parent_session_id=?", (handle.target.session_id,)))['n']==len(nodes)
     finally:
         provider.report(record_property)

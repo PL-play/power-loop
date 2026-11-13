@@ -1,17 +1,21 @@
-"""Workflow admission and driver execution through the common message runtime."""
+"""Session-native workflow admission, execution and recovery.
+
+The driver is a non-LLM session. Leaves are ordinary agent sessions created with
+one atomic session+start transaction; their journal entries commit afterwards.
+A replacement driver replays the frozen graph from those entries and ordinary
+node result inputs, never from a Python call stack or a job generation.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-from dataclasses import dataclass, replace
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 
-from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_store import FinalBatch, now_ms
 from power_loop.agent.runtime_types import (
-    Command,
     InputRef,
-    JobRef,
     RequestOptions,
     Result,
     RuntimeDescriptor,
@@ -20,139 +24,101 @@ from power_loop.agent.runtime_types import (
     TrustedActor,
     canonical,
     plain,
+    sha256_canonical,
 )
-from power_loop.runtime.jobs import JobActor, JobLease, JobManager, JobRegistration, _hash, _record
-from power_loop.runtime.store.types import SubagentLifecycle
+from power_loop.contracts.errors import SessionLeaseLost
 
 from . import journal
 from .engine import WorkflowEngine
 from .spec import WorkflowSpec
 
 
-@dataclass(frozen=True)
-class DriverActor(TrustedActor):
-    job_ref: JobRef | None = None
-
-
-async def authorize_driver(port, reader, actor):
-    from power_loop.runtime.session_ownership import current_ownership
-
-    ownership = current_ownership()
-    if ownership is None or ownership.key != (port.store.store_id, actor.session_id):
-        raise RuntimeRequestError("forbidden", "driver ownership required")
-    ownership.require_owned()
-    row = await reader.fetchone(
-        f"SELECT kind,session_id,generation FROM {port.jobs} WHERE job_id=?", (actor.job_ref.job_id,)
-    )
-    if row is None or (row["kind"], row["session_id"], row["generation"]) != (
-        "workflow",
-        actor.session_id,
-        actor.job_ref.generation,
-    ):
-        raise RuntimeRequestError("forbidden", "driver generation changed")
-
-
 async def submit(client, target, spec, *, message_id, actor, descriptor=None, options=None, parent=None):
-    """Freeze a graph and atomically create its independent driver and start input."""
+    """Create only the independent driver and its frozen start input."""
+    del parent  # Parent authority is the direct caller session, never a job lease.
     client._require_open()
     spec = WorkflowSpec.from_json(spec.to_dict() if isinstance(spec, WorkflowSpec) else spec)
-    port, manager = client.inputs, JobManager(client.store)
-    defaults = await port.authorize(port.db, target, actor)
-    origin = JobActor(actor.tenant_id, actor.principal_id, target.session_id)
-    key = manager._origin_key(
-        origin, "create", actor.call_ref, actor.tool_call_id, None if actor.call_ref else "workflow:" + message_id
-    )
-    sid = "driver_" + key[:32]
-    start = InputRef(target.store_id, sid, "start_" + key[:32])
+    port = client.inputs
+    caller = await port._session(port.db, target.session_id)
+    supplied_descriptor, supplied_options = descriptor, options
+    if descriptor is None:
+        descriptor = RuntimeDescriptor(**json.loads(caller["descriptor_json"]))
     options = options or RequestOptions()
-    async with manager.joined_write() as tx:
-        await port.db.dialect.lock_state(tx, port.state, target.session_id)
-        if parent:
-            await manager._fence(tx, origin, parent)
-        old = await tx.fetchone(f"SELECT job_id FROM {manager.events} WHERE operation_key=?", (key,))
-        accepted = await port.input(tx, start) if old else None
-        descriptor = descriptor or RuntimeDescriptor(
-            **(accepted.meta["descriptor"] if accepted else defaults["runtime_descriptor"])
-        )
-        allowed_tools = options.tools
-        if allowed_tools is None and accepted:
-            allowed_tools = accepted.meta["descriptor"]["config"]["workflow"]["allowed_tools"]
-        descriptor = replace(
-            descriptor,
-            kind="workflow_driver",
-            config={
-                **plain(descriptor.config),
-                "workflow": {"spec": spec.to_dict(), "allowed_tools": plain(allowed_tools)},
+    identity = [
+        "workflow_driver", target.store_id, target.session_id, message_id,
+        actor.call_ref.to_dict() if actor.call_ref is not None else None, actor.tool_call_id,
+    ]
+    sid = "ses_" + sha256_canonical(identity)[:56]
+    driver = TargetRef(target.store_id, sid)
+    start = InputRef(
+        target.store_id, sid,
+        "inp_" + sha256_canonical(["workflow_start", target.store_id, sid])[:56],
+    )
+    existing = await port.db.fetchone(
+        f"SELECT descriptor_json FROM {port.store.t.sessions} WHERE session_id=?", (sid,),
+    )
+    if existing is not None and supplied_descriptor is None and supplied_options is None:
+        descriptor = RuntimeDescriptor(**json.loads(existing["descriptor_json"]))
+        frozen_spec = WorkflowSpec.from_json(plain(descriptor.config["workflow"]["spec"]))
+        if canonical(frozen_spec.to_dict()) != canonical(spec.to_dict()):
+            raise RuntimeRequestError("creation_conflict")
+        options = RequestOptions(**{
+            key: value for key, value in descriptor.config["workflow"].get("options", {}).items()
+            if key in RequestOptions.__dataclass_fields__
+        })
+    descriptor = replace(
+        descriptor,
+        kind="workflow_driver",
+        config={
+            **plain(descriptor.config),
+            "workflow": {
+                "spec": spec.to_dict(),
+                "allowed_tools": plain(options.tools),
+                "options": plain(options),
             },
-        )
-        if old is None:
-            await port.store._create_session_tx(
-                tx,
-                sid,
-                now_ms(),
-                parent_session_id=target.session_id,
-                lifecycle=SubagentLifecycle.LINKED,
-                metadata={
-                    "tenant_id": actor.tenant_id,
-                    "principal_id": actor.principal_id,
-                    "execution_role": "workflow",
-                    "runtime_descriptor": plain(descriptor),
-                },
-            )
-        registration = await manager.register_job(
-            origin,
-            kind="workflow",
-            title=spec.name,
-            session_id=sid,
-            parent=parent,
-            independent=True,
-            call_ref=actor.call_ref,
-            tool_call_id=actor.tool_call_id,
-            system_key=None if actor.call_ref else "workflow:" + message_id,
-            request={"input_ref": plain(start)},
-        )
-        receipt = await port.accept_input(
-            tx,
-            Command(
-                start.message_id,
-                TargetRef(start.store_id, sid),
-                "send",
-                {"body": spec.input},
-                options=plain(options),
-            ),
-            actor,
-            descriptor=descriptor, child_start=True,
-        )
-        run_id = registration.operation.operation_id[3:]
-        if receipt.newly_accepted:
-            await tx.execute(
-                f"UPDATE {port.q} SET delivered_job_id=?,delivered_job_generation=0 WHERE session_id=? AND item_id=?",
-                (registration.job.job_id, sid, start.message_id),
-            )
-            await journal.put(
-                port.store,
-                tx,
-                sid,
-                journal.run_key(run_id),
-                {
-                    "run_id": run_id,
-                    "job_id": registration.job.job_id,
-                    "driver_sid": sid,
-                    "definition_ref": plain(start),
-                    "created_at_ms": now_ms(),
-                },
-            )
-    await client._notify(TargetRef(start.store_id, sid), start.message_id, start, ["work", "activation"])
-    return WorkflowRunHandle(client, actor, run_id, JobRef(start.store_id, registration.job.job_id, 0), start)
+        },
+    )
+    saved = {
+        "version": 1,
+        "run_id": start.message_id,
+        "driver_target": plain(driver),
+        "start_input_ref": plain(start),
+        "caller_target": plain(target),
+        "definition_ref": plain(start),
+        "created_at_ms": now_ms(),
+        "status": "running",
+        "result": None,
+        "result_seq": None,
+        "aggregate_delivered": False,
+        "continuation": {},
+        "execution_revision": 0,
+    }
+    await port.create_workflow_session(
+        descriptor,
+        parent=target,
+        actor=actor,
+        target=driver,
+        start=start,
+        body=spec.input,
+        result_kind="workflow_result",
+        cancel_propagation="independent",
+        run_journal=saved if existing is None else None,
+    )
+    await client._notify(driver, start.message_id, start, ["work", "activation"])
+    return WorkflowRunHandle(client, actor, driver, start)
 
 
 class WorkflowRunHandle:
-    """A durable reference, with no local task or callback ownership."""
+    """The complete durable handle: driver TargetRef, start InputRef and run alias."""
 
-    def __init__(self, client, actor, run_id, job_ref, input_ref):
-        self.client, self.actor, self.run_id = client, actor, run_id
-        self.job_ref, self.input_ref = job_ref, input_ref
-        self.job_id, self.operation_id = job_ref.job_id, "op_" + run_id
+    def __init__(self, client, actor, target: TargetRef, input_ref: InputRef):
+        if input_ref.message_id is None or (input_ref.store_id, input_ref.session_id) != (
+            target.store_id, target.session_id
+        ):
+            raise RuntimeRequestError("invalid_options", "workflow handle target/start mismatch")
+        self.client, self.actor = client, actor
+        self.target, self.input_ref = target, input_ref
+        self.run_id = input_ref.message_id
 
     async def wait(self, *, deadline_ms=None):
         result = await self.client.wait(self.input_ref, actor=self.actor, deadline_ms=deadline_ms)
@@ -160,37 +126,67 @@ class WorkflowRunHandle:
 
         data = plain(result.structured_output)
         if data is None:
-            return WorkflowResult(self.run_id, result.status, errors=[result.error] if result.error else [])
-        data["results"] = {key: AgentResult(**value) for key, value in data["results"].items()}
-        data["final"] = AgentResult(**data["final"]) if data["final"] else None
+            return WorkflowResult(
+                self.run_id, result.status, errors=[result.error] if result.error else [],
+            )
+        data["results"] = {
+            key: AgentResult(**value) for key, value in data.get("results", {}).items()
+        }
+        data["final"] = AgentResult(**data["final"]) if data.get("final") else None
         return WorkflowResult(**data)
 
-    async def resume(self, *, generation, node_id, message, message_id):
-        from .resume import resume_run
-
+    async def resume(self, *, node_id, message, message_id):
         return await resume_run(
-            self.client,
-            replace(self.job_ref, generation=generation),
-            node_id=node_id,
-            message=message,
-            message_id=message_id,
-            actor=self.actor,
+            self.client, self.target, node_id=node_id, message=message,
+            message_id=message_id, actor=self.actor,
         )
 
     async def cancel(self, reason="cancelled"):
-        return await self.client.cancel(self.input_ref, actor=self.actor, scope="subtree", reason=reason)
+        return await self.client.cancel(self.input_ref, actor=self.actor, reason=reason)
 
 
 class DurableExecutor:
-    def __init__(self, worker, ctx, runtime, binding, run_id, env):
-        self.worker, self.ctx, self.runtime, self.binding = worker, ctx, runtime, binding
-        self.port, self.manager = worker.inputs, runtime.manager
-        self.run_id, self.env = run_id, env
-        self.plan = {}
-        self.actor = DriverActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id, job_ref=ctx.job_ref)
+    """Narrow Executor adapter over the unified session Client."""
 
-    async def run_agent(self, request, *, allow_start=True):
-        """G: stable dispatch plus node record; consume results under driver ownership."""
+    def __init__(self, worker, ctx, env, run_id, saved):
+        self.worker, self.ctx, self.env = worker, ctx, env
+        self.client = worker.runtime.client
+        self.port = worker.inputs
+        self.run_id, self.saved = run_id, saved
+        self.plan = saved.get("continuation") or {}
+        self.driver = TargetRef(ctx.store_id, ctx.session_id)
+        self.actor = TrustedActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id)
+
+    def _coordinates(self, request):
+        offset = self.plan.get("attempt_offsets", {}).get(request.node_path, 0)
+        if offset:
+            request = replace(request, attempt=request.attempt + offset)
+        body = request.body
+        if request.continuation == 0:
+            body = self.plan.get("body_overrides", {}).get(request.node_path, request.body)
+        if body != request.body:
+            request = replace(request, body=body)
+        request_hash = sha256_canonical(plain(request))
+        sid = request.session_id or "ses_" + sha256_canonical([
+            "workflow_node", self.driver.store_id, self.driver.session_id, self.run_id,
+            request.node_path, request.iteration_path,
+        ])[:56]
+        target = TargetRef(self.driver.store_id, sid)
+        start = InputRef(
+            self.driver.store_id, sid,
+            "inp_" + sha256_canonical([
+                "workflow_node_start", self.driver.store_id, self.driver.session_id, self.run_id,
+                request.node_path, request.iteration_path, request.attempt,
+                request.continuation, request_hash,
+            ])[:56],
+        )
+        key = journal.node_key(
+            self.driver, self.run_id, request.node_path, request.iteration_path,
+            request.attempt, request.continuation,
+        )
+        return request, target, start, key, request_hash
+
+    def _descriptor(self, request):
         from power_loop.runtime.execution_roles import role_tools
         from power_loop.runtime.spec import AgentSpec, _child_config
 
@@ -198,28 +194,27 @@ class DurableExecutor:
         config = _child_config(spec, SimpleNamespace(config=self.env.config))
         available = self.env.tool_registry.names() if self.env.tool_registry else []
         tools = role_tools(
-            spec.tools if spec.tools is not None else available, "workflow_node", registry=self.env.tool_registry
+            spec.tools if spec.tools is not None else available,
+            "workflow_node", registry=self.env.tool_registry,
         )
         options = RequestOptions(
-            tools=tools,
+            tools=tuple(tools),
             **{
                 name: getattr(config, name)
                 for name in (
-                    "model",
-                    "temperature",
-                    "max_tokens",
-                    "max_rounds",
-                    "max_tokens_per_run",
-                    "system_prompt",
-                    "response_format",
+                    "model", "temperature", "max_tokens", "max_rounds", "max_tokens_per_run",
+                    "system_prompt", "response_format",
                 )
             },
         )
-        descriptor = replace(
+        return replace(
             self.ctx.descriptor,
-            kind="workflow_node",
+            kind="agent",
             config={
-                **{key: value for key, value in plain(self.ctx.descriptor.config).items() if key != "workflow"},
+                **{
+                    key: value for key, value in plain(self.ctx.descriptor.config).items()
+                    if key != "workflow"
+                },
                 "child_spec": request.spec,
                 "child_options": plain(options),
                 "workflow_node": {
@@ -230,313 +225,426 @@ class DurableExecutor:
                 },
             },
         )
-        # This exact system key is the G0 contract. Only the creation event is unique.
-        system_key = (
-            "wf:"
-            + hashlib.sha256(
-                canonical([self.run_id, request.node_path, request.iteration_path, request.attempt]).encode()
-            ).hexdigest()
+
+    async def _check_owner(self, tx):
+        state = await self.port.store._db.dialect.lock_state(tx, self.port.state, self.ctx.session_id)
+        batch = self.ctx.batch
+        if (
+            state["execution_state"] != "running"
+            or state["active_send_index"] != batch.send_index
+            or state["owner_epoch"] != batch.owner_epoch
+            or state["owner_token"] != batch.owner_token
+        ):
+            raise SessionLeaseLost(self.ctx.session_id)
+        return state
+
+    async def run_agent(self, request, *, allow_start=True):
+        request, target, start, key, request_hash = self._coordinates(request)
+        saved = await journal.get(self.port.store, self.port.db, self.ctx.session_id, key)
+        if saved is None:
+            if not allow_start:
+                return {"status": "budget_exceeded", "usage": {}, "session_id": target.session_id}
+            descriptor = self._descriptor(request)
+            if request.session_id is None and request.attempt == 1 and request.continuation == 0:
+                await self.port.create_workflow_session(
+                    descriptor,
+                    parent=self.driver,
+                    actor=self.actor,
+                    target=target,
+                    start=start,
+                    body=request.body,
+                    result_kind="workflow_node_result",
+                    cancel_propagation="linked",
+                )
+                await self.client._notify(target, start.message_id, start, ["work", "activation"])
+            else:
+                await self.client.send(
+                    target, request.body, message_id=start.message_id, actor=self.actor,
+                )
+            # Fixed order: session+start committed above, journal committed below.
+            async with self.port.db.transaction() as tx:
+                await self._check_owner(tx)
+                saved = await journal.get(self.port.store, tx, self.ctx.session_id, key)
+                if saved is None:
+                    saved = {
+                        "version": 1,
+                        "driver_target": plain(self.driver),
+                        "run_id": self.run_id,
+                        "path": request.node_path,
+                        "iteration": request.iteration_path,
+                        "attempt": request.attempt,
+                        "continuation_index": request.continuation,
+                        "target_ref": plain(target),
+                        "session_id": target.session_id,
+                        "input_ref": plain(start),
+                        "request_hash": request_hash,
+                        "revision": int(self.plan.get("revision", 0)),
+                        "superseded": False,
+                        "result": None,
+                        "result_seq": None,
+                        "result_input_ref": None,
+                        "late_results": [],
+                    }
+                    await journal.put(self.port.store, tx, self.ctx.session_id, key, saved)
+        elif saved["request_hash"] != request_hash:
+            raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
+
+        if saved.get("result") is None:
+            try:
+                result = await self.client.wait(start, actor=self.actor, deadline_ms=None)
+            except asyncio.CancelledError:
+                # Graph halt and explicit cancellation stop outstanding leaves. Driver
+                # shutdown/ownership replacement leaves healthy independent sessions alone.
+                if (
+                    not self.ctx.shutdown_interrupted
+                    and not self.ctx.ownership.lost
+                    and self.ctx.stop.reason != "worker shutdown"
+                ):
+                    await self.client.cancel(
+                        target, actor=self.actor, scope="subtree", reason="workflow branch stopped",
+                    )
+                raise
+            await self._consume_results()
+            saved = await journal.get(self.port.store, self.port.db, self.ctx.session_id, key)
+            if saved.get("result") is None:
+                # A full driver inbox can be drained and the ordinary result re-reported
+                # without re-executing the node. Unknown external actions are not replayed.
+                await self.port.accept_result(target, result, result_kind="workflow_node_result")
+                await self._consume_results()
+                saved = await journal.get(self.port.store, self.port.db, self.ctx.session_id, key)
+            if saved.get("result") is None:
+                raise RuntimeRequestError("result_delivery_failed", start.message_id)
+
+        raw = dict(saved["result"])
+        next_key = journal.node_key(
+            self.driver, self.run_id, request.node_path, request.iteration_path,
+            request.attempt, request.continuation + 1,
         )
-        origin = self.runtime.actor(self.ctx.session_id)
-        offset = self.plan.get("attempt_offsets", {}).get(request.node_path, 0)
-        if offset:
-            request = replace(request, attempt=request.attempt + offset)
-            system_key = (
-                "wf:"
-                + hashlib.sha256(
-                    canonical([self.run_id, request.node_path, request.iteration_path, request.attempt]).encode()
-                ).hexdigest()
-            )
-        key = self.manager._origin_key(origin, "create", None, None, system_key)
-        sid = request.session_id or "node_" + key[:32]
-        start = InputRef(self.ctx.store_id, sid, "start_" + key[:32])
-        entry_key = journal.node_key(key)
-        async with self.manager.joined_write() as tx:
-            await self.port.lock_owned(tx, TargetRef(self.ctx.store_id, self.ctx.session_id), self.ctx)
-            await self.manager._fence(tx, origin, self.binding.lease)
-            saved = await journal.get(self.port.store, tx, self.ctx.session_id, entry_key)
-            if saved is None:
-                if not allow_start:
-                    return {"status": "budget_exceeded", "usage": {}}
-                if request.session_id is None:
-                    await self.port.store._create_session_tx(
-                        tx,
-                        sid,
-                        now_ms(),
-                        parent_session_id=self.ctx.session_id,
-                        lifecycle=SubagentLifecycle.LINKED,
-                        metadata={
-                            **plain(spec.metadata),
-                            "tenant_id": self.actor.tenant_id,
-                            "principal_id": self.actor.principal_id,
-                            "execution_role": "workflow_node",
-                            "workflow_run_id": self.run_id,
-                            "runtime_descriptor": plain(descriptor),
-                        },
-                    )
-                registration = await self.manager.register_job(
-                    origin,
-                    kind="workflow_node",
-                    title=request.node_path,
-                    session_id=sid,
-                    parent=self.binding.lease,
-                    system_key=system_key,
-                    request={"input_ref": plain(start)},
-                )
-                receipt = await self.port.accept_input(
-                    tx,
-                    Command(
-                        start.message_id,
-                        TargetRef(start.store_id, sid),
-                        "send",
-                        {"body": request.body},
-                        options=plain(options),
-                    ),
-                    self.actor,
-                    descriptor=descriptor, child_start=True,
-                )
-                await tx.execute(
-                    f"UPDATE {self.port.q} SET delivered_job_id=?,delivered_job_generation=0 WHERE session_id=? AND item_id=?",
-                    (registration.job.job_id, sid, start.message_id),
-                )
-                saved = {
-                    "path": request.node_path,
-                    "iteration": request.iteration_path,
-                    "attempt": request.attempt,
-                    "session_id": sid,
-                    "job_id": registration.job.job_id,
-                    "input_ref": plain(receipt.input_ref),
-                    "request_hash": _hash(plain(request)),
-                    "continuations": {},
-                    "result_ref": None,
-                }
-                await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
-            elif request.continuation == 0 and saved["request_hash"] != _hash(plain(request)):
-                raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
-            wait_ref = InputRef(**self.plan.get("overrides", {}).get(key, saved["input_ref"]))
-            if request.continuation:
-                continuation_key = str(request.continuation)
-                existing = saved["continuations"].get(continuation_key)
-                if existing is None:
-                    if not allow_start:
-                        return {"status": "budget_exceeded", "session_id": saved["session_id"], "usage": {}}
-                    row = await self.manager._row(tx, saved["job_id"])
-                    wait_ref = InputRef(
-                        self.ctx.store_id,
-                        saved["session_id"],
-                        "continue_" + _hash([key, plain(wait_ref), request.continuation])[:32],
-                    )
-                    receipt = await self.port.accept_input(
-                        tx,
-                        Command(
-                            wait_ref.message_id,
-                            TargetRef(wait_ref.store_id, wait_ref.session_id, row["job_id"]),
-                            "resume",
-                            {"body": request.body},
-                            expected_job_generation=row["generation"],
-                            options=plain(options),
-                        ),
-                        self.actor,
-                        descriptor=descriptor,
-                    )
-                    saved["continuations"][continuation_key] = plain(receipt.input_ref)
-                    await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
-                else:
-                    wait_ref = InputRef(**existing)
-        await self.worker.runtime.client._notify(
-            TargetRef(wait_ref.store_id, wait_ref.session_id), wait_ref.message_id, wait_ref, ["work", "activation"]
-        )
-        try:
-            result = await self.worker.runtime.client.wait(wait_ref, actor=self.actor, deadline_ms=None)
-        except asyncio.CancelledError:
-            # A graph halt stops its outstanding leaves. Losing the driver
-            # process leaves healthy nodes alone for the replacement driver.
-            if not self.ctx.shutdown_interrupted and not self.ctx.lease.lost:
-                await self.worker.runtime.client.cancel(
-                    wait_ref, actor=self.actor, scope="subtree", reason="workflow branch stopped"
-                )
-            raise
-        from power_loop.runtime.result_revisions import result_id
-
-        reference = {
-            "result_id": result_id(result.job_ref.job_id, result.job_ref.generation),
-            "job_id": result.job_ref.job_id,
-            "generation": result.job_ref.generation,
-        }
-        async with self.manager.joined_write() as tx:
-            await self.port.lock_owned(tx, TargetRef(self.ctx.store_id, self.ctx.session_id), self.ctx)
-            await self.manager._fence(tx, origin, self.binding.lease)
-            saved = await journal.get(self.port.store, tx, self.ctx.session_id, entry_key)
-            # Re-reading earlier generations rebuilds usage, not the latest
-            # node projection. Keep the already consumed continuation result.
-            if saved["result_ref"] is None or saved["result_ref"]["generation"] < reference["generation"]:
-                saved["result_ref"] = reference
-                await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
-            item = hashlib.sha256(("result:" + reference["result_id"]).encode()).hexdigest()
-            await tx.execute(
-                f"UPDATE {self.port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
-                "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
-                (now_ms(), self.ctx.session_id, item),
-            )
-            await tx.update_event(
-                reference["job_id"],
-                f"UPDATE {self.port.events} SET delivery_status='handled' WHERE event_id=?",
-                (reference["result_id"],),
-            )
-            await tx.write_job(
-                reference["job_id"],
-                f"UPDATE {self.port.jobs} SET result_status='handled',version=version+1 "
-                "WHERE job_id=? AND generation=?",
-                (reference["job_id"], reference["generation"]),
-                obligations=True,
-            )
-            owner = (await self._node_stopped_notice(tx, request.node_path, result)
-                     if result.status == "cancelled" else None)
-        if owner is not None:
-            from power_loop.runtime.result_notices import notify
-
-            await notify(self.worker.runtime.client, *owner)
-        from power_loop.runtime.finalization import try_finalize
-
-        await try_finalize(self.manager, origin, result.job_ref.job_id, result.job_ref.generation)
-        raw = plain(result)
-        # Public results classify incomplete model turns as interrupted. The
-        # graph retains the explicit round-limit reason for its declared policy.
-        if result.status == "interrupted" and result.error in {"hit_round_limit", "context_checkpoint"}:
-            raw["status"] = result.error
+        following = await journal.get(self.port.store, self.port.db, self.ctx.session_id, next_key)
+        replayed = bool(self.plan) and int(saved.get("revision", 0)) < int(self.plan.get("revision", 0))
         return {
             **raw,
-            "session_id": saved["session_id"],
-            "has_next_continuation": str(request.continuation + 1) in saved["continuations"],
-            "accounting_usage": (
-                {}
-                if result.job_ref.generation <= self.plan.get("already_counted", {}).get(result.job_ref.job_id, 0)
-                else raw["usage"]
-            ),
+            "session_id": target.session_id,
+            "has_next_continuation": following is not None,
+            "accounting_usage": {} if replayed else raw.get("usage") or {},
         }
 
-    async def _node_stopped_notice(self, tx, node, result):
-        """Tell the workflow's owner at once that a node was stopped from outside the graph."""
-        from power_loop.agent.runtime_store import quiet_cancel_event
-        from power_loop.runtime.result_notices import accept
-
-        workflow = await self.manager._row(tx, self.binding.lease.job_id)
-        if workflow["cancel_requested_at"] is not None or workflow["parent_job_id"] is None:
-            return None
-        if await tx.fetchone(f"SELECT 1 AS quiet FROM {self.port.events} WHERE event_id=?",
-                             (quiet_cancel_event(result.job_ref.job_id),)):
-            return None
-        stopped = await self.manager._row(tx, result.job_ref.job_id)
-        main = await self.manager._row(tx, workflow["parent_job_id"])
-        actor = JobActor(main["tenant_id"], main["principal_id"], main["session_id"])
-        key = f"node_stopped_{result.job_ref.job_id}_{result.job_ref.generation}"
-        body = "[workflow_node_cancelled]\n" + canonical({"workflow_run_id": self.run_id, "node": node,
-            "job_id": result.job_ref.job_id, "reason": stopped["cancel_reason"]})
-        await accept(self.manager, tx, actor, main["job_id"], key, "task_notice", body)
-        return actor, key
+    async def _consume_results(self):
+        """Consume every ready node result and journal it in one fenced transaction."""
+        async with self.port.db.transaction() as tx:
+            await self._check_owner(tx)
+            rows = await tx.fetchall(
+                f"SELECT * FROM {self.port.q} WHERE session_id=? "
+                "AND kind='workflow_node_result' AND (status='pending' "
+                "OR (status='delivered' AND delivered_send_index=? AND terminal_status IS NULL)) "
+                "ORDER BY id LIMIT 1000",
+                (self.ctx.session_id, self.ctx.send_index),
+            )
+            if not rows:
+                return 0
+            entries = await journal.nodes(self.port.store, tx, self.ctx.session_id)
+            by_input = {canonical(entry["input_ref"]): (key, entry) for entry, key in zip(
+                entries,
+                [journal.node_key(
+                    self.driver, self.run_id, entry["path"], entry["iteration"],
+                    entry["attempt"], entry["continuation_index"],
+                ) for entry in entries], strict=True,
+            )}
+            run = await journal.get(
+                self.port.store, tx, self.ctx.session_id, journal.run_key(self.run_id),
+            )
+            consumed = 0
+            database_now = now_ms()
+            for row in rows:
+                body = json.loads(row["content_json"])
+                source = InputRef(**body["input_ref"])
+                found = by_input.get(canonical(source))
+                if found is None:
+                    # The node may have committed before its journal. Recovery aligns
+                    # that journal first; only then can this result advance the graph.
+                    continue
+                key, entry = found
+                raw = dict(body)
+                source_record = await self.port.input(tx, source)
+                if source_record is None or source_record.row["terminal_status"] is None:
+                    raise RuntimeRequestError("workflow_result_source_not_terminal")
+                raw["send_index"] = source_record.row["result_send_index"]
+                if raw.get("error_code") in {"hit_round_limit", "context_checkpoint"}:
+                    raw["status"] = raw["error_code"]
+                elif raw.get("error_code") in {"unknown", "store_commit_unknown"}:
+                    raw["status"] = "unknown"
+                if run.get("aggregate_delivered") or entry.get("superseded") or entry.get("result") is not None:
+                    if not any(item.get("input_ref") == body["input_ref"] for item in entry["late_results"]):
+                        entry["late_results"].append(raw)
+                else:
+                    entry["result"] = raw
+                    entry["result_seq"] = body.get("result_seq")
+                    entry["result_input_ref"] = plain(
+                        InputRef(self.ctx.store_id, self.ctx.session_id, row["item_id"])
+                    )
+                await journal.put(self.port.store, tx, self.ctx.session_id, key, entry)
+                changed = await tx.execute(
+                    f"UPDATE {self.port.q} SET status='delivered',delivered_at=?,"
+                    "delivered_seq=NULL,delivered_send_index=?,terminal_status='completed',"
+                    "result_send_index=?,completed_at=? WHERE session_id=? AND item_id=? "
+                    "AND (status='pending' OR (status='delivered' AND delivered_send_index=? "
+                    "AND terminal_status IS NULL))",
+                    (
+                        database_now, self.ctx.send_index, self.ctx.send_index, database_now,
+                        self.ctx.session_id, row["item_id"], self.ctx.send_index,
+                    ),
+                )
+                if changed != 1:
+                    raise SessionLeaseLost(self.ctx.session_id)
+                consumed += 1
+            return consumed
 
     async def todo_remaining(self, sid):
         state = await self.port.store.get_runtime_state(sid, "todo") or {}
         return [item["text"] for item in state.get("items", []) if item["status"] != "completed"]
 
 
-async def run(worker, ctx, record, env, runtime, *, recovery=False):
-    """Reconstruct a driver from the frozen definition and existing dispatches."""
-    from power_loop.runtime.task_runtime import Execution
+async def _prepare_explicit(worker, ctx, saved, origin, options):
+    from .continuation import plan_continuation
 
-    port, manager = worker.inputs, runtime.manager
-    await runtime.ensure_started()
-    job_id = record.row["delivered_job_id"] or record.row["target_job_id"]
-    async with manager.joined_write() as tx:
-        await port.lock_owned(tx, TargetRef(ctx.store_id, ctx.session_id), ctx)
-        row = await manager._row(tx, job_id)
-        if row["outcome"] is not None and (record.meta["operation"] != "resume" or recovery):
-            await consume_late_results(worker, ctx, row, tx)
-            from power_loop.runtime.finalization import try_finalize
-
-            await try_finalize(manager, runtime.actor(ctx.session_id), job_id, row["generation"])
-            return
-        explicit = record.meta["operation"] == "resume" and not recovery
-        if explicit:
-            claimed = await port.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx, 1, [record.ref])
-            if not claimed:
-                return
-            from power_loop.runtime.subagent_resume import resume_claim
-
-            binding = await resume_claim(runtime, tx, record, row)
-            ctx.job_ref = JobRef(ctx.store_id, job_id, binding.lease.generation)
-            await port.bind_input_job(tx, record.ref, ctx.job_ref, ctx, claim_token=claimed[0].row["claim_token"])
-            await tx.execute(
-                f"UPDATE {port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
-                "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
-                (now_ms(), ctx.session_id, record.ref.message_id),
-            )
-        elif row["generation"] == 0:
-            claimed = await port.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx, 1, [record.ref])
-            if not claimed:
-                return
-            binding = await runtime.claim(runtime.actor(ctx.session_id), JobRegistration(_record(row), None, False))
-            ctx.job_ref = JobRef(ctx.store_id, job_id, binding.lease.generation)
-            await port.bind_input_job(tx, record.ref, ctx.job_ref, ctx, claim_token=claimed[0].row["claim_token"])
-            await tx.execute(
-                f"UPDATE {port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
-                "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
-                (now_ms(), ctx.session_id, record.ref.message_id),
-            )
-        else:
-            # Only the new driver owner enters a new generation. No leaf is
-            # re-claimed or stopped, and its original result/cost owner remains.
-            old_ref = JobRef(ctx.store_id, job_id, row["generation"])
-            await port._commit_result(
-                tx,
-                old_ref,
-                Result(old_ref, record.ref, "interrupted", error="workflow driver replaced"),
-                ctx,
-                {"parent_session_id": None},
-            )
-            row = await manager._row(tx, job_id)
-            lease = JobLease(job_id, runtime.executor_id, runtime.boot_id, row["generation"] + 1)
-            from power_loop.runtime.executor_registry import ExecutorIdentity, require_accepting
-
-            executor = await require_accepting(
-                manager,
-                tx,
-                ExecutorIdentity(row["tenant_id"], row["principal_id"], runtime.executor_id, runtime.boot_id),
-                required=row["executor_key"] is not None,
-            )
-            changed = await tx.write_job(
-                job_id,
-                f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,version=version+1,"
-                "result_json=NULL,result_status='none',updated_at=? WHERE job_id=? AND generation=? AND version=? AND outcome IS NULL",
-                (
-                    lease.generation,
-                    lease.executor_id,
-                    lease.boot_id,
-                    executor["executor_key"] if executor else None,
-                    now_ms(),
-                    job_id,
-                    row["generation"],
-                    row["version"],
-                ),
-            )
-            if not changed:
-                raise RuntimeRequestError("stale_generation")
-            binding = Execution(runtime, runtime.actor(ctx.session_id), lease)
-            from power_loop.runtime.execution_membership import start
-
-            await start(manager, tx, await manager._row(tx, job_id))
-            ctx.job_ref = JobRef(ctx.store_id, job_id, lease.generation)
-        ctx.parent_job_id, ctx.root_job_id = row["parent_job_id"], row["root_job_id"]
-        creation = await tx.fetchone(
-            f"SELECT event_id FROM {manager.events} WHERE job_id=? AND action='create'", (job_id,)
+    port = worker.inputs
+    spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
+    plan = plan_continuation(spec, options["node_id"])
+    entries = await journal.nodes(port.store, port.db, ctx.session_id)
+    offsets = {}
+    for entry in entries:
+        if entry["path"] in plan.invalidated:
+            offsets[entry["path"]] = max(offsets.get(entry["path"], 0), int(entry["attempt"]))
+    revision = int(saved.get("execution_revision", 0)) + 1
+    continuation = {
+        "attempt_offsets": offsets,
+        "body_overrides": {options["node_id"]: options["message"]},
+        "prior_usage": (saved.get("result") or {}).get("usage") or {},
+        "invalidated": sorted(plan.invalidated),
+        "revision": revision,
+    }
+    async with port.db.transaction() as tx:
+        state = await port.store._db.dialect.lock_state(tx, port.state, ctx.session_id)
+        if (
+            state["execution_state"] != "running"
+            or state["active_send_index"] != ctx.send_index
+            or state["owner_epoch"] != ctx.batch.owner_epoch
+            or state["owner_token"] != ctx.batch.owner_token
+        ):
+            raise SessionLeaseLost(ctx.session_id)
+        for entry in entries:
+            if entry["path"] in plan.invalidated:
+                entry["superseded"] = True
+                key = journal.node_key(
+                    TargetRef(ctx.store_id, ctx.session_id), saved["run_id"],
+                    entry["path"], entry["iteration"], entry["attempt"], entry["continuation_index"],
+                )
+                await journal.put(port.store, tx, ctx.session_id, key, entry)
+        saved.update(
+            continuation=continuation,
+            execution_revision=revision,
+            definition_ref=plain(origin.ref),
+            status="running",
+            aggregate_delivered=False,
         )
-        run_id = creation["event_id"][3:]
-        saved = await journal.get(port.store, tx, ctx.session_id, journal.run_key(run_id))
-        if explicit:
-            saved = await prepare_continuation(worker, ctx, runtime, binding, run_id, saved, tx)
-            await journal.put(port.store, tx, ctx.session_id, journal.run_key(run_id), saved)
-    executor = DurableExecutor(worker, ctx, runtime, binding, run_id, env)
-    executor.plan = saved.get("continuation", {})
+        await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
+    return saved
+
+
+async def _complete_driver(worker, ctx, saved, origin, aggregate):
+    """Bind/finalize the driver chain and route one aggregate in the same transaction."""
+    port = worker.inputs
+    target = TargetRef(ctx.store_id, ctx.session_id)
+    async with port.db.transaction() as tx:
+        session = await port._session(tx, ctx.session_id)
+        route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
+        lock_ids = {ctx.session_id}
+        if route is not None:
+            lock_ids.add(route["target"]["session_id"])
+        for sid in sorted(lock_ids):
+            state = await port.store._db.dialect.lock_state(tx, port.state, sid)
+            if sid == ctx.session_id:
+                own_state = state
+        if (
+            own_state["execution_state"] != "running"
+            or own_state["active_send_index"] != ctx.send_index
+            or own_state["owner_epoch"] != ctx.batch.owner_epoch
+            or own_state["owner_token"] != ctx.batch.owner_token
+        ):
+            raise SessionLeaseLost(ctx.session_id)
+        root = await port._continuation_root(tx, origin)
+        status = aggregate["status"]
+        if status == "budget_exceeded":
+            status = "failed"
+        if own_state["cancel_send_index"] == ctx.send_index:
+            status = "cancelled"
+            aggregate = {**aggregate, "status": "cancelled"}
+        error = None if status == "completed" else (
+            own_state["cancel_reason"] if status == "cancelled" else status
+        )
+        database_now = now_ms()
+        result_seq = int(own_state["next_seq"])
+        final_text = (aggregate.get("final") or {}).get("text") or ""
+        result_meta = {
+            "usage": aggregate.get("usage") or {},
+            "structured_output": aggregate,
+            "error": error,
+            "error_code": None if status == "completed" else status,
+        }
+        await port._insert_message(
+            tx, ctx.session_id, result_seq, "assistant", final_text,
+            result_meta, ctx.send_index, database_now,
+        )
+        chain = [origin]
+        current = origin
+        while current.row["continuation_of"] is not None:
+            current = await port.input(tx, InputRef(
+                current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
+            ))
+            chain.append(current)
+        result_ref = delivery_error = None
+        activations = []
+        if route is not None:
+            result_ref, delivery_error = await port._route_result_tx(
+                tx, session, route,
+                Result(
+                    root.ref, target, status, ctx.send_index, result_seq, final_text,
+                    aggregate.get("usage") or {}, aggregate, error,
+                    None if status == "completed" else status,
+                ),
+                route["result_kind"], database_now, activations,
+            )
+        ids = [record.ref.message_id for record in chain]
+        await tx.execute(
+            f"UPDATE {port.q} SET status='delivered',terminal_status=?,result_seq=?,"
+            "result_send_index=?,error_code=?,error_detail=?,result_delivery_error=?,completed_at=? "
+            f"WHERE session_id=? AND item_id IN ({','.join('?' for _ in ids)}) "
+            "AND terminal_status IS NULL",
+            (
+                status, result_seq, ctx.send_index, None if status == "completed" else status,
+                error, delivery_error, database_now, ctx.session_id, *ids,
+            ),
+        )
+        other = [ref for ref in ctx.batch.input_refs if ref not in {record.ref for record in chain}]
+        if other:
+            await tx.execute(
+                f"UPDATE {port.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+                f"delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
+                "AND delivered_send_index=? AND terminal_status IS NULL "
+                f"AND item_id IN ({','.join('?' for _ in other)})",
+                (ctx.session_id, ctx.send_index, *[ref.message_id for ref in other]),
+            )
+        pending = await tx.fetchone(
+            f"SELECT COUNT(*) AS n FROM {port.q} WHERE session_id=? AND status='pending'",
+            (ctx.session_id,),
+        )
+        next_state = "queued" if int(pending["n"]) else "idle"
+        changed = await tx.execute(
+            f"UPDATE {port.state} SET execution_state=?,active_send_index=NULL,"
+            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+            "cancel_send_index=NULL,cancel_reason=NULL,next_seq=? WHERE session_id=? "
+            "AND execution_state='running' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
+            (
+                next_state, result_seq + 1, ctx.session_id, ctx.send_index,
+                ctx.batch.owner_epoch, ctx.batch.owner_token,
+            ),
+        )
+        if changed != 1:
+            raise SessionLeaseLost(ctx.session_id)
+        saved.update(
+            status=aggregate["status"], result=aggregate, result_seq=result_seq,
+            aggregate_delivered=True, aggregate_delivered_at=database_now,
+            continuation={}, last_input_ref=plain(origin.ref),
+        )
+        await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
+        results = tuple(
+            Result(
+                record.ref, target, status, ctx.send_index, result_seq, final_text,
+                aggregate.get("usage") or {}, aggregate, error,
+                None if status == "completed" else status, delivery_error,
+            )
+            for record in chain
+        )
+        return FinalBatch(
+            next_state, results, result_ref,
+            activations[0] if activations else None,
+        )
+
+
+async def _finish_late(worker, ctx, refs):
+    """Terminalize late result inputs without another graph run or parent result."""
+    port = worker.inputs
+    async with port.db.transaction() as tx:
+        state = await port.store._db.dialect.lock_state(tx, port.state, ctx.session_id)
+        if (
+            state["execution_state"] != "running"
+            or state["active_send_index"] != ctx.send_index
+            or state["owner_epoch"] != ctx.batch.owner_epoch
+            or state["owner_token"] != ctx.batch.owner_token
+        ):
+            raise SessionLeaseLost(ctx.session_id)
+        database_now = now_ms()
+        ids = [ref.message_id for ref in refs]
+        if ids:
+            await tx.execute(
+                f"UPDATE {port.q} SET terminal_status='completed',result_send_index=?,completed_at=? "
+                f"WHERE session_id=? AND item_id IN ({','.join('?' for _ in ids)}) "
+                "AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL",
+                (ctx.send_index, database_now, ctx.session_id, *ids, ctx.send_index),
+            )
+        pending = await tx.fetchone(
+            f"SELECT COUNT(*) AS n FROM {port.q} WHERE session_id=? AND status='pending'",
+            (ctx.session_id,),
+        )
+        next_state = "queued" if int(pending["n"]) else "idle"
+        await tx.execute(
+            f"UPDATE {port.state} SET execution_state=?,active_send_index=NULL,"
+            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+            "cancel_send_index=NULL,cancel_reason=NULL WHERE session_id=? "
+            "AND execution_state='running' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
+            (
+                next_state, ctx.session_id, ctx.send_index,
+                ctx.batch.owner_epoch, ctx.batch.owner_token,
+            ),
+        )
+        target = TargetRef(ctx.store_id, ctx.session_id)
+        return FinalBatch(next_state, tuple(
+            Result(ref, target, "completed", ctx.send_index, None) for ref in refs
+        ))
+
+
+async def run_driver(worker, ctx, env):
+    """Rebuild the graph at each send; healthy nodes are never adopted or cancelled.
+
+    RuntimeWorker's dispatcher excludes non-LLM drivers from model capacity, so a
+    driver can run (and recover) while all its healthy leaves still own the slots.
+    """
+    port = worker.inputs
+    session = await port._session(port.db, ctx.session_id)
+    run_id = session["start_input_message_id"]
+    saved = await journal.get(port.store, port.db, ctx.session_id, journal.run_key(run_id))
+    if saved is None:
+        raise RuntimeRequestError("workflow_journal_missing")
+    origins = []
+    for ref in ctx.batch.input_refs:
+        record = await port.input(port.db, ref)
+        if record is not None and record.row["kind"] in {"user", "workflow_continue"}:
+            origins.append(record)
+    origin = origins[-1] if origins else None
+    resume_options = None
+    if origin is not None:
+        content = json.loads(origin.row["content_json"])
+        if isinstance(content, dict) and "workflow_resume" in content:
+            resume_options = content["workflow_resume"]
+    executor = DurableExecutor(worker, ctx, env, run_id, saved)
+    if saved.get("aggregate_delivered") and resume_options is None:
+        await executor._consume_results()
+        return await _finish_late(worker, ctx, list(ctx.batch.input_refs))
+    if origin is None:
+        raise RuntimeRequestError("workflow_origin_missing")
+    if resume_options is not None and saved.get("definition_ref") != plain(origin.ref):
+        saved = await _prepare_explicit(worker, ctx, saved, origin, resume_options)
+        executor = DurableExecutor(worker, ctx, env, run_id, saved)
     spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
     engine = WorkflowEngine(
         executor,
@@ -546,181 +654,68 @@ async def run(worker, ctx, record, env, runtime, *, recovery=False):
         stop_event=ctx.stop,
         file_io=env.workflow_file_io,
     )
-    engine._usage_acc = dict(executor.plan.get("prior_usage", {}))
-    # The scheduler holds ownership but no model slot while awaiting leaves.
-    async with runtime.execution(binding, cancel_token=ctx.stop), worker.idle(ctx):
-        graph = asyncio.create_task(engine.run(spec))
-        stopped = asyncio.create_task(ctx.stop.wait())
-        timed_out = False
-        try:
-            remaining = max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000) if spec.timeout_s else None
-            done, _ = await asyncio.wait((graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-            if graph in done:
-                result = graph.result()
-            else:
-                timed_out = stopped not in done
-                if timed_out:
-                    await worker.runtime.client.cancel(
-                        ctx.job_ref, actor=executor.actor, scope="subtree", reason="workflow timeout"
-                    )
-                graph.cancel()
-                await asyncio.gather(graph, return_exceptions=True)
-                result = engine._build_result(spec, "failed" if timed_out else "cancelled")
-                if timed_out:
-                    result.errors.append("workflow timeout")
-        finally:
-            stopped.cancel()
-            graph.cancel()
-            await asyncio.gather(stopped, graph, return_exceptions=True)
-        async with manager.joined_write() as tx:
-            route = await port._lock_result_sessions(tx, ctx.job_ref)
-            await port.lock_owned(tx, TargetRef(ctx.store_id, ctx.session_id), ctx)
-            row = await manager._authorize(tx, binding.actor, job_id)
-            manager._check_proof(row, binding.lease)
-            status = "failed" if timed_out else "cancelled" if row["cancel_requested_at"] is not None else result.status
-            await tx.write_job(
-                job_id,
-                f"UPDATE {manager.jobs} SET status='settling',outcome=?,resource_state='stopped',intake='closed',"
-                "version=version+1 WHERE job_id=? AND generation=? AND version=?",
-                (
-                    "succeeded" if status == "completed" else "failed" if status == "budget_exceeded" else status,
-                    job_id,
-                    ctx.job_ref.generation,
-                    row["version"],
-                ),
-                obligations=True,
-            )
-            parent = await port._commit_result(
-                tx,
-                ctx.job_ref,
-                Result(
-                    ctx.job_ref,
-                    record.ref,
-                    status,
-                    result.final.text if result.final else "",
-                    result.usage,
-                    result.to_dict(),
-                ),
-                ctx,
-                route,
-            )
-    from power_loop.runtime.finalization import try_finalize
-
-    await try_finalize(manager, binding.actor, job_id, ctx.job_ref.generation)
-    if parent:
-        await worker.runtime.client._notify(
-            TargetRef(parent.store_id, parent.session_id), parent.message_id, parent, ["work", "activation"]
+    if executor.plan:
+        engine._usage_acc = dict(executor.plan.get("prior_usage") or {})
+    graph = asyncio.create_task(engine.run(spec))
+    stopped = asyncio.create_task(ctx.stop.wait())
+    timed_out = False
+    try:
+        remaining = (
+            max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000)
+            if spec.timeout_s else None
         )
+        done, _ = await asyncio.wait(
+            (graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if graph in done:
+            result = graph.result()
+        else:
+            timed_out = stopped not in done
+            if timed_out:
+                await worker.inputs.cancel_active(ctx.batch, reason="workflow timeout")
+            graph.cancel()
+            await asyncio.gather(graph, return_exceptions=True)
+            result = engine._build_result(spec, "failed" if timed_out else "cancelled")
+            if timed_out:
+                result.errors.append("workflow timeout")
+    finally:
+        stopped.cancel()
+        graph.cancel()
+        await asyncio.gather(stopped, graph, return_exceptions=True)
+    await executor._consume_results()
+    return await _complete_driver(worker, ctx, saved, origin, result.to_dict())
 
 
-async def prepare_continuation(worker, ctx, runtime, binding, run_id, saved, tx):
-    """The explicit new input selects one node and a new dependent tail."""
+async def resume_run(client, target, *, node_id, message, message_id, actor):
+    """Start a new driver input and recompute only the selected dependency tail."""
+    port = client.inputs
+    session = await port._session(port.db, target.session_id)
+    if session["session_kind"] != "workflow_driver":
+        raise RuntimeRequestError("not_found")
+    run_id = session["start_input_message_id"]
+    saved = await journal.get(port.store, port.db, target.session_id, journal.run_key(run_id))
+    if saved is None or not saved.get("aggregate_delivered"):
+        raise RuntimeRequestError("target_not_resumable", "Use send for a running leaf.")
+    descriptor = RuntimeDescriptor(**json.loads(session["descriptor_json"]))
+    spec = WorkflowSpec.from_json(plain(descriptor.config["workflow"]["spec"]))
     from .continuation import plan_continuation
 
-    port, manager = worker.inputs, runtime.manager
-    options = plain(ctx.descriptor.config["workflow_resume"])
-    plan = plan_continuation(
-        WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"])), options["node_id"]
-    )
-    rows = await tx.fetchall(
-        f"SELECT state_key,value_json FROM {port.store.t.session_runtime_state} "
-        "WHERE session_id=? AND state_key LIKE 'workflow:node:%' LIMIT 10001",
-        (ctx.session_id,),
-    )
-    import json
+    plan_continuation(spec, node_id)
+    if spec.budget:
+        from .result import SharedBudget
 
-    nodes = [(r["state_key"].removeprefix("workflow:node:"), json.loads(r["value_json"])) for r in rows]
-    selected = [(key, n) for key, n in nodes if n["path"] == options["node_id"]]
-    if not selected or len({canonical(n["iteration"]) for _, n in selected}) != 1:
-        raise RuntimeRequestError("workflow_node_ambiguous_choose_job")
-    key, node = max(selected, key=lambda pair: pair[1]["attempt"])
-    child = await manager._row(tx, node["job_id"])
-    original = await port.input(tx, InputRef(**node["input_ref"]))
-    actor = DriverActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id, job_ref=ctx.job_ref)
-    start = InputRef(ctx.store_id, node["session_id"], "resume_" + _hash([ctx.input_ref.message_id, key])[:32])
-    receipt = await port.accept_input(
-        tx,
-        Command(
-            start.message_id,
-            TargetRef(ctx.store_id, node["session_id"], node["job_id"]),
-            "resume",
-            {"body": options["message"]},
-            expected_job_generation=child["generation"],
-            options=original.meta["options"],
-        ),
-        actor,
-        descriptor=RuntimeDescriptor(**original.meta["descriptor"]),
-    )
-    # This explicit input starts a new continuation sequence. Driver recovery
-    # skips this preparation and retains that sequence's accepted references.
-    node["continuations"] = {}
-    await journal.put(port.store, tx, ctx.session_id, journal.node_key(key), node)
-    previous = saved.get("continuation", {})
-    offsets = dict(previous.get("attempt_offsets", {}))
-    for _, n in nodes:
-        if n["path"] in plan.invalidated and n["path"] != options["node_id"]:
-            offsets[n["path"]] = max(offsets.get(n["path"], 0), n["attempt"])
-    overrides = dict(previous.get("overrides", {}))
-    overrides[key] = plain(receipt.input_ref)
-    import json
-
-    from power_loop.runtime.result_revisions import result_id
-
-    old_result = await tx.fetchone(
-        f"SELECT payload_json FROM {manager.events} WHERE event_id=?",
-        (result_id(ctx.job_ref.job_id, ctx.job_ref.generation - 1),),
-    )
-    usage = json.loads(old_result["payload_json"])["result"]["usage"]
-    counted = {}
-    for _, n in nodes:
-        job = await manager._row(tx, n["job_id"])
-        counted[job["job_id"]] = job["generation"]
-    return {
-        **saved,
-        "definition_ref": plain(ctx.input_ref),
-        "continuation": {
-            "attempt_offsets": offsets,
-            "overrides": overrides,
-            "prior_usage": usage,
-            "already_counted": counted,
-        },
-    }
-
-
-async def consume_late_results(worker, ctx, workflow, tx):
-    """A finished graph records late node results without starting another graph."""
-    port = worker.inputs
-    records = await tx.fetchall(
-        f"SELECT * FROM {port.q} WHERE session_id=? AND status='pending' ORDER BY id LIMIT 100", (ctx.session_id,)
-    )
-    for row in records:
-        record = port.record(row)
-        if record.meta["operation"] != "result_ready":
-            await port.void_unbound(tx, record.ref, reason="workflow_finished")
-            continue
-        ref = record.meta["result_ref"]
-        source = await tx.fetchone(
-            f"SELECT j.parent_job_id,e.operation_key FROM {port.jobs} j JOIN {port.events} e "
-            "ON e.job_id=j.job_id AND e.action='create' WHERE j.job_id=?",
-            (ref["job_id"],),
+        budget = SharedBudget(
+            spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct,
         )
-        if source["parent_job_id"] != workflow["job_id"]:
-            raise RuntimeRequestError("forbidden")
-        key = journal.node_key(source["operation_key"])
-        node = await journal.get(port.store, tx, ctx.session_id, key)
-        if node is not None:
-            node["result_ref"] = ref
-            await journal.put(port.store, tx, ctx.session_id, key, node)
-        await tx.execute(
-            f"UPDATE {port.q} SET status='delivered',delivered_at=? WHERE session_id=? AND item_id=?",
-            (now_ms(), ctx.session_id, record.ref.message_id),
-        )
-        await tx.update_event(
-            ref["job_id"], f"UPDATE {port.events} SET delivery_status='handled' WHERE event_id=?", (ref["result_id"],)
-        )
-        await tx.write_job(
-            ref["job_id"],
-            f"UPDATE {port.jobs} SET result_status='handled',version=version+1 WHERE job_id=? AND generation=?",
-            (ref["job_id"], ref["generation"]),
-            obligations=True,
-        )
+        budget.commit((saved.get("result") or {}).get("usage") or {})
+        if not budget.can_spawn():
+            raise RuntimeRequestError("budget_exceeded", "The cumulative workflow budget is exhausted.")
+    if spec.timeout_s and now_ms() - saved["created_at_ms"] >= spec.timeout_s * 1000:
+        raise RuntimeRequestError("workflow_timeout")
+    receipt = await client.send(
+        target,
+        {"workflow_resume": {"node_id": node_id, "message": message}},
+        message_id=message_id,
+        actor=actor,
+    )
+    return WorkflowRunHandle(client, actor, target, receipt.input_ref)
