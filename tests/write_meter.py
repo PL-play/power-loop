@@ -19,6 +19,8 @@ class WriteMeter:
 
     @classmethod
     async def install(cls, db, prefix):
+        from tests.row_profile import _snapshot
+
         self = cls(db, prefix)
         dialect = db.dialect.name
         if dialect == "sqlite":
@@ -58,6 +60,7 @@ class WriteMeter:
                     await db.execute(f"CREATE TRIGGER {name} AFTER {op} ON {table} "
                                      f"FOR EACH ROW BEGIN {update} END")
                 self.triggers.append((name, table))
+        self.before = await _snapshot(db, prefix)
         return self
 
     async def totals(self, reader):
@@ -73,10 +76,15 @@ class WriteMeter:
         self.max_tx_bytes = max(self.max_tx_bytes, after[1] - before[1])
 
     async def reset(self):
+        from tests.row_profile import _snapshot
+
         await self.db.execute(f"UPDATE {self.table} SET n=0,b=0")
         self.max_tx_rows = self.max_tx_bytes = 0
+        self.before = await _snapshot(self.db, self.prefix)
 
     async def report(self):
+        from tests.row_profile import _snapshot
+
         rows = await self.db.fetchall(f"SELECT * FROM {self.table} ORDER BY name,op")
         by_table = {}
         total = {"insert_rows": 0, "update_rows": 0, "delete_rows": 0,
@@ -87,8 +95,12 @@ class WriteMeter:
             total[op + "_rows"] += n
             total["delete_bytes" if op == "delete" else "write_bytes"] += b
         total["affected_rows"] = sum(total[k] for k in ("insert_rows", "update_rows", "delete_rows"))
+        after = await _snapshot(self.db, self.prefix)
+        residue = {name: {"rows": values[0] - self.before.get(name, (0, 0))[0],
+                          "bytes": values[1] - self.before.get(name, (0, 0))[1]}
+                   for name, values in after.items()}
         return {**total, "max_tx_rows": self.max_tx_rows, "max_tx_bytes": self.max_tx_bytes,
-                "tables": by_table}
+                "tables": by_table, "net_residue": residue}
 
     async def close(self):
         for name, table in reversed(self.triggers):

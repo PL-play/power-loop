@@ -21,7 +21,6 @@ from power_loop.agent.runtime_types import InputRef, TargetRef, TrustedActor
 from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.delegation import start
 from power_loop.runtime.store.factory import open_store
-from power_loop.testing.db_session_ownership import DatabaseSessionOwnershipCoordinator
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 
@@ -96,7 +95,6 @@ async def main():
     )
     runtime = Runtime(
         store=store, factory=factory, node_id=role, boot_id=role,
-        coordinator=DatabaseSessionOwnershipCoordinator(coordinator_path),
         transport=DatabasePollingTransport(port, interval_s=0.05, control_interval_s=0.05),
         shared_execution=True, recovery_interval_s=0.1, session_lease_ttl_s=2,
         timers_enabled=False, capacity=2,

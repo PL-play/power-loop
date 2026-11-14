@@ -3,7 +3,7 @@
 - urgent input received during the model call does not cut it; the next round carries the input;
 - a non-urgent input does not interrupt anything;
 - a flag that can never be cleared can't spin the loop;
-- a tool already running finishes (whatever its interrupt mode); calls not yet started are skipped.
+- urgent input does not skip tools; the current model/tool round finishes intact.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMService,
     LLMTokenUsage,
 )
-from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME
+from power_loop.agent.runtime_store import now_ms
 from power_loop.contracts.hook_contexts import LlmBeforeCtx
 from power_loop.contracts.hooks import HookPoint
 from power_loop.contracts.tools import ToolDefinition
@@ -145,7 +145,7 @@ async def _steer(agent, body, message_id):
 
 
 @pytest.mark.asyncio
-async def test_steer_is_received_during_model_and_applies_at_next_safe_boundary(store, runtime_agent) -> None:
+async def test_urgent_input_at_final_boundary_runs_in_the_next_send(store, runtime_agent) -> None:
     bus = AgentEventBus()
     interrupted = _events(bus, AgentEventType.STEER_INTERRUPTED)
     completed = _events(bus, AgentEventType.LLM_CALL_COMPLETED)
@@ -155,21 +155,23 @@ async def test_steer_is_received_during_model_and_applies_at_next_safe_boundary(
     sid = loop.target.session_id
     run = asyncio.create_task(loop.send("write me a long story"))
     await asyncio.wait_for(llm.hanging.wait(), 5)
-    await _steer(loop, "stop — just tell me 2+2", "s1")
+    receipt = await _steer(loop, "stop — just tell me 2+2", "s1")
     assert not run.done() and llm.cancelled == 0
     llm.release.set()
     res = await asyncio.wait_for(run, 5)
 
-    assert res.status == "completed", res.status   # max_rounds=1: the aborted round didn't count
-    assert res.final_text == "4"
+    assert res.status == "completed" and res.final_text == "Original response"
+    follow = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+5000)
+    await loop.drain()
+    assert follow.final_text == "4" and follow.send_index == res.send_index + 1
     assert llm.cancelled == 0
     second = llm.calls[1]
-    assert any(m.get("name") == FOLLOW_UP_MESSAGE_NAME and "2+2" in m["content"] for m in second)
+    assert any("2+2" in str(m.get("content")) for m in second)
     rows = await store.load_active_messages(sid)
     assert "Original response" in _texts(rows)
     assert not interrupted
     assert all(event["success"] for event in completed)
-    assert res.usage.get("failed_calls", 0) == 0 and res.usage["calls"] == 2
+    assert res.usage.get("failed_calls", 0) == 0 and res.usage["calls"] == follow.usage["calls"] == 1
 
 
 @pytest.mark.asyncio
@@ -201,15 +203,23 @@ async def test_queue_item_does_not_interrupt(store, runtime_agent) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_append_joins_the_running_job_next_round(store, runtime_agent) -> None:
+async def test_session_append_during_a_tool_round_joins_the_running_send(store, runtime_agent) -> None:
     from power_loop import InputRef
-    llm = _LLM([("stream_then_gate", "first"), "done"])
-    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
+    llm = _LLM([_call("fast"), "done"])
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = llm.complete
+    async def gated(request, **kwargs):
+        if not llm.calls:
+            entered.set()
+            await release.wait()
+        return await original(request, **kwargs)
+    llm.complete = gated
+    loop = await runtime_agent(model=llm, store=store, registry=_registry(_Probe(), interrupt="finish"), config=AgentLoopConfig(
         system_prompt="S", max_rounds=3, compactor=None))
     first = await loop.runtime.client.send(loop.target, "go", message_id="m1", actor=loop.actor)
-    await asyncio.wait_for(llm.hanging.wait(), 5)
+    await asyncio.wait_for(entered.wait(), 5)
     await loop.runtime.client.send(loop.target, "one more thing", message_id="a1", actor=loop.actor)
-    llm.release.set()
+    release.set()
     await loop.runtime.client.wait(first.input_ref, actor=loop.actor, deadline_ms=None)
     added = await loop.runtime.client.inspect(InputRef(loop.target.store_id, loop.target.session_id, "a1"),
                                               actor=loop.actor)
@@ -224,7 +234,7 @@ async def test_a_steer_flag_that_cannot_clear_does_not_spin(store, runtime_agent
     loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
         system_prompt="S", max_rounds=2, compactor=None))
     from power_loop.agent.runtime_transport import TransportPacket
-    await loop.runtime.transport.publish(TransportPacket(42, loop.runtime.namespace, "stale",
+    await loop.runtime.transport.publish(TransportPacket(43, loop.runtime.namespace, "stale",
                                                          loop.target, "activation"))
     res = await asyncio.wait_for(loop.send("hi"), 5)
     assert res.status == "completed" and res.final_text == "fine"
@@ -247,9 +257,11 @@ async def test_durable_injection_occurs_once_per_model_round_with_steering(store
     sid = loop.target.session_id
     run = asyncio.create_task(loop.send("go"))
     await asyncio.wait_for(llm.hanging.wait(), 5)
-    await _steer(loop, "steer", "s")
+    receipt = await _steer(loop, "steer", "s")
     llm.release.set()
     await asyncio.wait_for(run, 5)
+    await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+5000)
+    await loop.drain()
     rows = await store.load_active_messages(sid)
     assert _texts(rows).count("REMINDER: keep notes") == len(llm.calls) == 2
 
@@ -281,7 +293,7 @@ async def test_finish_mode_tool_runs_to_completion(store, runtime_agent) -> None
     assert res.status == "completed" and probe.finished
     rows = await store.load_active_messages(sid)
     assert "slow tool real result" in _texts(rows)
-    assert any(m.get("name") == FOLLOW_UP_MESSAGE_NAME for m in llm.calls[1])
+    assert any("new question" in str(m.get("content")) for m in llm.calls[1])
 
 
 @pytest.mark.asyncio
@@ -297,7 +309,7 @@ async def test_urgent_input_does_not_interrupt_a_running_abort_mode_tool(store, 
 
 
 @pytest.mark.asyncio
-async def test_calls_not_yet_started_are_skipped(store, runtime_agent) -> None:
+async def test_urgent_input_preserves_all_tools_in_the_current_round(store, runtime_agent) -> None:
     probe = _Probe()
     llm = _LLM([_calls("slow", "fast"), "ok"])
     loop = await runtime_agent(model=llm, store=store,
@@ -313,7 +325,8 @@ async def test_calls_not_yet_started_are_skipped(store, runtime_agent) -> None:
     assert res.status == "completed"
     tool_rows = [r for r in await store.load_active_messages(sid) if r.role == "tool"]
     assert tool_rows[0].content == "slow tool real result"
-    assert tool_rows[1].content.startswith("[skipped:") and "fast result" not in tool_rows[1].content
+    assert tool_rows[1].content == "fast result"
+    assert any("wait" in str(m.get("content")) for m in llm.calls[1])
 
 
 # ── waiting tools ─────────────────────────────────────────────────────────────────────────
@@ -325,25 +338,22 @@ def test_interrupt_value_is_validated() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelling_the_run_waits_for_the_calls_own_cleanup(store, runtime_agent) -> None:
-    """A stop cancels the send while the (now separately-tasked) model call is streaming. The
-    call's cleanup — closing its stream, recording its estimated usage — must finish BEFORE the
-    send returns, as it did when the call ran inline. A transport whose cancel path awaits (httpx
-    closing a connection) used to finish after the send was gone, and its usage event was lost."""
+async def test_boundary_cancel_waits_for_model_cleanup_and_keeps_usage(store, runtime_agent) -> None:
+    """Durable cancellation is observed at the boundary after the active model call."""
     bus = AgentEventBus()
     completed = _events(bus, AgentEventType.LLM_CALL_COMPLETED)
     streaming = asyncio.Event()
+    release, cleaned = asyncio.Event(), asyncio.Event()
 
     class _SlowCleanup(LLMService):
         async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None, **kw: Any):
             if on_chunk_delta_text:
                 on_chunk_delta_text("partial " * 20)
             streaming.set()
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                await asyncio.sleep(0.05)       # async cleanup, like closing a stream
-                raise
+            await release.wait()
+            await asyncio.sleep(0.05)
+            cleaned.set()
+            return LLMResponse(raw_text="finished current call", token_usage=USAGE)
 
         async def close(self) -> None:
             return None
@@ -356,6 +366,8 @@ async def test_cancelling_the_run_waits_for_the_calls_own_cleanup(store, runtime
     await asyncio.wait_for(streaming.wait(), 5)
     from power_loop import InputRef
     await loop.runtime.client.cancel(InputRef(store.store_id, sid, "m1"), actor=loop.actor)
-    assert (await task).status == "cancelled"
-    assert completed and completed[0]["outcome"] == "aborted", \
-        "the call's accounting ran after the send was already gone"
+    release.set()
+    result = await asyncio.wait_for(task, 5)
+    assert result.status == "cancelled" and cleaned.is_set()
+    assert completed and completed[0]["success"]
+    assert result.usage["total_tokens"] == USAGE.total_tokens

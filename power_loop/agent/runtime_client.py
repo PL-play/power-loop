@@ -72,15 +72,15 @@ class RuntimeClient:
         periodic unfinished scan and the running loop's boundary read both pick it up).
         """
         self._require_open()
-        receipt = await self.inputs.accept(
+        receipt, activate = await self.inputs.accept(
             target, body, message_id=message_id, actor=actor, priority=priority,
-            deadline_ms=deadline_ms,
+            deadline_ms=deadline_ms, _with_activation=True,
         )
         if receipt.newly_accepted:
             from power_loop.contracts.hooks import HookPoint
             from power_loop.core.execution_notifications import notify
             await notify(self.hooks, HookPoint.MESSAGE_ACCEPTED, {"receipt": receipt}, timeout_s=self.hook_timeout_s)
-        if receipt.state != "accepted":
+        if receipt.state != "accepted" or not activate:
             return receipt
         published = await self._notify(receipt.target, receipt.message_id, receipt.input_ref,
                                        ["work", "activation"])

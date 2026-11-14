@@ -270,7 +270,9 @@ async def test_workflow_tree_sql_profile(registry_store, count):
         assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
         journal_records = [record for record in records if "session_runtime_state" in record.get("sql", "")]
         assert journal_records and all(
-            _category(record["chain"], record["sql"]) == "session_control" for record in journal_records
+            _category(record["chain"], record["sql"]) == (
+                "message" if "agent.stateful_loop:_record_history_mode" in record["chain"] else "session_control"
+            ) for record in journal_records
         )
         writes = await meter.report() if meter else None
         if output := os.environ.get("P215_COMPOSITION_OUT"):
@@ -287,6 +289,95 @@ async def test_workflow_tree_sql_profile(registry_store, count):
                     "records": records,
                     "tx_sites": tx_sites,
                 }) + "\n")
+    finally:
+        store._db = original
+        await runner.aclose()
+        if meter:
+            await meter.close()
+
+
+class CombinedModel(LLMService):
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, request, **kwargs):
+        if request.system_prompt.startswith(("CHILD-", "LEAF-")):
+            return LLMResponse(raw_text="child result")
+        self.calls += 1
+        if self.calls <= 16:
+            return LLMResponse(raw_text="", tool_calls=[{
+                "id": f"echo-{self.calls}", "type": "function",
+                "function": {"name": "profile_echo", "arguments": "{}"}}])
+        if self.calls == 17:
+            calls = [{"id": f"combined-spawn-{i}", "type": "function", "function": {
+                "name": "spawn_agent", "arguments": json.dumps({
+                    "task": f"task {i}", "system_prompt": f"CHILD-{i}", "tools": []})}}
+                for i in range(4)]
+            branches = [{"type": "agent", "id": f"N{i}", "input": f"work {i}",
+                         "spec": {"name": f"N{i}", "system_prompt": f"LEAF-{i}", "tools": []}}
+                        for i in range(4)]
+            calls.append({"id": "combined-workflow", "type": "function", "function": {
+                "name": "workflow", "arguments": json.dumps({"action": "create", "spec": {
+                    "name": "combined", "root": {"type": "parallel", "branches": branches}}})}})
+            return LLMResponse(raw_text="", tool_calls=calls)
+        return LLMResponse(raw_text="parent handled available results")
+
+    async def close(self):
+        pass
+
+
+async def test_combined_long_loop_children_workflow_sql_profile(registry_store):
+    """End-to-end 16 tool rounds + four children + a four-leaf workflow, including result ingestion."""
+    from power_loop import ToolDefinition
+    from power_loop.runtime.pricing import Free
+
+    store, _ = registry_store
+    model = CombinedModel()
+    registry = ToolRegistry()
+    registry.register(ToolDefinition("profile_echo", "measured ordinary tool",
+                                     input_schema={"type": "object", "properties": {}},
+                                     pricing=Free("measurement")), lambda: "echo result")
+    register_spawn_agent(registry)
+    register_workflow_tool(registry)
+    runner = await RunningAgent(store, model, registry,
+                                AgentLoopConfig(compactor=None, max_rounds=32), capacity=10).start()
+    original = store._db
+    meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
+    store._db = profiled = Profiled(original, meter)
+    started = time.monotonic()
+    try:
+        assert (await runner.send("run the combined workload")).status == "completed"
+        rows = await original.fetchall(
+            f"SELECT content,name FROM {store.t.messages} WHERE session_id=? AND role='tool' "
+            "AND tool_call_id LIKE 'combined-%'", (runner.target.session_id,))
+        assert len(rows) == 5
+        for row in rows:
+            receipt = json.loads(row["content"])
+            start, target = InputRef(**receipt["input_ref"]), TargetRef(**receipt["target_ref"])
+            result = await runner.runtime.client.wait(start, actor=runner.actor, deadline_ms=now_ms() + 20000)
+            assert result.status == "completed"
+            kind = "workflow_result" if row["name"] == "workflow" else "agent_result"
+            if kind == "workflow_result":
+                assert len(result.structured_output["results"]) == 4
+            parent_ref = InputRef(store.store_id, runner.target.session_id,
+                                  result_message_id(target, start, 1, kind))
+            assert (await runner.runtime.client.wait(
+                parent_ref, actor=runner.actor, deadline_ms=now_ms() + 20000)).status == "completed"
+        await runner.drain()
+        tools = await original.fetchone(
+            f"SELECT COUNT(*) AS n FROM {store.t.messages} WHERE session_id=? AND role='tool' "
+            "AND tool_call_id LIKE 'echo-%'", (runner.target.session_id,))
+        assert tools["n"] == 16
+        records, tx_sites = list(profiled.records), list(profiled.tx_sites)
+        counts = _counts(records, tx_sites, profiled.tx_categories)
+        assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+        writes = await meter.report() if meter else None
+        if output := os.environ.get("P215_COMPOSITION_OUT"):
+            with open(output, "a") as stream:
+                stream.write(json.dumps({"db": original.dialect.name,
+                    "scenario": "combined_16_tools_4_children_4_leaves", "total_sql": len(records),
+                    "counts": counts, "transactions": profiled.transactions, "writes": writes,
+                    "elapsed_s": time.monotonic() - started, "records": records, "tx_sites": tx_sites}) + "\n")
     finally:
         store._db = original
         await runner.aclose()

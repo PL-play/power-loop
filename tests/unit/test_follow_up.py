@@ -107,10 +107,7 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 @pytest.mark.asyncio
-async def test_no_tools_drained_round_emits_round_completed(store: SessionStore, runtime_agent) -> None:
-    # pipeline-runner-3: a no-tools round that drains a queued follow-up (instead of completing)
-    # must still close itself in the event stream — emit ROUND_COMPLETED + per-round usage — before
-    # steering reopens the loop. Pre-fix the drained round was left unterminated.
+async def test_final_boundary_leaves_new_input_for_next_send_and_closes_both_rounds(store: SessionStore, runtime_agent) -> None:
     from power_loop import AgentEventBus, AgentEventType
 
     bus = AgentEventBus()
@@ -137,12 +134,16 @@ async def test_no_tools_drained_round_emits_round_completed(store: SessionStore,
     else:
         pytest.fail("expected round 0 to reach the LLM during send")
 
-    await loop.runtime.client.send(loop.target, "steer me", message_id="steer me", actor=loop.actor)  # queued while round 0's LLM call is gated
+    receipt = await loop.runtime.client.send(loop.target, "steer me", message_id="steer me", actor=loop.actor)
     llm.release_first.set()
     result = await send_task
     assert result.status == "completed"
-    # Both the drained no-tools round (0) and the final round (1) emitted ROUND_COMPLETED.
-    assert 0 in completed and 1 in completed, completed
+    from power_loop.agent.runtime_store import now_ms
+    follow = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+5000)
+    await loop.drain()
+    assert follow.status == "completed" and follow.send_index == result.send_index + 1
+    assert follow.final_text == "done after steering"
+    assert completed == [0, 0]
 
 
 @pytest.mark.asyncio
@@ -184,7 +185,7 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore, runt
     assert result.status == "completed"
 
     rows = await store.load_active_messages(sid)
-    follow_rows = [r for r in rows if r.name == FOLLOW_UP_MESSAGE_NAME]
+    follow_rows = [r for r in rows if r.role == "user" and "focus on feelings" in (r.content or "")]
     assert len(follow_rows) == 1
     assert "focus on feelings" in follow_rows[0].content
     assert "keep it short" in follow_rows[0].content
@@ -193,8 +194,7 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore, runt
     follow_contents = [
         str(m.get("content") or "")
         for m in second_request
-        if m.get("name") == FOLLOW_UP_MESSAGE_NAME
-        or "<follow_up>" in str(m.get("content") or "")
+        if m.get("role") == "user"
     ]
     assert any("focus on feelings" in c and "keep it short" in c for c in follow_contents)
 
@@ -291,7 +291,7 @@ async def test_empty_activation_and_busy_append_do_not_start_duplicate_execution
             await asyncio.sleep(.005)
     await loop.runtime.client.send(loop.target, "steer", message_id="steer", actor=loop.actor)
     for _ in range(3):
-        await loop.runtime.transport.publish(TransportPacket(42, loop.runtime.namespace, "duplicate-wake",
+        await loop.runtime.transport.publish(TransportPacket(43, loop.runtime.namespace, "duplicate-wake",
                                                             loop.target, "activation"))
     assert len(llm.calls) == 1
     llm.release_first.set()

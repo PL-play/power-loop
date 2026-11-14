@@ -381,7 +381,7 @@ class RuntimeInputStore:
 
     async def accept(
         self, target, body, *, message_id, actor, priority="normal", deadline_ms=None,
-        kind="user", result_kind=None,
+        kind="user", result_kind=None, _with_activation=False,
     ) -> Receipt:
         if priority not in {"normal", "urgent"}:
             raise RuntimeRequestError("invalid_options", "priority")
@@ -390,12 +390,15 @@ class RuntimeInputStore:
         digest = self.request_hash(target, body, priority)
         # Validate JSON before opening the write transaction.
         content = canonical(body)
+        activations = []
         try:
             async with self.db.transaction() as tx:
-                return await self._accept_tx(
+                receipt = await self._accept_tx(
                     tx, target, body, ref, digest, content, actor=actor, priority=priority,
                     deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
+                    activations=activations,
                 )
+            return (receipt, bool(activations)) if _with_activation else receipt
         except RuntimeRequestError:
             raise
         except (Exception, asyncio.CancelledError) as exc:
@@ -403,7 +406,7 @@ class RuntimeInputStore:
 
     async def _accept_tx(
         self, tx, target, body, ref, digest, content, *, actor, priority, deadline_ms,
-        kind, result_kind,
+        kind, result_kind, activations=None,
     ):
         try:
             state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
@@ -469,6 +472,8 @@ class RuntimeInputStore:
             "session_id": target.session_id, "item_id": ref.message_id, "status": "pending",
             "delivered_send_index": None, "result_send_index": None, "error_detail": None,
         }
+        if activations is not None and next_state != "running":
+            activations.append(target)
         return self.receipt(InputRecord(ref, row, {}), new=True)
 
     async def accept_result(self, child_target, result: Result, *, result_kind):
@@ -488,7 +493,7 @@ class RuntimeInputStore:
             )
             return ref, error, activations[0] if activations else None
 
-    async def claim(self, target, *, node_id, boot_id, ttl_s=30.0) -> ClaimedBatch | None:
+    async def claim(self, target, *, node_id, boot_id, ttl_s=30.0, _owner_token=None) -> ClaimedBatch | None:
         self.check_store(target)
         if ttl_s <= 0:
             raise RuntimeRequestError("invalid_options", "ttl_s")
@@ -515,7 +520,7 @@ class RuntimeInputStore:
                 )
                 refs = tuple(InputRef(target.store_id, target.session_id, row["item_id"]) for row in rows)
                 context["refs"] = refs
-                token = uuid.uuid4().hex
+                token = _owner_token or uuid.uuid4().hex
                 send_index = int(state["send_index"]) + 1
                 seq = int(state["next_seq"]) + repaired
                 epoch = int(state["owner_epoch"]) + 1

@@ -15,7 +15,6 @@ from power_loop import (
 )
 from power_loop.agent.runtime_store import RuntimeInputStore
 from power_loop.runtime.store.factory import open_store
-from power_loop.testing.db_session_ownership import DatabaseSessionOwnershipCoordinator
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -61,7 +60,6 @@ async def main():
         node_id=role,
         boot_id=role,
         capacity=2,
-        coordinator=DatabaseSessionOwnershipCoordinator(coordinator_path),
         transport=DatabasePollingTransport(RuntimeInputStore(store), interval_s=0.03),
         session_lease_ttl_s=1,
         recovery_interval_s=0.05,

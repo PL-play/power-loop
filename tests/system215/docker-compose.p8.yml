@@ -1,0 +1,82 @@
+name: p8-215
+x-node: &node
+  image: p8-215-node:local
+  env_file: ${P8_ENV_FILE:?Run prepare.py first}
+  environment: &environment
+    REDIS_URL: redis://redis:6379/0
+    KAFKA_SERVERS: kafka:29092
+    WORKSPACE: /workspace
+  volumes:
+    - ../..:/sdk:ro
+    - ../../../agent:/agent:ro
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  cap_add: [NET_ADMIN]
+  mem_limit: 512m
+  depends_on:
+    kafka:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+services:
+  redis:
+    image: redis:7
+    command: [redis-server, --save, "", --appendonly, "no"]
+    ports: ["127.0.0.1:46379:6379"]
+    mem_limit: 128m
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      retries: 20
+  kafka:
+    image: apache/kafka:3.8.0
+    ports: ["127.0.0.1:49092:9092"]
+    mem_limit: 768m
+    healthcheck:
+      test: [CMD, /opt/kafka/bin/kafka-broker-api-versions.sh, --bootstrap-server, localhost:29092]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:49092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx256m
+  a:
+    <<: *node
+    build:
+      context: .
+    environment:
+      <<: *environment
+      NODE_ID: a
+      STORE_NAMESPACE: p8-215-a
+    ports: ["127.0.0.1:48101:8080"]
+    tmpfs: [/workspace]
+  b:
+    <<: *node
+    environment:
+      <<: *environment
+      NODE_ID: b
+      STORE_NAMESPACE: p8-215-b
+    ports: ["127.0.0.1:48102:8080"]
+    tmpfs: [/workspace]
+  c:
+    <<: *node
+    environment:
+      <<: *environment
+      NODE_ID: c
+      STORE_NAMESPACE: p8-215-c
+    ports: ["127.0.0.1:48103:8080"]
+    tmpfs: [/workspace]
+networks:
+  default:
+    name: p8-215-isolated

@@ -280,6 +280,7 @@ class RuntimeWorker:
         output_task = None
         renewal = None
         ownership = None
+        external_ownership = None
         batch = None
         try:
             session_row = await store._db.fetchone(
@@ -320,8 +321,12 @@ class RuntimeWorker:
             expired = (state["owner_lease_until_ms"] is not None
                        and int(state["owner_lease_until_ms"]) <= database_now)
             if exec_state == "recovering" or (exec_state == "running" and expired):
-                recovered = await self.inputs.recover(
-                    target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
+                if getattr(r.coordinator, "installs_session_fence", False):
+                    recovered = await r.coordinator.recover(
+                        self.inputs, target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
+                else:
+                    recovered = await self.inputs.recover(
+                        target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
                 if recovered is None:
                     return
                 await self._notify_results(recovered)
@@ -331,8 +336,18 @@ class RuntimeWorker:
             if exec_state != "queued":
                 return
 
-            batch = await self.inputs.claim(
-                target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
+            if getattr(r.coordinator, "installs_session_fence", False):
+                batch = await r.coordinator.claim(
+                    self.inputs, target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
+            else:
+                external_ownership = await r.coordinator.acquire(
+                    (store.store_id, sid), owner_id=r.node_id + "/" + r.boot_id,
+                    ttl_s=r.session_lease_ttl_s, on_lost=lambda: None)
+                if external_ownership is None:
+                    return
+                batch = await self.inputs.claim(
+                    target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
+                    _owner_token=external_ownership.token)
             if batch is None:
                 return
 
@@ -344,6 +359,11 @@ class RuntimeWorker:
                 token=batch.owner_token, epoch=batch.owner_epoch,
                 node_id=r.node_id, boot_id=r.boot_id, installs_fence=True,
             )
+            if external_ownership is not None:
+                ownership = external_ownership
+                ownership.epoch = batch.owner_epoch
+                ownership.node_id, ownership.boot_id = r.node_id, r.boot_id
+                ownership.installs_fence = True
             store._forget_appended(sid)
             for cache in ("_next_seqs", "_cached_sessions", "_send_indexes", "_change_versions"):
                 getattr(store, cache, {}).pop(sid, None)
@@ -477,6 +497,8 @@ class RuntimeWorker:
             if renewal is not None:
                 renewal.cancel()
                 await asyncio.gather(renewal, return_exceptions=True)
+            if external_ownership is not None:
+                await r.coordinator.release(external_ownership)
             if output_task is not None:
                 await ctx.output.put(None)
                 await asyncio.gather(output_task, return_exceptions=True)
@@ -529,18 +551,14 @@ class RuntimeWorker:
         try:
             while not ctx.closing:
                 await asyncio.sleep(ttl / 3)
-                database_now = await self.inputs._db_now(self.runtime.store._db)
-                changed = await self.runtime.store._db.execute(
-                    f"UPDATE {self.runtime.store.t.session_state} SET owner_lease_until_ms=? "
-                    "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
-                    "AND owner_epoch=? AND owner_token=?",
-                    (database_now + int(ttl * 1000), sid, batch.send_index,
-                     batch.owner_epoch, batch.owner_token),
-                )
-                if changed != 1:
+                async with asyncio.timeout(max(0, ownership.expires_at - time.monotonic())):
+                    renewed = await r.coordinator.renew(ownership, ttl_s=ttl)
+                    if renewed and not getattr(r.coordinator, "installs_session_fence", False):
+                        from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
+                        renewed = await StoreSessionOwnershipCoordinator(r.store).renew(ownership, ttl_s=ttl)
+                if not renewed:
                     ownership.lose()
                     return
-                ownership.expires_at = time.monotonic() + ttl
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -54,7 +54,10 @@ async def test_real_facade_validation_admission_and_actual_result_after_caller_y
             result = await accepted[0].handle.wait(deadline_ms=now_ms()+90000)
             assert result.status == "completed" and result.results["calculate"].text.strip() == "42"
             await loop.drain()
-            assert (await store.inbox_counts(sid))["pending"] == 0
+            pending = await store._db.fetchone(
+                f"SELECT COUNT(*) AS n FROM {store.t.follow_up_queue} "
+                "WHERE session_id=? AND status IN ('pending','waiting_continuation')", (sid,))
+            assert pending["n"] == 0
             assert any(m.role=="assistant" and "42" in (m.content or "") for m in await store.load_all_messages(sid))
             assert len(accepted) == 1
     finally:

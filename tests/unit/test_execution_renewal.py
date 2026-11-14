@@ -47,14 +47,14 @@ class WaitingModel(LLMService):
 
 
 @asynccontextmanager
-async def running(store, coordinator, *, hooks=None):
+async def running(store, coordinator, *, hooks=None, ttl_s=.3):
     model, factory = WaitingModel(), RegistryRuntimeFactory()
     async def build(descriptor, context):
         assert context.owner_epoch > 0 and context.owner_token
         return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(compactor=None))
     factory.register('test.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='test', coordinator=coordinator,
-        session_lease_ttl_s=.3, recovery_interval_s=None, hooks=hooks, hook_timeout_s=.03)
+        session_lease_ttl_s=ttl_s, recovery_interval_s=None, hooks=hooks, hook_timeout_s=.03)
     _, target, actor = await fixture(store)
     await runtime.worker.start()
     try:
@@ -76,8 +76,10 @@ async def test_only_session_renews_without_writing_job_heartbeats(registry_store
             self.renewals += 1
             return await super().renew(lease, **kwargs)
     coordinator = Counting()
-    async with running(store, coordinator) as (runtime, model, target, actor):
-        await asyncio.sleep(.45)
+    async with running(store, coordinator, ttl_s=1.5) as (runtime, model, target, actor):
+        async with asyncio.timeout(4):
+            while coordinator.renewals < 2:
+                await asyncio.sleep(.02)
         assert coordinator.renewals >= 2
         assert not model.cancelled.is_set() and model.calls == 1
 
@@ -112,7 +114,12 @@ async def test_renewal_failure_cancels_before_broken_lost_hook(registry_store, f
 
 @pytest.mark.parametrize('directive', [HookDirective.SKIP, HookDirective.SHORT_CIRCUIT])
 async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_store, directive):
-    store, _ = registry_store
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import TargetRef
+    from power_loop.core.execution_context import get_execution_context
+
+    store, connect = registry_store
+    other = await connect(schema="verify")
     calls, invoked = [], []
     class Model(WaitingModel):
         async def complete(self, request, **kwargs):
@@ -121,6 +128,16 @@ async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_sto
                 'function': {'name': 'lose', 'arguments': '{}'}}])
     async def lose():
         calls.append('tool')
+        execution = get_execution_context()
+        # A real expired lease is taken by another store connection. The old tool
+        # then observes its stale write permission; its hook must not retry it.
+        await other._db.execute(
+            f"UPDATE {other.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+            (execution.session_id,),
+        )
+        await RuntimeInputStore(other).recover(
+            TargetRef(other.store_id, execution.session_id), node_id="replacement", boot_id="replacement",
+        )
         raise SessionLeaseLost('test')
     def replace_error(ctx):
         invoked.append(ctx.error)
@@ -133,7 +150,7 @@ async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_sto
     agent = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None), hooks=hooks).start()
     try:
         result = await agent.send('go')
-        assert result.status == 'failed' and result.error == 'SessionLeaseLost', result
+        assert result.status == 'interrupted', result
         assert calls == ['tool'] and not invoked and model.calls == 1
     finally:
         await agent.aclose()

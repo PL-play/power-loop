@@ -6,9 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from .runtime_types import CapacityError, InputRef, RuntimeRequestError, TargetRef, canonical, freeze
-
-PROTOCOL_VERSION = 42
+from .runtime_types import PROTOCOL_VERSION, CapacityError, InputRef, RuntimeRequestError, TargetRef, canonical, freeze
 
 
 @dataclass(frozen=True)

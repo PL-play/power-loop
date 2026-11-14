@@ -130,6 +130,8 @@ class Runtime:
         shared_lock = coordinator is None or getattr(coordinator, "scope", "process") == "shared"
         if shared_execution and not (shared_lock and self.transport.capabilities.scope == "shared"):
             raise RuntimeRequestError("invalid_options", "shared_execution requires shared adapters")
+        if shared_execution and not getattr(coordinator, "installs_session_fence", False):
+            raise RuntimeRequestError("invalid_options", "shared coordinator must install the database session fence")
         self.host_context_fields = {k: frozenset(v) for k, v in (host_context_fields or {}).items()}
         self.capacity, self.claim_limit = capacity, claim_limit
         self.session_lease_ttl_s, self.recovery_interval_s = session_lease_ttl_s, recovery_interval_s

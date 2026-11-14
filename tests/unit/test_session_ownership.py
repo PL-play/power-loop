@@ -27,6 +27,23 @@ class TestMemorySessionOwnership(SessionOwnershipContractTests, unittest.Isolate
 
 
 @pytest.mark.asyncio
+async def test_shared_runtime_rejects_coordinator_without_database_fence(registry_store):
+    from power_loop import DatabasePollingTransport, RegistryRuntimeFactory, Runtime
+
+    class Unfenced(MemorySessionOwnershipCoordinator):
+        scope = "shared"
+
+    store, _ = registry_store
+    transport = DatabasePollingTransport(RuntimeInputStore(store))
+    try:
+        with pytest.raises(RuntimeRequestError, match="database session fence"):
+            Runtime(store=store, factory=RegistryRuntimeFactory(), node_id="invalid",
+                    coordinator=Unfenced(), transport=transport, shared_execution=True)
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.asyncio
 async def test_owner_fence_renew_final_release_and_stale_handle(registry_store):
     store, _ = registry_store
     port = RuntimeInputStore(store)

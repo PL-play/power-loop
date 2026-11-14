@@ -18,6 +18,13 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
         self.store = store
         self.table = store.t.session_state
 
+    async def claim(self, inputs, target, **options):
+        """Install the fence in the same transaction as the input batch."""
+        return await inputs.claim(target, **options)
+
+    async def recover(self, inputs, target, **options):
+        return await inputs.recover(target, **options)
+
     async def acquire(self, key, *, owner_id, ttl_s, on_lost, node_id=None, boot_id=None):
         if ttl_s <= 0:
             raise ValueError("session ownership ttl_s must be positive")
