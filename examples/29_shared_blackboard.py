@@ -48,8 +48,7 @@ async def main():
         await runtime.worker.start()
         async def write(name, actions):
             target = await runtime.open_session(RuntimeDescriptor(2,'agent','board-writer@215',None,
-                'board@215','builtin.none@215','board@215',{'actions':actions},{}),actor=actor)
-            await store.merge_session_metadata(target.session_id, {'name':name})
+                'board@215','builtin.none@215','board@215',{'actions':actions,'name':name},{}),actor=actor)
             receipt = await runtime.client.send(target,'post your note',message_id='post',actor=actor)
             result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=int(time.time()*1000)+10000)
             assert result.status=='completed', result

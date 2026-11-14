@@ -94,3 +94,5 @@ The P7 report records executed checks and remaining blockers; final full suites 
 belong to P8.
 
 Notes, default timers and shared blackboards store their documents in session_runtime_state. No auxiliary schema tables are required.
+
+`runtime_transport.PROTOCOL_VERSION=42` is used by `TransportPacket` for internal notifications; it is separate from the store `schema_migrations.protocol_version=43`.

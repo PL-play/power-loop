@@ -5,7 +5,7 @@ separate ``board_*`` tools were merged in 5.0.0). It resolves the live
 :class:`~power_loop.runtime.blackboard.Blackboard` and the agent's ``board_id``
 from the current :class:`~power_loop.runtime.env.RuntimeEnv` at call time (so a
 host injects the implementation + id per run/send, exactly like the sandbox
-``ShellBackend``). The author is taken from the session metadata.
+``ShellBackend``). The author is taken from the frozen session descriptor config.
 ``kind``/``status`` vocabularies are the host's policy, set when the tool is
 registered.
 

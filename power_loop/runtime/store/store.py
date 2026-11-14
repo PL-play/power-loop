@@ -1400,35 +1400,6 @@ class SessionStore:
                 cached.system_prompt = system_prompt
                 cached.updated_at = updated
 
-    async def merge_session_metadata(self, session_id: str, patch: dict[str, Any]) -> None:
-        """Shallow-merge ``patch`` into the session's ``metadata_json`` (read-modify-write under
-        the session-state row lock so concurrent merges don't clobber each other). No-op if the
-        session is gone. Used to record the projection/history mode + projector config for
-        inspection and switch-detection."""
-        if {"tenant_id", "principal_id"}.intersection(patch):
-            raise ValueError("session identity is immutable")
-        if not patch:
-            return
-        send_reads.forget(self, session_id, "session")
-        async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            row = await tx.fetchone(
-                f"SELECT metadata_json FROM {self.t.sessions} WHERE session_id=?", (session_id,)
-            )
-            if row is None:
-                return
-            current = _loads(row["metadata_json"]) or {}
-            current.update(patch)
-            updated = _now_ms()
-            await tx.execute(
-                f"UPDATE {self.t.sessions} SET metadata_json=?, updated_at=? WHERE session_id=?",
-                (_dumps(current), updated, session_id),
-            )
-            cached = getattr(self, "_cached_sessions", {}).get(session_id)
-            if cached is not None:
-                cached.metadata = dict(current)
-                cached.updated_at = updated
-
     # Normal timers and notes share the existing runtime-state table in schema 17.
     def _json_field(self, name, *, number=False):
         dialect = self._db.dialect.name

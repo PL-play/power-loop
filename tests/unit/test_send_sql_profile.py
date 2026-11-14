@@ -99,6 +99,15 @@ def _category(chain, sql=""):
         return "legacy_job_control"
     if any(c.startswith(_LEGACY_MODULES) or c in _LEGACY_RUNTIME_STORE_CALLS for c in chain):
         return "legacy_job_control"
+    # append_message touches activity at most once per second. Metadata's initial
+    # write also touches activity, so cold/warm sends can differ by this timed write.
+    if ("runtime.store.store:append_message" in chain
+            and re.match(r"update \S*sessions set updated_at", normalized)):
+        return "periodic"
+    # Inspection metadata is ordinary storage, outside accept/claim/final control.
+    # Keep every statement in total_sql; classify by its actual live caller.
+    if "agent.stateful_loop:_record_history_mode" in chain:
+        return "message"
     if "agent.runtime_store:_db_now" in chain:
         return "session_control"
     if normalized.startswith("select last_insert_id()"):

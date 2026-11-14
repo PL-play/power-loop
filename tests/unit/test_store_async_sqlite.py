@@ -7,19 +7,23 @@ the ``pl_`` table prefix, and the schema-init contract.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, StoreSchemaError
 from power_loop.runtime.store.store import SessionStore
+
+from .session_native_fixture import ACTOR, DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
 
 async def test_create_append_load_and_seq_monotonic() -> None:
     async with await SessionStore.open(":memory:") as store:
-        sid = await store.create_session(system_prompt="hi", metadata={"k": "v"})
+        sid = await store.create_session(replace(DESCRIPTOR, config={"system_prompt":"hi"}, host_context={"k":"v"}), actor=ACTOR)
         sess = await store.get_session(sid)
-        assert sess is not None and sess.system_prompt == "hi" and sess.metadata == {"k": "v"}
+        assert sess is not None and sess.descriptor.config["system_prompt"] == "hi" and sess.descriptor.host_context == {"k": "v"}
 
         seqs = []
         for i in range(4):
@@ -34,7 +38,7 @@ async def test_create_append_load_and_seq_monotonic() -> None:
 
 async def test_compaction_marks_exact_set_and_orders_note_logically() -> None:
     async with await SessionStore.open(":memory:") as store:
-        sid = await store.create_session()
+        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         for i in range(4):
             await store.append_message(sid, role="user", content=f"m{i}")
         # fold the first two; the note logically sits at ord=1 (front)
@@ -64,7 +68,7 @@ async def test_transaction_rolls_back_on_error() -> None:
 
 async def test_pl_prefix_isolates_tables() -> None:
     async with await SessionStore.open(":memory:") as store:
-        await store.create_session(session_id="s")
+        await store.create_session(DESCRIPTOR, actor=ACTOR, session_id="s")
         names = {r["name"] for r in await store._db.fetchall(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "pl_sessions" in names and "pl_messages" in names

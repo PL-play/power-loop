@@ -32,13 +32,13 @@ class TicketProjector(RuntimeProjector):
 
 async def capture_ticket_context() -> str:
     ctx = get_tool_runtime_context(required=True)
-    session = await ctx.store.get_session(ctx.session_id)
+    meta = await ctx.store.get_runtime_state(ctx.session_id, "meta")
     messages = await ctx.store.load_all_messages(ctx.session_id)
     await ctx.store.set_runtime_state(
         ctx.session_id,
         "ticket",
         {
-            "customer": session.metadata["customer"],
+            "customer": meta["customer"],
             "messages_seen": len(messages),
         },
     )
@@ -60,7 +60,7 @@ async def main():
     registry.register(ToolDefinition(name='capture_ticket_context', description='Capture ticket context', pricing=Free('local')), capture_ticket_context)
     config = AgentLoopConfig(compactor=None, runtime_projectors=(TicketProjector(),))
     async with demo_runtime(TicketModel(), registry, config=config) as (runtime, loop, target, actor):
-        await runtime.store.merge_session_metadata(target.session_id, {'customer':'Ada'})
+        await runtime.store.set_runtime_state(target.session_id, 'meta', {'customer':'Ada'})
         result = await loop.send(target, 'Capture ticket', message_id='ticket', actor=actor, deadline_ms=int(time.time()*1000)+10000)
         assert result.status == 'completed'
         ticket = await runtime.store.get_runtime_state(target.session_id, 'ticket')
