@@ -556,7 +556,9 @@ class SessionStore:
 
     async def session_owner_epoch(self, session_id):
         row = await self._db.fetchone(
-            f"SELECT owner_epoch,lifecycle FROM {self.t.session_state} WHERE session_id=?", (session_id,))
+            f"SELECT st.owner_epoch,s.lifecycle FROM {self.t.session_state} st "
+            f"JOIN {self.t.sessions} s ON s.session_id=st.session_id WHERE st.session_id=?",
+            (session_id,))
         if row is None:
             raise ValueError(f"unknown session: {session_id}")
         if row['lifecycle'] != 'open':
@@ -570,7 +572,9 @@ class SessionStore:
             lease.require_owned()
             changed = await tx.execute(
                 f"UPDATE {self.t.session_state} SET owner_epoch=owner_epoch+1,owner_token=?,"
-                "owner_node_id=?,owner_boot_id=? WHERE session_id=? AND owner_epoch=? AND lifecycle='open'",
+                "owner_node_id=?,owner_boot_id=? WHERE session_id=? AND owner_epoch=? "
+                f"AND EXISTS (SELECT 1 FROM {self.t.sessions} s "
+                f"WHERE s.session_id={self.t.session_state}.session_id AND s.lifecycle='open')",
                 (lease.token, lease.node_id, lease.boot_id, session_id, expected_epoch))
             lease.require_owned()
         if changed:
@@ -1386,19 +1390,6 @@ class SessionStore:
         """Delete at most limit rows; an unfinished tree keeps its session roots."""
         from .closing import delete_sessions
         return await delete_sessions(self, session_id, cascade=cascade, limit=limit, resource_guard=resource_guard)
-
-    async def update_session_prompt(self, session_id: str, system_prompt: str | None) -> None:
-        send_reads.forget(self, session_id, "session")
-        updated = _now_ms()
-        async with self._db.transaction() as tx:
-            await tx.execute(
-                f"UPDATE {self.t.sessions} SET system_prompt=?, updated_at=? WHERE session_id=?",
-                (system_prompt, updated, session_id),
-            )
-            cached = getattr(self, "_cached_sessions", {}).get(session_id)
-            if cached is not None:
-                cached.system_prompt = system_prompt
-                cached.updated_at = updated
 
     # Normal timers and notes share the existing runtime-state table in schema 17.
     def _json_field(self, name, *, number=False):

@@ -102,3 +102,33 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
         await port.cancel_active(old)
     recovered = await port.recover(root, node_id="new", boot_id="new")
     assert recovered.execution_state == "queued"
+
+    # Store ownership helpers read lifecycle from sessions, including a close
+    # committed between reading the epoch and the conditional owner write.
+    active = await port.claim(root, node_id="new", boot_id="new")
+    epoch = await store.session_owner_epoch(root.session_id)
+    assert epoch == active.owner_epoch
+    lease = SessionOwnership(
+        (store.store_id, root.session_id), "replacement", time.monotonic() + 90,
+        lambda: None, node_id="replacement", boot_id="replacement",
+    )
+    assert await store.install_session_owner(root.session_id, lease, epoch)
+    assert lease.epoch == epoch + 1
+    assert await store.session_owner_epoch(root.session_id) == lease.epoch
+    assert not await store.install_session_owner(root.session_id, lease, epoch)
+    with pytest.raises(SessionLeaseLost):
+        await port.final(active, final_text="stale")
+
+    for lifecycle in ("closing", "closed"):
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET lifecycle=? WHERE session_id=?",
+            (lifecycle, root.session_id),
+        )
+        with pytest.raises(RuntimeRequestError, match="session_closed"):
+            await store.session_owner_epoch(root.session_id)
+        assert not await store.install_session_owner(root.session_id, lease, lease.epoch)
+        state = await store._db.fetchone(
+            f"SELECT owner_epoch,owner_token FROM {store.t.session_state} WHERE session_id=?",
+            (root.session_id,),
+        )
+        assert state == {"owner_epoch": lease.epoch, "owner_token": lease.token}
