@@ -1,8 +1,8 @@
 # Runtime capacity and shared workers
 
-SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor schema 2.
 
-[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
+[Runtime contract](../../runtime-12.md) · [API](../api/index.md)
 
 Runtime.capacity bounds active execution. Independent sessions and children use the same admission mechanism; workflow waiting does not reserve a model slot. The default composition uses in-process coordination and transport. It acquires an exclusive store startup lock, so a second independent default process is rejected. Client-only publishers do not acquire this lock.
 
@@ -14,7 +14,7 @@ Measure the complete request, including acceptance, execution, persistence and r
 
 ## Runnable examples
 
-Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design215_single_process.py.
 
 | Example | Behavior |
 |---|---|

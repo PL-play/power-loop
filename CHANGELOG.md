@@ -1,3 +1,13 @@
+# 12.0.0 — session-native runtime
+
+- Freeze schema 17, protocol 43, descriptor 2 and the complete v12 STABLE_API.
+- Remove the task execution modules and public identities. Use TargetRef/InputRef, session send,
+  ordinary result messages and direct parent/child sessions throughout.
+- Close/delete and retention use session ownership, unfinished inputs and tool/resource guards.
+- Older stores and descriptors are rejected; use a fresh store. No online migration or compatibility path.
+- Refresh examples, public runtime documentation and dependency consumers. Local source delivery;
+  publishing, deployment and the final multi-node/full-suite validation remain separate.
+
 # Changelog
 
 ## 11.0.0 — Design 203 (source delivery; not published)

@@ -108,35 +108,6 @@ async def test_send_result_carries_summed_usage(registry_store, runtime_agent):
     await loop.aclose()
 
 
-@pytest.mark.asyncio
-async def test_tool_rounds_also_persist_per_round_usage_rows(registry_store, runtime_agent):
-    """每一轮都要有 usage_rounds 行——包括带工具调用的回合。
-
-    5.2.2 之前 on_round_ended(usage=…) 只在无工具回合的收尾路径上发：agent 会话里几乎
-    每轮都带工具，于是一个 34 轮的叶子在表里只剩最后一轮那一行（2026-08-19 线上实锤）。
-    总量从来没错（session_stats 用 send 结束时的内存聚合 bump），丢的是这张表存在的
-    唯一意义——逐轮明细。"""
-
-    from power_loop import AgentLoopConfig, create_default_tool_registry
-
-    llm = _Scripted(responses=[
-        _tool_resp("c1", "todo_write", prompt=100, completion=10),  # round 1: tool round
-        _tool_resp("c2", "todo_write", prompt=120, completion=12),  # round 2: tool round
-        _resp("final answer", prompt=150, completion=5),            # round 3: text
-    ])
-    reg = create_default_tool_registry(preset="core", bind=False)
-    loop = await runtime_agent(store=registry_store[0], model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=6), registry=reg)
-    sid = loop.target.session_id
-    res = await loop.send("hi")
-    assert res.status == "completed"
-    await loop.aclose()
-    store = loop.runtime.store
-    rows = await store._db.fetchall(
-        f"SELECT round_index, prompt_tokens, completion_tokens FROM {store.t.usage_rounds} "
-        "WHERE session_id=? ORDER BY round_index", (sid,))
-    assert [r['round_index'] for r in rows] == [0, 1, 2]
-    assert [r['prompt_tokens'] for r in rows] == [100, 120, 150]
-    assert [r['completion_tokens'] for r in rows] == [10, 12, 5]
 
 
 
@@ -195,25 +166,24 @@ async def test_send_interrupts_pending_and_proceeds(tmp_path, runtime_agent):
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_send_interrupts_stale_pending(registry_store, runtime_agent):  # noqa: F811
-    from power_loop import AgentLoopConfig
-    from power_loop.runtime.jobs import JobManager
-    from power_loop.runtime.task_runtime import TaskRuntime
+async def test_tool_rounds_also_persist_per_round_usage_rows(registry_store, runtime_agent):
+    """Tool and final response rounds both retain their normal usage details."""
 
-    store, _ = registry_store
-    runtime = TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host",
-                          executor_id="heal", boot_id="boot")
-    model = StrictModel()
-    loop = await runtime_agent(model=model, store=store, task_runtime=runtime, config=AgentLoopConfig(compactor=None, delegation_policy="single_level"))
-    try:
-        sid = loop.target.session_id
-        await _wedge_session(loop.runtime.store, sid)
-        assert (await loop.send("continue")).status == "completed"
-        assert (await store.get_state(sid)).pending is None
-        tools = [m for m in model.requests[0] if m["role"] == "tool"]
-        assert len(tools) == 1 and "执行中断，结果未知" in tools[0]["content"]
-        assert (await loop.send("continue again")).status == "completed"
-        rows = await store.load_active_messages(sid)
-        assert len([r for r in rows if r.role == "tool"]) == 1
-    finally:
-        await loop.aclose()
+    from power_loop import AgentLoopConfig, create_default_tool_registry
+
+    llm = _Scripted(responses=[
+        _tool_resp("c1", "todo_write", prompt=100, completion=10),  # round 1: tool round
+        _tool_resp("c2", "todo_write", prompt=120, completion=12),  # round 2: tool round
+        _resp("final answer", prompt=150, completion=5),            # round 3: text
+    ])
+    reg = create_default_tool_registry(preset="core", bind=False)
+    loop = await runtime_agent(store=registry_store[0], model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=6), registry=reg)
+    sid = loop.target.session_id
+    res = await loop.send("hi")
+    assert res.status == "completed"
+    await loop.aclose()
+    store = loop.runtime.store
+    rows = await store.list_usage_rounds(sid)
+    assert [r['round_index'] for r in rows] == [0, 1, 2]
+    assert [r['prompt_tokens'] for r in rows] == [100, 120, 150]
+    assert [r['completion_tokens'] for r in rows] == [10, 12, 5]

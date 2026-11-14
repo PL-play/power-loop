@@ -1,8 +1,8 @@
 # 工具与内置能力
 
-SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
+SDK 12.0.0 · 会话结构 17 · 协议 43 · 描述符结构 2。
 
-[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
+[Runtime 契约](../../runtime-12.md) · [API](../api/index.md)
 
 工厂提供 ToolRegistry 和明确的 RuntimeEnv。create_default_tool_registry 装配选择的内置工具，但不会自动授权所有资源。RequestOptions.tools 限制本次调用工具，required_profiles 声明部署必需能力。校验错误和能力缺失明确可见。
 
@@ -12,7 +12,7 @@ SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
 
 ## 可执行示例
 
-从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design215_single_process.py。
 
 | 示例 | 行为 |
 |---|---|

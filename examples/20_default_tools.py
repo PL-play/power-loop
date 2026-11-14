@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 
 from _runtime import demo_runtime
 
-from power_loop import AgentLoopConfig, JobRef, LLMResponse, LLMService, RuntimeEnv, create_default_tool_registry
+from power_loop import AgentLoopConfig, InputRef, LLMResponse, LLMService, RuntimeEnv, create_default_tool_registry
 
 
 class ToolsModel(LLMService):
@@ -54,7 +54,7 @@ async def main():
             outputs = [row for row in rows if row.role == 'tool']
             assert len(outputs) == 10 and all(row.name in registry.names() for row in outputs) and not any(row.content.startswith('Error:') for row in outputs), [(row.name,row.content) for row in outputs]
             receipt = json.loads(next(row.content for row in outputs if row.name=='background_run'))
-            child = await runtime.client.wait(JobRef(**receipt['job_ref']), actor=actor, deadline_ms=int(time.time()*1000)+10000)
+            child = await runtime.client.wait(InputRef(**receipt['input_ref']), actor=actor, deadline_ms=int(time.time()*1000)+10000)
             assert child.status == 'completed' and 'background-finished' in child.final_text
             assert (workspace/'notes.txt').read_text() == 'ALPHA\nBETA\n'
             print([row.name for row in outputs], child.final_text)

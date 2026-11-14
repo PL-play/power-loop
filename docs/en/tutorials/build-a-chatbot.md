@@ -1,6 +1,6 @@
 # Build a chatbot
 
-SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor 2.
 
 The host authenticates the user, persists TargetRef and input IDs, and renders persisted Result or live output. New messages get new IDs; retries retain the original ID. The factory owns model/tool/resource construction.
 

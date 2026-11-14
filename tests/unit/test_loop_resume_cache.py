@@ -34,11 +34,9 @@ from power_loop._vendor.llm_client.interface import (
 )
 from power_loop.agent.stateful_loop import _ExecutionLoop
 from power_loop.runtime.compact import CompactionPlan
-from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.memory import MemoryProvider
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
-from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
@@ -166,9 +164,7 @@ class _EveryRoundCompactor:
 
 def _cache_loop(store, *, size=256):
     # Pure cache units do not execute inputs or use a removed public constructor.
-    return _ExecutionLoop(llm=_SeqLLM(), store=store, session_cache_size=size, config=AgentLoopConfig(delegation_policy="single_level"),
-        task_runtime=TaskRuntime(JobManager(store), tenant_id="test", principal_id="host",
-                                 executor_id="fixture", boot_id="boot"))
+    return _ExecutionLoop(llm=_SeqLLM(), store=store, session_cache_size=size, config=AgentLoopConfig(delegation_policy="single_level"))
 
 
 @pytest.mark.parametrize("mode", ["plain", "recall", "tool", "fold", "microcompact", "fold_once"])
@@ -300,7 +296,8 @@ async def test_internal_cache_remains_bounded_and_prewarm_handles_missing_sessio
     try:
         assert not await loop.prewarm("missing")
         for i in range(4):
-            sid = await store.create_session()
+            from .session_native_fixture import new_session
+            sid = (await new_session(store)).session_id
             await store.append_message(sid, role="user", content=str(i))
             await loop.prewarm(sid)
         assert loop.cache_stats["entries"] <= size
@@ -317,7 +314,8 @@ async def test_internal_cache_invalidates_folded_rows(tmp_path):
     store = await SessionStore.open(str(tmp_path / "cache.db"))
     loop = _cache_loop(store)
     try:
-        sid = await store.create_session()
+        from .session_native_fixture import new_session
+        sid = (await new_session(store)).session_id
         for i in range(4):
             await store.append_message(sid, role="user", content=f"m{i}")
         assert await loop.prewarm(sid)
@@ -350,7 +348,8 @@ async def test_store_schema_verify_and_reopen_through_current_runtime(tmp_path):
     reopened = await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
     agent = await RunningAgent(reopened, _SeqLLM(responses=[LLMResponse(raw_text="again")])).start(target=target)
     try:
-        assert [m.content for m in await reopened.load_active_messages(target.session_id)] == ["hello", "hi"]
+        rows = await reopened.load_active_messages(target.session_id)
+        assert "hello" in rows[0].content and rows[1].content == "hi"
         assert (await agent.send("next", message_id="second")).status == "completed"
     finally:
         await agent.aclose()

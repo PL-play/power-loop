@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from power_loop import AgentLoopConfig, JobRef, LLMResponse, LLMService
+from power_loop import AgentLoopConfig, InputRef, LLMResponse, LLMService
 from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.history_sanitize import sanitize_request_messages
 from tests.unit.test_stateful_loop import _echo_registry
@@ -122,10 +122,10 @@ async def test_bad_stored_history_can_continue(tmp_path, messages, action, runti
         await loop.send('delegate')
         rows = await store.load_all_messages(loop.target.session_id)
         created = json.loads(next(r.content for r in rows if r.tool_call_id == 'spawn'))
-        ref = JobRef(**created['job_ref'])
+        ref = InputRef(**created['input_ref'])
         original = await loop.runtime.client.wait(ref, actor=loop.actor, deadline_ms=now_ms()+10000)
         assert original.status == 'completed' and original.final_text == 'initial child result'
-        ref = original.job_ref
+        ref = original.target
         await loop.drain()
         sid = created['session_id']
     else:
@@ -138,7 +138,7 @@ async def test_bad_stored_history_can_continue(tmp_path, messages, action, runti
     if action == 'send':
         result = await loop.send('continue')
     else:
-        receipt = await loop.runtime.client.resume(ref, message_id='resume', actor=loop.actor, body='continue')
+        receipt = await loop.runtime.client.send(ref, 'continue', message_id='continue', actor=loop.actor)
         result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
         await loop.drain()
     assert result.status == 'completed' and len(model.requests) == 2

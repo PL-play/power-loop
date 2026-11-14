@@ -197,7 +197,6 @@ async def run_session(worker, ctx, env, config):
     loop = SimpleNamespace(
         config=config,
         tool_registry=env.tool_registry,
-        task_runtime=None,
         _runtime_worker=worker,
         _runtime_worker_context=ctx,
         store=worker.runtime.store,

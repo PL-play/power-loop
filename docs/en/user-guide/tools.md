@@ -1,8 +1,8 @@
 # Tools and built-in capabilities
 
-SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor schema 2.
 
-[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
+[Runtime contract](../../runtime-12.md) · [API](../api/index.md)
 
 The factory supplies ToolRegistry and explicit RuntimeEnv. create_default_tool_registry assembles selected built-ins; it does not authorize every resource by itself. Use RequestOptions.tools to restrict a call, and declare deployment-required capabilities in required_profiles. Validation errors and missing capabilities stay visible.
 
@@ -12,7 +12,7 @@ Synchronous functions, async functions and callable objects are supported by the
 
 ## Runnable examples
 
-Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design215_single_process.py.
 
 | Example | Behavior |
 |---|---|

@@ -81,7 +81,8 @@ _LEGACY_RUNTIME_STORE_CALLS = (
 
 def _periodic(chain):
     return (_executor_heartbeat(chain) or any(site.startswith("runtime.timers:") for site in chain)
-            or any(site.startswith("runtime.store.retention:") for site in chain))
+            or any(site.startswith("runtime.store.retention:") for site in chain)
+            or any(site in ("runtime.store.store:due_timers", "runtime.store.store:recover_stale_firing_timers") for site in chain))
 
 
 def _category(chain, sql=""):
@@ -371,9 +372,11 @@ async def test_send_sql_profile(registry_store, models, tools_per_round):
         one, *_ = await _measure(store, 1, tools_per_round=tools_per_round)
         # Marginal cost per additional round. The time-based session activity touch
         # (UPDATE sessions SET updated_at, <=1/sec of send duration) is periodic, not a
-        # per-round control cost, so exclude it from the marginal.
+        # per-round control cost. Timer polling is independently scheduled too; both
+        # remain counted in raw total SQL / periodic, outside the per-round marginal.
         def non_periodic(recs):
-            return [r for r in recs if not re.search(r"UPDATE \S*sessions SET updated_at", r["sql"])]
+            return [r for r in recs if _category(r["chain"], r["sql"]) != "periodic"
+                        and not re.search(r"UPDATE \S*sessions SET updated_at", r["sql"])]
         per_round = (len(non_periodic(records)) - len(non_periodic(one))) / (models - 1)
         assert per_round <= _per_round_ceiling(db, tools_per_round), (per_round, counts)
 

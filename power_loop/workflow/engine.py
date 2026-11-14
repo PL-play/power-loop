@@ -1,4 +1,4 @@
-"""Graph interpretation over independently owned durable node jobs."""
+"""Graph interpretation over independently owned node sessions."""
 
 from __future__ import annotations
 

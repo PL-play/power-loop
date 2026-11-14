@@ -1,3 +1,5 @@
+> Historical design record. The current contract is [Runtime 12](../runtime-12.md); this page is not an implementation guide.
+
 # Host processing steps and original model sends
 
 This opt-in protocol binds one trusted host processing step to its original main send. It does not implement the host processing state machine, acquire a new execution lease, reconcile external effects, or settle money.

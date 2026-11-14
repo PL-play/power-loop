@@ -24,9 +24,6 @@ class ExecutionContext:
     node_id: str
     boot_id: str
     input_ref: object = None
-    job_ref: object = None
-    parent_job_id: str | None = None
-    root_job_id: str | None = None
     owner_epoch: int = 0
     owner_token: str | None = None
     actor: object = None
@@ -35,8 +32,7 @@ class ExecutionContext:
     cancel_token: object = None
     host_context: Mapping = field(default_factory=lambda: MappingProxyType({}))
     #: design 215 session-native identity: the claimed send index and direct parent
-    #: session. job_ref/parent_job_id/root_job_id remain only for unmigrated modules
-    #: and are None on the session path (removed with them in P7).
+    #: session.
     send_index: int | None = None
     parent_session_id: str | None = None
 
@@ -90,9 +86,9 @@ def independent_execution_scope():
     from power_loop.runtime.invocation import _INVOCATION
     from power_loop.runtime.session_ownership import _CURRENT
     from power_loop.runtime.store.send_reads import ACTIVE
-    from power_loop.runtime.task_runtime import _OWNER, _SEND, _TASK_OWNERS
+    from power_loop.runtime.task_runtime import _SESSION_SEND
 
-    values = ((_CURRENT, None), (_SEND, None), (_OWNER, None), (_TASK_OWNERS, ()),
+    values = ((_CURRENT, None), (_SESSION_SEND, None),
               (_INVOCATION, None), (ACTIVE, None), (_CURRENT_EXECUTION, None),
               (_HOST_CONTEXT, None), (_HOST_FIELDS, None), (ctx._current_cancel_token, None),
               (ctx._current_loop, None), (ctx._current_ctx, None), (ctx._current_session_id, None),

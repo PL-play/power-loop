@@ -205,7 +205,7 @@ async def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> N
 
     import json
 
-    from power_loop import JobRef
+    from power_loop import InputRef
     from power_loop.agent.runtime_store import now_ms
     from power_loop.runtime.store.factory import open_store
     from tests.runtime_fixture import RunningAgent
@@ -219,7 +219,7 @@ async def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> N
         assert (await agent.send("run shell")).status == "completed"
         started = json.loads(next(row.content for row in await store.load_all_messages(agent.target.session_id)
                                  if row.role == "tool" and row.tool_call_id == "background"))
-        checked = await agent.runtime.client.wait(JobRef(**started["job_ref"]), actor=agent.actor,
+        checked = await agent.runtime.client.wait(InputRef(**started["input_ref"]), actor=agent.actor,
                                                   deadline_ms=now_ms()+10000)
         assert checked.status == "completed" and "background-ok" in checked.final_text
         await agent.drain()

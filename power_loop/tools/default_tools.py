@@ -1535,9 +1535,7 @@ async def run_recall_send(send_index: int | None = None, seq: int | None = None,
                           source: str = "messages", ids: list[int] | None = None, id: int | None = None,
                           cursor: str | None = None, output_file: str | None = None, group_id: str | None = None,
                           offset: int = 0, limit: int = 20, item: int | None = None,
-                          char_offset: int | None = None, char_limit: int | None = None,
-                          job_id: str | None = None, message_id: str | int | None = None,
-                          message_ids: list[str | int] | None = None) -> str:
+                          char_offset: int | None = None, char_limit: int | None = None) -> str:
     """Re-expand one past send the send-context projection summarized.
 
     When ``AgentLoopConfig.history_projector`` is set, finished sends appear in context as a
@@ -1550,30 +1548,6 @@ async def run_recall_send(send_index: int | None = None, seq: int | None = None,
     ctx = get_tool_runtime_context(required=True)
     store, sid = ctx.store, ctx.session_id
     assert store is not None and sid is not None  # required=True guarantees this
-
-    if job_id is not None or message_id is not None or message_ids is not None:
-        from power_loop.runtime.jobs import JobError
-        from power_loop.runtime.task_history import read_history
-
-        runtime = getattr(ctx.loop, "task_runtime", None)
-        if runtime is None:
-            return json.dumps({"version": 1, "error": {"code": "task_registry_required"}})
-        if store is not runtime.manager.store:
-            return json.dumps({"version": 1, "error": {"code": "task_store_mismatch"}})
-        if group_id is not None or item is not None or offset != 0:
-            return json.dumps({"version": 1, "error": {"code": "task_history_archive_selection_unavailable"}})
-        if output_file is not None and char_limit is not None:
-            return json.dumps({"version": 1, "error": {"code": "task_history_export_selection_conflict"}})
-        try:
-            result = await read_history(runtime.manager, runtime.actor(sid), job_id, session_id=sub_session,
-                source=source, ids=ids, seq=seq, id=id, message_id=message_id, message_ids=message_ids,
-                send_index=send_index, limit=limit, cursor=cursor, char_offset=char_offset,
-                max_chars=8000 if char_limit is None else char_limit, output_file=output_file)
-            return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-        except JobError as exc:
-            return json.dumps({"version": 1, "error": {"code": exc.code}})
-        except Exception:
-            return json.dumps({"version": 1, "error": {"code": "task_history_backend_unavailable"}})
 
     if group_id is not None and (source != "messages" or ids is not None or id is not None
                                  or cursor is not None or output_file is not None):
@@ -1845,7 +1819,7 @@ async def _h_background_run(**kw: Any) -> Any:
 
 _h_recall_send = FunctionRuntimeTool(
     _h_recall_send, ToolRuntimeContract("sdk.recall"),
-    policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("job_id") is not None),
+    policy=lambda arguments: ToolDispatchPolicy(native_admitted=True),
 )
 
 _h_todo = FunctionRuntimeTool(

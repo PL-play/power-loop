@@ -288,7 +288,6 @@ class _ExecutionLoop:
         event_bus: AgentEventBus | None = None,
         max_spawn_depth: int | None = None,
         session_cache_size: int = 256,
-        task_runtime: Any,
         timer_backend: Any = None,
         session_coordinator: Any = None,
     ) -> None:
@@ -314,16 +313,10 @@ class _ExecutionLoop:
         self.store: SessionStore | None = store
         if store is None:
             raise ValueError("a pre-opened authoritative store is required")
-        # Session-native sends (design 215) run without a job TaskRuntime; the claim
-        # transaction owns the fence and final writes the result. Legacy job paths still
-        # pass a TaskRuntime bound to this same store.
-        if task_runtime is not None and task_runtime.manager.store is not store:
-            raise ValueError("task_runtime requires its pre-opened authoritative store")
         from power_loop.runtime.timer_backend import TimerBackend
         if timer_backend is not None and not isinstance(timer_backend, TimerBackend):
             raise ValueError('timer_backend must implement create/list/cancel')
         self.timer_backend = timer_backend
-        self.task_runtime = task_runtime
         from power_loop.runtime.session_ownership import DEFAULT_SESSION_COORDINATOR
         self.session_coordinator = session_coordinator or DEFAULT_SESSION_COORDINATOR
         self._dsn = dsn if dsn is not None else (db_path if db_path is not None else DEFAULT_DB_PATH)
@@ -344,7 +337,7 @@ class _ExecutionLoop:
         self._orphaned_close_task: asyncio.Future[None] | None = None
         self.config = config if config is not None else AgentLoopConfig()
         if self.config.delegation_policy != "single_level":
-            raise ValueError("task_runtime requires single_level delegation")
+            raise ValueError("session runtime requires single_level delegation")
         self.tool_registry = tool_registry
         # Own a FRESH AgentHooks when the caller supplies none — NOT the shared
         # module-level DEFAULT_HOOKS singleton — so per-loop built-in hooks (e.g.
@@ -677,27 +670,8 @@ class _ExecutionLoop:
 
 
 
-    def _note_committed_inbox(self, session_id: str) -> None:
-        """Re-read pending inputs after a rolled-back batch releases its claims."""
-        ctx = self._runtime_worker_context
-        ctx.append_overflow = True
-        ctx.append_cursor = 0
 
-    def pending_follow_up_count(self, session_id: str) -> int:
-        """In-process HINT of undelivered inbox items for ``session_id`` (items this process
-        accepted and no drain has claimed yet).
 
-        Steering accepted in the terminal window of a run (after the loop's last round-boundary
-        drain) stays in the inbox of the now-idle session; hosts use this after a run returns to
-        detect it and hand it to :meth:`flush_follow_ups`. Sync and cheap, but blind to other
-        processes and to a restart — :meth:`inbox_pending` asks the store."""
-        entry = _SESSION_SYNC.get(session_id)
-        return max(0, entry.pending_hint) if entry is not None else 0
-
-    async def inbox_pending(self, session_id: str) -> dict[str, int]:
-        """Authoritative ``{"pending": n, "steer": m}`` for ``session_id`` from the store."""
-        store = await self._ensure_store()
-        return await store.inbox_counts(session_id)
 
     def extend_rounds(self, session_id: str, rounds: int) -> bool:
         """给**正在跑**的会话加轮数（6.46，DeepTalk design/170）：它在下一轮开始时把轮数上限加上 ``rounds``。
@@ -743,16 +717,6 @@ class _ExecutionLoop:
 
 
 
-    async def _require_host_continuation(self, sid: str) -> None:
-        from power_loop.runtime.execution_roles import session_role
-        from power_loop.runtime.jobs import JobError
-        from power_loop.runtime.task_runtime import _OWNER, _SEND
-        # Check before taking the session lock or writing an answer: a tool must
-        # not recursively resume its own running send or drive another owner.
-        if _SEND.get() is not None or _OWNER.get() is not None:
-            raise JobError("task_owner_required")
-        if await session_role(await self._ensure_store(), sid) != "main":
-            raise JobError("task_owner_required")
 
     async def _interrupt_pending(self, sid: str) -> int:
         """Reuse the send-entry snapshot; only stale pending causes writes."""
@@ -834,17 +798,7 @@ class _ExecutionLoop:
 
     # ── work in flight: list + stop by id (design/124 §8.1 / §8.4) ────────────────────────
 
-    async def list_jobs(self, session_id: str) -> list[dict[str, Any]]:
-        from power_loop.runtime import task_query
-        from power_loop.runtime.child_tasks import tool_actor
-        _, actor = await tool_actor(self)
-        result = await task_query.list_jobs(self.task_runtime.manager,
-            self.task_runtime.actor(actor.session_id), status="active", limit=100)
-        return result["nodes"]
 
-    async def stop_job(self, session_id: str, job_id: str) -> dict:
-        from power_loop.runtime.task_control import stop_from_current_call
-        return await stop_from_current_call(self, session_id, job_id)
 
 
     # ── inspection ────────────────────────────────────────────────────────
@@ -986,18 +940,6 @@ class _ExecutionLoop:
             entry.users -= 1
             self._release_idle_sync(sid)
 
-    async def _claim_inbox(self, sid: str) -> list[dict[str, Any]]:
-        """Claim everything waiting in ``sid``'s inbox (see ``SessionStore.inbox_claim``)."""
-        store = await self._ensure_store()
-        entry = _session_sync(sid, owner=self)
-        self._sync_sids.add(sid)
-        async with entry.queue_lock:
-            rows = await store.inbox_claim(sid)
-        entry.pending_hint = max(0, entry.pending_hint - len(rows))
-        if rows:
-            entry.steer.clear()
-        self._release_idle_sync(sid)
-        return rows
 
     async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
         """Round-boundary drain: claim the inbox and render it as ``<follow_up>`` messages (one

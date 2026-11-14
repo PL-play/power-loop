@@ -8,6 +8,7 @@ import pytest
 
 from power_loop.agent.sink import SQLiteSink
 
+from .session_native_fixture import new_session
 from .test_send_sql_profile import Profiled
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -16,7 +17,7 @@ USAGE = dict(prompt_tokens=7, completion_tokens=5, total_tokens=12, cached_token
 
 async def test_response_original_has_usage_without_an_additional_statement(registry_store):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = (await new_session(store)).session_id
     await store.append_message(sid, role='user', content='input', send_index=1)
     original = store._db
     store._db = counted = Profiled(original)
@@ -25,7 +26,7 @@ async def test_response_original_has_usage_without_an_additional_statement(regis
             round_index=0, meta={'visible':'kept'}, round_usage=USAGE)
         assert counted.transactions == 1
         assert len(counted.records) == (3 if original.dialect.name == 'mysql' else 2)
-        assert not any(store.t.usage_observations in row['sql'] for row in counted.records)
+        assert not any("usage:" in row["sql"] for row in counted.records)
         raw = await original.fetchone(f'SELECT meta_json FROM {store.t.messages} '
             'WHERE session_id=? AND seq=?', (sid, seq))
         assert json.loads(raw['meta_json']) == {'visible':'kept', '_round_usage':USAGE}
@@ -43,7 +44,7 @@ async def test_response_original_has_usage_without_an_additional_statement(regis
 
 async def test_lost_append_ack_and_round_end_observation_count_one_round(registry_store, monkeypatch):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = (await new_session(store)).session_id
     sink = SQLiteSink(store, sid)
     sink.send_index = 1
     transaction = store._db.transaction
@@ -65,13 +66,13 @@ async def test_lost_append_ack_and_round_end_observation_count_one_round(registr
     assert len(await cold.load_all_messages(sid)) == 1
     [detail] = await cold.list_usage_rounds(sid)
     assert detail['total_tokens'] == 12 and detail['cached_tokens'] == 3
-    assert (await cold._db.fetchone(f'SELECT COUNT(*) AS n FROM {cold.t.usage_observations} '
-        'WHERE session_id=?', (sid,)))['n'] == 1
+    assert (await cold._db.fetchone(f'SELECT COUNT(*) AS n FROM {cold.t.session_runtime_state} '
+        "WHERE session_id=? AND state_key LIKE 'usage:%'", (sid,)))['n'] == 1
 
 
 async def test_pruning_details_counts_distinct_rounds_and_preserves_message_bodies(registry_store):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = (await new_session(store)).session_id
     await store.record_usage(sid, send_index=1, round_index=0, **USAGE)
     await store.append_message(sid, role='assistant', content='one', send_index=1,
         round_index=0, round_usage=USAGE)
@@ -87,16 +88,34 @@ async def test_pruning_details_counts_distinct_rounds_and_preserves_message_bodi
     assert await store.list_usage_rounds(sid) == []
 
 
-async def test_export_import_keeps_response_and_empty_round_usage(registry_store):
+async def test_export_keeps_response_and_empty_round_usage(registry_store):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = (await new_session(store)).session_id
     await store.append_message(sid, role='assistant', content='original', send_index=7,
         round_index=0, round_usage=USAGE)
     await store.record_usage(sid, send_index=7, round_index=1, **USAGE)
     exported = await store.export_session(sid)
-    assert exported['tables']['usage_rounds'][0]['send_index'] == 7
-    restored = await store.import_session(exported)
-    details = await store.list_usage_rounds(restored)
-    assert [(row['send_index'], row['round_index'], row['total_tokens']) for row in details] == [(7, 0, 12), (7, 1, 12)]
-    [message] = await store.load_all_messages(restored)
+    observation = next(r for r in exported['tables']['session_runtime_state'] if r['state_key']=='usage:7:1')
+    assert json.loads(observation['value_json'])['total_tokens'] == 12
+    details = await store.list_usage_rounds(sid)
+    assert [(r['send_index'],r['round_index'],r['total_tokens']) for r in details] == [(7,0,12),(7,1,12)]
+    [message] = await store.load_all_messages(sid)
     assert message.content == 'original' and '_round_usage' not in message.meta
+
+
+async def test_hook_audit_and_corrected_auxiliary_usage_share_schema17(registry_store):
+    store, connect = registry_store
+    sid = (await new_session(store)).session_id
+    seq = await store.append_message(sid, role='assistant', content='public', hook_injected={
+        'hook_point':'llm_before','hook':'memory','kind':'context','payload':{'text':'private'}})
+    peer = await connect()
+    [audit] = await peer.list_hook_events(sid, message_seq=seq)
+    assert audit.payload == {'text':'private'}
+    assert (await peer.load_all_messages(sid))[0].content == 'public'
+    await store.record_auxiliary_usage(sid, 'fold', USAGE)
+    await peer.record_auxiliary_usage(sid, 'fold', USAGE)
+    await peer.record_auxiliary_usage(sid, 'fold', {**USAGE, 'total_tokens':15}, revision=1)
+    stats = await store.get_session_stats(sid)
+    assert stats.llm_calls == 1 and stats.total_tokens == 15
+    assert (await store.list_session_stats())[0] == stats
+    assert not any(r['state_key'].startswith('hook:') for r in (await store.export_session(sid))['tables']['session_runtime_state'])

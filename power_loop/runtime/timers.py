@@ -95,8 +95,8 @@ class TimerRunner:
                 from_status='firing', to_status='cancelled')
             self._emit(timer, 'cancelled')
             return
-        metadata = session.metadata or {}
-        if session.parent_session_id is not None or metadata.get('execution_role', 'main') != 'main':
+        if (session.parent_session_id is not None or session.created_by_session_id is not None
+                or session.session_kind != 'agent' or session.lifecycle != 'open'):
             await self.store.transition_timer(timer.session_id, timer.timer_id,
                 from_status='firing', to_status='cancelled')
             self._emit(timer, 'forbidden')
@@ -120,7 +120,7 @@ class TimerRunner:
         else:
             await self.client.send(TargetRef(self.store.store_id, timer.session_id), ctx.message,
                 message_id=f'timer-{timer.timer_id}-{timer.created_at}-{timer.fire_count}',
-                actor=TrustedActor(metadata['tenant_id'], metadata['principal_id'], None))
+                actor=TrustedActor(session.tenant_id,session.principal_id,None))
             await self.store.finish_firing_timer(timer.session_id, timer.timer_id)
         self._emit(timer, outcome)
 

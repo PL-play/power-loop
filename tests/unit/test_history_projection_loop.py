@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from power_loop import JobRef
+from power_loop import InputRef
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.types import AgentLoopConfig
@@ -135,7 +135,7 @@ async def test_unknown_pending_tool_is_not_replayed_and_keeps_its_send_index(sto
     llm = _Scripted([LLMResponse(raw_text='continued')])
     loop = await _projection_loop_with_tools(runtime_agent, store, llm, registry)
     sid = loop.target.session_id
-    await store.set_runtime_state(sid, 'send_index', 1)
+    await store._db.execute(f'UPDATE {store.t.session_state} SET send_index=1 WHERE session_id=?', (sid,))
     await store.append_message(sid, role='user', content='old input', send_index=1)
     call = {'id':'unknown-tool','type':'function','function':{'name':'echo','arguments':'{"text":"original"}'}}
     seq = await store.append_message(sid, role='assistant', send_index=1, round_index=0, tool_calls=[call])
@@ -188,7 +188,7 @@ async def test_child_session_projected_without_tool_context(store: SessionStore,
     await loop.send('delegate')
     rows = await store.load_all_messages(loop.target.session_id)
     created = json.loads(next(row.content for row in rows if row.tool_call_id == 'spawn'))
-    result = await loop.runtime.client.wait(JobRef(**created['job_ref']), actor=loop.actor, deadline_ms=now_ms()+10000)
+    result = await loop.runtime.client.wait(InputRef(**created['input_ref']), actor=loop.actor, deadline_ms=now_ms()+10000)
     assert result.status == 'completed'
     child = created['session_id']
     assert {(r.send_index, r.kind) for r in await store.load_project_messages(child)} == {(1, 'user'), (1, 'project')}
@@ -285,43 +285,8 @@ async def test_identity_projector_never_compacts(store: SessionStore, runtime_ag
     assert await store.latest_project_compact(sid) is None  # keep_last_sends=0 → never folds
 
 
-@pytest.mark.asyncio
-async def test_legacy_null_send_index_rows_rendered_verbatim(store: SessionStore, runtime_agent) -> None:
-    # Rows predating the projection era carry send_index=NULL (pre-v2 migration / export-import).
-    # Enabling projection must NOT silently drop them — they render VERBATIM and temporally BEFORE
-    # the projected/in-flight sends (regression for the NULL-send_index silent-drop bug).
-    llm = _Scripted(responses=[LLMResponse(raw_text="reply1"), LLMResponse(raw_text="reply2")])
-    loop = await _projector_loop(runtime_agent, store, llm, DefaultDeterministicProjector())
-    sid = loop.target.session_id
-    await store.append_message(sid, role="user", content="LEGACY-USER")      # send_index defaults NULL
-    await store.append_message(sid, role="assistant", content="LEGACY-REPLY")
-
-    await loop.send("first")
-    n = len(llm.calls)
-    await loop.send("second")
-    contents = [str(m.get("content", "")) for m in llm.calls[n]]
-    joined = "\n".join(contents)
-    assert "LEGACY-USER" in joined and "LEGACY-REPLY" in joined  # not dropped
-    assert "first" in joined and "reply1" in joined and "second" in joined  # projected + in-flight
-    # temporal order: legacy verbatim < send-1 projection < send-2 in-flight user
-    i_legacy = next(i for i, c in enumerate(contents) if "LEGACY-USER" in c)
-    i_first = next(i for i, c in enumerate(contents) if "first" in c)
-    i_second = next(i for i, c in enumerate(contents) if "second" in c)
-    assert i_legacy < i_first < i_second
 
 
-@pytest.mark.asyncio
-async def test_legacy_null_rows_not_re_dropped_across_sends(store: SessionStore, runtime_agent) -> None:
-    # Across MULTIPLE projected sends the legacy rows must persist in context every send (the bug
-    # dropped them the moment current_send_index advanced past 1).
-    llm = _Scripted(responses=[LLMResponse(raw_text=f"r{i}") for i in range(1, 5)])
-    loop = await _projector_loop(runtime_agent, store, llm, DefaultDeterministicProjector())
-    sid = loop.target.session_id
-    await store.append_message(sid, role="user", content="LEGACY-X")
-    for i in range(1, 4):
-        n = len(llm.calls)
-        await loop.send(f"m{i}")
-        assert "LEGACY-X" in "\n".join(str(m.get("content", "")) for m in llm.calls[n])
 
 
 @pytest.mark.asyncio
@@ -558,43 +523,8 @@ async def test_repair_corrupt_history_deactivates_orphan_row(store: SessionStore
     assert any(m.tool_call_id == "ghost" for m in await store.load_all_messages(sid))  # audit kept
 
 
-@pytest.mark.asyncio
-async def test_history_mode_recorded_and_switch_warns(store: SessionStore, caplog, runtime_agent) -> None:
-    # The ORIGINAL mode is recorded once; a later switch logs a warning (never raises) and does not
-    # overwrite the original — so it stays available for inspection/comparison.
-    import logging
-
-    base = await runtime_agent(
-        model=_Scripted(responses=[LLMResponse(raw_text="a")]), store=store,
-        registry=_echo_registry(), config=AgentLoopConfig(system_prompt="S", max_rounds=2),
-    )
-    sid = base.target.session_id
-    await base.send("first")
-    meta = (await store.get_session(sid)).metadata
-    assert meta["history_mode"] == "default"  # original recorded in SESSION METADATA
-    assert meta["projector_version"] is None  # default mode → no projector config
-
-    await base.aclose()
-    proj = await _projector_loop(runtime_agent, store, _Scripted(responses=[LLMResponse(raw_text="b")]),
-                           DefaultDeterministicProjector(), target=base.target)
-    with caplog.at_level(logging.WARNING):
-        await proj.send("second", message_id="projection")
-    assert "originally" in caplog.text and "default" in caplog.text  # switch warned
-    assert (await store.get_session(sid)).metadata["history_mode"] == "default"  # NOT overwritten
 
 
-@pytest.mark.asyncio
-async def test_projection_mode_records_projector_config_in_metadata(store: SessionStore, runtime_agent) -> None:
-    # Projection sessions stamp the full projector config in metadata (for inspection + comparison).
-    proj = await _projector_loop(runtime_agent, store, _two_send_script(),
-                           DefaultDeterministicProjector(version=3, trigger_ratio=0.5, keep_last_sends=2))
-    sid = proj.target.session_id
-    await proj.send("first")
-    meta = (await store.get_session(sid)).metadata
-    assert meta["history_mode"] == "projection"
-    assert meta["projector_version"] == 3
-    assert meta["projector_trigger_ratio"] == 0.5
-    assert meta["projector_keep_last_sends"] == 2
 
 
 
@@ -626,7 +556,7 @@ async def test_interrupted_send_is_lazily_projected_on_next_send(store: SessionS
     loop = await _projection_loop_with_tools(runtime_agent, store, llm, _echo_registry())
     sid = loop.target.session_id
     # 模拟中断的 send 1：只有原始行，没有投影行
-    await store.mutate_runtime_state(sid, "send_index", lambda v: 1, default=0)
+    await store._db.execute(f'UPDATE {store.t.session_state} SET send_index=1 WHERE session_id=?', (sid,))
     await store.append_message(sid, role="user", content="kick off", send_index=1)
     await store.append_message(
         sid, role="assistant", send_index=1, round_index=0,

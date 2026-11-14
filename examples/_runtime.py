@@ -35,15 +35,15 @@ async def demo_runtime(model, registry=None, *, config=None, command=None, store
     async def build(descriptor, context):
         return ExecutionEnvironment(BorrowedModel(model), registry, config or AgentLoopConfig(compactor=None),
             command=command if 'child_spec' not in descriptor.config else None, runtime_env=runtime_env, hooks=hooks, event_bus=event_bus)
-    factory.register('example@1', build, profiles=('example.tools@1',))
+    factory.register('example@215', build, profiles=('example.tools@215',))
     runtime = Runtime(store=store, factory=factory, node_id='example', capacity=capacity,
-                      required_profiles=['example@1', 'example.tools@1'])
+                      required_profiles=['example@215', 'example.tools@215'])
     facade = StatefulAgentLoop(runtime=runtime)
     try:
         await runtime.worker.start()
         actor = TrustedActor('example', 'host', None)
-        target = target or await facade.new_session(RuntimeDescriptor(1, 'agent', 'example@1', None,
-            'example.tools@1', 'builtin.none@1', 'builtin.none@1', {}, {}), actor=actor)
+        target = target or await facade.new_session(RuntimeDescriptor(2, 'agent', 'example@215', None,
+            'example.tools@215', 'builtin.none@215', 'builtin.none@215', {}, {}), actor=actor)
         yield runtime, facade, target, actor
     finally:
         await facade.aclose()

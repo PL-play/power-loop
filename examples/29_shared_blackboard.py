@@ -41,14 +41,14 @@ async def main():
         register_blackboard_tools(registry)
         return ExecutionEnvironment(Writer(descriptor.config['actions']),registry,
             AgentLoopConfig(max_rounds=5),runtime_env=RuntimeEnv(blackboard=board,blackboard_id='demo'))
-    factory.register('board-writer@1',build)
+    factory.register('board-writer@215',build)
     runtime = Runtime(store=store,factory=factory,node_id='example',timers_enabled=False)
     actor = TrustedActor('demo','host',None)
     try:
         await runtime.worker.start()
         async def write(name, actions):
-            target = await runtime.open_session(RuntimeDescriptor(1,'agent','board-writer@1',None,
-                'board@1','builtin.none@1','board@1',{'actions':actions},{}),actor=actor)
+            target = await runtime.open_session(RuntimeDescriptor(2,'agent','board-writer@215',None,
+                'board@215','builtin.none@215','board@215',{'actions':actions},{}),actor=actor)
             await store.merge_session_metadata(target.session_id, {'name':name})
             receipt = await runtime.client.send(target,'post your note',message_id='post',actor=actor)
             result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=int(time.time()*1000)+10000)

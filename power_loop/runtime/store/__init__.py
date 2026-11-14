@@ -19,7 +19,6 @@ from power_loop.runtime.store.store import (
     SessionStore,
 )
 from power_loop.runtime.store.types import (
-    BackgroundTaskRow,
     CompactionRow,
     MessageRow,
     MessageState,
@@ -34,7 +33,6 @@ from power_loop.runtime.store.types import (
 )
 
 __all__ = [
-    "BackgroundTaskRow",
     "CompactionRow",
     "MessageRow",
     "MessageState",

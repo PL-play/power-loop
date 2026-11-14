@@ -14,7 +14,7 @@ from power_loop.agent.runtime_transport import MemoryMessageTransport
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 from power_loop.runtime.store.process_guard import ProcessStoreGuard
 
-from .test_runtime_messaging_203 import fixture
+from .session_native_fixture import fixture
 
 
 @pytest.mark.parametrize('operation',['timer_create_cancel','timer_fire_acceptance','timer_scan_empty',

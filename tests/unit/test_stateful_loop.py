@@ -256,7 +256,7 @@ async def test_two_facades_serialize_and_keep_own_result(agent_factory):
         first_result, second_result = await asyncio.gather(agent.send('one'), second.send(agent.target, 'two',
             message_id='two', actor=agent.actor, deadline_ms=__import__('time').time_ns() // 1000000 + 10000))
         assert (first_result.final_text, second_result.final_text) == ('first', 'second')
-        assert first_result.job_ref != second_result.job_ref
+        assert first_result.input_ref != second_result.input_ref
     finally:
         await second.aclose()
 

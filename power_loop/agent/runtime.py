@@ -21,7 +21,6 @@ class ExecutionEnvironment:
     config: AgentLoopConfig
     hooks: object = None
     resources: object = None
-    task_runtime: object = None
     # A trusted factory may resolve an explicit host command instead of an LLM
     # turn. The registered name/arguments come from the frozen descriptor.
     command: tuple[str, dict] | None = None
@@ -56,7 +55,7 @@ class RegistryRuntimeFactory:
     def __init__(self):
         self._builders = {}
         self._capabilities = {}
-        self.profiles = {"builtin.none@1", "builtin.empty@1"}
+        self.profiles = {"builtin.none@215", "builtin.empty@215"}
         self._preflights = {}
 
     def register_profile(self, name, *, preflight=None):

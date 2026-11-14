@@ -17,7 +17,7 @@ from power_loop import (
     create_default_tool_registry,
 )
 from power_loop.agent.runtime_store import now_ms
-from power_loop.agent.runtime_types import JobRef
+from power_loop.agent.runtime_types import InputRef
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -167,7 +167,7 @@ async def test_subtree_cancel_reaches_child_model(registry_store, kind):
     try:
         if kind == 'subagent':
             parent = await runner.send('delegate')
-            reference = parent.job_ref
+            reference = parent.input_ref
         else:
             handle = await runner.runtime.client.workflow(runner.target,
                 {'name':'hang','root':{'type':'agent','id':'a','spec':{'name':'a','system_prompt':'HANG','tools':[]}}},
@@ -209,13 +209,13 @@ async def test_background_shell_stop_reaches_processes_that_left_the_group(regis
     try:
         await runner.send('launch')
         rows = await store.load_all_messages(runner.target.session_id)
-        ref = JobRef(**json.loads(next(row.content for row in rows if row.tool_call_id=='bg'))['job_ref'])
-        tag = ref.job_id+'_1'
+        ref = InputRef(**json.loads(next(row.content for row in rows if row.tool_call_id=='bg'))['input_ref'])
+        tag = ref.session_id+'_1'
         async with asyncio.timeout(10):
             while not _tagged_pids(tag):
                 await asyncio.sleep(.02)
         status = await runner.runtime.client.inspect(ref,actor=runner.actor)
-        await runner.runtime.client.cancel(status.job_ref,actor=runner.actor)
+        await runner.runtime.client.cancel(status.input_ref,actor=runner.actor)
         result = await runner.runtime.client.wait(ref,actor=runner.actor,deadline_ms=now_ms()+10000)
         assert result.status == 'cancelled'
         async with asyncio.timeout(5):

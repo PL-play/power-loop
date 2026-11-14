@@ -385,6 +385,7 @@ class RuntimeInputStore:
     ) -> Receipt:
         if priority not in {"normal", "urgent"}:
             raise RuntimeRequestError("invalid_options", "priority")
+        self.check_store(target)
         ref = InputRef(target.store_id, target.session_id, message_id)
         digest = self.request_hash(target, body, priority)
         # Validate JSON before opening the write transaction.
@@ -404,10 +405,13 @@ class RuntimeInputStore:
         self, tx, target, body, ref, digest, content, *, actor, priority, deadline_ms,
         kind, result_kind,
     ):
+        try:
+            state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
+        except ValueError as exc:
+            raise RuntimeRequestError("not_found") from exc
         session = await self.authorize(tx, target, actor)
         if session["lifecycle"] != "open":
             raise RuntimeRequestError("session_closed")
-        state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
         old = await self.input(tx, ref)
         if old is not None:
             if old.row["request_hash"] != digest:

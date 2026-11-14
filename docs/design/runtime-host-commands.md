@@ -1,3 +1,5 @@
+> Historical design record. The current contract is [Runtime 12](../runtime-12.md); this page is not an implementation guide.
+
 # Runtime host commands (design 203 P5a)
 
 This describes the unpublished unified runtime branch. It is not a package release or deployment instruction.

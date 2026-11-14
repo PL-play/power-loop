@@ -646,14 +646,7 @@ class AgentPipeline:
             for w in waiters.values():
                 w.cancel()
             work.cancel()
-            try:
-                await asyncio.wait({work}, timeout=.1 if policy_deadline else 5)
-            finally:
-                if policy_deadline and not work.done():
-                    from power_loop.runtime.task_runtime import _SEND
-                    binding = _SEND.get()
-                    if binding is not None:
-                        binding.runtime.track_task(work, job_id=binding.lease.job_id)
+            await asyncio.wait({work}, timeout=5)
             raise
         for w in waiters.values():
             if w not in done:
@@ -1130,10 +1123,10 @@ class AgentPipeline:
         if compact_before.directive == HookDirective.SKIP:
             return
 
-        from power_loop.runtime.model_attempts import is_managed
+        from power_loop.runtime.task_runtime import current_session_send
         fold_calls = None
         compact_llm = self.llm
-        if is_managed(self.session_id):
+        if current_session_send(session_id=self.session_id) is not None:
             # A task-managed send books its fold calls itself (purpose "fold").
             from power_loop.runtime.fold_calls import FoldCalls
             fold_calls = FoldCalls(session_id=self.session_id, bus=self.bus, cancel_token=self.cancel_token)
@@ -1332,7 +1325,6 @@ class AgentPipeline:
                 return await _perform_call()
 
         async def _perform_call() -> LLMResponse:
-            from power_loop.runtime.task_runtime import check_dispatch
             # STREAM_STARTED/COMPLETED are emitted **per attempt** and paired in this call's own
             # finally (M-pipeline-runner-1): the terminal used to live in the OUTER finally, which
             # ran once, so N retry attempts emitted N STARTED but only 1 COMPLETED — unbalanced
@@ -1340,26 +1332,11 @@ class AgentPipeline:
             attempt_box[0] += 1
             attempt = attempt_box[0]
             call_id = f"r{round_index}.a{attempt}"
-            from power_loop.runtime.model_attempts import (
-                event_identity,
-                observe,
-                provider_deadline,
-                response_observation,
-                start_call,
-            )
-            try:
-                await check_dispatch(self.session_id)
-                model_attempt = await start_call(self, request, round_index=round_index, retry_index=attempt, model=model_name)
-            except Exception as exc:
-                # Durable admission failure is not permission for the retry
-                # policy to allocate a replacement request/identity.
-                raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
-            durable_identity = event_identity(model_attempt)
+            from power_loop.runtime.model_attempts import response_observation
             streamed["text"].clear()
             streamed["think"].clear()
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                        round_index=round_index, stream_id="main")
-            policy_alarm = None
             response_received = False
             try:
                 # Per-call observability (H4.1): pair STARTED/COMPLETED by call_id so a
@@ -1368,36 +1345,18 @@ class AgentPipeline:
                 self._emit(
                     AgentEventType.LLM_CALL_STARTED,
                     LlmCallStartedPayload(call_id=call_id, round_index=round_index,
-                                          attempt=attempt, model=model_name, **durable_identity),
+                                          attempt=attempt, model=model_name),
                     round_index=round_index, stream_id="main",
                 )
                 t0 = time.perf_counter()
-                policy_clock = None
                 provider_started = False
                 try:
-                    from power_loop._vendor.llm_client.attempt_scope import single_attempt
-                    attempt_token = single_attempt.set(True) if model_attempt is not None else None
-                    try:
-                        deadline = await provider_deadline(model_attempt)
-                        if deadline is not None and deadline <= asyncio.get_running_loop().time():
-                            from power_loop.runtime.jobs import JobError
-                            raise JobError("owner_wait_deadline_exceeded")
-                        policy_clock = asyncio.timeout_at(deadline)
-                        async with policy_clock:
-                            if deadline is not None:
-                                policy_alarm = asyncio.get_running_loop().call_at(deadline, self._model_policy_due.set)
-                            provider_started = True
-                            resp = await self.llm.complete(
-                                request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
-                            )
-                            response_received = True
-                    finally:
-                        if attempt_token is not None:
-                            single_attempt.reset(attempt_token)
+                    provider_started = True
+                    resp = await self.llm.complete(
+                        request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                    )
+                    response_received = True
                 except BaseException as exc:
-                    if isinstance(exc, TimeoutError) and policy_clock is not None and policy_clock.expired():
-                        from power_loop.runtime.jobs import JobError
-                        exc = JobError("owner_wait_deadline_exceeded")
                     # No usage chunk will ever come for this attempt, but it was billed: prompt
                     # in full once the provider started on it, plus what it streamed before the
                     # failure (design/124 §11.2). A request REJECTED with an HTTP status before any
@@ -1415,8 +1374,6 @@ class AgentPipeline:
                         messages=messages, system_prompt=system_prompt, tools=tools)
                     c_est = estimate_completion_tokens(text=produced[0], think=produced[1])
                     self.ctx.add_unreported_usage(p_est, c_est)
-                    await observe(model_attempt, usage={"prompt_tokens": p_est, "completion_tokens": c_est,
-                        "total_tokens": p_est + c_est}, estimated=not repairable, error=exc, rejected=rejected)
                     self._emit(
                         AgentEventType.LLM_CALL_COMPLETED,
                         LlmCallCompletedPayload(
@@ -1426,11 +1383,10 @@ class AgentPipeline:
                             prompt_tokens=p_est, completion_tokens=c_est,
                             total_tokens=p_est + c_est, estimated=not repairable, outcome=outcome,
                             endpoint=_llm_endpoint(self.llm),
-                            **durable_identity,
-                        ),
+                            ),
                         round_index=round_index, stream_id="main",
                     )
-                    if (model_attempt is not None or repair_kind is not None) and isinstance(exc, Exception):
+                    if repair_kind is not None and isinstance(exc, Exception):
                         raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
                     raise
                 usage = getattr(resp, "token_usage", None)
@@ -1442,7 +1398,7 @@ class AgentPipeline:
                         LlmResponseReceivedPayload(call_id=call_id, round_index=round_index,
                             attempt=attempt, model=model_name, usage=dict(reported["usage"]),
                             cost_amount=reported["cost_amount"], response_id=reported["response_id"],
-                            **durable_identity), round_index=round_index, stream_id="main")
+), round_index=round_index, stream_id="main")
                 except (Exception, asyncio.CancelledError) as exc:
                     logging.getLogger(__name__).warning("Response observer failed: %s", type(exc).__name__)
                 estimated = usage is None or getattr(usage, "prompt_tokens", None) is None
@@ -1459,9 +1415,6 @@ class AgentPipeline:
                                           total_tokens=p_est + c_est)
                     resp.token_usage = usage
                     self.ctx.note_estimated_call(p_est + c_est)
-                if model_attempt is not None:
-                    from power_loop.runtime.model_attempts import observe
-                    await observe(model_attempt, **response_observation(usage, resp), estimated=estimated)
                 from power_loop.llm_metrics import enforce_extraction_policy
                 enforce_extraction_policy(resp)
                 self._emit(
@@ -1480,15 +1433,9 @@ class AgentPipeline:
                         provider_cost=getattr(getattr(resp, "provider_cost", None), "amount", None),
                         provider_cost_currency=getattr(getattr(resp, "provider_cost", None), "currency", None),
                         prompt_image_tokens=getattr(usage, "prompt_image_tokens", None),
-                        **durable_identity,
                     ),
                     round_index=round_index, stream_id="main",
                 )
-                if policy_clock is not None and policy_clock.expired():
-                    # A provider may suppress cancellation and return late. Keep
-                    # its actual usage above, but never use it as an on-time answer.
-                    from power_loop.runtime.jobs import JobError
-                    raise LLMNonRetryable(attempts=attempt, last_error=JobError("owner_wait_deadline_exceeded"))
                 return resp
             except Exception as exc:
                 # Once the physical response returned, failure of capture,
@@ -1497,8 +1444,6 @@ class AgentPipeline:
                     raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
                 raise
             finally:
-                if policy_alarm is not None:
-                    policy_alarm.cancel()
                 try:
                     self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
                                round_index=round_index, stream_id="main")
@@ -1571,7 +1516,7 @@ class AgentPipeline:
         from power_loop.contracts.errors import CompactionFailed
         from power_loop.runtime.compact import DefaultCompactor
         from power_loop.runtime.history_sanitize import sanitize_request_messages
-        from power_loop.runtime.model_attempts import is_managed
+        from power_loop.runtime.task_runtime import current_session_send
 
         compactor = DefaultCompactor(keep_last_n=1)
         span = compactor._compactable_span(messages)
@@ -1580,7 +1525,7 @@ class AgentPipeline:
         start, end = span
         summary_llm = self.llm
         fold_calls = None
-        if is_managed(self.session_id):
+        if current_session_send(session_id=self.session_id) is not None:
             from power_loop.runtime.fold_calls import FoldCalls
             fold_calls = FoldCalls(session_id=self.session_id, bus=self.bus, cancel_token=self.cancel_token)
             summary_llm = fold_calls.wrap(summary_llm)
@@ -1655,19 +1600,13 @@ class AgentPipeline:
                 with invocation_context(self.session_id,
                         assistant_seq if assistant_seq is not None else getattr(self.sink, "persisted_assistant_seq", None),
                         tool_call_id, tool_name):
-                    from power_loop.runtime.task_runtime import check_tool_dispatch
-                    registered = await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
+                    registered = self.tool_registry.get(tool_name)
                     from power_loop.runtime.tool_contracts import validate_registration
                     validate_registration(self.tool_registry, tool_name, registered)
                     from power_loop.runtime.background_execution import automatic, invoke_and_wait
-                    from power_loop.runtime.tool_attempts import begin_pipeline
                     independent = automatic(registered)
-                    attempt = None if independent else await begin_pipeline(self, registered, tool_args)
-                    from power_loop.runtime.tool_call_plans import dispatch as record_tool_dispatch
-                    receipt = await record_tool_dispatch(self, tool_name, tool_args, registered,
-                                                         attempt=attempt)
                     from power_loop.runtime.native_returns import invoke
-                    result = await invoke(self, registered, tool_args, receipt, attempt=attempt,
+                    result = await invoke(self, registered, tool_args,
                         dispatch=(lambda: invoke_and_wait(self, registered, tool_args)) if independent else None)
             finally:
                 reset_current_cancel_token(_ctok)
@@ -1897,11 +1836,6 @@ class AgentPipeline:
 
             # ── pass_turn：上一轮调了 → 这一轮开始前硬停（design/188，不再调模型）──
             if self._pass_state and self._pass_state.get("passed"):
-                from power_loop.runtime.child_completion import continue_before_finish
-                final_text = self._make_result("completed", rounds=round_idx).final_text
-                if await continue_before_finish(self, final_text, round_idx - 1):
-                    self._pass_state["passed"] = False
-                    continue
                 if drained_count or await self._runtime_work_after_model():
                     # 停的这一刻有刚折进来的新输入：不撤销停，留痕交给宿主（另起一轮处理）
                     self._pass_state["new_input_after_pass"] = True
@@ -1997,10 +1931,6 @@ class AgentPipeline:
                     await self._finalize('capacity_blocked', rounds=round_idx)
                     return self._make_result('degraded', final_text=self._capacity_blocked, rounds=round_idx)
 
-            from power_loop.runtime.task_runtime import observe_model_inputs
-            await observe_model_inputs(self, llm_before.messages, round_idx,
-                provider_call=llm_before.directive not in (HookDirective.SHORT_CIRCUIT, HookDirective.BREAK))
-
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output
                 if not isinstance(response, LLMResponse):
@@ -2021,40 +1951,13 @@ class AgentPipeline:
                     )
                     # design/124 §8.4: a STOP interrupts the model call (immediately — its
                     # output is discarded, the run ends cancelled).
-                    from power_loop.runtime.model_attempts import is_managed
-                    _managed_call = is_managed(self.session_id)
-                    if _managed_call or not self.cancel_token.is_never:
-                        self._model_policy_due.clear()
+                    if not self.cancel_token.is_never:
                         _llm_work = asyncio.ensure_future(_llm_call)
-                        response, _why = await self._race(_llm_work, policy_deadline=_managed_call)
-                        if _why == "policy_deadline":
-                            from power_loop.runtime.task_runtime import _SEND
-                            _binding = _SEND.get()
-                            _binding.runtime.track_task(_llm_work, job_id=_binding.lease.job_id)
-                            # The timeout already signalled the exact request once.
-                            # Keep an uncooperative call reachable, with its durable
-                            # attempt unresolved, instead of awaiting it indefinitely
-                            # or cancelling its usage cleanup a second time.
-                            await asyncio.wait({_llm_work}, timeout=.1)
-                            msg = "[timed out: original continuation policy deadline reached]"
-                            await self._finalize("timed_out", final_text=msg, rounds=round_idx + 1)
-                            return self._make_result("timed_out", final_text=msg, rounds=round_idx + 1)
+                        response, _why = await self._race(_llm_work)
                         if _why != "done":
-                            # Discard the call: nothing it produced reaches history (the
-                            # response is only assembled at its end), its partial usage is
-                            # recorded as an estimate by call_llm's own failure path.
                             _llm_work.cancel()
-                            if _managed_call:
-                                try:
-                                    await asyncio.wait({_llm_work}, timeout=.1)
-                                finally:
-                                    if not _llm_work.done():
-                                        from power_loop.runtime.task_runtime import _SEND
-                                        _binding = _SEND.get()
-                                        _binding.runtime.track_task(_llm_work, job_id=_binding.lease.job_id)
-                            if _llm_work.done() or not _managed_call:
-                                with contextlib.suppress(BaseException):
-                                    await _llm_work
+                            with contextlib.suppress(BaseException):
+                                await _llm_work
                             raise CancellationRequested(self.cancel_token.reason)
                     else:
                         response = await _llm_call
@@ -2080,10 +1983,10 @@ class AgentPipeline:
                         else "retry_exhausted"
                     )
                     inner = getattr(exc, "last_error", exc)
-                    from power_loop.runtime.task_runtime import _SEND
-                    binding = _SEND.get()
+                    from power_loop.runtime.task_runtime import current_session_send
+                    binding = current_session_send(session_id=self.session_id)
                     if binding is not None and getattr(inner, "code", None) is not None:
-                        binding.resource_evidence["_runtime_error_code"] = inner.code
+                        binding.error_code = inner.code
                     self._emit(
                         AgentEventType.LLM_DEGRADED,
                         LlmDegradedPayload(
@@ -2187,10 +2090,6 @@ class AgentPipeline:
                     tool_calls=sanitized_tool_calls,
                     round_index=round_idx,
                 )
-            if sanitized_tool_calls and self.tool_registry is not None:
-                from power_loop.runtime.tool_call_plans import prepare as prepare_tool_calls
-                await prepare_tool_calls(self)
-
             # ── 截断优先判定：它和「空响应打嗝」长得像，但重试方式必须相反 ──
             # provider 因 max_tokens 硬切时，工具调用的 JSON 断在半路 → 解析不出 tool_calls，
             # 正文往往也是空的（内容全在那段 JSON 里）。**原样重试必然再次截断**，
@@ -2308,9 +2207,6 @@ class AgentPipeline:
                     reason="completed", round_idx=round_idx, final_text=assistant_text,
                     next_round=round_idx + 1,
                 ):
-                    continue
-                from power_loop.runtime.child_completion import continue_before_finish
-                if await continue_before_finish(self, assistant_text, round_idx):
                     continue
                 await self._finalize("completed", final_text=assistant_text, rounds=round_idx + 1)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
@@ -2647,10 +2543,10 @@ class AgentPipeline:
         except (LLMRetryExhausted, LLMTimeout) as exc:
             reason = "timeout" if isinstance(exc, LLMTimeout) else "retry_exhausted"
             inner = getattr(exc, "last_error", exc)
-            from power_loop.runtime.task_runtime import _SEND
-            binding = _SEND.get()
+            from power_loop.runtime.task_runtime import current_session_send
+            binding = current_session_send(session_id=self.session_id)
             if binding is not None and getattr(inner, "code", None) is not None:
-                binding.resource_evidence["_runtime_error_code"] = inner.code
+                binding.error_code = inner.code
             self._emit(AgentEventType.LLM_DEGRADED, LlmDegradedPayload(
                 reason=reason, attempts=getattr(exc, "attempts", 0),
                 error_type=type(inner).__name__, error_message=str(inner)[:500]),

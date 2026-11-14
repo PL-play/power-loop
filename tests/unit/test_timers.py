@@ -71,12 +71,12 @@ def _tool_resp(call_id: str, name: str, args: str) -> LLMResponse:
 
 @asynccontextmanager
 async def timers(store, model=None, *, hooks=None):
-    from .test_runtime_messaging_203 import fixture
+    from .session_native_fixture import fixture
     _, target, actor = await fixture(store)
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(model or _Scripted(), None, AgentLoopConfig(compactor=None))
-    factory.register('test.agent@1', build)
+    factory.register('test.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='timer-test', hooks=hooks)
     await runtime.worker.start()
     # Explicit scans make time/races deterministic; lifecycle itself is tested below.
@@ -143,7 +143,7 @@ async def test_periodic_fixed_delay_and_unknown_occurrence_not_replayed(registry
         one = await runtime.timer_backend.create(source, due_at_ms=1, note='unknown')
         for item in (timer,one):
             await store.transition_timer(target.session_id,item.timer_id,from_status='armed',to_status='firing')
-        await store._db.execute(f"UPDATE {store.t.timers} SET updated_at=1 WHERE status='firing'")
+        await store._db.execute(f"UPDATE {store.t.session_runtime_state} SET updated_at=1 WHERE state_key LIKE 'timer:%'")
         recovered = TimerRunner(store=store,client=runtime.client)
         assert await recovered.scan_once() == 0
         periodic = await store.get_timer(target.session_id,timer.timer_id)
@@ -209,16 +209,18 @@ async def test_busy_append_and_driver_stop_do_not_wait_for_or_cancel_model(regis
     async with timers(store,model) as (runtime,target,actor,source):
         receipt = await runtime.client.send(target,'start',message_id='original',actor=actor)
         await asyncio.wait_for(model.entered.wait(),10)
-        await runtime.timer_backend.create(source,due_at_ms=1,note='WAKE_NOTE')
+        timer = await runtime.timer_backend.create(source,due_at_ms=1,note='WAKE_NOTE')
         try:
             assert await asyncio.wait_for(runtime.timer_driver.scan_once(),5) == 1
             await asyncio.wait_for(runtime.timer_driver.stop(),1)
             assert not model.release.is_set()
             model.release.set()
             result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=int(time.time()*1000)+10000)
-            assert result.status=='completed' and len(model.calls)==2 and 'WAKE_NOTE' in model.calls[1]
-            jobs = await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='send'")
-            assert len(jobs)==1
+            timer_input = InputRef(store.store_id,target.session_id,
+                f'timer-{timer.timer_id}-{timer.created_at}-0')
+            fired = await runtime.client.wait(timer_input,actor=actor,deadline_ms=int(time.time()*1000)+10000)
+            assert result.status == fired.status == 'completed'
+            assert len(model.calls)==2 and 'WAKE_NOTE' in model.calls[1]
         finally:
             model.release.set()
 

@@ -41,7 +41,7 @@ def current(store, sid):
 
 
 def trusted(store, sid):
-    from ..jobs import TRUST_OWN_WRITES
+    from .verification import TRUST_OWN_WRITES
     return current(store, sid) if TRUST_OWN_WRITES.get() else None
 
 

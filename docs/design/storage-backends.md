@@ -1,3 +1,5 @@
+> Historical design record. The current contract is [Runtime 12](../runtime-12.md); this page is not an implementation guide.
+
 # Design: Pluggable storage backends (SQLite · PostgreSQL · MySQL)
 
 Status: **DONE** — SQLite (default, zero-dep), PostgreSQL (`[postgres]`), and MySQL (`[mysql]`)

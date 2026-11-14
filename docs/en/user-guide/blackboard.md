@@ -25,4 +25,4 @@ Run the credential-free example:
 python examples/29_shared_blackboard.py
 ```
 
-`SqliteBlackboard` is removed; no compatibility alias is provided. See [Runtime 11](../../runtime-11.md) for composition and lifecycle.
+`SqliteBlackboard` is removed; no compatibility alias is provided. See [Runtime 12](../../runtime-12.md) for composition and lifecycle.

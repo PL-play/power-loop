@@ -5,7 +5,7 @@ import time
 
 from _runtime import demo_runtime
 
-from power_loop import JobRef, LLMResponse, LLMService, ToolRegistry, register_spawn_agent
+from power_loop import InputRef, LLMResponse, LLMService, ToolRegistry, register_spawn_agent
 
 
 class DelegatingModel(LLMService):
@@ -31,7 +31,7 @@ async def main():
         assert parent.status == 'completed'
         rows = await runtime.store.load_all_messages(target.session_id)
         receipt = json.loads(next(row.content for row in rows if row.tool_call_id == 'spawn'))
-        result = await runtime.client.wait(JobRef(**receipt['job_ref']), actor=actor,
+        result = await runtime.client.wait(InputRef(**receipt['input_ref']), actor=actor,
                                             deadline_ms=int(time.time()*1000)+10000)
         assert result.status == 'completed' and result.final_text == 'Tokyo'
         print(result.final_text)

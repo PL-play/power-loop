@@ -1,3 +1,5 @@
+> Historical design record. The current contract is [Runtime 12](../runtime-12.md); this page is not an implementation guide.
+
 # Memory-owned execution and root-scoped control
 
 This is the single execution contract. Runtime execution, recovery and inspection

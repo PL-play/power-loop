@@ -43,8 +43,8 @@ async def _author() -> str | None:
     if ctx.store is not None and ctx.session_id:
         try:
             row = await ctx.store.get_session(ctx.session_id)
-            md = (getattr(row, "metadata", None) or {}) if row is not None else {}
-            return md.get("spec_name") or md.get("name") or ctx.session_id
+            config = row.descriptor.config if row is not None else {}
+            return config.get("child_spec", {}).get("name") or config.get("name") or ctx.session_id
         except Exception:  # noqa: BLE001 — author is best-effort
             return ctx.session_id
     return ctx.session_id

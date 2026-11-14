@@ -279,33 +279,10 @@ def result_message_id(
     ])[:56]
 
 
-# The following declarations belong to the unmigrated pre-P2 execution modules.
-# They are not used by schema 17 or RuntimeInputStore and are removed with those modules.
-@dataclass(frozen=True)
-class JobRef:
-    store_id: str
-    job_id: str
-    generation: int | None = None
 
 
-@dataclass(frozen=True)
-class Command:
-    message_id: str
-    target: TargetRef
-    operation: str
-    payload: dict
-    urgent: bool = False
-    descriptor_ref: str | None = None
-    options: dict | None = None
-    expires_at_ms: int | None = None
-    expected_job_generation: int | None = None
-    scope: str = "self"
 
 
-@dataclass(frozen=True)
-class JobPage:
-    items: tuple
-    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -317,7 +294,6 @@ class ShutdownResult:
 @dataclass(frozen=True)
 class OutputItem:
     input_ref: InputRef
-    job_ref: JobRef | None
     sequence: int
     kind: str
     payload: dict

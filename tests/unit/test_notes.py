@@ -21,6 +21,9 @@ from power_loop.runtime.store.store import SessionStore
 @pytest.fixture()
 async def store() -> AsyncIterator[SessionStore]:
     s = await SessionStore.open(":memory:")
+    from .session_native_fixture import new_session
+    await new_session(s, SID)
+    await new_session(s, "sess_other")
     yield s
     await s.close()
 
@@ -65,7 +68,8 @@ async def test_update_and_delete(store: SessionStore) -> None:
 
 
 async def test_close_session_cascades_notes(store: SessionStore) -> None:
-    sid = await store.create_session()
+    from .session_native_fixture import new_session
+    sid = (await new_session(store)).session_id
     await store.add_note(sid, "to be removed")
     await store.close_session(sid)
     assert await store.count_notes(sid) == 0
@@ -290,7 +294,8 @@ async def test_note_list_action_reads_back_notes(store: SessionStore) -> None:
             self.store = s
             self.config = None
 
-    sid = await store.create_session()
+    from .session_native_fixture import new_session
+    sid = (await new_session(store)).session_id
     tok_l = set_current_loop(_FakeLoop(store))  # type: ignore[arg-type]
     tok_s = set_session_id(sid)
     try:
@@ -360,7 +365,8 @@ async def test_run_note_update_without_id_records_new_note(store) -> None:
             self.store = s
             self.config = None
 
-    sid = await store.create_session()
+    from .session_native_fixture import new_session
+    sid = (await new_session(store)).session_id
     tok_l = set_current_loop(_FakeLoop(store))  # type: ignore[arg-type]
     tok_s = set_session_id(sid)
     try:

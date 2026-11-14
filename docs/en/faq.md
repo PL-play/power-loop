@@ -44,7 +44,7 @@ Every exception inherits from `PowerLoopError` and carries a stable, machine-rea
 ```python
 from power_loop import PowerLoopError
 try:
-    await loop.send("hi", session_id=sid)
+    await runtime.client.send(target, "hi", message_id="greeting", actor=actor)
 except PowerLoopError as exc:
     if exc.code == "llm.timeout": ...
 ```

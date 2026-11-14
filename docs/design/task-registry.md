@@ -1,4 +1,6 @@
-> Historical B1 design. SDK 11 uses schema 15 / protocol 42 and the Runtime factory/client contract in [runtime-11.md](../runtime-11.md). The old activation and construction examples below are not current API.
+> Historical design record. The current contract is [Runtime 12](../runtime-12.md); this page is not an implementation guide.
+
+> Historical B1 design. SDK 12 uses schema 17 / protocol 43 and the Runtime factory/client contract in [runtime-12.md](../runtime-12.md). The old activation and construction examples below are not current API.
 
 # Experimental task registry: B1 storage and identity ports
 

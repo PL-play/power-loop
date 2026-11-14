@@ -234,9 +234,7 @@ async def _hold_session_ownership(loop, session_id):
                                   loop.config.session_lease_ttl_s)
         # The expected epoch belongs to this acquire request, never its reply.
         while True:
-            runtime = loop.task_runtime
-            node_id = runtime.executor_id if runtime else loop._owner_id
-            boot_id = runtime.boot_id if runtime else loop._owner_id
+            node_id = boot_id = loop._owner_id
             coordinator = loop.session_coordinator
             if getattr(coordinator, "installs_session_fence", False):
                 lease = await coordinator.acquire(
@@ -301,11 +299,7 @@ async def hold_session_ownership(loop, session_id):
         async with _hold_session_ownership(loop, session_id) as lease:
             if get_execution_context(required=False) is None:
                 def snapshot():
-                    from .task_runtime import _SEND
-                    execution = _SEND.get()
                     return ExecutionContext(loop.store.store_id, session_id, lease.node_id, lease.boot_id,
-                        input_ref=getattr(execution, "input_ref", None) if execution else None,
-                        owner_epoch=lease.epoch, owner_token=lease.token,
-                        actor=execution.actor if execution else None)
+                        owner_epoch=lease.epoch, owner_token=lease.token)
                 scopes.enter_context(_bind_execution_context(snapshot))
             yield lease

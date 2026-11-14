@@ -19,7 +19,7 @@ power-loop is an **embeddable Agent execution kernel** — not a framework, not 
 ## What power-loop gives you
 
 - **LLM abstraction** — one `LLMService` interface, multiple transports (OpenAI-compatible, Anthropic Messages API)
-- **Multi-turn loop** — `new_session()` creates the conversation; `send(user_input, session_id=sid)` appends turns
+- **Multi-turn loop** — `RuntimeClient.create_session(descriptor, actor=actor)` creates a session; `send(target, body, message_id=..., actor=actor)` accepts an input
 - **Tool calling** — register tools with JSON Schema validation; sync and async handlers
 - **Hooks** — 17 hook points to intercept every phase of the loop
 - **Event bus** — 30 typed events for observability, audit, streaming

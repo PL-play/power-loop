@@ -29,7 +29,7 @@ async def test_real_withdrawn_input_never_reaches_provider(runtime_agent,record_
                     async with asyncio.timeout(5):
                         while len(ctx.append_refs)<1+int(keep):
                             await asyncio.sleep(.005)
-                    assert (await client.cancel(drop.input_ref,actor=agent.actor)).job_ref is None
+                    assert (await client.cancel(drop.input_ref,actor=agent.actor)).terminal_status == "cancelled"
                 await asyncio.create_task(add_and_cancel(),context=contextvars.Context())
             return response
     provider=Provider(limit=3)
@@ -46,7 +46,7 @@ async def test_real_withdrawn_input_never_reaches_provider(runtime_agent,record_
             try:
                 drop=await client.send(agent.target,'WITHDRAWN-DO-NOT-READ',message_id='drop',actor=agent.actor)
                 survivor=await client.send(agent.target,'Return READY.',message_id='keep',actor=agent.actor)
-                assert (await client.cancel(drop.input_ref,actor=agent.actor)).job_ref is None
+                assert (await client.cancel(drop.input_ref,actor=agent.actor)).terminal_status == "cancelled"
             finally:
                 await agent.runtime.coordinator.release(gate)
             result=await client.wait(survivor.input_ref,actor=agent.actor,deadline_ms=now_ms()+120000)

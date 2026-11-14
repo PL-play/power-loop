@@ -59,7 +59,8 @@ def test_side_disabled_without_losing_other_limit():
 async def test_off_on_keep_idempotence_and_recount(trigger):
     store = await SessionStore.open(':memory:')
     try:
-        sid = await store.create_session()
+        from .session_native_fixture import new_session
+        sid = (await new_session(store)).session_id
         cfg = ToolContextConfig(hot_tail=0, overrides={'bash': {'age_retirement': 'preserve', 'insend_fuse': 'preserve',
             'retention_rounds': 16, 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=1, llm=None, model='test', registry=create_default_tool_registry(bind=False))
@@ -104,12 +105,12 @@ async def test_off_on_keep_idempotence_and_recount(trigger):
 
 @pytest.mark.parametrize("keep", [False, True])
 async def test_background_uses_target_limits_and_keep(keep, tmp_path):
-    from power_loop import JobRef, RuntimeEnv
+    from power_loop import InputRef, RuntimeEnv
     from power_loop.agent.runtime_store import now_ms
-    from power_loop.runtime.background import encode_results, load_record
+    from power_loop.runtime.background import encode_results, load_record, summarize_record
     from power_loop.tools.registry import ToolRegistry
 
-    from .test_tool_background_contracts_192 import start_background
+    from .background_fixture import start_background
     store = await SessionStore.open(':memory:')
     registry = ToolRegistry()
     bash = create_default_tool_registry(bind=False).get('bash')
@@ -119,17 +120,20 @@ async def test_background_uses_target_limits_and_keep(keep, tmp_path):
         arguments['context_policy'] = 'keep'
     runner, row = await start_background(store, registry, 'work', arguments, runtime_env=RuntimeEnv(workspace_dir=tmp_path))
     try:
-        ref = JobRef(**json.loads(row.content)['job_ref'])
+        ref = InputRef(**json.loads(row.content)['input_ref'])
         result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+10000)
         assert result.status == 'completed', result
         sid = runner.target.session_id
-        record = await load_record(store, sid, ref.job_id)
+        record = await load_record(store, sid, ref.session_id)
         config = ToolContextConfig(overrides={'work': {'insend_fuse': 'truncate',
             'general': 'truncate', 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
             owner_send_index=1, llm=None, model='test', registry=registry)
         await engine.start()
-        wrapped = ToolSource(sid,1,row.seq,'background','defer_work',{},encode_results([record]))
+        from power_loop.runtime.tool_context import active_engine
+        token = active_engine.set(engine)
+        wrapped = ToolSource(sid,1,row.seq,'background','background_run',{},encode_results([summarize_record(record)]))
+        active_engine.reset(token)
         text = await engine.distill(wrapped, 'insend_fuse')
         if keep:
             assert text is None
@@ -137,7 +141,7 @@ async def test_background_uses_target_limits_and_keep(keep, tmp_path):
             assert text is not None and 'recall_send' in text
             assert 'x' * 201 not in text and 'y' * 301 not in text
         assert await engine.distill(wrapped, 'general') is not None
-        assert 'y' * 3000 in (await load_record(store,sid,ref.job_id))['result']
+        assert 'y' * 3000 in (await load_record(store,sid,ref.session_id))['result']
     finally:
         await runner.aclose()
         await store.close()

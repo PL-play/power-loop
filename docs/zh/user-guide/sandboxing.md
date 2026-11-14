@@ -1,8 +1,8 @@
 # 沙箱与进程资源
 
-SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
+SDK 12.0.0 · 会话结构 17 · 协议 43 · 描述符结构 2。
 
-[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
+[Runtime 契约](../../runtime-12.md) · [API](../api/index.md)
 
 执行工厂返回 ExecutionEnvironment(runtime_env=..., process_control=..., workflow_file_io=...)。RuntimeEnv 在实际执行节点提供 workspace、skills 和 ShellBackend。模型生成的命令拥有该后端的权限；产品需要隔离时由宿主管理隔离容器。
 
@@ -14,7 +14,7 @@ Runtime 与工作流文件 IO 显式装配。共享节点核验共享引用及�
 
 ## 可执行示例
 
-从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design215_single_process.py。
 
 | 示例 | 行为 |
 |---|---|

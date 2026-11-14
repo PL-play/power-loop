@@ -1,8 +1,8 @@
 # Sandbox and process resources
 
-SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor schema 2.
 
-[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
+[Runtime contract](../../runtime-12.md) · [API](../api/index.md)
 
 The execution factory returns ExecutionEnvironment(runtime_env=..., process_control=..., workflow_file_io=...). RuntimeEnv supplies workspace, skills and ShellBackend on the node that executes the input. Model-authored shell runs with the permissions of that backend; choose an isolated host-managed container when the product needs isolation.
 
@@ -14,7 +14,7 @@ Default runtime and workflow file IO are explicitly assembled. Shared nodes must
 
 ## Runnable examples
 
-Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design215_single_process.py.
 
 | Example | Behavior |
 |---|---|

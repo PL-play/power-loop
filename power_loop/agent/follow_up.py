@@ -11,7 +11,6 @@ it as the input of a fresh send. Each item has a ``kind`` (who/what it is from) 
 from __future__ import annotations
 
 import json
-import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -49,38 +48,8 @@ class InboxItem:
             raise ValueError(f"InboxItem.mode must be one of {INBOX_MODES}, got {self.mode!r}")
 
 
-def inbox_row(item: InboxItem) -> dict[str, Any]:
-    """The store payload for ``item`` (``SessionStore.inbox_put``). Structured content is JSON-
-    encoded and flagged so :func:`render_inbox_rows` rebuilds it exactly (images included — the
-    old text-only cross-process queue flattened them away)."""
-    content: Any = item.content
-    if isinstance(content, Mapping):
-        content = content.get("content")
-    structured = not (content is None or isinstance(content, str))
-    text = json.dumps(content, ensure_ascii=False) if structured else str(content or "")
-    meta: dict[str, Any] = {}
-    if structured:
-        meta["structured"] = True
-    if item.meta:
-        meta["host"] = dict(item.meta)
-    return {
-        "item_id": item.item_id or f"auto:{uuid.uuid4().hex}",
-        "kind": item.kind,
-        "mode": item.mode,
-        "content": text,
-        "meta": meta or None,
-    }
 
 
-def _row_payload(row: Mapping[str, Any]) -> str | LoopMessage:
-    meta = row.get("meta") or {}
-    content = row.get("content") or ""
-    if meta.get("structured"):
-        try:
-            return {"role": "user", "content": json.loads(content)}
-        except ValueError:
-            return str(content)
-    return str(content)
 
 
 def session_batch_content(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -183,41 +152,6 @@ def _merge_plain(payloads: list[str | LoopMessage]) -> LoopMessage | None:
     return {"role": "user", "content": body}
 
 
-def render_inbox_rows(
-    rows: Sequence[Mapping[str, Any]], *, wrap: bool
-) -> list[LoopMessage]:
-    """Turn claimed inbox rows (oldest first) into transcript user messages.
-
-    Consecutive rows of the same ``kind`` merge into one message; a change of kind starts a new
-    one — what a person said never shares a message with a system wake-up (design/124 Z2). With
-    ``wrap`` (steering into a run in flight) each message gets the ``<follow_up>`` envelope and
-    ``name="follow_up"``; without it (the input of a fresh send) the content goes in as-is.
-
-    Every message carries a private ``_inbox`` marker (claim token + row ids) that the pipeline
-    strips before the provider sees it and hands to the store, which marks exactly those rows
-    delivered in the same transaction as the transcript row."""
-    groups: list[list[Mapping[str, Any]]] = []
-    for r in rows:
-        if groups and groups[-1][0].get("kind") == r.get("kind"):
-            groups[-1].append(r)
-        else:
-            groups.append([r])
-    out: list[LoopMessage] = []
-    for g in groups:
-        payloads = [_row_payload(r) for r in g]
-        msg = merge_follow_up_inputs(payloads) if wrap else _merge_plain(payloads)
-        if msg is None:
-            # Empty content: still deliver (and mark) so an empty item can't wedge the inbox.
-            msg = {"role": "user", "content": ""}
-        msg = dict(msg)
-        msg["_inbox"] = {
-            "claim_token": g[0].get("claim_token"),
-            "ids": [int(r["id"]) for r in g],
-            "item_ids": [str(r["item_id"]) for r in g],
-            "kinds": [str(g[0].get("kind") or INBOX_KIND_USER)],
-        }
-        out.append(msg)
-    return out
 
 
 def format_follow_up_user_message(text: str) -> LoopMessage:
@@ -315,8 +249,6 @@ __all__ = [
     "INBOX_KIND_TASK_DONE",
     "INBOX_KIND_USER",
     "InboxItem",
-    "inbox_row",
-    "render_inbox_rows",
     "session_batch_content",
     "follow_up_text",
     "format_follow_up_user_message",

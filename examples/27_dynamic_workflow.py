@@ -92,17 +92,17 @@ async def main():
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(WorkflowModel(), None, AgentLoopConfig(compactor=None))
-    factory.register("example.workflow@1", build)
+    factory.register("example.workflow@215", build)
     store = await SessionStore.open(":memory:")
     runtime = Runtime(store=store, factory=factory, node_id="example", capacity=1)
     actor = TrustedActor("example", "host", None)
-    descriptor = RuntimeDescriptor(1, "agent", "example.workflow@1", None,
-        "example.tools@1", "example.hooks@1", "example.resources@1", {}, {})
+    descriptor = RuntimeDescriptor(2, "agent", "example.workflow@215", None,
+        "example.tools@215", "example.hooks@215", "example.resources@215", {}, {})
     try:
         await runtime.worker.start()
         target = await runtime.open_session(descriptor, actor=actor)
         handle = await runtime.client.workflow(target, SPEC, message_id=uuid4().hex, actor=actor)
-        print("Accepted", handle.job_ref)
+        print("Accepted", handle.input_ref)
         result = await handle.wait()
         assert result.status == 'completed', result
         assert 'synthesize' in result.results

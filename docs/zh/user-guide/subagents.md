@@ -1,20 +1,14 @@
 # 子 Agent 与任务归属
 
-SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
+SDK 12.0.0 / schema 17 / protocol 43 / descriptor 2。
 
-[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
+通过 Runtime 工厂装配模型、工具、hooks 和资源；调用 create_session 创建会话，再以稳定 message_id 调用 send。Receipt 表示已受理，wait(InputRef) 返回执行结果。子 Agent、后台工具和 workflow 都使用 session、InputRef 和普通结果输入；继续处理使用 send，取消使用 cancel。授权由宿主提供，工具参数不携带可信身份。
 
-在工厂的 ToolRegistry 注册 spawn_agent。模型可见的 create 返回子任务受理引用，不等待模型执行。子任务拥有独立会话和 Runtime 任务，完成后投递父会话收件箱。等待不占唯一执行槽，容量为 1 时仍可运行。
-
-AgentSpec 指定名称、system_prompt、工具白名单、模型参数、轮数限制和可选 output_schema，在受理前校验。工具白名单和深度限制在子节点生效；切换模型需要宿主声明 allowed_models。结构化输出必须解析校验，不能只因看起来像 JSON 就认定成功。
-
-使用原 JobRef 查询、等待、引导、取消或继续。父任务中断不会暗中取消健康子任务，结果仍可查询。工作流节点显式继续沿用原归属和累计额度，不刷新为新 root。已经结束节点保存的晚到子结果，要到节点实际处理后才标记已消费。
-
-工厂通过稳定引用重建工具、workspace 和 hooks，不能把捕获父 loop 的闭包或旧会话句柄当作部署资源。
+[Runtime 12](../../runtime-12.md)
 
 ## 可执行示例
 
-从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design215_single_process.py。
 
 | 示例 | 行为 |
 |---|---|

@@ -143,7 +143,7 @@ async def test_update_during_last_model_round_is_consumed_before_completion(regi
         late = await runner.runtime.client.wait(
             __import__('power_loop').InputRef(store.store_id, runner.target.session_id, 'late'),
             actor=runner.actor, deadline_ms=now_ms()+5000)
-        assert late.job_ref == result.job_ref
+        assert late.send_index == result.send_index
     finally:
         model.release.set()
         await runner.aclose()

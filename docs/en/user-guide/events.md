@@ -1,8 +1,8 @@
 # Events and output
 
-SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor schema 2.
 
-[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
+[Runtime contract](../../runtime-12.md) · [API](../api/index.md)
 
 Attach an EventBus through ExecutionEnvironment.event_bus. Subscribe before execution; use session and execution identities to correlate model, tool, child, usage and lifecycle events. A shared bus must filter by the intended session. Runtime removes its own streaming subscriptions and drains bounded async subscribers when execution ends; the host owns its subscribers and bus.
 
@@ -12,7 +12,7 @@ Output subscriptions have bounded buffers. Slow consumers must handle gaps and f
 
 ## Runnable examples
 
-Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design215_single_process.py.
 
 | Example | Behavior |
 |---|---|

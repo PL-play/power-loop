@@ -1,19 +1,21 @@
 """Current timer authority is main-only, including orphaned child sessions."""
 
+from dataclasses import replace
+
 import pytest
 
 from power_loop import RuntimeRequestError, StoreTimerBackend, TimerContext, TrustedActor
 
-from .test_runtime_messaging_203 import fixture
+from .session_native_fixture import DESCRIPTOR, fixture
 
 
-@pytest.mark.parametrize('role', ['subagent','workflow_node','workflow'])
+@pytest.mark.parametrize('role', ['agent','workflow_driver','background'])
 @pytest.mark.parametrize('orphan', [False,True])
 async def test_child_timer_cannot_be_created(registry_store,role,orphan):
     store, _ = registry_store
     _, parent, actor = await fixture(store)
-    child = await store.create_session(parent_session_id=None if orphan else parent.session_id,
-        metadata={'tenant_id':actor.tenant_id,'principal_id':actor.principal_id,'execution_role':role})
+    child = await store.create_session(replace(DESCRIPTOR, kind=role), actor=actor,
+        parent_session_id=None if orphan else parent.session_id, created_by_session_id=parent.session_id)
     backend = StoreTimerBackend(store)
     source = TimerContext(store.store_id, child, actor)
     with pytest.raises(RuntimeRequestError,match='only main'):
@@ -25,8 +27,8 @@ async def test_child_timer_cannot_be_created(registry_store,role,orphan):
 async def test_child_actor_cannot_schedule_for_parent(registry_store):
     store, _ = registry_store
     _, parent, actor = await fixture(store)
-    child = await store.create_session(parent_session_id=parent.session_id,metadata={
-        'tenant_id':actor.tenant_id,'principal_id':actor.principal_id,'execution_role':'subagent'})
+    child = await store.create_session(DESCRIPTOR, actor=actor,
+        parent_session_id=parent.session_id, created_by_session_id=parent.session_id)
     source = TimerContext(store.store_id,parent.session_id,TrustedActor(actor.tenant_id,actor.principal_id,child))
     with pytest.raises(RuntimeRequestError,match='forbidden'):
         await StoreTimerBackend(store).create(source,delay_s=10,note='not your parent')

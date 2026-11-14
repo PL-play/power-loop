@@ -194,11 +194,6 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
         raise WorkflowToolInputError("nested_workflow_forbidden")
     if any(key in options for key in ("wait", "sync")) or ("detached" in options and options["detached"] is not True):
         raise WorkflowToolInputError("workflow_async_only")
-    # A control-only pipeline lane must never authorize source loading, resource
-    # factories or presentation hooks for a new execution.
-    from power_loop.runtime.task_runtime import check_dispatch
-
-    await check_dispatch(sid)
     prepared = await prepare_workflow(options, ports)
     warning = await _observe(ports.on_compiled, ports, copy.deepcopy(prepared.spec.to_dict()))
     from power_loop.agent.runtime_types import RequestOptions, TargetRef, plain

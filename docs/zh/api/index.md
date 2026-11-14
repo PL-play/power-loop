@@ -12,9 +12,9 @@
 | Provisional | 从 `power_loop` 顶层导出，但未来 minor 可能调整。 |
 | Internal | `power_loop.core.*` 等子模块导入，无兼容性承诺。 |
 
-## 当前运行时（11.0.0）
+## 当前运行时（12.0.0）
 
-见[运行时装配](../../runtime-11.md)和 `examples/design203_single_process.py`。
+见[运行时装配](../../runtime-12.md)和 `examples/design215_single_process.py`。
 `StatefulAgentLoop(runtime=...)` 委托 RuntimeClient；旧直接构造、同步执行和进程启动接口已退出。
 受理回执与持久结果分别查询。存储由 `SessionStore.open`（SQLite）或 `open_store`（DSN）装配。
 
@@ -84,7 +84,7 @@ transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResp
 | `ToolValidationError` | `tool.invalid_args` |
 | `SpecValidationError` | `spec.invalid` |
 
-## Timer, factory and resource ports (11.0.0)
+## Timer, factory and resource ports (12.0.0)
 
 | Public port | Contract |
 |---|---|
@@ -103,9 +103,9 @@ transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResp
 coordination holds a native store lock; another independent process/domain is
 rejected, while pure clients and workers sharing one coordinator/transport remain
 supported. See [timers](../user-guide/timers.md), [blackboard](../user-guide/blackboard.md)
-and [runtime setup](../../runtime-11.md).
+and [runtime setup](../../runtime-12.md).
 
-## Runtime 宿主接口（11.0.0 / schema 15 / protocol 42 / descriptor 1）
+## Runtime 宿主接口（12.0.0 / schema 17 / protocol 43 / descriptor 2）
 
 | 公开接口 | 合同 |
 |---|---|
@@ -123,11 +123,3 @@ and [runtime setup](../../runtime-11.md).
 `Runtime.status()` 读取内存中的 worker 和 driver 状态，不为每个请求新增健康查询。纯 Client 不启动定时驱动、不拿默认进程锁。默认内存协调的 worker 使用数据库或文件原生锁；共享模式必须配置共享适配器。
 
 ### 子任务定时等待
-
-公开 `WaitPolicy(deadline_at_ms, max_wait_ms=1800000)` 和
-`register_wait_handoff_tool(registry, policy=...)`。在原主 Agent 和子任务的工厂
-工具集合中注册；可信截止时间由工厂提供，模型不能设置或延长。子任务请求定时复核，
-释放执行容量；主 Agent 读取原续办内容，再明确继续、延后或取消原 JobRef。
-继续使用 RuntimeClient.answer，取消使用 RuntimeClient.cancel，提醒使用已配置的
-TimerBackend/driver。未知定时创建不在重开时重放；错误保存在 schedule_error，
-后续新决定可继续或取消原任务。详细装配见 [运行时合同](../../runtime-11.md#finite-child-review)。

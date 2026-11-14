@@ -1,4 +1,6 @@
-> 历史设计（3.14），不是 11.0.0 的装配指南。内联子任务与 `ChildRunGuard` 已删除；每次执行由 `RuntimeFactory` 创建独立 hooks/resources，并由 `ExecutionEnvironment.aclose()` 释放。当前接口见 [API](../en/api/index.md)。
+> Historical design record. The current contract is [Runtime 12](../runtime-12.md); this page is not an implementation guide.
+
+> 历史设计（3.14），不是 12.0.0 的装配指南。内联子任务与 `ChildRunGuard` 已删除；每次执行由 `RuntimeFactory` 创建独立 hooks/resources，并由 `ExecutionEnvironment.aclose()` 释放。当前接口见 [API](../en/api/index.md)。
 
 # Host Seams（3.14.0）— 接口级设计
 

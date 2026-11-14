@@ -286,7 +286,7 @@ def _model_service(parent_loop, spec, override=None):
     binding = spec.metadata.get('model_binding')
     if binding is None:
         return parent_loop.llm if override is None else override
-    services = getattr(parent_loop.task_runtime, 'model_services', {})
+    services = getattr(parent_loop, 'model_services', {})
     service = services.get(binding)
     if service is None or override is not None and override is not service:
         from power_loop.agent.runtime_types import RuntimeRequestError

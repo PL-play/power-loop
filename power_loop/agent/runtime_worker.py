@@ -420,7 +420,7 @@ class RuntimeWorker:
 
                 loop = _ExecutionLoop(
                     llm=env.llm, store=store, config=config, tool_registry=env.tool_registry,
-                    hooks=env.hooks, event_bus=bus, task_runtime=None,
+                    hooks=env.hooks, event_bus=bus,
                     session_coordinator=r.coordinator, session_cache_size=0,
                     timer_backend=r.timer_backend,
                 )

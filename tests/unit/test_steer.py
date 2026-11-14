@@ -1,4 +1,4 @@
-"""Urgent input (``send(urgent=True)``) reaches the model at the next safe boundary.
+"""Urgent input (``send(priority="urgent")``) reaches the model at the next safe boundary.
 
 - urgent input received during the model call does not cut it; the next round carries the input;
 - a non-urgent input does not interrupt anything;
@@ -138,7 +138,7 @@ async def _steer(agent, body, message_id):
     from power_loop import InputRef
     current = await agent.runtime.client.inspect(InputRef(agent.target.store_id, agent.target.session_id, "m1"),
                                                   actor=agent.actor)
-    return await agent.runtime.client.send(current.job_ref, body, urgent=True, message_id=message_id, actor=agent.actor)
+    return await agent.runtime.client.send(current.target, body, priority="urgent", message_id=message_id, actor=agent.actor)
 
 
 # ── the model call ────────────────────────────────────────────────────────────────────────
@@ -214,7 +214,7 @@ async def test_session_append_joins_the_running_job_next_round(store, runtime_ag
     added = await loop.runtime.client.inspect(InputRef(loop.target.store_id, loop.target.session_id, "a1"),
                                               actor=loop.actor)
     original = await loop.runtime.client.inspect(first.input_ref, actor=loop.actor)
-    assert added.job_ref == original.job_ref
+    assert added.send_index == original.send_index
     assert any("one more thing" in str(m.get("content")) for m in llm.calls[1])
 
 

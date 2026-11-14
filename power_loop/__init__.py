@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "11.0.0"
+__version__ = "12.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -56,22 +56,51 @@ from power_loop.agent.runtime_transport import (
     TransportPacket,
 )
 from power_loop.agent.runtime_types import (
+    CancelPropagation as CancelPropagation,
+)
+from power_loop.agent.runtime_types import (
     CapacityError,
-    Command,
     InputRef,
-    JobPage,
-    JobRef,
+    MessageRow,
     Receipt,
     RequestOptions,
     Result,
     RuntimeDescriptor,
     RuntimeRequestError,
+    SessionKind,
     ShutdownResult,
     Status,
     StoreError,
     TargetRef,
     TrustedActor,
     WaitTimeout,
+)
+from power_loop.agent.runtime_types import (
+    ExecutionState as ExecutionState,
+)
+from power_loop.agent.runtime_types import (
+    InputState as InputState,
+)
+from power_loop.agent.runtime_types import (
+    Lifecycle as Lifecycle,
+)
+from power_loop.agent.runtime_types import (
+    MessagePage as MessagePage,
+)
+from power_loop.agent.runtime_types import (
+    Priority as Priority,
+)
+from power_loop.agent.runtime_types import (
+    ResultKind as ResultKind,
+)
+from power_loop.agent.runtime_types import (
+    SessionPage as SessionPage,
+)
+from power_loop.agent.runtime_types import (
+    TerminalStatus as TerminalStatus,
+)
+from power_loop.agent.runtime_types import (
+    result_message_id as result_message_id,
 )
 from power_loop.agent.runtime_worker import RuntimeWorker
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
@@ -135,7 +164,6 @@ from power_loop.contracts.event_payloads import (
     SubagentTaskStartPayload,
     SubagentTextPayload,
     SystemLogPayload,
-    TaskSupervisionClosedPayload,
     TimerFiredPayload,
     TodoUpdatedPayload,
     ToolCallCompletedPayload,
@@ -264,14 +292,11 @@ from power_loop.runtime.store.store import (
 )
 from power_loop.runtime.store.types import (
     HookEventRow,
-    MessageRow,
     MessageState,
     ProjectMessageRow,
-    SessionKind,
     SessionRow,
     SessionStatsRow,
     SessionStatus,
-    SubagentLifecycle,
     TimerRow,
 )
 from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
@@ -328,59 +353,7 @@ _logging.getLogger("power_loop").addHandler(_logging.NullHandler())
 # The authoritative STABLE tier (single source of truth — tests assert the module
 # docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed
 # without a major bump). Add freely; never remove/rename within a major version.
-STABLE_API = (
-    "TimerBackend", "TimerContext", "timer_context", "TimerDriver", "TimerDriverStatus", "StoreTimerBackend", "TimerRunner", "StoreBlackboard",
-    "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
-    "RuntimeClient", "RuntimeWorker", "ExecutionContext", "OutputSubscription",
-    "TargetRef", "InputRef", "JobRef", "Command", "RequestOptions", "RuntimeDescriptor",
-    "TrustedActor", "Receipt", "Status", "Result", "ShutdownResult", "JobPage",
-    "RuntimeRequestError", "CapacityError", "WaitTimeout", "StoreError",
-    "MessageTransport", "MemoryMessageTransport", "DatabasePollingTransport",
-    "PublishReceipt", "SubscriptionSpec", "TransportCapabilities", "TransportPacket",
-    "SessionOwnership", "SessionOwnershipCoordinator", "MemorySessionOwnershipCoordinator",
-    "StoreSessionOwnershipCoordinator",
-    "StatefulAgentLoop",
-    "AgentLoopConfig",
-    "AgentLoopResult",
-    "SessionStore",
-    "SubagentLifecycle",
-    "PowerLoopError",
-    "SessionBusy",
-    "SessionLeaseLost",
-    "SessionNotFoundError",
-    "LLMTimeout",
-    "LLMRetryExhausted",
-    "CancellationRequested",
-    "LLMRetryPolicy",
-    "CancellationToken",
-    "AgentHooks",
-    "AgentEventBus",
-    "HookPoint",
-    "HookDirective",
-    "ToolRegistry",
-    "ToolDefinition",
-    # LLM contract — STABLE as of 1.0 so the flagship StatefulAgentLoop has
-    # *construction closure*: you can build and use it (and implement a custom
-    # provider) from STABLE-only symbols. Frozen for the 1.x line.
-    "LLMService",
-    "LLMRequest",
-    "LLMResponse",
-    "LLMStreamChunk",
-    "LLMProviderConfig",
-    "ModelCapabilities",
-    "ModelCapabilityError",
-    "create_llm_service_from_env",
-    "create_llm_service_from_config",
-    "ResponseMetrics",
-    "ProviderCost",
-    "TokenUsageExtractor",
-    "CostExtractor",
-    "DefaultTokenUsageExtractor",
-    "DefaultCostExtractor",
-    "FieldTokenUsageExtractor",
-    "FieldCostExtractor",
-    "ResponseExtractionError",
-)
+STABLE_API = ('AgentEventBus', 'AgentHooks', 'AgentLoopConfig', 'AgentLoopResult', 'CancellationRequested', 'CancellationToken', 'CapacityError', 'CancelPropagation', 'CostExtractor', 'DatabasePollingTransport', 'DefaultCostExtractor', 'DefaultTokenUsageExtractor', 'ExecutionContext', 'ExecutionEnvironment', 'ExecutionState', 'FieldCostExtractor', 'FieldTokenUsageExtractor', 'HookDirective', 'HookPoint', 'InputRef', 'InputState', 'Lifecycle', 'LLMProviderConfig', 'LLMRequest', 'LLMResponse', 'LLMRetryExhausted', 'LLMRetryPolicy', 'LLMService', 'LLMStreamChunk', 'LLMTimeout', 'MemoryMessageTransport', 'MemorySessionOwnershipCoordinator', 'MessagePage', 'MessageRow', 'MessageState', 'MessageTransport', 'ModelCapabilities', 'ModelCapabilityError', 'OutputSubscription', 'PowerLoopError', 'Priority', 'ProviderCost', 'PublishReceipt', 'Receipt', 'RegistryRuntimeFactory', 'RequestOptions', 'ResponseExtractionError', 'ResponseMetrics', 'Result', 'ResultKind', 'Runtime', 'RuntimeClient', 'RuntimeDescriptor', 'RuntimeFactory', 'RuntimeRequestError', 'RuntimeWorker', 'SessionBusy', 'SessionKind', 'SessionLeaseLost', 'SessionNotFoundError', 'SessionOwnership', 'SessionOwnershipCoordinator', 'SessionPage', 'SessionStore', 'ShutdownResult', 'StatefulAgentLoop', 'Status', 'StoreBlackboard', 'StoreError', 'StoreSessionOwnershipCoordinator', 'StoreTimerBackend', 'SubscriptionSpec', 'TargetRef', 'TerminalStatus', 'TimerBackend', 'TimerContext', 'TimerDriver', 'TimerDriverStatus', 'TimerRunner', 'TokenUsageExtractor', 'ToolDefinition', 'ToolRegistry', 'TransportCapabilities', 'TransportPacket', 'TrustedActor', 'WaitTimeout', 'create_llm_service_from_config', 'create_llm_service_from_env', 'result_message_id', 'timer_context')
 
 __all__ = [
     "SessionOwnership",
@@ -427,7 +400,6 @@ __all__ = [
 	"TimerFiredPayload",
 	"SessionStatus",
 	"SessionKind",
-	"SubagentLifecycle",
 	"MessageRow",
 	"HookEventRow",
 	"MessageState",
@@ -577,7 +549,6 @@ __all__ = [
 	"SubagentTextPayload",
 	"SubagentLimitPayload",
 	"SubagentCompletedPayload",
-    "TaskSupervisionClosedPayload",
 	"EventHandler",
 	"HookHandler",
 	"ToolHandler",
@@ -624,8 +595,11 @@ __all__ = [
 __all__ += [
     "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
     "RuntimeClient", "RuntimeWorker", "ExecutionContext", "bind_host_context", "get_execution_context", "OutputSubscription",
-    "TargetRef", "InputRef", "JobRef", "Command", "RequestOptions", "RuntimeDescriptor", "TrustedActor",
-    "Receipt", "Status", "Result", "ShutdownResult", "JobPage", "RuntimeRequestError", "CapacityError", "WaitTimeout", "StoreError",
+    "TargetRef", "InputRef", "RequestOptions", "RuntimeDescriptor", "TrustedActor",
+    "Receipt", "Status", "Result", "ShutdownResult", "RuntimeRequestError", "CapacityError", "WaitTimeout", "StoreError",
     "MessageTransport", "MemoryMessageTransport", "DatabasePollingTransport",
     "TransportPacket", "TransportCapabilities", "SubscriptionSpec", "PublishReceipt",
 ]
+
+# Session-native public row/enumeration contracts.
+__all__ = list(dict.fromkeys([*__all__, *STABLE_API]))

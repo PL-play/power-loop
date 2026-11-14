@@ -1,20 +1,14 @@
 # Sub-agents and task ownership
 
-SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
+SDK 12.0.0 / schema 17 / protocol 43 / descriptor 2.
 
-[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
+Build models, tools, hooks and resources in the Runtime factory. Create a session, then send with a stable message ID. A receipt confirms acceptance; wait on its InputRef for completion. Children, background work and workflows use sessions and ordinary result inputs. Continue with send and stop with cancel. The host supplies trusted identity.
 
-Register spawn_agent in the factory's ToolRegistry. A model-visible create returns an accepted child reference without waiting for model execution. The child has its own session and Runtime job; completion is delivered to the parent inbox. Capacity one remains usable because waiting does not hold the only execution slot.
-
-AgentSpec selects name, system_prompt, tool allowlist, model options, round limits and optional output_schema. Validate those values before admission. Tool allowlists and depth limits apply on the child node. Model changes require the host's allowed_models declaration. Structured output is parsed and validated as a child result, not trusted solely because it looks like JSON.
-
-Use the original JobRef to inspect, wait, send a message, cancel or resume. Parent interruption does not silently cancel a healthy child; the result remains queryable. Workflow-node budgets and original owners continue across explicit resumes and do not refresh into a new root. Late child output retained in a finished node's history is not marked consumed until the node actually processes it.
-
-Factories reconstruct tools, workspace and hooks from stable profiles; neither a closure around a parent loop nor an old session handle is a deployment resource.
+[Runtime 12](../../runtime-12.md)
 
 ## Runnable examples
 
-Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design215_single_process.py.
 
 | Example | Behavior |
 |---|---|

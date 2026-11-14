@@ -75,7 +75,7 @@ async def test_lock_connection_loss_stops_admission(registry_store,active):
     from power_loop import AgentLoopConfig, ExecutionEnvironment, LLMResponse, LLMService
     from power_loop.agent.runtime_store import now_ms
 
-    from .test_runtime_messaging_203 import fixture
+    from .session_native_fixture import fixture
     store,_=registry_store
     _,target,actor=await fixture(store)
     entered=asyncio.Event()
@@ -89,7 +89,7 @@ async def test_lock_connection_loss_stops_admission(registry_store,active):
     factory=RegistryRuntimeFactory()
     async def build(descriptor,context):
         return ExecutionEnvironment(Model(),None,AgentLoopConfig(compactor=None))
-    factory.register('test.agent@1',build)
+    factory.register('test.agent@215',build)
     runtime=Runtime(store=store,factory=factory,node_id='lost',timers_enabled=False)
     await runtime.worker.start()
     try:

@@ -47,3 +47,13 @@ def fail_next_commit(monkeypatch, store):
                 yield tx
 
     monkeypatch.setattr(type(store._db), "transaction", transaction)
+
+
+async def fixture(store):
+    from power_loop import RuntimeDescriptor, TrustedActor
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    descriptor = RuntimeDescriptor(2, "agent", "test.agent@215", None, "builtin.empty@215",
+                                   "builtin.none@215", "builtin.none@215", {"max_rounds": 2}, {})
+    actor = TrustedActor("tenant", "principal", None)
+    port = RuntimeInputStore(store)
+    return port, await port.create_session(descriptor, actor=actor), actor

@@ -1,3 +1,5 @@
+> Historical feasibility study. Current behavior is defined by [Runtime 12](runtime-12.md).
+
 # power-loop 动态工作流（Dynamic Workflow）能力可行性报告
 
 > 目标读者：power-loop 库作者 / 维护者

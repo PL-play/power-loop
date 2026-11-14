@@ -11,9 +11,9 @@ def encode_results(tasks: list[dict[str, Any]]) -> str:
     return RESULT_PREFIX + json.dumps({"version": 1, "tasks": tasks}, ensure_ascii=False)
 
 
-async def load_record(store: Any, sid: str | None, task_id: str, *, reader=None, generation=None) -> dict[str, Any] | None:
+async def load_record(store: Any, sid: str | None, task_id: str, *, reader=None) -> dict[str, Any] | None:
     from power_loop.agent.runtime_store import RuntimeInputStore
-    from power_loop.agent.runtime_types import InputRef
+    from power_loop.agent.runtime_types import InputRef, plain
 
     port = RuntimeInputStore(store)
     reader = reader or port.db
@@ -33,7 +33,7 @@ async def load_record(store: Any, sid: str | None, task_id: str, *, reader=None,
         "args": original["arguments"],
         "status": result.status if result else "accepted",
         "result": result.final_text if result else None,
-        "result_ref": start,
+        "result_ref": plain(start),
     }
 
 

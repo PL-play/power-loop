@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, JobRef, ToolDefinition, ToolRegistry
+from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, InputRef, ToolDefinition, ToolRegistry
 from power_loop.agent.runtime_store import now_ms
 from power_loop.runtime.pricing import Free
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -56,8 +56,8 @@ async def test_real_subtree_stop_reaches_original_running_subagent(runtime_agent
         message_id='delegate', actor=agent.actor)
     await asyncio.wait_for(started.wait(), 120)
     [child] = await agent.runtime.store._db.fetchall(
-        f"SELECT job_id,generation FROM {agent.runtime.store.table_prefix}jobs WHERE kind='subagent'")
-    child_ref = JobRef(agent.target.store_id, child['job_id'], child['generation'])
+        f"SELECT session_id,start_input_message_id FROM {agent.runtime.store.table_prefix}sessions WHERE parent_session_id IS NOT NULL")
+    child_ref = InputRef(agent.target.store_id, child['session_id'], child['start_input_message_id'])
     start = time.monotonic()
     await client.cancel(receipt.input_ref, actor=agent.actor, scope='subtree', reason='user stop')
     child_result = await client.wait(child_ref, actor=agent.actor, deadline_ms=now_ms()+60000)

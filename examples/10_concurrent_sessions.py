@@ -144,8 +144,8 @@ class CommandModel(LLMService):
 
 
 async def drive_session(runtime, loop, actor, label, command):
-    target = await runtime.open_session(RuntimeDescriptor(1,'agent','example@1',None,
-        'example.tools@1','builtin.none@1','builtin.none@1',{},{}), actor=actor)
+    target = await runtime.open_session(RuntimeDescriptor(2,'agent','example@215',None,
+        'example.tools@215','builtin.none@215','builtin.none@215',{},{}), actor=actor)
     result = await loop.send(target, command, message_id=label, actor=actor,
                              deadline_ms=int(time.time()*1000)+10000)
     assert result.status == 'completed'

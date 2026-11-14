@@ -135,22 +135,22 @@ class StoreBlackboard:
 
     @asynccontextmanager
     async def _edit(self, board_id):
-        db, table = self._store._db, self._store.t.shared_state
+        db, table = self._store._db, self._store.t.session_runtime_state
         owner = self._owner(board_id)
         async with db.transaction() as tx:
-            insert = (f"INSERT INTO {table} (owner,state_key,value_json,updated_at) VALUES (?,?,?,?) "
-                "ON DUPLICATE KEY UPDATE owner=VALUES(owner)" if db.dialect.name == "mysql" else
-                db.dialect.insert_ignore(table, ("owner", "state_key", "value_json", "updated_at")))
+            insert = (f"INSERT INTO {table} (session_id,state_key,value_json,updated_at) VALUES (?,?,?,?) "
+                "ON DUPLICATE KEY UPDATE session_id=VALUES(session_id)" if db.dialect.name == "mysql" else
+                db.dialect.insert_ignore(table, ("session_id", "state_key", "value_json", "updated_at")))
             await tx.execute(insert,
-                (owner, self._DOC_KEY, json.dumps(self._empty()), int(time.time()*1000)))
+                (owner, "shared:"+self._DOC_KEY, json.dumps(self._empty()), int(time.time()*1000)))
             suffix = "" if db.dialect.name == "sqlite" else " FOR UPDATE"
             row = await tx.fetchone(f"SELECT value_json FROM {table} "
-                "WHERE owner=? AND state_key=?" + suffix, (owner, self._DOC_KEY))
+                "WHERE session_id=? AND state_key=?" + suffix, (owner, "shared:"+self._DOC_KEY))
             doc = json.loads(row["value_json"])
             yield doc
             await tx.execute(f"UPDATE {table} SET value_json=?,updated_at=? "
-                "WHERE owner=? AND state_key=?",
-                (json.dumps(doc, ensure_ascii=False), int(time.time()*1000), owner, self._DOC_KEY))
+                "WHERE session_id=? AND state_key=?",
+                (json.dumps(doc, ensure_ascii=False), int(time.time()*1000), owner, "shared:"+self._DOC_KEY))
 
     async def delete(self, board_id):
         """Release a board whose host-owned scope has ended."""

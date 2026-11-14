@@ -163,10 +163,10 @@ class NoteMemory:
     """``MemoryProvider`` that injects the session's own notes every send.
 
     Backend-agnostic: it reads notes from whatever :class:`SessionStore` the
-    loop uses (SQLite / Postgres / MySQL — the store owns the ``*notes`` table),
+    loop uses (SQLite / Postgres / MySQL — the store uses session_runtime_state),
     so the name carries no storage implication.
 
-    ``remember()`` is a no-op: the notes table is mutated in real time by the
+    ``remember()`` is a no-op: note documents are mutated in real time by the
     note tools, so there is nothing to persist at session end.
 
     Pass the **same** :class:`SessionStore` the loop uses (or rely on the loop

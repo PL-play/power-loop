@@ -1,6 +1,6 @@
 # Tool calling
 
-SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor 2.
 
 Define the tool schema and handler, register it, and return the registry from ExecutionEnvironment. The runtime validates arguments, checks allowlists and invokes before/after hooks. Business permissions and budget remain in the authoritative host backend.
 

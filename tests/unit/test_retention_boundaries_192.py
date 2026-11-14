@@ -1,6 +1,8 @@
 """Indexed retention boundaries preserve sends, age filters and other sessions."""
 import pytest
 
+from .session_native_fixture import new_session
+
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -8,22 +10,22 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
     (2,3600000,[(1,0),(1,1),(2,0),(3,0)]), (2,-1000,[(2,0),(3,0)]), (0,None,[])])
 async def test_usage_retention_uses_global_send_round_order_and_intersects_age(registry_store, keep, age, remaining):
     store, _ = registry_store
-    sid, other = await store.create_session(), await store.create_session()
+    sid, other = (await new_session(store)).session_id, (await new_session(store)).session_id
     for send, round_ in [(1,0),(1,1),(2,0),(3,0)]:
         await store.record_usage(sid, send_index=send, round_index=round_, prompt_tokens=2, completion_tokens=3, total_tokens=5)
     await store.record_usage(other, send_index=1, round_index=0, prompt_tokens=7, completion_tokens=0, total_tokens=7)
-    foreign = await store._db.fetchall(f'SELECT * FROM {store.t.usage_rounds} WHERE session_id=?', (other,))
+    foreign = await store.list_usage_rounds(other)
     deleted = await store.prune_usage_rounds(sid, keep_last=keep, older_than_ms=age)
-    actual = await store._db.fetchall(f'SELECT send_index,round_index FROM {store.t.usage_rounds} WHERE session_id=? ORDER BY send_index,round_index', (sid,))
+    actual = await store.list_usage_rounds(sid)
     assert [(row['send_index'],row['round_index']) for row in actual] == remaining
     assert deleted == 4-len(remaining)
-    assert await store._db.fetchall(f'SELECT * FROM {store.t.usage_rounds} WHERE session_id=?', (other,)) == foreign
+    assert await store.list_usage_rounds(other) == foreign
 
 
 @pytest.mark.parametrize('keep,age,deleted', [(2,None,2),(10,None,0),(2,3600000,0),(2,-1000,2),(0,None,4)])
 async def test_message_retention_preserves_active_window_and_insufficient_keep_is_noop(registry_store, keep, age, deleted):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = (await new_session(store)).session_id
     for i in range(6):
         await store.append_message(sid, role='user', content=f'original-{i}')
     await store.record_compaction(sid, from_seq=1, to_seq=4, note_content='original summary', before_tokens=100,

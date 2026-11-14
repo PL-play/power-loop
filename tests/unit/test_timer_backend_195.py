@@ -60,12 +60,12 @@ async def test_model_tool_schedule_list_cancel_share_backend_and_original_identi
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(model,registry,AgentLoopConfig(max_rounds=5))
-    factory.register('timer@1', build)
+    factory.register('timer@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='timer', timer_backend=backend, timer_driver=driver)
     try:
         await runtime.worker.start()
         actor = TrustedActor('tenant','principal',None)
-        descriptor = RuntimeDescriptor(1,'agent','timer@1',None,'tools@1','hooks@1','resources@1',{}, {'source':{'original':'run'}})
+        descriptor = RuntimeDescriptor(2,'agent','timer@215',None,'tools@215','hooks@215','resources@215',{}, {'source':{'original':'run'}})
         target = await runtime.open_session(descriptor,actor=actor)
         receipt = await runtime.client.send(target,'schedule, list, cancel',message_id='original',actor=actor)
         result = await runtime.client.wait(receipt.input_ref,actor=actor,deadline_ms=int(time.time()*1000)+10000)
@@ -75,7 +75,7 @@ async def test_model_tool_schedule_list_cancel_share_backend_and_original_identi
         assert len(creates)==len(cancels)==1
         source = creates[0][1]
         assert source.store_id == store.store_id and source.session_id == target.session_id
-        assert source.actor.tenant_id == 'tenant' and source.job_ref == result.job_ref
+        assert source.actor.tenant_id == 'tenant' and source.session_id == result.input_ref.session_id
         assert source.tool_call_id == 'schedule' and source.operation_id.startswith('timer-tool-')
         assert cancels[0][1].operation_id != source.operation_id
         assert plain(source.host_context) == {'source':{'original':'run'}}

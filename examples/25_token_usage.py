@@ -1,6 +1,6 @@
 """25 · Result usage is per input; stored session statistics accumulate.
 
-Usage events are for observation. A billing host must use the TaskRuntime
+Usage events are for observation. A billing host must use the host BillingChargeEvent
 billing port and must not treat an event subscriber as its authoritative ledger.
 """
 import asyncio

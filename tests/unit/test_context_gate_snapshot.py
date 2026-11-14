@@ -14,7 +14,7 @@ import pytest
 
 from power_loop.runtime.store.factory import _make_database
 
-from .test_executor_drain_trees import stop_worker, wait_ready
+from .process_fixture import stop_worker, wait_ready
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 

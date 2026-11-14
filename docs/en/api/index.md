@@ -14,10 +14,10 @@ inspect the source modules linked below.
 | Provisional | Re-exported from `power_loop`, but may change in a future minor. |
 | Internal | Submodule imports such as `power_loop.core.*`; no compatibility guarantee. |
 
-## Current runtime (11.0.0)
+## Current runtime (12.0.0)
 
-See the [current runtime contract](../../runtime-11.md) and the executable
-`examples/design203_single_process.py`. `StatefulAgentLoop(runtime=...)` delegates
+See the [current runtime contract](../../runtime-12.md) and the executable
+`examples/design215_single_process.py`. `StatefulAgentLoop(runtime=...)` delegates
 to `RuntimeClient`; the old direct constructor, sync methods and process worker
 bootstrap are retired. Acceptance receipts and persisted results are distinct.
 
@@ -89,7 +89,7 @@ you don't reach into the vendored transport package. **STABLE as of 1.0** — `L
 | `ToolValidationError` | `tool.invalid_args` |
 | `SpecValidationError` | `spec.invalid` |
 
-## Timer, factory and resource ports (11.0.0)
+## Timer, factory and resource ports (12.0.0)
 
 | Public port | Contract |
 |---|---|
@@ -108,9 +108,9 @@ you don't reach into the vendored transport package. **STABLE as of 1.0** — `L
 coordination holds a native store lock; another independent process/domain is
 rejected, while pure clients and workers sharing one coordinator/transport remain
 supported. See [timers](../user-guide/timers.md), [blackboard](../user-guide/blackboard.md)
-and [runtime setup](../../runtime-11.md).
+and [runtime setup](../../runtime-12.md).
 
-## Runtime host ports (11.0.0 / schema 15 / protocol 42 / descriptor 1)
+## Runtime host ports (12.0.0 / schema 17 / protocol 43 / descriptor 2)
 
 | Public symbol | Contract |
 |---|---|
@@ -126,12 +126,3 @@ and [runtime setup](../../runtime-11.md).
 `Runtime.status()` reads in-memory driver/worker state; it does not issue a health query for each request. Pure clients do not start timers or acquire a process coordination lock. A worker using default memory coordination takes a native store lock; shared mode requires explicit shared adapters.
 
 ### Finite child wait
-
-`WaitPolicy(deadline_at_ms, max_wait_ms=1800000)` and
-`register_wait_handoff_tool(registry, policy=...)` are public. Register the tool
-in the original main and child profiles. A child requests a timed review; the
-main inspects the original continuation and explicitly continues, defers or
-cancels the same JobRef. This uses RuntimeClient answers/cancellation and the
-configured TimerBackend. The factory supplies the trusted deadline. See
-[runtime contract](../../runtime-11.md#finite-child-review) for assembly and
-failure behavior.

@@ -14,7 +14,7 @@ from power_loop import AgentLoopConfig, FoldResult, LLMResponse, LLMService, Pro
 class CountOnlyFold:
     keep_last_sends = 1
     trigger_ratio = .5
-    fold_id = 'example.count-only@1'
+    fold_id = 'example.count-only@215'
 
     async def fold(self, rows, *, context):
         return FoldResult(content={'summary':f'{len(rows)} old records discarded by explicit host policy.'},

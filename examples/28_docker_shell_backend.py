@@ -3,7 +3,7 @@
 Requires a working Docker CLI/daemon and python:3.12-slim (pulled if missing).
 Missing Docker is an error. The fixed model makes no remote calls. This example
 uses a process-local shell; shared deployments also need shared process control
-and stable workspace/resource profiles, as described in docs/runtime-11.md.
+and stable workspace/resource profiles, as described in docs/runtime-12.md.
 """
 
 from __future__ import annotations

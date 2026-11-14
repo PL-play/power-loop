@@ -127,7 +127,10 @@ async def test_board_tools_end_to_end() -> None:
     from types import SimpleNamespace
     store = await SessionStore.open(":memory:")
     loop = SimpleNamespace(store=store, config=AgentLoopConfig())
-    sid = await store.create_session(metadata={"spec_name": "alice"})
+    from dataclasses import replace
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR
+    sid = await store.create_session(replace(DESCRIPTOR,config={'name':'alice'}),actor=ACTOR)
     bb = StoreBlackboard(loop.store)
     reg = _tools()
     board = reg.get("board").handler
@@ -164,7 +167,8 @@ async def test_board_post_validates_kind() -> None:
     from types import SimpleNamespace
     store = await SessionStore.open(":memory:")
     loop = SimpleNamespace(store=store, config=AgentLoopConfig())
-    sid = await store.create_session()
+    from .session_native_fixture import new_session
+    sid = (await new_session(store)).session_id
     reg = _tools()
     board = reg.get("board").handler
     with runtime_env_context(RuntimeEnv(blackboard=StoreBlackboard(loop.store), blackboard_id="b")):

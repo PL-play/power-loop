@@ -1,6 +1,6 @@
 # 工具调用
 
-SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor 2.
 
 定义工具结构与处理器、完成注册，再从 ExecutionEnvironment 返回注册表。Runtime 校验参数、检查白名单并调用前后 hooks。业务权限与额度仍在权威宿主后端执行。
 

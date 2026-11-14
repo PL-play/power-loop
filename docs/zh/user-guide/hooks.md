@@ -1,8 +1,8 @@
 # Hooks
 
-SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
+SDK 12.0.0 · 会话结构 17 · 协议 43 · 描述符结构 2。
 
-[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
+[Runtime 契约](../../runtime-12.md) · [API](../api/index.md)
 
 在 ExecutionEnvironment.hooks 提供 AgentHooks。按 HookPoint 注册处理器，并使用该点约定的 HookDirective；任意替换对象不等于有效指令。Hooks 在执行节点运行，工厂需通过声明的 hook profile 重建。
 
@@ -14,7 +14,7 @@ TIMER_FIRE 保留继续、跳过、取消和延后决策。TimerFireCtx 携带�
 
 ## 可执行示例
 
-从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design215_single_process.py。
 
 | 示例 | 行为 |
 |---|---|

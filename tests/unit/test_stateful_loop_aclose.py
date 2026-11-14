@@ -1,12 +1,13 @@
 """Facade shutdown releases its references; worker shutdown owns execution."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentEvent, AgentEventBus, AgentEventType, StatefulAgentLoop
+from power_loop import AgentEvent, AgentEventBus, AgentEventType, RuntimeClient, StatefulAgentLoop
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.runtime_types import RuntimeRequestError
-from tests.legacy_job_helpers import _Gate, _wait_calls, store
+from tests.model_fixture import _Gate, _wait_calls, store
 from tests.runtime_fixture import RunningAgent
 
 __all__ = ['store']
@@ -17,7 +18,7 @@ async def test_closing_one_facade_does_not_cancel_execution_or_other_client(stor
     model = _Gate([])
     release = model.gate(0)
     agent = await RunningAgent(store, model).start()
-    other = StatefulAgentLoop(runtime=agent.runtime)
+    other = StatefulAgentLoop(runtime=SimpleNamespace(store=store, client=RuntimeClient(store=store, transport=agent.runtime.transport)))
     try:
         run = asyncio.create_task(agent.loop.send(agent.target, 'hello', message_id='one',
             actor=agent.actor, deadline_ms=now_ms()+10000))
@@ -32,7 +33,7 @@ async def test_closing_one_facade_does_not_cancel_execution_or_other_client(stor
         assert await store.get_session(agent.target.session_id)
         await agent.loop.aclose()
         with pytest.raises(RuntimeRequestError, match='session_closed'):
-            await agent.loop.follow_up(agent.target, 'no', message_id='closed', actor=agent.actor)
+            await agent.loop.send(agent.target, 'no', message_id='closed', actor=agent.actor)
     finally:
         release.set()
         await other.aclose()
@@ -47,7 +48,7 @@ async def test_worker_shutdown_drains_then_closes_subscriptions(store):
     await _wait_calls(model, 1)
     shutdown = asyncio.create_task(agent.runtime.worker.shutdown(timeout_s=5))
     await asyncio.sleep(.01)
-    assert not shutdown.done() and len(agent.runtime.transport._subscriptions) == 3
+    assert not shutdown.done() and len(agent.runtime.transport._subscriptions) == 2
     release.set()
     result = await shutdown
     assert result.drained
@@ -67,9 +68,9 @@ async def test_shutdown_cancellation_is_persisted_before_releasing_worker(store)
     assert result.drained
     result = await agent.loop.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
     assert result.status == 'cancelled'
-    job = await store._db.fetchone(f'SELECT cancel_requested_at FROM {store.table_prefix}jobs WHERE job_id=?',
-                                   (result.job_ref.job_id,))
-    assert job['cancel_requested_at'] is not None
+    state = await store._db.fetchone(f'SELECT execution_state FROM {store.t.session_state} WHERE session_id=?',
+                                    (agent.target.session_id,))
+    assert state['execution_state'] == 'idle'
     await agent.aclose()
 
 
@@ -92,8 +93,11 @@ async def test_worker_shutdown_timeout_reports_interrupted_and_releases_slots(st
     receipt = await agent.runtime.client.send(agent.target, 'running', message_id='one', actor=agent.actor)
     await _wait_calls(model, 1)
     result = await asyncio.wait_for(agent.runtime.worker.shutdown(timeout_s=.01), 5)
-    assert not result.drained and len(result.interrupted_jobs) == 1
-    result = await agent.loop.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
-    assert result.status == 'interrupted'
+    assert not result.drained and len(result.interrupted_inputs) == 1
+    status = await agent.loop.client.inspect(receipt.input_ref, actor=agent.actor)
+    assert status.terminal_status is None
+    assert status.execution_state == 'running'
+    state = await store._db.fetchone(f'SELECT owner_token FROM {store.t.session_state} WHERE session_id=?', (agent.target.session_id,))
+    assert state['owner_token'] is not None  # expired ownership is recovered by another worker
     assert not agent.runtime.worker._active and not agent.runtime.worker._tasks
     await agent.aclose()

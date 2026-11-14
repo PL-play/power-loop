@@ -1,4 +1,4 @@
-# Runtime 架构 · SDK 11
+# Runtime 架构 · SDK 12
 
 公开入口为 RuntimeClient。StatefulAgentLoop(runtime=runtime) 提供提交并等待的便捷调用。工厂在执行节点按不可变、版本化的描述符引用重建 ExecutionEnvironment；消息中不保存活的模型对象、资源连接或宿主密钥。
 
@@ -25,4 +25,4 @@ Store ID、会话目标、输入 ID 和任务代次分别标识不同对象。�
 
 未知外部动作只查询原结果或明确 unknown，不自动重放。恢复目标是格式正确、任务可见、流程可继续，不保证逐阶段精确恢复。当前结构可以重开，旧结构和协议直接拒绝，不保留兼容执行分支。
 
-详见 [Runtime 契约](runtime-11.md)、[中文 API](zh/api/index.md) 和可执行编号示例。本文对应 SDK 11.0.0、任务结构 15、协议 42、描述符结构 1，不代表已经部署或启用。
+详见 [Runtime 契约](runtime-12.md)、[中文 API](zh/api/index.md) 和可执行编号示例。本文对应 SDK 12.0.0、会话结构 17、协议 43、描述符结构 2，不代表已经部署或启用。

@@ -30,7 +30,7 @@ class ConcurrentModel(LLMService):
 async def main():
     model = ConcurrentModel()
     async with demo_runtime(model, capacity=2) as (runtime, loop, target, actor):
-        descriptor = RuntimeDescriptor(1, 'agent', 'example@1', None, 'example.tools@1', 'builtin.none@1', 'builtin.none@1', {}, {})
+        descriptor = RuntimeDescriptor(2, 'agent', 'example@215', None, 'example.tools@215', 'builtin.none@215', 'builtin.none@215', {}, {})
         targets = [target] + [await runtime.open_session(descriptor, actor=actor) for _ in range(3)]
         results = await asyncio.gather(*(loop.send(t, 'Work', message_id=f'work-{i}', actor=actor,
             deadline_ms=int(time.time()*1000)+10000) for i, t in enumerate(targets)))

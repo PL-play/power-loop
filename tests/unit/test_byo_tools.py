@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from power_loop import AgentLoopConfig, JobRef, RuntimeEnv, StoreBlackboard, ToolRegistry
+from power_loop import AgentLoopConfig, InputRef, RuntimeEnv, StoreBlackboard, ToolRegistry
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.runtime.store.store import SessionStore
 from tests.unit.test_stateful_loop import _Scripted, _tool_resp
@@ -115,7 +115,7 @@ async def test_subagent_delegate_returns_receipt_and_child_result(store, runtime
     assert (await loop.send("delegate a greeting")).status == "completed"
     rows = await store.load_all_messages(loop.target.session_id)
     receipt = json.loads(next(row.content for row in rows if row.tool_call_id == "c1"))
-    result = await loop.runtime.client.wait(JobRef(**receipt["job_ref"]), actor=loop.actor, deadline_ms=now_ms()+10000)
+    result = await loop.runtime.client.wait(InputRef(**receipt["input_ref"]), actor=loop.actor, deadline_ms=now_ms()+10000)
     assert result.status == "completed" and result.final_text == "child says hello"
     await loop.drain()
 
@@ -139,12 +139,12 @@ async def test_background_bg_run_executes_after_parent_and_remains_queryable(sto
     assert (await loop.send("run in background")).status == "completed"
     rows = await store.load_all_messages(loop.target.session_id)
     receipt = json.loads(next(row.content for row in rows if row.tool_call_id == "c1"))
-    ref = JobRef(**receipt["job_ref"])
+    ref = InputRef(**receipt["input_ref"])
     result = await loop.runtime.client.wait(ref, actor=loop.actor, deadline_ms=now_ms()+10000)
     assert result.status == "completed" and "hi" in result.final_text
     await loop.drain()
     await loop.send("next turn")
-    notices = [row for row in await store.load_all_messages(loop.target.session_id)
-               if "[background_tool_results]" in str(row.content)]
-    assert len(notices) == 1 and "hi" in notices[0].content
+    notices = await store._db.fetchall(f"SELECT content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='background_result'", (loop.target.session_id,))
+    assert len(notices) == 1 and "hi" in notices[0]['content_json']
     assert await loop.runtime.client.wait(ref, actor=loop.actor, deadline_ms=now_ms()+10000) == result

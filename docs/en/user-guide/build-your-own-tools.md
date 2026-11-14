@@ -1,8 +1,8 @@
 # Extending tools
 
-SDK 11.0.0 · task schema 15 · protocol 42 · descriptor schema 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor schema 2.
 
-[Runtime contract](../../runtime-11.md) · [API](../api/index.md)
+[Runtime contract](../../runtime-12.md) · [API](../api/index.md)
 
 Define ToolDefinition with a JSON input schema, register a synchronous or asynchronous handler in ToolRegistry, and return that registry from the execution factory. Tool names in RequestOptions.tools are an allowlist; missing required tools fail explicitly. Handlers receive validated arguments; keep error output useful without inventing successful results.
 
@@ -14,7 +14,7 @@ Host business permissions and budget checks remain at their authoritative API. A
 
 ## Runnable examples
 
-Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design203_single_process.py.
+Run from the SDK checkout with its installed environment. These complete programs include resource cleanup; numbered examples share examples/_runtime.py. Host-dependent examples state their required services. For a standalone composition without that helper, use design215_single_process.py.
 
 | Example | Behavior |
 |---|---|

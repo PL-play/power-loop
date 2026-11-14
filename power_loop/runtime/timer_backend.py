@@ -18,7 +18,6 @@ class TimerContext:
     store_id: str
     session_id: str
     actor: TrustedActor
-    job_ref: object = None
     tool_call_id: str | None = None
     operation_id: str | None = None
     host_context: Mapping = field(default_factory=dict)
@@ -35,7 +34,7 @@ async def timer_context() -> TimerContext:
     ref = await call.store.message_ref(execution.session_id, call.assistant_seq)
     actor = replace(execution.actor, call_ref=ref, tool_call_id=call.tool_call_id)
     return TimerContext(execution.store_id, execution.session_id, actor,
-        execution.job_ref, call.tool_call_id, operation, execution.host_context)
+        call.tool_call_id, operation, execution.host_context)
 
 
 @runtime_checkable
@@ -77,9 +76,8 @@ class StoreTimerBackend:
         port = RuntimeInputStore(self.store)
         target = TargetRef(source.store_id, source.session_id)
         port.check_store(target)
-        row = await tx.fetchone(f'SELECT parent_session_id,metadata_json FROM {self.store.t.sessions} WHERE session_id=?', (source.session_id,))
-        metadata = await port._authorize_session(tx, target.session_id, source.actor, row)
-        return metadata, row['parent_session_id']
+        row = await port.authorize(tx,target,source.actor)
+        return row
 
     async def create(self, source, *, delay_s=None, due_at_ms=None, note, interval_s=None):
         if (delay_s is None) == (due_at_ms is None):
@@ -89,14 +87,14 @@ class StoreTimerBackend:
         due = due_at_ms if due_at_ms is not None else int(time.time()*1000 + delay_s*1000)
         # Creation and the live-timer limit share the existing session-state lock.
         async with self.store._db.transaction() as tx:
-            meta, parent = await self._authorize(source, tx)
-            state = await self.store._db.dialect.lock_state(tx, self.store.t.session_state, source.session_id)
-            if state['lifecycle'] != 'open':
+            await self.store._db.dialect.lock_state(tx, self.store.t.session_state, source.session_id)
+            row = await self._authorize(source, tx)
+            if row['lifecycle'] != 'open':
                 raise RuntimeRequestError('session_closed')
-            if parent is not None or meta.get('execution_role', 'main') != 'main':
+            if (row['parent_session_id'] is not None or row['created_by_session_id'] is not None
+                    or row['session_kind'] != 'agent'):
                 raise RuntimeRequestError('forbidden', 'only main agents may schedule timers')
-            count = await tx.fetchone(f"SELECT COUNT(*) AS n FROM {self.store.t.timers} WHERE session_id=? AND status IN ('armed','firing')", (source.session_id,))
-            if count['n'] >= 10:
+            if len(await self.store.list_timers(source.session_id,reader=tx)) >= 10:
                 raise RuntimeRequestError('timer_limit_reached')
             return await self.store.create_timer(source.session_id, due_at=due, note=note.strip(), interval_s=interval_s, tx=tx)
 
@@ -108,9 +106,12 @@ class StoreTimerBackend:
         await self._authorize(source, self.store._db)
         # Cancelling a claimed recurring timer prevents rearming; the accepted
         # occurrence remains governed by the normal input cancellation API.
-        return bool(await self.store._db.execute(f"UPDATE {self.store.t.timers} SET status='cancelled',updated_at=? "
-            "WHERE session_id=? AND timer_id=? AND (status='armed' OR (status='firing' AND interval_s IS NOT NULL))",
-            (int(time.time()*1000), source.session_id, timer_id)))
+        def cancel(value):
+            if value['status'] != 'armed' and not (value['status'] == 'firing' and value['interval_s'] is not None):
+                return False
+            value['status'] = 'cancelled'
+            return True
+        return await self.store._change_timer(source.session_id,timer_id,cancel)
 
 
 def backend_for(loop, store=None) -> TimerBackend:

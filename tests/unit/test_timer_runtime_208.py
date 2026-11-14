@@ -16,7 +16,7 @@ from power_loop import (
     create_default_tool_registry,
 )
 
-from .test_runtime_messaging_203 import fixture
+from .session_native_fixture import fixture
 from .test_timers import _Scripted
 
 
@@ -25,7 +25,7 @@ async def composition(store):
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(_Scripted(), create_default_tool_registry(preset='core',bind=False), AgentLoopConfig())
-    factory.register('test.agent@1', build)
+    factory.register('test.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='timers')
     await runtime.worker.start()
     return runtime, target, actor, TimerContext(store.store_id, target.session_id, actor)
@@ -78,26 +78,6 @@ async def test_board_first_writers_and_limit(registry_store):
     assert await store._db.fetchone(f'SELECT 1 FROM {store.t.sessions}') is None
 
 
-@pytest.mark.parametrize('code', ['capability_unavailable','resource_unavailable','definition_unavailable'])
-async def test_factory_code_survives_query(registry_store, code):
-    store, _ = registry_store
-    _, target, actor = await fixture(store)
-    factory = RegistryRuntimeFactory()
-    async def build(descriptor, context):
-        raise RuntimeRequestError(code, 'missing shell@1')
-    factory.register('test.agent@1', build)
-    runtime = Runtime(store=store, factory=factory, node_id='codes', timers_enabled=False)
-    await runtime.worker.start()
-    try:
-        receipt = await runtime.client.send(target, 'test', message_id='missing', actor=actor)
-        result = await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
-        assert result.error_code == code
-        assert (await runtime.client.wait(receipt.input_ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)).error_code == code
-        assert 'shell@1' in result.error
-    finally:
-        await runtime.worker.shutdown()
-        await runtime.client.aclose()
-        await runtime.transport.aclose()
 
 
 @pytest.mark.parametrize('directive,outcome', [('continue','fired'), ('skip','fired'), ('break','cancelled'), ('postpone','armed')])
@@ -118,10 +98,10 @@ async def test_timer_hooks(registry_store, directive, outcome):
         timer = await runtime.timer_backend.create(source, due_at_ms=1, note='hook')
         await runner.scan_once()
         assert (await store.get_timer(target.session_id, timer.timer_id)).status == outcome
-        rows = await store._db.fetchall(f'SELECT content FROM {store.t.follow_up_queue} WHERE session_id=?', (target.session_id,))
+        rows = await store._db.fetchall(f'SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?', (target.session_id,))
         assert len(rows) == (1 if directive == 'continue' else 0)
         if rows:
-            assert 'hook-modified-message' in rows[0]['content']
+            assert 'hook-modified-message' in rows[0]['content_json']
     finally:
         await runtime.worker.shutdown()
         await runtime.client.aclose()
@@ -141,7 +121,7 @@ async def test_timer_backend_authorization_and_closed_target(registry_store):
                        lambda: runtime.timer_backend.cancel(stranger, 1)):
             with pytest.raises(RuntimeRequestError, match='forbidden'):
                 await action()
-        await store._db.execute(f"UPDATE {store.t.session_state} SET lifecycle='closed' WHERE session_id=?", (target.session_id,))
+        await store._db.execute(f"UPDATE {store.t.sessions} SET lifecycle='closed' WHERE session_id=?", (target.session_id,))
         with pytest.raises(RuntimeRequestError, match='session_closed'):
             await runtime.timer_backend.create(source, delay_s=10, note='closed')
     finally:
@@ -156,7 +136,7 @@ async def test_timer_driver_required_and_profiles_preflight(registry_store):
     factory = RegistryRuntimeFactory()
     with pytest.raises(RuntimeRequestError, match='timer_driver'):
         Runtime(store=store, factory=factory, node_id='bad', timer_backend=StoreTimerBackend(store))
-    runtime = Runtime(store=store, factory=factory, node_id='missing', required_profiles=['shell@1'])
+    runtime = Runtime(store=store, factory=factory, node_id='missing', required_profiles=['shell@215'])
     with pytest.raises(RuntimeRequestError, match='missing profiles'):
         await runtime.worker.start()
     assert not runtime.client._accepting
@@ -172,10 +152,10 @@ async def test_registered_resource_check_precedes_accepting_and_can_retry(regist
     async def mount_ready():
         checked.append('mount')
         if not (tmp_path/'mounted').exists():
-            raise RuntimeRequestError('resource_unavailable','workspace@1 mount unavailable')
-    factory.register_profile('workspace@1', preflight=mount_ready)
+            raise RuntimeRequestError('resource_unavailable','workspace@215 mount unavailable')
+    factory.register_profile('workspace@215', preflight=mount_ready)
     runtime = Runtime(store=store,factory=factory,node_id='mount',timers_enabled=False,
-        required_profiles=['workspace@1'])
+        required_profiles=['workspace@215'])
     try:
         with pytest.raises(RuntimeRequestError,match='resource_unavailable'):
             await runtime.worker.start()

@@ -66,40 +66,6 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_marker)
 
 
-@pytest.fixture(autouse=True)
-def require_declared_control_writes(monkeypatch):
-    """Catch forgotten intent declarations, including SQL built dynamically.
-
-    SQL inspection is deliberately confined to tests. Production transactions
-    derive all invalidations and pending-index work from their explicit ports.
-    """
-    import re
-
-    from power_loop.runtime.session_controls import ControlTransaction
-
-    execute = ControlTransaction.execute
-    execute_flag = ControlTransaction.execute_flag
-
-    def declared(self, sql):
-        for table in (self._events, self._jobs, self._executors, self._context_events, self._executor_groups,
-                      self._principal_admissions):
-            # Search the mutation target so WITH ... UPDATE is covered while
-            # a SELECT ... FOR UPDATE remains an ordinary locking read.
-            assert not re.search(r"\b(?:INSERT(?:\s+OR\s+IGNORE|\s+IGNORE)?\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+"
-                + re.escape(table) + r"\b", sql, re.I), ("Control writes must declare an explicit intent", sql)
-
-    async def checked(self, sql, params=()):
-        declared(self, sql)
-        return await execute(self, sql, params)
-
-    async def checked_flag(self, sql, params=()):
-        declared(self, sql)
-        return await execute_flag(self, sql, params)
-
-    monkeypatch.setattr(ControlTransaction, "execute", checked)
-    monkeypatch.setattr(ControlTransaction, "execute_flag", checked_flag)
-
-
 @pytest.fixture
 async def runtime_agent(tmp_path):
     """Compose and close a current Runtime for each test's explicit factory inputs."""
@@ -109,11 +75,11 @@ async def runtime_agent(tmp_path):
     agents = []
     stores = []
 
-    async def create(*, model, store=None, registry=None, config=None, hooks=None, target=None, event_bus=None, task_runtime=None, command=None, allowed_models=None, capacity=1, runtime_env=None, process_control=None):
+    async def create(*, model, store=None, registry=None, config=None, hooks=None, target=None, event_bus=None, command=None, allowed_models=None, capacity=1, runtime_env=None, process_control=None):
         if store is None:
             store = await SessionStore.open(str(tmp_path / f"runtime-{len(agents)}.db"))
             stores.append(store)
-        agent = await RunningAgent(store, model, registry, config, hooks=hooks, event_bus=event_bus, task_runtime=task_runtime, command=command, allowed_models=allowed_models, capacity=capacity, runtime_env=runtime_env, process_control=process_control).start(target=target)
+        agent = await RunningAgent(store, model, registry, config, hooks=hooks, event_bus=event_bus, command=command, allowed_models=allowed_models, capacity=capacity, runtime_env=runtime_env, process_control=process_control).start(target=target)
         agents.append(agent)
         return agent
 

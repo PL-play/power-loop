@@ -30,13 +30,13 @@ async def main():
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(Echo(), None, AgentLoopConfig(max_rounds=1))
-    factory.register('echo@1', build)
-    runtime = Runtime(store=store, factory=factory, node_id='example', required_profiles=['echo@1'])
+    factory.register('echo@215', build)
+    runtime = Runtime(store=store, factory=factory, node_id='example', required_profiles=['echo@215'])
     try:
         await runtime.worker.start()
         actor = TrustedActor('example', 'host', None)
-        target = await runtime.open_session(RuntimeDescriptor(1, 'agent', 'echo@1', None,
-            'builtin.empty@1', 'builtin.none@1', 'builtin.none@1', {}, {}), actor=actor)
+        target = await runtime.open_session(RuntimeDescriptor(2, 'agent', 'echo@215', None,
+            'builtin.empty@215', 'builtin.none@215', 'builtin.none@215', {}, {}), actor=actor)
         timer = await runtime.timer_backend.create(TimerContext(store.store_id, target.session_id, actor),
             delay_s=.01, note='Check progress')
         async with asyncio.timeout(10):

@@ -25,4 +25,4 @@ await board.delete("project-37")  # 宿主结束整个黑板的使用范围。
 python examples/29_shared_blackboard.py
 ```
 
-旧公开名 `SqliteBlackboard` 已删除，不提供兼容别名。装配和生命周期见 [Runtime 11](../../runtime-11.md)。
+旧公开名 `SqliteBlackboard` 已删除，不提供兼容别名。装配和生命周期见 [Runtime 12](../../runtime-12.md)。

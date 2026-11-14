@@ -7,7 +7,7 @@ import pytest
 
 from power_loop import StoreBlackboard, StoreTimerBackend, TimerContext
 
-from .test_runtime_messaging_203 import fixture
+from .session_native_fixture import fixture
 
 
 @pytest.mark.parametrize('mode', ['timers', 'board'])

@@ -1,6 +1,6 @@
 # 构建聊天应用
 
-SDK 11.0.0 · schema 15 · protocol 42 · descriptor 1.
+SDK 12.0.0 · schema 17 · protocol 43 · descriptor 2.
 
 宿主认证用户，保存 TargetRef 与输入 ID，并展示持久 Result 或实时输出。新消息使用新 ID，重试使用原 ID；模型、工具与资源由工厂装配。
 

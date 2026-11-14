@@ -1,8 +1,8 @@
 # Runtime 容量与共享 worker
 
-SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
+SDK 12.0.0 · 会话结构 17 · 协议 43 · 描述符结构 2。
 
-[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
+[Runtime 契约](../../runtime-12.md) · [API](../api/index.md)
 
 Runtime.capacity 限制活跃执行数量。独立会话和子任务使用同一容量机制；工作流等待不占模型槽位。默认使用进程内协调与传输，并取得 store 独占启动锁，第二个独立默认进程会被拒绝。纯 Client 发布者不取得该锁。
 
@@ -14,7 +14,7 @@ Runtime.capacity 限制活跃执行数量。独立会话和子任务使用同一
 
 ## 可执行示例
 
-从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design215_single_process.py。
 
 | 示例 | 行为 |
 |---|---|

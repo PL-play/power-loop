@@ -1,8 +1,8 @@
 # 事件与输出
 
-SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
+SDK 12.0.0 · 会话结构 17 · 协议 43 · 描述符结构 2。
 
-[Runtime 契约](../../runtime-11.md) · [API](../api/index.md)
+[Runtime 契约](../../runtime-12.md) · [API](../api/index.md)
 
 通过 ExecutionEnvironment.event_bus 提供 EventBus。执行前订阅，使用会话与执行身份关联模型、工具、子任务、用量和生命周期事件。共享 bus 按目标会话过滤。执行结束时 Runtime 删除自己的流式订阅，并限时排空异步订阅回调；宿主拥有自己的订阅和 bus。
 
@@ -12,7 +12,7 @@ SDK 11.0.0 · 任务结构 15 · 协议 42 · 描述符结构 1。
 
 ## 可执行示例
 
-从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design203_single_process.py。
+从 SDK 源码目录使用已安装依赖的环境运行。完整程序包含资源清理；编号示例共用 examples/_runtime.py。依赖宿主的示例明确列出所需服务。不依赖该辅助文件的完整装配见 design215_single_process.py。
 
 | 示例 | 行为 |
 |---|---|

@@ -199,7 +199,7 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 
 ## 当前存储
 
-11.0.0 使用新 SDK 库，不导入或转换历史 SDK 会话。当前数据的投影缺失或版本不符时读取原始消息，正常投影修复保留。
+12.0.0 使用新 SDK 库，不导入或转换历史 SDK 会话。当前数据的投影缺失或版本不符时读取原始消息，正常投影修复保留。
 
 
 ## 鲁棒性：自愈错乱的历史

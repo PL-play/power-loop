@@ -30,31 +30,106 @@ def test_stable_api_symbols_are_exported_and_real() -> None:
     assert not missing_all, f"STABLE_API names not in __all__: {missing_all}"
 
 
-# Frozen stable surface for 11.0: input receipts and durable results replace
-# the retired direct-loop result/queued-return types.
-_FROZEN_STABLE_V11 = frozenset({
-    "StatefulAgentLoop", "Receipt", "Result", "Runtime", "RuntimeClient", "RuntimeWorker",
-    "AgentLoopConfig", "AgentLoopResult", "SessionStore", "SubagentLifecycle",
-    "PowerLoopError", "SessionNotFoundError",
-    "LLMTimeout", "LLMRetryExhausted", "CancellationRequested",
-    "LLMRetryPolicy", "CancellationToken",
-    "AgentHooks", "AgentEventBus", "HookPoint", "HookDirective",
-    "ToolRegistry", "ToolDefinition",
-    # construction closure (1.0): build + use + implement a provider from STABLE symbols
-    "LLMService", "LLMRequest", "LLMResponse", "LLMStreamChunk",
-    "LLMProviderConfig", "create_llm_service_from_env", "create_llm_service_from_config",
+_FROZEN_STABLE_V12 = frozenset({
+    'AgentEventBus',
+    'AgentHooks',
+    'AgentLoopConfig',
+    'AgentLoopResult',
+    'CancellationRequested',
+    'CancellationToken',
+    'CapacityError',
+    'CancelPropagation',
+    'CostExtractor',
+    'DatabasePollingTransport',
+    'DefaultCostExtractor',
+    'DefaultTokenUsageExtractor',
+    'ExecutionContext',
+    'ExecutionEnvironment',
+    'ExecutionState',
+    'FieldCostExtractor',
+    'FieldTokenUsageExtractor',
+    'HookDirective',
+    'HookPoint',
+    'InputRef',
+    'InputState',
+    'Lifecycle',
+    'LLMProviderConfig',
+    'LLMRequest',
+    'LLMResponse',
+    'LLMRetryExhausted',
+    'LLMRetryPolicy',
+    'LLMService',
+    'LLMStreamChunk',
+    'LLMTimeout',
+    'MemoryMessageTransport',
+    'MemorySessionOwnershipCoordinator',
+    'MessagePage',
+    'MessageRow',
+    'MessageState',
+    'MessageTransport',
+    'ModelCapabilities',
+    'ModelCapabilityError',
+    'OutputSubscription',
+    'PowerLoopError',
+    'Priority',
+    'ProviderCost',
+    'PublishReceipt',
+    'Receipt',
+    'RegistryRuntimeFactory',
+    'RequestOptions',
+    'ResponseExtractionError',
+    'ResponseMetrics',
+    'Result',
+    'ResultKind',
+    'Runtime',
+    'RuntimeClient',
+    'RuntimeDescriptor',
+    'RuntimeFactory',
+    'RuntimeRequestError',
+    'RuntimeWorker',
+    'SessionBusy',
+    'SessionKind',
+    'SessionLeaseLost',
+    'SessionNotFoundError',
+    'SessionOwnership',
+    'SessionOwnershipCoordinator',
+    'SessionPage',
+    'SessionStore',
+    'ShutdownResult',
+    'StatefulAgentLoop',
+    'Status',
+    'StoreBlackboard',
+    'StoreError',
+    'StoreSessionOwnershipCoordinator',
+    'StoreTimerBackend',
+    'SubscriptionSpec',
+    'TargetRef',
+    'TerminalStatus',
+    'TimerBackend',
+    'TimerContext',
+    'TimerDriver',
+    'TimerDriverStatus',
+    'TimerRunner',
+    'TokenUsageExtractor',
+    'ToolDefinition',
+    'ToolRegistry',
+    'TransportCapabilities',
+    'TransportPacket',
+    'TrustedActor',
+    'WaitTimeout',
+    'create_llm_service_from_config',
+    'create_llm_service_from_env',
+    'result_message_id',
+    'timer_context',
 })
 
 
-def test_stable_api_semver_guard() -> None:
-    """No STABLE symbol may be dropped/renamed without a major bump (and a conscious
-    edit to this frozen baseline)."""
-    current = set(power_loop.STABLE_API)
-    removed = _FROZEN_STABLE_V11 - current
-    assert not removed, (
-        f"STABLE_API dropped/renamed {sorted(removed)} — that's a breaking change "
-        "requiring a MAJOR version bump. If intentional, update _FROZEN_STABLE_V11."
-    )
+def test_frozen_v12():
+    import importlib.metadata
+
+    assert set(power_loop.STABLE_API) == _FROZEN_STABLE_V12
+    assert power_loop.__version__ == importlib.metadata.version('power-loop') == '12.0.0'
+    assert not {'JobRef', 'JobPage', 'Command', 'SubagentLifecycle'} & set(power_loop.__all__)
 
 
 # The error `.code` dotted strings are an advertised machine-readable contract

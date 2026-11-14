@@ -233,19 +233,19 @@ class OutputSubscription:
                 payload = delivery.packet.payload or {}
                 if payload.get("kind") == "delta":
                     self.sequence += 1
-                    return OutputItem(self.ref, None, self.sequence, "delta", plain(payload))
+                    return OutputItem(self.ref, self.sequence, "delta", plain(payload))
             if input_ref is not None:
                 result = await self.client.inputs.get_result(input_ref, actor=self.actor)
                 if result is not None:
                     self.sequence += 1
                     await self.aclose()
-                    return OutputItem(self.ref, None, self.sequence, "completed", plain(result))
+                    return OutputItem(self.ref, self.sequence, "completed", plain(result))
             await self.client.inspect(self.ref, actor=self.actor)
             if self.initial or (payload and payload.get("kind") in {"gap", "error"}):
                 self.initial = False
                 self.sequence += 1
                 kind = payload.get("kind", "gap") if payload else "gap"
-                return OutputItem(self.ref, None, self.sequence, kind, plain(payload or {}))
+                return OutputItem(self.ref, self.sequence, kind, plain(payload or {}))
         raise StopAsyncIteration
 
     async def aclose(self):

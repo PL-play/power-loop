@@ -1,4 +1,4 @@
-# Examples (11.0.0)
+# Examples (12.0.0)
 
 Default examples use fixed model responses but execute the actual Runtime, tools and store. No model credentials are needed. Example 18 uses a real provider and requires model configuration/credentials. Example 28 requires a working Docker CLI/daemon. Example 38 requires MCP 2.x (`pip install 'power-loop[mcp]'`). Missing dependencies are errors, not successful validation.
 

@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, JobRef, SubagentLifecycle, ToolDefinition, ToolRegistry
+from power_loop import AgentLoopConfig, AgentSpec, InputRef, ToolDefinition, ToolRegistry
 from power_loop.agent.runtime_store import now_ms
 from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.pricing import Free
@@ -24,11 +24,11 @@ async def test_parent_can_spawn_subagent_via_tool(tmp_path):
         'Delegate once with spawn_agent; after subagent_result report the answer.',max_rounds=5,max_tokens=2048,compactor=None)) as runner:
         await runner.send('Delegate this and report back: what is the capital of Japan? Give the child tools=[]; after acceptance end the turn.')
         receipt=await tool_receipt(runner,'spawn_agent')
-        result=await runner.runtime.client.wait(JobRef(**receipt['job_ref']),actor=runner.actor,deadline_ms=now_ms()+120000)
+        result=await runner.runtime.client.wait(InputRef(**receipt['input_ref']),actor=runner.actor,deadline_ms=now_ms()+120000)
         assert result.status=='completed' and any(word in result.final_text.lower() for word in ('tokyo','东京'))
         await settle(runner)
         children=await runner.runtime.store.list_children(runner.target.session_id)
-        assert len(children)==1 and children[0].lifecycle is SubagentLifecycle.LINKED
+        assert len(children)==1 and children[0].cancel_propagation == "linked"
         rows=await runner.runtime.store.load_all_messages(runner.target.session_id)
         assert any(word in [row.content for row in rows if row.role=='assistant' and row.content][-1].lower() for word in ('tokyo','东京'))
 
@@ -44,7 +44,7 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child(tmp_path):
         result=await runner.send('explicit host command')
         assert result.status=='completed' and '42' in result.final_text
         children=await runner.runtime.store.list_children(runner.target.session_id)
-        assert len(children)==1 and children[0].lifecycle is SubagentLifecycle.LINKED
+        assert len(children)==1 and children[0].cancel_propagation == "linked"
         rows=await runner.runtime.store.load_all_messages(children[0].session_id)
         assert any(row.role=='assistant' and '42' in str(row.content) for row in rows)
 
@@ -64,7 +64,7 @@ async def test_spawn_agent_returns_parsed_json_without_native_json_schema(tmp_pa
     async with live_agent(tmp_path,model,registry,AgentLoopConfig(max_rounds=5,max_tokens=2048,compactor=None)) as runner:
         await runner.send('Use spawn_agent once. Ask the child to triage checkout returning 500 for every user; payments are down. Tell it to return JSON with urgent priority and an owning team. Supply output_schema='+json.dumps(schema)+'. Give it tools=[] and finish after acceptance.')
         receipt=await tool_receipt(runner,'spawn_agent')
-        result=await runner.runtime.client.wait(JobRef(**receipt['job_ref']),actor=runner.actor,deadline_ms=now_ms()+120000)
+        result=await runner.runtime.client.wait(InputRef(**receipt['input_ref']),actor=runner.actor,deadline_ms=now_ms()+120000)
         assert result.status=='completed',result
         assert result.structured_output['priority']=='urgent'
         assert result.structured_output['team'].strip()

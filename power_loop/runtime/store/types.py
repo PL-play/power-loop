@@ -12,7 +12,7 @@ for backward-compatible imports.)
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -27,7 +27,6 @@ __all__ = [
     "MessageRow",
     "SessionStateRow",
     "CompactionRow",
-    "BackgroundTaskRow",
     "NoteRow",
     "ProjectMessageRow",
     "HookEventRow",
@@ -97,26 +96,26 @@ class SessionStatsRow:
     first_send_at: int | None
     last_send_at: int | None
     updated_at: int
-    #: Prompt cache-read tokens (v5). Default 0 so the legacy SQLite store (which doesn't track it)
-    #: still constructs the row.
+    #: Prompt cache-read tokens.
     cached_tokens: int = 0
 
 
 @dataclass
 class SessionRow:
+    """Schema 17 session identity and frozen runtime descriptor."""
+
     session_id: str
     created_at: int
     updated_at: int
-    system_prompt: str | None
-    model: str | None
-    config: dict[str, Any]
-    status: SessionStatus
-    kind: SessionKind
+    session_kind: str
     parent_session_id: str | None
-    spawn_tool_call_id: str | None
-    spawn_depth: int
-    lifecycle: SubagentLifecycle
-    metadata: dict[str, Any] = field(default_factory=dict)
+    created_by_session_id: str | None
+    lifecycle: str
+    cancel_propagation: str
+    tenant_id: str
+    principal_id: str
+    descriptor: Any
+    result_route: dict[str, Any] | None
 
 
 #: ``MessageRow.meta`` key recording that the row's ``content`` TEXT column holds a
@@ -186,18 +185,6 @@ class CompactionRow:
     created_at: int
 
 
-@dataclass
-class BackgroundTaskRow:
-    session_id: str
-    task_id: str
-    command: str
-    status: str
-    return_code: int | None
-    output_tail: str | None
-    output_path: str | None
-    last_seen_at: int
-    created_at: int
-    updated_at: int
 
 
 @dataclass
@@ -244,7 +231,7 @@ class ProjectMessageRow:
 
 @dataclass
 class HookEventRow:
-    """One audit row of an EPHEMERAL hook augmentation (``{prefix}hook_events``) — e.g. the memory
+    """One audit row of an EPHEMERAL hook augmentation (``session_runtime_state``) — e.g. the memory
     block an ``LLM_BEFORE`` hook injected into a single LLM call's request. It is observability ONLY:
     written alongside the message it fed into, NEVER read back into history or the LLM request. So
     the injected context (which today vanishes after the call) is recoverable for audit.

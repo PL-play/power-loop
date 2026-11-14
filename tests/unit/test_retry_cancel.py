@@ -198,7 +198,7 @@ async def test_pipeline_cancel_status_and_event(runtime_agent):
     receipt = await loop.runtime.client.send(loop.target, "hi", message_id="cancel", actor=loop.actor)
     await asyncio.wait_for(entered.wait(), 5)
     status = await loop.runtime.client.inspect(receipt.input_ref, actor=loop.actor)
-    await loop.runtime.client.cancel(status.job_ref, actor=loop.actor)
+    await loop.runtime.client.cancel(status.target, actor=loop.actor)
     result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
     await loop.finish(receipt.input_ref, failed=True)
     assert result.status == "cancelled" and llm.calls == 1

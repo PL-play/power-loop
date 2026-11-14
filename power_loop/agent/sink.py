@@ -17,8 +17,6 @@ import logging
 from typing import Any, Protocol, runtime_checkable
 
 from power_loop.agent.types import LoopMessage
-from power_loop.contracts.errors import InboxClaimChanged
-from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.store.types import (
     CONTENT_ENCODING_JSON,
@@ -217,21 +215,13 @@ class SQLiteSink:
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
             text, structured = _encode_content(message.get("content"))
-            from power_loop.runtime.task_runtime import bind_tool_receipt, tool_receipt_required
-
-            # Operation-free calls clear pending with the message. Calls with a
-            # task operation retain it durably until receipt binding succeeds,
-            # including across process death between these two transactions.
             resolves = bool(tool_call_id) and tool_call_id in self._unresolved
-            needs_receipt = resolves and tool_receipt_required(
-                self.store, self.session_id, self._assistant_seq, tool_call_id)
             options = dict(usage_options)
             remaining_pending = None
             if resolves:
                 remaining = self._unresolved - {tool_call_id}
                 remaining_pending = await self._remaining_pending(remaining, round_index) if remaining else None
-                if not needs_receipt:
-                    options["pending"] = remaining_pending
+                options["pending"] = remaining_pending
             seq = await self.store.append_message(
                 self.session_id,
                 role="tool",
@@ -248,11 +238,7 @@ class SQLiteSink:
             self._capture_row(seq, "tool", message, round_index, message.get("send_index"))
             if usage:
                 self._usage_written.add(round_index)
-            assistant_seq = self._assistant_seq
-            await bind_tool_receipt(self.store, self.session_id, assistant_seq, tool_call_id, seq)
             if resolves:
-                if needs_receipt:
-                    await self.store.set_pending(self.session_id, remaining_pending)
                 self._unresolved.discard(tool_call_id)
                 if not self._unresolved:
                     self._assistant_seq = None
@@ -297,27 +283,16 @@ class SQLiteSink:
             # Which inbox items this row carries (dedupe/audit; design/124 §6).
             meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
                                               if k in inbox}}
-        try:
-            seq = await self.store.append_message(
-                self.session_id,
-                role=str(role or "user"),
-                content=text,
-                name=message.get("name"),
-                round_index=round_index,
-                meta=meta,
-                send_index=message.get("send_index"),
-                inbox=inbox,
-                **usage_options,
-            )
-        except InboxClaimChanged:
-            # The batch was rolled back. Release only its surviving claim rows;
-            # the pipeline will render a fresh batch, never reuse the old text.
-            await self.store.inbox_release(self.session_id, inbox["claim_token"])
-            pending = (await self.store.inbox_counts(self.session_id))["pending"]
-            loop = get_current_loop()
-            if pending and loop is not None:
-                loop._note_committed_inbox(self.session_id)
-            raise
+        seq = await self.store.append_message(
+            self.session_id,
+            role=str(role or "user"),
+            content=text,
+            name=message.get("name"),
+            round_index=round_index,
+            meta=meta,
+            send_index=message.get("send_index"),
+            **usage_options,
+        )
         self._history_seqs.append(seq)
         self._history_ord.append(seq)
         self._capture_row(seq, str(role or "user"), message, round_index, message.get("send_index"))

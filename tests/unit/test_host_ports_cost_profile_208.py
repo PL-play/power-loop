@@ -19,10 +19,10 @@ from power_loop import (
 from power_loop.agent.runtime_transport import MemoryMessageTransport
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 from power_loop.runtime.store.process_guard import ProcessStoreGuard
+from tests.row_profile import _snapshot
 from tests.write_meter import WriteMeter
 
-from .test_runtime_messaging_203 import fixture
-from .test_send_row_profile import _snapshot
+from .session_native_fixture import fixture
 from .test_send_sql_profile import Profiled, _counts
 
 

@@ -1,11 +1,8 @@
-"""Host-invoked retention; one shared row allowance per call, including every transaction."""
+"""Bounded retention over schema 17 sessions, terminal inputs and derived history."""
 from __future__ import annotations
 
-from . import message_usage
-
 DAY_MS = 86400000
-DEFAULT_DAYS = {'task_trees': 30, 'executors': 1, 'follow_ups': 7, 'timers': 7,
-                'hooks': 30, 'usage': 90, 'runtime': 30}
+DEFAULT_DAYS = {'sessions': 30, 'messages': 30, 'inbox': 7, 'runtime': 30, 'projections': 30}
 
 
 def batch_limit(limit):
@@ -27,142 +24,9 @@ async def delete_batch(tx, table, keys, where, params, limit, *, order=None):
                             (*values, *params))
 
 
-async def prune_timers(store, session_id, *, statuses, cutoff, limit):
-    limit = batch_limit(limit)
-    if not statuses:
-        return 0
-    if not set(statuses) <= {'fired', 'cancelled', 'unknown'}:
-        raise ValueError('only terminal timers can be pruned')
-    where, params = 'status IN ('+','.join('?' for _ in statuses)+')', list(statuses)
-    if session_id is not None:
-        where += ' AND session_id=?'
-        params.append(session_id)
-    if cutoff is not None:
-        where += ' AND updated_at<?'
-        params.append(cutoff)
-    async with store._db.transaction() as tx:
-        return await delete_batch(tx, store.t.timers, ('session_id', 'timer_id'), where, params,
-                                  limit, order='updated_at,session_id,timer_id')
+async def purge_expired(store, now, *, limit, retention_days, session_id=None, categories=None):
+    from .closing import busy
 
-
-async def prune_usage(store, session_id, *, cutoff, limit):
-    """Both observation sources, without reading the historical reporting view."""
-    limit = batch_limit(limit)
-    where, params = 'created_at<?', [cutoff]
-    if session_id is not None:
-        where += ' AND session_id=?'
-        params.append(session_id)
-    backend = store._db.dialect.name
-    present = ("CAST(meta_json AS jsonb)->'_round_usage'" if backend == 'postgres'
-               else "JSON_EXTRACT(meta_json,'$._round_usage')")
-    columns = 'session_id,send_index,round_index,created_at'
-    async with store._db.transaction() as tx:
-        observations = await tx.fetchall(f'SELECT {columns} FROM {store.t.usage_observations} '
-            f'WHERE {where} ORDER BY created_at LIMIT ?', (*params, limit))
-        messages = await tx.fetchall(f'SELECT seq,{columns} FROM {store.t.messages} '
-            f'WHERE {where} AND {present} IS NOT NULL ORDER BY created_at LIMIT ?', (*params, limit))
-        changed = 0
-        for row in sorted([*observations, *messages], key=lambda row: row['created_at']):
-            key = (row['session_id'], row['send_index'] or 0, row['round_index'])
-            if changed == limit:
-                break
-            if 'seq' in row:
-                affected = await tx.execute(f'UPDATE {store.t.messages} SET meta_json={message_usage.remove_sql(backend)} '
-                    f'WHERE session_id=? AND seq=? AND created_at<? AND {present} IS NOT NULL',
-                    (row['session_id'], row['seq'], cutoff))
-            else:
-                affected = await tx.execute(f'DELETE FROM {store.t.usage_observations} '
-                    'WHERE session_id=? AND send_index=? AND round_index=? AND created_at<?', (*key, cutoff))
-            changed += affected
-        return changed
-
-
-def ready_condition(prefix):
-    # All subqueries use a root/job/session key index. A pending alert remains
-    # actionable even if its root has already published a closure.
-    return ("root.supervision_status='closed' AND NOT EXISTS ("
-        f'SELECT 1 FROM {prefix}jobs j WHERE j.root_job_id=root.job_id AND ('
-        "j.supervision_status<>'closed' OR j.resource_state<>'stopped' OR j.intake<>'closed')) "
-        f'AND NOT EXISTS (SELECT 1 FROM {prefix}jobs j JOIN {prefix}job_events e ON e.job_id=j.job_id '
-        f'JOIN {prefix}follow_up_queue q ON q.session_id=root.session_id AND q.item_id=e.event_id '
-        "WHERE j.root_job_id=root.job_id AND e.event_type='task_alert' AND q.status IN ('pending','claimed'))")
-
-
-async def ready_tree(tx, prefix, root_id):
-    return await tx.fetchone(f'SELECT job_id FROM {prefix}jobs root WHERE root.job_id=? AND '
-                            +ready_condition(prefix), (root_id,))
-
-
-async def lock_root(store, tx, root_id):
-    suffix = '' if store._db.dialect.name == 'sqlite' else ' FOR UPDATE'
-    return await tx.fetchone(f'SELECT * FROM {store.table_prefix}jobs WHERE job_id=?'+suffix, (root_id,))
-
-
-def runtime_tree_condition(store):
-    p, r = store.table_prefix, store.t.session_runtime_state
-    concat = (lambda *parts: 'CONCAT('+','.join(parts)+')') if store._db.dialect.name == 'mysql' else (lambda *parts: ' || '.join(parts))
-    child = concat("'subagent:child:'", 'j.session_id')
-    run = concat("'subagent:run:'", 'SUBSTR(e.event_id,4)')
-    workflow = concat("'workflow:run:'", 'SUBSTR(e.event_id,4)')
-    node = concat("'workflow:node:'", 'e.operation_key')
-    # Restrict the outer runtime table by its (session_id,state_key) primary key.
-    # Historical descriptors belonging to other trees are not cleanup candidates.
-    sessions = (f'{r}.session_id IN (SELECT j.session_id FROM {p}jobs j WHERE j.root_job_id=? '
-        f'UNION SELECT j.created_by_session_id FROM {p}jobs j WHERE j.root_job_id=? '
-        f'UNION SELECT e.caller_session_id FROM {p}jobs j JOIN {p}job_events e ON e.job_id=j.job_id '
-        f"WHERE j.root_job_id=? AND e.event_type='operation') AND ")
-    return sessions + (f"EXISTS (SELECT 1 FROM {p}jobs j WHERE j.root_job_id=? AND ("
-        f"(j.created_by_session_id={r}.session_id AND {r}.state_key={child}) OR "
-        f"EXISTS (SELECT 1 FROM {p}job_events e WHERE e.job_id=j.job_id AND e.event_type='operation' AND ("
-        f"({r}.session_id=COALESCE(e.caller_session_id,j.created_by_session_id) AND {r}.state_key={run}) OR "
-        f"({r}.session_id=j.session_id AND {r}.state_key={workflow}) OR "
-        f"({r}.session_id=j.created_by_session_id AND {r}.state_key={node})))))")
-
-
-async def tree_runtime(store, tx, root_id, cutoff, limit, *, force=False):
-    where = runtime_tree_condition(store)
-    params = (root_id,)*4 + (() if force else (cutoff,))
-    count = await delete_batch(tx, store.t.session_runtime_state, ('session_id', 'state_key'),
-        where + ('' if force else ' AND updated_at<?'), params, limit)
-    retained = await tx.fetchone(f'SELECT state_key FROM {store.t.session_runtime_state} WHERE {where} LIMIT 1', (root_id,)*4)
-    return count, bool(retained)
-
-
-async def delete_tree(store, tx, root_id, limit, counts):
-    """Remove dependents before jobs and keep the root until the final batch."""
-    p = store.table_prefix
-    remaining = limit
-    jobs = f'SELECT job_id FROM {p}jobs WHERE root_job_id=?'
-    # Follow-up references must disappear before their event IDs do.
-    where = (f'delivered_job_id IN ({jobs}) OR target_job_id IN ({jobs})')
-    specs = [(store.t.follow_up_queue, 'follow_up_queue', ('id',), where, (root_id, root_id))]
-    for table, keys in (
-        ('job_events', ('event_id',)), ('execution_checkpoints', ('job_id','generation'))):
-        specs.append((p+table, table, keys, f'job_id IN ({jobs})', (root_id,)))
-    for table, category, keys, where, params in specs:
-        if not remaining:
-            return False
-        deleted = await delete_batch(tx, table, keys, where, params, remaining)
-        counts[category] = counts.get(category, 0)+deleted
-        remaining -= deleted
-        if not remaining:
-            return False
-    # Bound the child deletion as well. The root is not among these candidates.
-    deleted = await delete_batch(tx, p+'jobs', ('job_id',), 'root_job_id=? AND job_id<>?',
-                                 (root_id, root_id), remaining)
-    counts['jobs'] = counts.get('jobs', 0)+deleted
-    remaining -= deleted
-    if not remaining:
-        return False
-    # A partial child batch spends the whole allowance, so reaching here means
-    # every dependent and child was removed in this or previous batches.
-    deleted = await tx.execute(f'DELETE FROM {p}jobs WHERE job_id=?', (root_id,))
-    counts['jobs'] = counts.get('jobs', 0)+deleted
-    counts['task_trees'] = counts.get('task_trees', 0)+deleted
-    return True
-
-
-async def purge_expired(store, now, *, limit, retention_days, session_id=None, job_id=None, categories=None):
     remaining = batch_limit(limit)
     days = {**DEFAULT_DAYS, **(retention_days or {})}
     if days.keys() != DEFAULT_DAYS.keys() or any(type(v) not in (int, float) or v < 0 for v in days.values()):
@@ -172,120 +36,61 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, j
         raise ValueError('unknown retention category')
     cutoff = {key: int(now-value*DAY_MS) for key, value in days.items()}
     counts = {}
-    p = store.table_prefix
-    root_filter, root_params = '', ()
-    if job_id is not None:
-        # A job selects its whole tree; trees are only removed once fully finished.
-        row = await store._db.fetchone(f'SELECT root_job_id FROM {p}jobs WHERE job_id=?', (job_id,))
-        if row is None:
-            return counts
-        root_filter, root_params = ' AND job_id=?', (row['root_job_id'] or job_id,)
-        wanted &= {'task_trees'}
-    elif session_id is not None:
-        root_filter, root_params = ' AND session_id=?', (session_id,)
-        wanted -= {'executors', 'runtime'}
-    scope, scope_params = (' AND session_id=?', (session_id,)) if session_id is not None else ('', ())
-    async with store._db.transaction() as tx:
-        ordinary = (f' AND NOT EXISTS (SELECT 1 FROM {store.table_prefix}jobs j '
-                    f'WHERE (j.job_id={store.t.follow_up_queue}.delivered_job_id '
-                    f'OR j.job_id={store.t.follow_up_queue}.target_job_id) '
-                    "AND (j.supervision_status<>'closed' OR j.resource_state<>'stopped'))") if store.has_message_ids else ''
-        for category, age, table, keys, where, params, order in (
-            ('follow_up_queue', 'follow_ups', store.t.follow_up_queue, ('id',),
-             "status IN ('delivered','void') AND created_at<? AND (delivered_at IS NULL OR delivered_at<?)"+ordinary,
-             (cutoff['follow_ups'], cutoff['follow_ups']), 'created_at,id'),
-            ('hook_events', 'hooks', store.t.hook_events, ('session_id','event_id'), 'created_at<?',
-             (cutoff['hooks'],), 'created_at,session_id,event_id')):
-            if age in wanted:
-                counts[category] = await delete_batch(tx, table, keys, where+scope, (*params, *scope_params),
-                                                      remaining, order=order)
-                remaining -= counts[category]
-    for category, prune, age in (('timers', store.prune_timers, 'timers'),
-                                 ('usage_rounds', store.prune_usage_rounds, 'usage')):
+    scope, params = (' AND s.session_id=?', (session_id,)) if session_id else ('', ())
+    candidates = await store._db.fetchall(
+        f'SELECT s.session_id FROM {store.t.sessions} s JOIN {store.t.session_state} st '
+        "ON st.session_id=s.session_id WHERE st.execution_state='idle' AND s.updated_at<?"
+        + scope + ' ORDER BY s.updated_at,s.session_id LIMIT ?',
+        (max(cutoff.values()), *params, remaining),
+    )
+    for candidate in candidates:
         if not remaining:
-            return counts
-        if age in wanted:
-            counts[category] = await prune(session_id, older_than_ms=int(now-cutoff[age]), now=now, limit=remaining)
-            remaining -= counts[category]
-    if not store.has_message_ids or not remaining:
-        return counts
-    runtime_ref = runtime_tree_condition(store).replace('j.root_job_id=?', 'j.root_job_id=root.job_id')
-    if 'task_trees' not in wanted:
-        roots = []
-    else:
-        roots = await store._db.fetchall(f'SELECT job_id FROM {p}jobs root WHERE '
-            +ready_condition(p)+f' AND parent_job_id IS NULL{root_filter} AND updated_at<? AND NOT EXISTS ('
-            f'SELECT 1 FROM {store.t.session_runtime_state} WHERE updated_at>=? AND {runtime_ref}) '
-            'ORDER BY updated_at,job_id LIMIT ?',
-            (*root_params, min(cutoff['task_trees'], cutoff['runtime']), cutoff['runtime'], remaining))
-    for candidate in roots:
-        if not remaining:
-            return counts
+            break
+        sid = candidate['session_id']
         async with store._db.transaction() as tx:
-            root = await lock_root(store, tx, candidate['job_id'])
-            if root is None or root['updated_at'] >= cutoff['task_trees'] or not await ready_tree(tx, p, root['job_id']):
+            state = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            row = await tx.fetchone(f'SELECT lifecycle,updated_at FROM {store.t.sessions} WHERE session_id=?', (sid,))
+            if row is None or await busy(store, tx, sid, state):
                 continue
-            deleted, retained = await tree_runtime(store, tx, root['job_id'], cutoff['runtime'], remaining)
-            counts['session_runtime_state'] = counts.get('session_runtime_state', 0)+deleted
-            remaining -= deleted
-            if not retained and remaining:
-                before = sum(v for k, v in counts.items() if k != 'task_trees')
-                await delete_tree(store, tx, root['job_id'], remaining, counts)
-                remaining -= sum(v for k, v in counts.items() if k != 'task_trees')-before
-    if not remaining:
-        return counts
-    if 'executors' in wanted:
-        unreferenced = f'NOT EXISTS (SELECT 1 FROM {p}jobs j WHERE j.executor_key={p}task_executors.executor_key)'
-        candidates = await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
-            f"WHERE state='draining' AND updated_at<? AND {unreferenced} ORDER BY updated_at LIMIT ?",
-            (cutoff['executors'], remaining))
-        candidates += await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
-            f'WHERE lease_until_ms<? AND {unreferenced} ORDER BY lease_until_ms LIMIT ?', (cutoff['executors'], remaining))
-        for key in sorted({row['executor_key'] for row in candidates}):
-            if not remaining:
-                break
-            async with store._db.transaction() as tx:
-                suffix = '' if store._db.dialect.name == 'sqlite' else ' FOR UPDATE'
-                row = await tx.fetchone(f'SELECT * FROM {p}task_executors WHERE executor_key=?'+suffix, (key,))
-                if row is None or not (row['lease_until_ms'] < cutoff['executors'] or
-                                      row['state'] == 'draining' and row['updated_at'] < cutoff['executors']):
-                    continue
-                if await tx.fetchone(f'SELECT job_id FROM {p}jobs WHERE executor_key=? LIMIT 1', (key,)):
-                    continue
-                deleted = await delete_batch(tx, p+'task_executor_events', ('event_id',), 'executor_key=?', (key,), remaining)
-                counts['task_executor_events'] = counts.get('task_executor_events', 0)+deleted
-                remaining -= deleted
-                if remaining:
-                    deleted = await tx.execute(f'DELETE FROM {p}task_executors WHERE executor_key=?', (key,))
-                    counts['task_executors'] = counts.get('task_executors', 0)+deleted
-                    remaining -= deleted
-    if 'runtime' in wanted:
-        await _descriptors(store, cutoff, remaining, counts)
-    return counts
-
-
-async def _descriptors(store, cutoff, remaining, counts):
-    p = store.table_prefix
-    if remaining >= 2:
-        table = store.t.sessions
-        present = ("CAST(metadata_json AS jsonb)->'runtime_descriptor'" if store._db.dialect.name == 'postgres'
-                   else "JSON_EXTRACT(metadata_json,'$.runtime_descriptor')")
-        where = (f"kind='subagent' AND updated_at<? AND {present} IS NOT NULL "
-            f'AND NOT EXISTS (SELECT 1 FROM {p}jobs j WHERE j.session_id={table}.session_id) '
-            f'AND NOT EXISTS (SELECT 1 FROM {store.t.follow_up_queue} q WHERE q.session_id={table}.session_id)')
-        rows = await store._db.fetchall(f'SELECT session_id FROM {table} WHERE {where} ORDER BY updated_at,session_id LIMIT ?',
-                                       (cutoff['runtime'], remaining//2))
-        for row in rows:
-            async with store._db.transaction() as tx:
-                sid = row['session_id']
-                await store._db.dialect.lock_state(tx, store.t.session_state, sid)
-                if not await tx.fetchone(f'SELECT session_id FROM {table} WHERE session_id=? AND {where}',
-                                        (sid, cutoff['runtime'])):
-                    continue
-                removed = ("CAST(CAST(metadata_json AS jsonb)-'runtime_descriptor' AS text)"
-                           if store._db.dialect.name == 'postgres' else "JSON_REMOVE(metadata_json,'$.runtime_descriptor')")
-                count = await tx.execute(f"UPDATE {store.t.session_state} SET lifecycle='closed',inbox_version=inbox_version+1 "
-                                         'WHERE session_id=?', (sid,))
-                count += await tx.execute(f'UPDATE {table} SET metadata_json={removed} WHERE session_id=?', (sid,))
-                counts['descriptor_rows'] = counts.get('descriptor_rows', 0)+count
+            if await tx.fetchone(
+                f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? LIMIT 1', (sid,),
+            ):
+                continue
+            if 'inbox' in wanted:
+                count = await delete_batch(tx, store.t.follow_up_queue, ('id',),
+                    'session_id=? AND terminal_status IS NOT NULL AND completed_at<?',
+                    (sid, cutoff['inbox']), remaining)
+                counts['inbox'] = counts.get('inbox', 0) + count
                 remaining -= count
+            # Open sessions retain their context/journal. Closed sessions can be
+            # drained in bounded batches, but results remain while inputs reference them.
+            if row['lifecycle'] == 'open' or await tx.fetchone(
+                f'SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? LIMIT 1', (sid,),
+            ):
+                continue
+            for category, table, keys, age_column in (
+                ('projections', store.t.project_messages, ('id',), 'created_at'),
+                ('runtime', store.t.session_runtime_state, ('state_key',), 'updated_at'),
+                ('messages', store.t.messages, ('id',), 'created_at'),
+            ):
+                if category in wanted:
+                    count = await delete_batch(tx, table, keys,
+                        f'session_id=? AND {age_column}<?', (sid, cutoff[category]), remaining)
+                    counts[category] = counts.get(category, 0) + count
+                    remaining -= count
+            if 'sessions' not in wanted or remaining < 2 or row['updated_at'] >= cutoff['sessions']:
+                continue
+            retained = False
+            for table in (store.t.project_messages, store.t.session_runtime_state, store.t.messages):
+                if await tx.fetchone(f'SELECT session_id FROM {table} WHERE session_id=? LIMIT 1', (sid,)):
+                    retained = True
+                    break
+            if retained:
+                continue
+            count = await tx.execute(f'DELETE FROM {store.t.session_state} WHERE session_id=?', (sid,))
+            count += await tx.execute(f'DELETE FROM {store.t.sessions} WHERE session_id=?', (sid,))
+            counts['sessions'] = counts.get('sessions', 0) + count
+            remaining -= count
+            store._forget_appended(sid)
+            getattr(store, '_cached_sessions', {}).pop(sid, None)
+    return counts
