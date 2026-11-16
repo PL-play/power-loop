@@ -62,7 +62,7 @@ async def test_tool_round_routes_through_registry_and_judges_answer(runtime_agen
                     "the only authoritative source."
                 ),
                 max_rounds=4, max_tokens=512, temperature=0,
-                compactor=None,
+                context_budget_tokens=10**9,
             ),
             registry=_build_registry(call_log),
         )

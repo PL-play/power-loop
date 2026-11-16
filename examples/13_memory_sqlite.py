@@ -106,7 +106,7 @@ async def main():
         memory = SqliteFactMemory(str(Path(directory)/'memory.db'))
         targets = []
         for index, question in enumerate(['Remember my name and number', 'What do you remember?']):
-            async with demo_runtime(FactModel(), config=AgentLoopConfig(memory=memory, compactor=None)) as (runtime, loop, target, actor):
+            async with demo_runtime(FactModel(), config=AgentLoopConfig(memory=memory, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
                 targets.append(target)
                 result = await loop.send(target, question, message_id=f'memory-{index}', actor=actor,
                                          deadline_ms=int(time.time()*1000)+10000)

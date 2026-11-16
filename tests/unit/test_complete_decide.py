@@ -97,7 +97,7 @@ async def test_natural_completion_injects_and_continues_same_send(compose) -> No
     store = await SessionStore.open(":memory:")
     loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=10, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=10, context_budget_tokens=10**9),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, _finalize_once("[system] wrap up now"))
     sid = loop.target.session_id
@@ -126,7 +126,7 @@ async def test_round_limit_injects_and_extends_budget(compose) -> None:
     store = await SessionStore.open(":memory:")
     loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=1, context_budget_tokens=10**9),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, _finalize_once("[system] budget gone — wrap up", 2))
     sid = loop.target.session_id
@@ -162,7 +162,7 @@ async def test_handler_bounds_itself_with_fire_count(compose) -> None:
     store = await SessionStore.open(":memory:")
     loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=10, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=10, context_budget_tokens=10**9),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, handler)
     res = await loop.send("go")
@@ -179,7 +179,7 @@ async def test_no_hook_baseline_unchanged(compose) -> None:
     store = await SessionStore.open(":memory:")
     loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=3, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=3, context_budget_tokens=10**9),
     )
     res = await loop.send("go")
     assert res.status == "completed" and res.final_text == "plain"
@@ -189,10 +189,10 @@ async def test_no_hook_baseline_unchanged(compose) -> None:
     store2 = await SessionStore.open(":memory:")
     loop2 = await compose(
         llm=llm2, store=store2, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=1, context_budget_tokens=10**9),
     )
     res2 = await loop2.send("go")
-    assert res2.status == "interrupted" and res2.error == "hit_round_limit"
+    assert res2.status == "failed" and res2.error_code == "hit_round_limit"
     assert "summary" in (res2.final_text or "")
 
 
@@ -207,7 +207,7 @@ async def test_empty_inject_or_wrong_directive_ends_normally(compose) -> None:
     store = await SessionStore.open(":memory:")
     loop = await compose(
         llm=llm, store=store, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=5, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=5, context_budget_tokens=10**9),
     )
     loop.hooks.register(HookPoint.COMPLETE_DECIDE, empty_inject)
     sid = loop.target.session_id

@@ -21,7 +21,7 @@ async def test_parent_can_spawn_subagent_via_tool(tmp_path):
     registry=ToolRegistry()
     register_spawn_agent(registry)
     async with live_agent(tmp_path,model,registry,AgentLoopConfig(system_prompt=
-        'Delegate once with spawn_agent; after subagent_result report the answer.',max_rounds=5,max_tokens=2048,compactor=None)) as runner:
+        'Delegate once with spawn_agent; after subagent_result report the answer.',max_rounds=5,max_tokens=2048,context_budget_tokens=10**9)) as runner:
         await runner.send('Delegate this and report back: what is the capital of Japan? Give the child tools=[]; after acceptance end the turn.')
         receipt=await tool_receipt(runner,'spawn_agent')
         result=await runner.runtime.client.wait(InputRef(**receipt['input_ref']),actor=runner.actor,deadline_ms=now_ms()+120000)
@@ -40,7 +40,7 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child(tmp_path):
         return await run_agent_spec(AgentSpec(name='math-helper',system_prompt='Reply with the number only.',
             tools=[],max_rounds=1,max_tokens=128,lifecycle='linked'),'What is 17+25?',parent_loop=get_current_loop())
     registry.register(ToolDefinition('delegate','Host delegation',pricing=Free('composite')),delegate)
-    async with live_agent(tmp_path,model,registry,AgentLoopConfig(compactor=None),command=('delegate',{})) as runner:
+    async with live_agent(tmp_path,model,registry,AgentLoopConfig(context_budget_tokens=10**9),command=('delegate',{})) as runner:
         result=await runner.send('explicit host command')
         assert result.status=='completed' and '42' in result.final_text
         children=await runner.runtime.store.list_children(runner.target.session_id)
@@ -61,7 +61,7 @@ async def test_spawn_agent_returns_parsed_json_without_native_json_schema(tmp_pa
     schema={'type':'object','properties':{'priority':{'type':'string'},'team':{'type':'string'}},'required':['priority','team']}
     registry=ToolRegistry()
     register_spawn_agent(registry)
-    async with live_agent(tmp_path,model,registry,AgentLoopConfig(max_rounds=5,max_tokens=2048,compactor=None)) as runner:
+    async with live_agent(tmp_path,model,registry,AgentLoopConfig(max_rounds=5,max_tokens=2048,context_budget_tokens=10**9)) as runner:
         await runner.send('Use spawn_agent once. Ask the child to triage checkout returning 500 for every user; payments are down. Tell it to return JSON with urgent priority and an owning team. Supply output_schema='+json.dumps(schema)+'. Give it tools=[] and finish after acceptance.')
         receipt=await tool_receipt(runner,'spawn_agent')
         result=await runner.runtime.client.wait(InputRef(**receipt['input_ref']),actor=runner.actor,deadline_ms=now_ms()+120000)

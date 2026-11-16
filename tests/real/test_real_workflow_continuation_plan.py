@@ -20,7 +20,7 @@ async def test_real_resume_recomputes_review_and_assembly_with_current_answer(ru
             roles[role]+=1
             return await super().complete(request,**kwargs)
     provider=Provider(limit=14)
-    agent=await runtime_agent(model=provider,config=AgentLoopConfig(compactor=None,max_tokens=2048))
+    agent=await runtime_agent(model=provider,config=AgentLoopConfig(context_budget_tokens=10**9,max_tokens=2048))
     def leaf(name,role,**extra):
         return {'type':'agent','id':name,'spec':{'name':name,'tools':[],'max_rounds':2,
             'system_prompt':'ROLE-'+role+'. Copy the latest supplied VERSION code verbatim. Reply only with that code, without tools.'},**extra}
@@ -53,7 +53,7 @@ async def test_real_child_empty_pass_repairs_answer_in_original_session(runtime_
     import json
     provider,registry=BoundedProvider(limit=9),ToolRegistry()
     register_spawn_agent(registry)
-    agent=await runtime_agent(model=provider,registry=registry,config=AgentLoopConfig(compactor=None,max_rounds=4,max_tokens=2048))
+    agent=await runtime_agent(model=provider,registry=registry,config=AgentLoopConfig(context_budget_tokens=10**9,max_rounds=4,max_tokens=2048))
     provider.root_sid,provider.hold_children=agent.target.session_id,True
     try:
         first=await agent.send("Call spawn_agent exactly once with tools=[], max_rounds=4, task='Report result code 42', "

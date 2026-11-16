@@ -47,7 +47,7 @@ async def test_child_factory_is_applied_before_admission_and_on_worker(store,mod
             return replace(default,system_prompt=default.system_prompt+' HOST NOTE')
         return replace(default,temperature=.9,max_tokens=1234)
     model, registry=_Capturing(),ToolRegistry()
-    config=AgentLoopConfig(compactor=None,max_rounds=3,
+    config=AgentLoopConfig(context_budget_tokens=10**9,max_rounds=3,
         subagent_config_factory=None if mode=='default' else factory)
     async def delegate():
         return await run_agent_spec(AgentSpec(name='kid',system_prompt='p',max_tokens=500,temperature=.2),

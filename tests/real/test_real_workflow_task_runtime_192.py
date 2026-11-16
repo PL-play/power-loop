@@ -27,7 +27,7 @@ async def test_real_nested_child_continues_after_node_exit_without_replacement(r
     register_spawn_agent(registry)
     register_workflow_tool(registry,ports=WorkflowToolPorts(on_accepted=lambda value:accepted.append(value)))
     agent=await runtime_agent(model=provider,registry=registry,capacity=2,
-        config=AgentLoopConfig(compactor=None,max_tokens=2048,max_rounds=4))
+        config=AgentLoopConfig(context_budget_tokens=10**9,max_tokens=2048,max_rounds=4))
     child_prompt='CHILD. Compute 19+23 and return only 42 in assistant text. Do not use tools.'
     if child_ending=='pass_then_text':
         child_prompt='CHILD. The exact code is 42. First call pass_turn once without text. When asked for a final answer, return 42 without tools.'

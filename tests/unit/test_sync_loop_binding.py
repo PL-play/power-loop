@@ -14,7 +14,7 @@ def test_synchronous_host_reuses_one_runner_for_start_requests_and_close(tmp_pat
     with asyncio.Runner() as runner:
         async def start():
             store = await SessionStore.open(str(tmp_path/'sync-host.db'))
-            return await RunningAgent(store, _Scripted(), config=AgentLoopConfig(compactor=None)).start()
+            return await RunningAgent(store, _Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
         agent = runner.run(start())
         try:
             for body in ('one', 'two', 'three'):
@@ -39,7 +39,7 @@ async def test_repeated_runtime_calls_keep_pooled_store_on_owning_event_loop(reg
         async def complete(self, request, **kwargs):
             calls.append(asyncio.get_running_loop())
             return await super().complete(request, **kwargs)
-    agent = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    agent = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         for i in range(3):
             agent.target = await agent.loop.new_session(agent.descriptor, actor=agent.actor)

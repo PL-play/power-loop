@@ -29,7 +29,7 @@ async def main():
     store=await open_store(os.environ['P7A_DB_DSN'],table_prefix=os.environ['P7A_TABLE_PREFIX'],schema='tasks')
     factory=RegistryRuntimeFactory()
     async def build(*args):
-        return ExecutionEnvironment(Model(),None,AgentLoopConfig(compactor=None))
+        return ExecutionEnvironment(Model(),None,AgentLoopConfig(context_budget_tokens=10**9))
     factory.register('test.agent@1',build)
     runtime=Runtime(store=store,factory=factory,node_id='process',timers_enabled=False)
     try:

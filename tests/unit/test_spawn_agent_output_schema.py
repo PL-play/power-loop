@@ -135,7 +135,7 @@ async def test_child_format_and_persisted_parent_completion(registry_store, repl
     model,registry=Model(),ToolRegistry()
     model.child_requests=[]
     register_spawn_agent(registry)
-    agent=await RunningAgent(store,model,registry,AgentLoopConfig(max_rounds=4,compactor=None)).start()
+    agent=await RunningAgent(store,model,registry,AgentLoopConfig(max_rounds=4,context_budget_tokens=10**9)).start()
     model.parent=agent.target.session_id
     try:
         await agent.send('classify')

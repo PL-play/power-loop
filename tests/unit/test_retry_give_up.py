@@ -169,7 +169,7 @@ async def test_pipeline_rejects_once_with_original_error(runtime_agent) -> None:
         bus.subscribe(AgentEventType.LLM_DEGRADED, lambda e: degraded.append(dict(e.payload or {})))
         llm = _Broke()
         loop = await runtime_agent(model=llm, store=store, event_bus=bus, config=AgentLoopConfig(
-            system_prompt="S", max_rounds=2, compactor=None,
+            system_prompt="S", max_rounds=2, context_budget_tokens=10**9,
             retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0, total_timeout=None)))
         res = await loop.send("hi")
         assert res.status == "failed" and "Insufficient Balance" in res.error

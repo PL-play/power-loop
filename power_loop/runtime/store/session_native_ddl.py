@@ -21,6 +21,7 @@ INDEXES = {
     "idx_inbox_session_status": ("follow_up_queue", ("session_id", "status", "id")),
     "idx_inbox_pending": ("follow_up_queue", ("status", "id")),
     "idx_inbox_retention": ("follow_up_queue", ("terminal_status", "completed_at", "id")),
+    "idx_inbox_output": ("follow_up_queue", ("session_id", "terminal_status", "completed_at", "id")),
     "idx_inbox_expiry": ("follow_up_queue", ("status", "expires_at", "id")),
     "idx_messages_session_state": ("messages", ("session_id", "state", "seq")),
     "idx_messages_send": ("messages", ("session_id", "send_index", "seq")),
@@ -159,7 +160,11 @@ def session_native_ddl(name: str, prefix: str) -> list[str]:
         for index, table in enumerate(CONTRACT_TABLES):
             extra = "".join(constraints.get(table, ()))
             if extra:
-                marker = f"            {indexes(table)}){opts}"
+                # The index fragment is inline on some tables and newline-indented on others;
+                # match it without the surrounding whitespace so every table gets its UNIQUE
+                # key. A whitespace-sensitive marker silently dropped the key for messages,
+                # follow_up_queue and project_messages, turning their upserts into INSERTs.
+                marker = f"{indexes(table)}){opts}"
                 statements[index] = statements[index].replace(
                     marker, extra + marker, 1
                 )

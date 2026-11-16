@@ -95,7 +95,7 @@ async def test_prepare_execute_and_original_call_state(registry_store):
     store, _ = registry_store
     state = SimpleNamespace(prepared=0, executed=0, recovered=0, resolved=True)
     runner = await RunningAgent(
-        store, ManagedParent(), _registry(_adapter(state)), AgentLoopConfig(compactor=None),
+        store, ManagedParent(), _registry(_adapter(state)), AgentLoopConfig(context_budget_tokens=10**9),
     ).start()
     try:
         assert (await runner.send("post once")).status == "completed"
@@ -123,7 +123,7 @@ async def test_unknown_recover_is_read_only_and_late_result_is_new_input(registr
     state = SimpleNamespace(prepared=0, executed=0, recovered=0, resolved=False)
     adapter = _adapter(state, pending=True)
     runner = await RunningAgent(
-        store, ManagedParent(), _registry(adapter), AgentLoopConfig(compactor=None),
+        store, ManagedParent(), _registry(adapter), AgentLoopConfig(context_budget_tokens=10**9),
     ).start()
     try:
         await runner.send("post once")

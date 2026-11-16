@@ -23,7 +23,7 @@ that the in-memory active set and order ALWAYS equal what reload reconstructs.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,22 +32,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from power_loop import (
-    AgentLoopConfig,
     MessageState,
-    RequestOptions,
     SessionStore,
-    ToolDefinition,
-    ToolRegistry,
-)
-from power_loop._vendor.llm_client.interface import (
-    LLMRequest,
-    LLMResponse,
-    LLMService,
-    LLMStreamChunk,
 )
 from power_loop.agent.sink import SQLiteSink
-from power_loop.runtime.compact import CompactionPlan
-from power_loop.runtime.pricing import Free
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -107,7 +97,7 @@ async def _assert_consistent(store: SessionStore, sid: str, sink: SQLiteSink) ->
 async def test_two_folds_one_run_no_divergence(store: SessionStore) -> None:
     """Two folds within ONE run must keep in-memory history == persisted active set
     (the regression: previously 5 in-mem vs 9 in DB)."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
 
@@ -126,7 +116,7 @@ async def test_two_folds_one_run_no_divergence(store: SessionStore) -> None:
 
 async def test_three_folds_one_run_stay_consistent(store: SessionStore) -> None:
     """Stress the same-run regime past two folds."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     rnd = 0
@@ -140,7 +130,7 @@ async def test_three_folds_one_run_stay_consistent(store: SessionStore) -> None:
 
 async def test_no_inverted_audit_rows(store: SessionStore) -> None:
     """The compactions audit table never records from_seq > to_seq."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     await _append(sink, 6)
@@ -157,7 +147,7 @@ async def test_no_inverted_audit_rows(store: SessionStore) -> None:
 async def test_single_fold_note_reloads_at_front(store: SessionStore) -> None:
     """A prefix fold's note summarizes the oldest turns → it must reload FIRST,
     not sink below the kept tail (the high-identity-seq bug)."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     await _append(sink, 6)
@@ -171,7 +161,7 @@ async def test_single_fold_note_reloads_at_front(store: SessionStore) -> None:
 async def test_middle_fold_note_reloads_between_head_and_tail(store: SessionStore) -> None:
     """A note that folds a MIDDLE span sorts after the kept head and before the
     kept tail on reload (logical position, not identity seq)."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     await _append(sink, 6)  # seqs 1..6
@@ -209,7 +199,7 @@ async def _reseed_sink(store: SessionStore, sid: str) -> SQLiteSink:
 async def test_reload_then_fold_consistent(store: SessionStore) -> None:
     """Fold, simulate a process restart (reseed the sink from the DB), append more,
     fold again — the reloaded logical map must keep marking correct."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     await _append(sink, 6)
@@ -231,7 +221,7 @@ async def test_leading_note_refold_across_none_placeholders(store: SessionStore)
     start boundary (never a None), the placeholders sit strictly inside the span and
     are skipped when marking, and exactly ONE active note survives with the in-memory
     map consistent with the reloaded DB."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     await _append(sink, 6)
@@ -266,7 +256,7 @@ async def test_fold_over_only_placeholders_keeps_maps_aligned(store: SessionStor
     tail-injection that never enters the maps); they are seeded by projection mode
     (a None-prefix) and corrupt-history repair (align_tool_calls). Here we seed two
     leading None placeholders the way projection does (init_history_seqs)."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     sink = SQLiteSink(store, sid)
     # two synthesized None placeholders at the front, then two real messages
     sink.init_history_seqs([None, None], [None, None])
@@ -288,7 +278,7 @@ async def test_fold_over_only_placeholders_keeps_maps_aligned(store: SessionStor
 
 
 async def test_record_compaction_explicit_set_marks_exactly_those(store: SessionStore) -> None:
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     seqs = [await store.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
     # fold a NON-contiguous subset; only those become compacted_out
     await store.record_compaction(
@@ -307,7 +297,7 @@ async def test_record_compaction_explicit_set_marks_exactly_those(store: Session
 async def test_record_compaction_unordered_fold_seqs_not_inverted(store: SessionStore) -> None:
     """Passing fold_seqs whose translated boundary would invert under BETWEEN
     (high-then-low) still marks every one and records a sane audit span."""
-    sid = await store.create_session(session_id="s")
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     seqs = [await store.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
     await store.record_compaction(
         sid, from_seq=seqs[0], to_seq=seqs[3], note_content="n",
@@ -352,7 +342,7 @@ def test_random_schedule_keeps_reload_equal_to_inmemory(ops: list[tuple[str, int
     async def _body(ops: list[tuple[str, int]]) -> None:
         store = await SessionStore.open(":memory:")
         try:
-            sid = await store.create_session(session_id="p")
+            sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
             sink = SQLiteSink(store, sid)
             sink.init_history_seqs([])
             rnd = 0
@@ -381,119 +371,3 @@ def test_random_schedule_keeps_reload_equal_to_inmemory(ops: list[tuple[str, int
             await store.close()
 
     asyncio.run(_body(ops))
-
-
-# ── end-to-end: two compactions in ONE send through the real pipeline ────────
-
-
-@dataclass
-class _ToolLooper(LLMService):
-    """Emits a tool call for the first ``tool_rounds`` responses (each tool result
-    is fat, keeping tokens above the tiny compaction threshold every round), then a
-    final answer — so a single send spans several rounds and folds more than once."""
-
-    tool_rounds: int = 3
-    _idx: int = 0
-
-    async def complete(
-        self,
-        request: LLMRequest,
-        *,
-        on_chunk_delta_text: Callable[[str], Any] | None = None,
-        on_chunk_think: Callable[[str], Any] | None = None,
-        on_stream_end: Callable[[LLMResponse], Any] | None = None,
-    ) -> LLMResponse:
-        i = self._idx
-        self._idx += 1
-        # The summary LLM call (compaction) also routes here; it has no tools and a
-        # single user message — answer it with a summary so the fold proceeds.
-        if not request.tools:
-            return LLMResponse(raw_text="<summary>folded</summary>")
-        if i < self.tool_rounds:
-            return LLMResponse(
-                raw_text="",
-                tool_calls=[{
-                    "id": f"tc{i}", "type": "function",
-                    "function": {"name": "blob", "arguments": "{}"},
-                }],
-            )
-        return LLMResponse(raw_text="final answer")
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-
-        return _empty()
-
-    async def close(self) -> None:
-        return None
-
-
-def _blob_registry() -> ToolRegistry:
-    reg = ToolRegistry()
-    reg.register(
-        ToolDefinition(name="blob", description="returns fat content",
-                       input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
-        lambda **kw: "T" * 4000,
-    )
-    return reg
-
-
-class _EveryRoundCompactor:
-    """Folds the front of history (keeping the last 2 messages) on every round once
-    there is enough to fold — so a single multi-round send folds repeatedly. The
-    DefaultCompactor keys its kept tail on user-bounded *exchanges*, so it folds at
-    most once per single-user-turn send; this exercises the multi-fold-in-one-run
-    regime the corruption needed. The bug lived in the sink/store, not the
-    compactor, so any plan-emitting compactor drives the same persistence path."""
-
-    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
-        if len(messages) < 4:
-            return None
-        return CompactionPlan(
-            fold_start_idx=0, fold_end_idx=len(messages) - 3,
-            summary_text="folded", before_tokens=100, after_tokens=10,
-        )
-
-
-@pytest.mark.asyncio
-async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monkeypatch, runtime_agent) -> None:
-    """The real bug regime, end-to-end: a multi-round send that folds twice must
-    leave a coherent, correctly-ordered session that reloads and recalls cleanly."""
-    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")  # tiny → folds every round
-    cfg = AgentLoopConfig(system_prompt="S", max_rounds=6, max_tokens=4000, compactor=_EveryRoundCompactor())
-    loop = await runtime_agent(model=_ToolLooper(tool_rounds=3), store=store, config=cfg, registry=_blob_registry())
-    sid = loop.target.session_id
-    for i in range(4):
-        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
-        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
-    r = await loop.send("go", options=RequestOptions(tools=["blob"]))
-    assert r.status == "completed"
-
-    # more than one fold actually happened (the regime that used to corrupt)
-    assert len(await store.list_compactions(sid)) >= 2, await store.list_compactions(sid)
-
-    # exactly one active compact_note, and it reloads at the FRONT
-    active = await store.load_active_messages(sid)
-    notes = [m for m in active if m.name == "compact_note"]
-    assert len(notes) == 1
-    assert active[0].name == "compact_note", [m.name or m.role for m in active]
-
-    # no inverted audit rows
-    assert all(c.from_seq <= c.to_seq for c in await store.list_compactions(sid))
-
-    # the folded originals are retained (recall path) and consistent
-    compacted = [m for m in await store.load_all_messages(sid)
-                 if m.state is MessageState.COMPACTED_OUT]
-    assert compacted, "folded originals must be retained for recall"
-
-    # a follow-up send on the reloaded session still works
-    await loop.aclose()
-    loop2 = await runtime_agent(
-        model=_ToolLooper(tool_rounds=0), store=store, config=cfg,
-        registry=_blob_registry(), target=loop.target,
-    )
-    r2 = await loop2.send("again", message_id="again", options=RequestOptions(tools=["blob"]))
-    assert r2.status == "completed"
-    assert (await store.load_active_messages(sid))[0].name == "compact_note"

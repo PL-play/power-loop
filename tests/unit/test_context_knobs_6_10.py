@@ -102,7 +102,7 @@ async def test_context_checkpoint_ends_send_when_real_prompt_reaches_threshold(t
     bus.subscribe(AgentEventType.STATUS_CHANGED, events.append)
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, context_checkpoint_tokens=4000), registry=_echo_registry("ok"), event_bus=bus)
     res = await loop.send("hi")
-    assert res.status == "interrupted" and res.error == "context_checkpoint"
+    assert res.status == "failed" and res.error_code == "context_checkpoint"
     assert (await loop.runtime.store.get_session_stats(loop.target.session_id)).rounds == 2
     assert llm._idx == 2, "第三个响应不该被消费：检查点在轮边界停"
     kinds = [(e.payload or {}).get("kind") for e in events]

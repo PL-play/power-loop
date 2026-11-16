@@ -110,7 +110,7 @@ async def composite(store, scenario, *, coordinator=None, transport=None):
         handles.append(handle)
         return json.dumps({'run_id':handle.run_id})
     registry.register(ToolDefinition('launch', 'Start workflow', input_schema={'type':'object','properties':{}}, pricing=Free('fixture')), launch)
-    runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None),
+    runner = await RunningAgent(store, model, registry, AgentLoopConfig(context_budget_tokens=10**9),
         coordinator=coordinator, transport=transport).start()
     try:
         async def operation():

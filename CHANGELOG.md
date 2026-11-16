@@ -10,6 +10,26 @@
 
 # Changelog
 
+# 13.0.0 — Design 216 projection-only history
+
+- Finished sends reach the model only through their stored `pl_project_messages` projection.
+  The SDK default `representation` is `ProjectedRepresentation`; `VerbatimRepresentation`, the
+  in-place compactor runtime path, and the deprecated `history_projector` / `compactor` config
+  kwargs are removed (no aliases or implicit conversion). `pl_messages` stays the immutable
+  audit/recall source.
+- Missing or stale projections are rebuilt by the existing lazy heal before the send; if a legal
+  projection cannot be produced, the send stops with `RuntimeRequestError("projection_unavailable")`
+  before the first model/tool call instead of feeding raw history.
+- History entry is one bounded projection read (`SessionStore.load_projection_window`); the
+  previous compact + projection + unsent legacy reads are gone. A host `max_context_rows` cap
+  bounds the read by whole sends.
+- Projection persistence reuses the locked owner/state row, writes the send's user/project rows
+  as one multi-row UPSERT, and derives fold-state invalidation without spurious runtime-version
+  bumps. Fold statistics, revision/generation owners and stale-fold rejection are unchanged.
+- MySQL DDL now actually creates the `messages`, `follow_up_queue` and `project_messages` unique
+  keys (the previous whitespace-sensitive marker dropped them, turning upserts into inserts);
+  this fixes the three MySQL projection-fold statistics failures.
+
 ## 11.0.0 — Design 203 (source delivery; not published)
 
 - One input call: `RuntimeClient.send(target, body, urgent=False)`. Idle sessions start

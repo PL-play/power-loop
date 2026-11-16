@@ -1,7 +1,12 @@
 """Independent pools atomically claim inbox items on all three databases."""
+
 import asyncio
+import dataclasses
 
 import pytest
+
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -13,7 +18,7 @@ async def stores(registry_store):
 @pytest.mark.asyncio
 async def test_concurrent_drains_deliver_each_item_exactly_once(stores) -> None:
     """The regression that SQLite could not see: steering must never be replayed."""
-    sid = await stores[0].create_session(system_prompt="S")
+    sid = await stores[0].create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     await stores[0].inbox_put(sid, [{"item_id": f"m{i}", "content": f"m{i}"} for i in range(50)])
 
     batches = await asyncio.gather(*(s.inbox_claim(sid) for s in stores))

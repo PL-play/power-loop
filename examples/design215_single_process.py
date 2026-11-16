@@ -35,7 +35,7 @@ async def build_demo(descriptor, execution_context):
     # Credentials, tools and clients are resolved here on this node.
     return ExecutionEnvironment(
         llm=FixedModel(), tool_registry=ToolRegistry(),
-        config=AgentLoopConfig(max_rounds=descriptor.config["max_rounds"], compactor=None),
+        config=AgentLoopConfig(max_rounds=descriptor.config["max_rounds"], context_budget_tokens=10**9),
     )
 
 

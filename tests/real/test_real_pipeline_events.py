@@ -31,7 +31,7 @@ async def test_real_send_emits_paired_events_and_usage(runtime_agent) -> None:
         loop = await runtime_agent(
             model=make_llm(max_tokens=128, temperature=0), store=store, event_bus=bus,
             config=AgentLoopConfig(system_prompt="Reply in one short sentence.",
-                                   max_rounds=1, max_tokens=128, temperature=0, compactor=None),
+                                   max_rounds=1, max_tokens=128, temperature=0, context_budget_tokens=10**9),
         )
         r1 = await loop.send("Say hi.")
         assert r1.status == "completed"

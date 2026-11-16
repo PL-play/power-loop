@@ -75,7 +75,7 @@ async def timers(store, model=None, *, hooks=None):
     _, target, actor = await fixture(store)
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
-        return ExecutionEnvironment(model or _Scripted(), None, AgentLoopConfig(compactor=None))
+        return ExecutionEnvironment(model or _Scripted(), None, AgentLoopConfig(context_budget_tokens=10**9))
     factory.register('test.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='timer-test', hooks=hooks)
     await runtime.worker.start()

@@ -16,6 +16,8 @@ from power_loop import AgentLoopConfig, SessionStore
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.core.pipeline import AgentPipeline
 from tests.runtime_fixture import RunningAgent
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 _summarize = AgentPipeline._summarize_hook_injection
 
@@ -100,7 +102,7 @@ def test_summarize_rebind_failsafe_does_not_dump_conversation() -> None:
 async def test_store_records_and_lists_hook_events() -> None:
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         seq = await store.append_message(
             sid, role="assistant", content="a", round_index=2, send_index=5,
             hook_injected={"hook_point": "LLM_BEFORE", "hook": "builtin.memory_recall",
@@ -126,7 +128,7 @@ async def test_store_records_and_lists_hook_events() -> None:
 async def test_event_ids_are_monotonic_per_session() -> None:
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         hi = {"hook_point": "LLM_BEFORE", "hook": "h", "position": "tail", "kind": "inject",
               "payload": {"v": 1, "items": []}}
         await store.append_message(sid, role="assistant", content="a", hook_injected=hi)
@@ -143,7 +145,7 @@ async def test_hook_events_excluded_from_export_by_design() -> None:
     # audit lives in the live store). Pin that decision so it can't silently change.
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         await store.append_message(
             sid, role="assistant", content="a", round_index=0, send_index=1,
             hook_injected={"hook_point": "LLM_BEFORE", "hook": "builtin.memory_recall",
@@ -152,8 +154,9 @@ async def test_hook_events_excluded_from_export_by_design() -> None:
         )
         blob = await store.export_session(sid)
         assert "hook_events" not in blob["tables"]
-        new_id = await store.import_session(blob, new_session_id="he_restored")
-        assert await store.list_hook_events(new_id) == []  # not carried over
+        from power_loop import RuntimeRequestError
+        with pytest.raises(RuntimeRequestError, match="capability_unavailable"):
+            await store.import_session(blob, new_session_id="he_restored")
     finally:
         await store.close()
 
@@ -162,7 +165,7 @@ async def test_hook_events_excluded_from_export_by_design() -> None:
 async def test_close_session_tree_deletes_hook_events() -> None:
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         await store.append_message(
             sid, role="assistant", content="a",
             hook_injected={"hook_point": "LLM_BEFORE", "hook": "h", "position": "tail",
@@ -212,7 +215,7 @@ async def _run_with(record_mode: str, *, recall_text="the-secret-memory"):
     loop = await RunningAgent(
         model=llm, store=store,
         config=AgentLoopConfig(
-            max_rounds=1, compactor=None,
+            max_rounds=1, context_budget_tokens=10**9,
             memory=_FakeProvider(to_recall=[{"content": recall_text}]),
             record_hook_events=record_mode,
         ),
@@ -276,7 +279,7 @@ async def test_loop_records_one_event_per_round_in_multi_round_send(runtime_agen
             LLMResponse(raw_text="done"),                # round 1 → finish
         ])
         loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(), config=AgentLoopConfig(
-                max_rounds=4, compactor=None,
+                max_rounds=4, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "M"}]),
                 record_hook_events="full",
             ))
@@ -284,7 +287,8 @@ async def test_loop_records_one_event_per_round_in_multi_round_send(runtime_agen
         await loop.send("go")
         evs = await store.list_hook_events(sid)
         assert len(evs) == 2  # one per round
-        assert [e.event_id for e in evs] == [1, 2]  # monotonic
+        event_ids = [e.event_id for e in evs]
+        assert event_ids == sorted(set(event_ids))  # message coordinates, not a sidecar sequence
         assert len({e.message_seq for e in evs}) == 2  # distinct assistant rows
         asst_seqs = {m.seq for m in await store.load_all_messages(sid) if m.role == "assistant"}
         assert all(e.message_seq in asst_seqs for e in evs)
@@ -292,8 +296,8 @@ async def test_loop_records_one_event_per_round_in_multi_round_send(runtime_agen
         # a SECOND send continues the id sequence (no reattach/double-count of prior events)
         await loop.send("again")
         evs2 = await store.list_hook_events(sid)
-        assert [e.event_id for e in evs2][:2] == [1, 2]
-        assert len(evs2) > 2 and evs2[-1].event_id == len(evs2)
+        assert [e.event_id for e in evs2][:2] == event_ids
+        assert len(evs2) > 2 and evs2[-1].event_id > event_ids[-1]
     finally:
         await loop.aclose()
         await store.close()
@@ -318,7 +322,7 @@ async def test_degraded_round_records_the_injection_that_fed_the_failed_call(run
     store = await SessionStore.open(":memory:")
     try:
         loop = await runtime_agent(model=_RaisingLLM(), store=store, config=AgentLoopConfig(
-                max_rounds=1, compactor=None,
+                max_rounds=1, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "M"}]),
                 record_hook_events="full",
             ))
@@ -345,7 +349,7 @@ async def test_llm_after_break_round_records_the_injection(runtime_agent) -> Non
     store = await SessionStore.open(":memory:")
     try:
         loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(
-                max_rounds=2, compactor=None,
+                max_rounds=2, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "M"}]),
                 record_hook_events="full",
             ))
@@ -371,7 +375,7 @@ async def test_loop_custom_hook_total_rebind_records_unresolved_marker(runtime_a
 
     store = await SessionStore.open(":memory:")
     try:
-        loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(max_rounds=1, compactor=None, record_hook_events="full"))
+        loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(max_rounds=1, context_budget_tokens=10**9, record_hook_events="full"))
 
         def _rebind(ctx):
             ctx.messages = [{**m} for m in ctx.messages] + [
@@ -434,7 +438,7 @@ async def test_leak_guard_audit_never_enters_history_or_request(runtime_agent) -
     store = await SessionStore.open(":memory:")
     llm = _RecLLM()
     loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
-            max_rounds=1, compactor=None,
+            max_rounds=1, context_budget_tokens=10**9,
             memory=_FakeProvider(to_recall=[{"content": "SECRET"}]),
             record_hook_events="full",
         ))

@@ -83,7 +83,7 @@ async def main():
     bus = AgentEventBus()
     make_typewriter(bus)
     async with demo_runtime(StreamingModel(), event_bus=bus,
-            config=AgentLoopConfig(max_rounds=1, compactor=None)) as (runtime, loop, target, actor):
+            config=AgentLoopConfig(max_rounds=1, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
         result = await loop.send(target, 'stream', message_id='stream', actor=actor,
                                  deadline_ms=int(time.time()*1000)+10000)
         assert result.status == 'completed' and result.final_text == 'Streamed through the Runtime.'

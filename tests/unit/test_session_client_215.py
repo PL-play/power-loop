@@ -1,6 +1,8 @@
 """Cold storage reads backing the unified session client (no main loop)."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import pytest
 
 from power_loop.agent.runtime_store import RuntimeInputStore
@@ -8,10 +10,13 @@ from power_loop.agent.runtime_types import (
     InputRef,
     RuntimeDescriptor,
     RuntimeRequestError,
+    TrustedActor,
+    canonical,
     result_message_id,
 )
 
 from .session_native_fixture import ACTOR, DESCRIPTOR, target
+from .test_send_sql_profile import Profiled
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -285,3 +290,204 @@ async def test_message_rows_pagination_scope_export(registry_store):
     ]
     assert exported["tables"]["follow_up_queue"][0]["item_id"] == receipt.input_ref.message_id
     assert "OTHER-PRIVATE" not in json.dumps(exported, ensure_ascii=False)
+
+
+@asynccontextmanager
+async def _profiled(store):
+    """Measure only the calls made inside the context."""
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+    try:
+        yield profiled
+    finally:
+        store._db = original
+
+
+async def _terminal_input(port, name, *, final_status="completed", **final):
+    session = await target(port, name)
+    receipt = await port.accept(session, "run", message_id="start", actor=ACTOR)
+    batch = await port.claim(session, node_id="a", boot_id="a")
+    await port.final(batch, status=final_status, **final)
+    return session, receipt.input_ref
+
+
+async def test_result_read_is_one_statement_for_root_states(registry_store):
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+
+    pending = await target(port, "read-pending")
+    pending_receipt = await port.accept(pending, "run", message_id="start", actor=ACTOR)
+    async with _profiled(store) as measured:
+        assert await port.get_result(pending_receipt.input_ref, actor=ACTOR) is None
+    assert (len(measured.records), measured.transactions) == (1, 0)
+
+    _session, completed_ref = await _terminal_input(
+        port, "read-completed", final_text="done", usage={"total_tokens": 4},
+        structured_output={"answer": 42},
+    )
+    async with _profiled(store) as measured:
+        completed = await port.get_result(completed_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (1, 0)
+    assert completed.status == "completed" and completed.final_text == "done"
+    assert dict(completed.usage) == {"total_tokens": 4}
+    assert dict(completed.structured_output) == {"answer": 42}
+
+    _session, failed_ref = await _terminal_input(
+        port, "read-failed", final_status="failed", error="boom", error_code="failed",
+    )
+    async with _profiled(store) as measured:
+        failed = await port.get_result(failed_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (1, 0)
+    assert failed.status == "failed" and failed.result_seq is None
+    assert failed.final_text == "" and failed.error == "boom"
+
+    cancelled_session = await target(port, "read-cancelled")
+    cancelled_receipt = await port.accept(
+        cancelled_session, "run", message_id="start", actor=ACTOR,
+    )
+    await port.cancel(cancelled_receipt.input_ref, actor=ACTOR, reason="stop")
+    async with _profiled(store) as measured:
+        cancelled = await port.get_result(cancelled_receipt.input_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (1, 0)
+    assert cancelled.status == "cancelled" and cancelled.result_seq is None
+
+    missing_ref = InputRef(store.store_id, cancelled_session.session_id, "missing")
+    async with _profiled(store) as measured:
+        state = await port.read_result_state(missing_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (1, 0)
+    assert state.record is None and state.resolved is None and state.result is None
+    assert state.session["tenant_id"] == "tenant"
+    async with _profiled(store) as measured:
+        with pytest.raises(RuntimeRequestError) as error:
+            await port.get_result(missing_ref, actor=ACTOR)
+    assert error.value.code == "not_found"
+    assert (len(measured.records), measured.transactions) == (1, 0)
+
+
+async def test_result_read_keeps_authorization_and_counts_special_paths(registry_store):
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    parent = await target(port, "read-parent")
+    child = await target(port, "read-child", parent=parent)
+    receipt = await port.accept(child, "run", message_id="start", actor=ACTOR)
+    batch = await port.claim(child, node_id="a", boot_id="a")
+    await port.final(batch, final_text="child result")
+
+    async with _profiled(store) as measured:
+        own = await port.get_result(
+            receipt.input_ref, actor=TrustedActor("tenant", "host", child.session_id),
+        )
+    assert (len(measured.records), measured.transactions) == (1, 0)
+    assert own.final_text == "child result"
+
+    async with _profiled(store) as measured:
+        ancestor = await port.get_result(
+            receipt.input_ref, actor=TrustedActor("tenant", "host", parent.session_id),
+        )
+    assert (len(measured.records), measured.transactions) == (2, 1)
+    assert ancestor.final_text == "child result"
+
+    for actor in (
+        TrustedActor("other", "host", None),
+        TrustedActor("tenant", "other", None),
+    ):
+        async with _profiled(store) as measured:
+            with pytest.raises(RuntimeRequestError) as error:
+                await port.get_result(receipt.input_ref, actor=actor)
+        assert error.value.code == "forbidden"
+        assert (len(measured.records), measured.transactions) == (1, 0)
+
+    unrelated = TrustedActor("tenant", "host", "unrelated")
+    async with _profiled(store) as measured:
+        with pytest.raises(RuntimeRequestError) as error:
+            await port.get_result(receipt.input_ref, actor=unrelated)
+    assert error.value.code == "forbidden"
+    assert (len(measured.records), measured.transactions) == (2, 1)
+
+    async with _profiled(store) as measured:
+        with pytest.raises(RuntimeRequestError) as error:
+            await port.get_result(
+                InputRef("wrong", child.session_id, "start"), actor=ACTOR,
+            )
+    assert error.value.code == "wrong_store"
+    assert (len(measured.records), measured.transactions) == (0, 0)
+
+
+async def test_result_read_follows_continuation_and_reports_extra_reads(registry_store):
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    session = await target(port, "read-continuation")
+    receipt = await port.accept(session, "run", message_id="start", actor=ACTOR)
+    batch = await port.claim(session, node_id="a", boot_id="a")
+    await store._db.execute(
+        f"UPDATE {store.t.follow_up_queue} SET status='waiting_continuation' "
+        "WHERE session_id=? AND item_id=?",
+        (session.session_id, "start"),
+    )
+    await store._db.execute(
+        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,kind,priority,status,"
+        "content_json,meta_json,request_hash,created_at,continuation_of,continuation_index) "
+        "VALUES (?,?,'workflow_continue','normal','pending',?,?,?,?,?,?)",
+        (session.session_id, "wfc-1", canonical({"workflow_continue": {}}), canonical({}),
+         "0" * 64, 1, "start", 1),
+    )
+    await port.final(batch)
+    continuation = await port.claim(session, node_id="b", boot_id="b")
+    await port.final(continuation, final_text="continued", usage={"total_tokens": 7})
+
+    async with _profiled(store) as measured:
+        state = await port.read_result_state(receipt.input_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (4, 1)
+    assert state.record.ref == receipt.input_ref
+    assert "content_json" not in state.record.row and "meta_json" not in state.record.row
+    assert state.resolved.ref.message_id == "wfc-1"
+    assert state.result.status == "completed" and state.result.final_text == "continued"
+    assert state.result.send_index == 2
+    assert state.result.input_ref == receipt.input_ref
+
+    async with _profiled(store) as measured:
+        result = await port.get_result(receipt.input_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (4, 1)
+    assert result.final_text == "continued"
+
+
+async def test_result_read_follows_multihop_continuation(registry_store):
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    session = await target(port, "read-multihop")
+    receipt = await port.accept(session, "run", message_id="start", actor=ACTOR)
+    batch = await port.claim(session, node_id="a", boot_id="a")
+    await store._db.execute(
+        f"UPDATE {store.t.follow_up_queue} SET status='waiting_continuation',"
+        "delivered_at=1,delivered_seq=1,delivered_send_index=1 "
+        "WHERE session_id=? AND item_id='start'",
+        (session.session_id,),
+    )
+    await store._db.execute(
+        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,kind,priority,status,"
+        "content_json,meta_json,request_hash,created_at,delivered_at,delivered_seq,"
+        "delivered_send_index,continuation_of,continuation_index) "
+        "VALUES (?,?,'workflow_continue','normal','waiting_continuation',?,?,?,?,?,?,?,?,?)",
+        (session.session_id, "wfc-1", canonical({"workflow_continue": {}}), canonical({}),
+         "0" * 64, 1, 1, 1, 2, "start", 1),
+    )
+    await store._db.execute(
+        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,kind,priority,status,"
+        "content_json,meta_json,request_hash,created_at,continuation_of,continuation_index) "
+        "VALUES (?,?,'workflow_continue','normal','pending',?,?,?,?,?,?)",
+        (session.session_id, "wfc-2", canonical({"workflow_continue": {}}), canonical({}),
+         "0" * 64, 1, "wfc-1", 2),
+    )
+    await port.final(batch)
+    continuation = await port.claim(session, node_id="b", boot_id="b")
+    await port.final(continuation, final_text="multihop done")
+
+    async with _profiled(store) as measured:
+        state = await port.read_result_state(receipt.input_ref, actor=ACTOR)
+    assert (len(measured.records), measured.transactions) == (5, 1)
+    assert state.record.ref == receipt.input_ref
+    assert state.resolved.ref.message_id == "wfc-2"
+    assert state.result.status == "completed" and state.result.final_text == "multihop done"
+    assert state.result.send_index == 2
+    assert state.result.input_ref == receipt.input_ref

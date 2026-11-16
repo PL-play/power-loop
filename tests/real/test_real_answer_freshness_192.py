@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 async def test_real_corrected_node_does_not_deliver_old_text_after_empty_pass(runtime_agent, record_property, monkeypatch):
     provider=BoundedProvider(limit=12)
-    agent=await runtime_agent(model=provider,config=AgentLoopConfig(max_rounds=5,max_tokens=2048,compactor=None,
+    agent=await runtime_agent(model=provider,config=AgentLoopConfig(max_rounds=5,max_tokens=2048,context_budget_tokens=10**9,
         system_prompt='Report the computed workflow answer in assistant text, without tools.'))
     node_sids=[]
     complete=provider.complete

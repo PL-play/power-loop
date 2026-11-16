@@ -119,7 +119,7 @@ async def main() -> dict:
             registry = create_default_tool_registry(include=['bash'], bind=False)
             env = RuntimeEnv(workspace_dir=host_ws, shell_backend=backend)
             async with demo_runtime(ShellModel(), registry, runtime_env=env,
-                    config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+                    config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
                 result = await loop.send(target, 'Inspect container and mounted file', message_id='docker', actor=actor,
                                          deadline_ms=int(time.time()*1000)+15000)
                 assert result.status == 'completed', result

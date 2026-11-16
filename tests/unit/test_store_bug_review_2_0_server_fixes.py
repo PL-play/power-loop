@@ -16,6 +16,8 @@ import pytest
 
 from power_loop.runtime.store.schema import _STORE_TABLES
 from power_loop.runtime.store.task_schema import TASK_TABLES
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -57,7 +59,7 @@ async def test_pg_concurrent_create_timer_no_pk_collision():
     try:
         tables = ",".join(store.table_prefix + n for n in _ALL_TABLES if n != "schema_migrations")
         await store._db.execute(f"TRUNCATE {tables}")
-        sid = await store.create_session(session_id="race_timers")
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="race_timers")
         # Without the session_state FOR UPDATE lock, concurrent allocators read the same
         # MAX(timer_id) and the 2nd INSERT raises UniqueViolation on the (session_id, timer_id) PK.
         n = 12
@@ -79,7 +81,7 @@ async def test_pg_concurrent_add_note_no_pk_collision():
     try:
         tables = ",".join(store.table_prefix + n for n in _ALL_TABLES if n != "schema_migrations")
         await store._db.execute(f"TRUNCATE {tables}")
-        sid = await store.create_session(session_id="race_notes")
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="race_notes")
         n = 12
         notes = await asyncio.gather(*(store.add_note(sid, f"n{i}") for i in range(n)))
         ids = sorted(x.note_id for x in notes)

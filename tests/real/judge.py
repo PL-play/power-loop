@@ -63,7 +63,7 @@ async def judge_async(
                 max_rounds=1,
                 temperature=0,
                 max_tokens=256,
-                compactor=None,
+                context_budget_tokens=10**9,
             ),
         ).start()
         user_msg = (

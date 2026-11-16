@@ -171,7 +171,7 @@ async def test_pipeline_unknown_failure_is_visible_and_new_input_can_continue(ru
     events = []
     bus = AgentEventBus()
     bus.subscribe(None, events.append)
-    loop = await runtime_agent(model=llm, event_bus=bus, config=AgentLoopConfig(compactor=None,
+    loop = await runtime_agent(model=llm, event_bus=bus, config=AgentLoopConfig(context_budget_tokens=10**9,
         retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0)))
     result = await loop.send("first input")
     assert result.status == "failed" and "unconfirmed call" in result.error

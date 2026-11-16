@@ -11,9 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
-import functools
-import inspect
 import json
 import logging
 import threading
@@ -43,7 +40,6 @@ from power_loop.contracts.errors import (
 )
 from power_loop.contracts.event_payloads import (
     AgentErrorPayload,
-    AutoCompactStatusPayload,
     BaseEventPayload,
     BudgetExceededStatusPayload,
     ContextCheckpointStatusPayload,
@@ -72,8 +68,6 @@ from power_loop.contracts.event_payloads import (
 )
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import (
-    CompactAfterCtx,
-    CompactBeforeCtx,
     CompleteDecideCtx,
     LlmAfterCtx,
     LlmBeforeCtx,
@@ -99,7 +93,6 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
 from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
-from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.image_recall import drain_queued_images
 from power_loop.runtime.memory import MemorySnapshot
 from power_loop.runtime.retry import _status_of, with_retry
@@ -187,20 +180,6 @@ def _finish_reason(response: Any) -> str:
     return ""
 
 RESULT_MAX_CHARS = 20000
-
-
-@functools.cache
-def _maybe_compact_accepts_context(func: Any) -> bool:
-    """Whether a compactor's ``maybe_compact`` accepts the optional ``context``
-    kwarg (or ``**kwargs``). Cached per function — introspect once. The back-compat
-    gate for H7 Phase 2 so old-signature compactors are never passed ``context``."""
-    try:
-        params = inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return False
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return True
-    return "context" in params
 
 
 # ── Utility functions (unchanged from old agent.py) ──
@@ -952,7 +931,7 @@ class AgentPipeline:
         """
         rep = self.config.representation
         distill = getattr(rep, "distill_tool_call", None)
-        if getattr(rep, "kind", "projection") == "verbatim" or distill is None:
+        if distill is None:
             return 0
         seqs = getattr(self.sink, "_history_seqs", None) or []
         start = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
@@ -1021,33 +1000,6 @@ class AgentPipeline:
             self._tok_len = len(self.history)
         return self._tok_total
 
-    def _build_compaction_context(self, round_index: int) -> CompactionContext:
-        """Build the optional handle a context-aware compactor receives (H7 P2):
-        the configured MemoryProvider + a read-only seq-range message accessor."""
-        store = self.store
-        sid = self.session_id
-
-        async def _fetch(from_seq: int, to_seq: int) -> list[dict[str, Any]]:
-            assert store is not None and sid is not None  # set only when has_store
-            rows = await store.load_all_messages(sid)
-            return [
-                {
-                    "role": r.role, "name": r.name, "content": r.content,
-                    "tool_calls": r.tool_calls, "tool_call_id": r.tool_call_id,
-                    "seq": r.seq, "round_index": r.round_index,
-                }
-                for r in rows if from_seq <= r.seq <= to_seq
-            ]
-
-        has_store = store is not None and sid is not None
-        return CompactionContext(
-            session_id=sid,
-            memory=self.config.memory,
-            round_index=round_index,
-            fetch_messages=_fetch if has_store else None,
-            current_tokens=self._estimate_history_tokens(),
-        )
-
     async def prepare_round(self, round_index: int) -> None:
         """Prepare a new round: todo reminders, then run the pluggable
         compactor if one is configured on the loop config."""
@@ -1108,96 +1060,6 @@ class AgentPipeline:
             # changing len(self.history), so the SCALE-4 incremental estimate would
             # stay stale-high and over-trigger LLM-summary compaction. Invalidate it.
             self._tok_len = -1
-
-        # 3.0: verbatim mode → an in-place Compactor mapped from config.fold_strategy; projection
-        # mode → None (it folds at end-of-send in the derived layer).
-        compactor = self.config.resolve_compactor()
-        if compactor is None:
-            return
-
-        compact_before = CompactBeforeCtx(
-            round_index=round_index,
-            messages=self.history,
-        )
-        await self.hooks.run_typed_async(HookPoint.COMPACT_BEFORE, compact_before)
-        if compact_before.directive == HookDirective.SKIP:
-            return
-
-        from power_loop.runtime.task_runtime import current_session_send
-        fold_calls = None
-        compact_llm = self.llm
-        if current_session_send(session_id=self.session_id) is not None:
-            # A task-managed send books its fold calls itself (purpose "fold").
-            from power_loop.runtime.fold_calls import FoldCalls
-            fold_calls = FoldCalls(session_id=self.session_id, bus=self.bus, cancel_token=self.cancel_token)
-            compact_llm = fold_calls.wrap(self.llm)
-            if getattr(compactor, "summary_llm", None) is not None:
-                compactor = copy.copy(compactor)
-                compactor.summary_llm = fold_calls.wrap(compactor.summary_llm)
-        compact_kwargs: dict[str, Any] = dict(
-            llm=compact_llm,
-            # Reserve headroom for the ephemeral tail-injected memory block (it
-            # isn't in self.history so the compactor can't see it) — fold a bit
-            # earlier so history + memory stays within the window.
-            max_tokens=self.config.effective_context_budget(),
-            round_index=round_index,
-        )
-        # Back-compat: only hand the optional CompactionContext to compactors whose
-        # maybe_compact() actually accepts it, so pre-existing (old-signature) custom
-        # compactors keep working unchanged (H7 Phase 2).
-        if _maybe_compact_accepts_context(type(compactor).maybe_compact):
-            compact_kwargs["context"] = self._build_compaction_context(round_index)
-        plan = await compactor.maybe_compact(self.history, **compact_kwargs)
-        if fold_calls is not None:
-            fold_calls.raise_if_cancelled()
-        if plan is None:
-            return
-
-        self._emit(
-            AgentEventType.STATUS_CHANGED,
-            AutoCompactStatusPayload(
-                phase="started",
-                round_index=round_index,
-                trigger="compactor_plan_emitted",
-                before_tokens=plan.before_tokens,
-                after_tokens=plan.after_tokens,
-            ),
-            round_index=round_index,
-        )
-
-        # Apply plan IN-MEMORY first, then persist via the sink.
-        note_msg = {"role": "system", "name": "compact_note", "content": plan.summary_text}
-        before_len = len(self.history)
-        self.history = (
-            self.history[: plan.fold_start_idx]
-            + [note_msg]
-            + self.history[plan.fold_end_idx + 1 :]
-        )
-        # SCALE-4: a fold reassigns history; invalidate the incremental estimate
-        # like the other reassignment sites. A single-message fold (start==end)
-        # keeps len() unchanged, so without this the cache returns a stale (too-high)
-        # count and the next round's trigger decision is made on it.
-        self._tok_len = -1
-        # Persist (no-op for NullSink). Pass the pre-fold history length so the
-        # sink can refuse to persist if its index↔seq map ever drifts out of
-        # alignment (H1.1 safety net), rather than mark the wrong rows.
-        await self._emit_sink(
-            self.sink.on_compaction,
-            fold_start_idx=plan.fold_start_idx,
-            fold_end_idx=plan.fold_end_idx,
-            summary_text=plan.summary_text,
-            before_tokens=plan.before_tokens,
-            after_tokens=plan.after_tokens,
-            round_index=round_index,
-            expected_history_len=before_len,
-        )
-        compact_after = CompactAfterCtx(
-            round_index=round_index,
-            messages=self.history,
-            messages_before_count=before_len,
-            messages_after_count=len(self.history),
-        )
-        await self.hooks.run_typed_async(HookPoint.COMPACT_AFTER, compact_after)
 
     async def _runtime_messages_for_round(self, round_index: int) -> list[LoopMessage]:
         """Build transient runtime-state messages for the next LLM call.

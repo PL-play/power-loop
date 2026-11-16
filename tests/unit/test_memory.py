@@ -83,7 +83,7 @@ async def _new_loop(runtime_agent, *, llm, store, bus, memory=None, hooks=None):
     return await runtime_agent(
         model=llm, store=store, event_bus=bus, hooks=hooks,
         config=AgentLoopConfig(
-            system_prompt="sp", max_rounds=1, compactor=None, memory=memory,
+            system_prompt="sp", max_rounds=1, context_budget_tokens=10**9, memory=memory,
         ),
     )
 

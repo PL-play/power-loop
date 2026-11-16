@@ -204,7 +204,7 @@ def parse_structured(
             extracted = _extract_first_json_object(cleaned) or cleaned
             candidate = _try_repair_json(extracted)
         try:
-            parsed = json.loads(candidate)
+            parsed = json.loads(candidate, parse_constant=_reject_nonfinite)
             break
         except Exception:
             continue
@@ -221,6 +221,10 @@ def parse_structured(
     if schema is not None:
         _check_top_level_schema(parsed, schema, raw_text=text)
     return parsed
+
+
+def _reject_nonfinite(value: str):
+    raise ValueError(f"non-JSON numeric value: {value}")
 
 
 def _check_top_level_schema(obj: dict[str, Any], schema: dict[str, Any], *, raw_text: str) -> None:

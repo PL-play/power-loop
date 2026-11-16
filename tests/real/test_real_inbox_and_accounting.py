@@ -84,7 +84,7 @@ async def test_real_cancelled_input_does_not_erase_the_next_accepted_input(runti
             config=AgentLoopConfig(
                 system_prompt="First call the `wait` tool exactly once, then answer the user "
                               "briefly in English.",
-                max_rounds=4, max_tokens=2048, temperature=0, compactor=None))
+                max_rounds=4, max_tokens=2048, temperature=0, context_budget_tokens=10**9))
         sid = loop.target.session_id
         first = await loop.runtime.client.send(loop.target, 'Name a fruit.', message_id='m1', actor=loop.actor)
         await _until_in_flight(started, loop, sid)
@@ -127,7 +127,7 @@ async def test_real_user_message_and_task_wakeup_arrive_separately_and_both_land
             config=AgentLoopConfig(
                 system_prompt="You are an assistant. First call the `wait` tool exactly once, "
                               "then reply to everything you have been told, in English.",
-                max_rounds=4, max_tokens=2048, temperature=0, compactor=None))
+                max_rounds=4, max_tokens=2048, temperature=0, context_budget_tokens=10**9))
         sid = loop.target.session_id
         run = asyncio.create_task(loop.send("Hi, I'm starting a session."))
         await _until_in_flight(started, loop, sid)
@@ -179,7 +179,7 @@ async def test_real_image_survives_the_inbox(tmp_path: Any, runtime_agent) -> No
             config=AgentLoopConfig(
                 system_prompt="First call the `wait` tool exactly once, then answer the user's "
                               "latest question.", max_rounds=4, max_tokens=2048, temperature=0,
-                compactor=None))
+                context_budget_tokens=10**9))
         sid = loop.target.session_id
         run = asyncio.create_task(loop.send("I'll send you a picture in a moment."))
         await _until_in_flight(started, loop, sid)
@@ -222,7 +222,7 @@ async def test_real_bad_key_costs_one_request(runtime_agent) -> None:
         degraded: list[dict] = []
         bus.subscribe(AgentEventType.LLM_DEGRADED, lambda e: degraded.append(dict(e.payload or {})))
         loop = await runtime_agent(model=svc, store=store, event_bus=bus, config=AgentLoopConfig(
-            system_prompt="S", max_rounds=1, compactor=None,
+            system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
             retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=1.0, total_timeout=None)))
         t0 = time.monotonic()
         res = await loop.send("hello")
@@ -254,7 +254,7 @@ async def test_real_streamed_call_reports_provider_usage_and_estimate_is_close(r
         system = "You are a concise travel guide. " * 20
         loop = await runtime_agent(model=make_llm(max_tokens=2048, temperature=0), store=store,
                                  event_bus=bus, config=AgentLoopConfig(
-                                     system_prompt=system, max_rounds=1, compactor=None))
+                                     system_prompt=system, max_rounds=1, context_budget_tokens=10**9))
         res = await loop.send(_PROMPT * 8)
         assert res.status == "completed"
         ev = done[-1]
@@ -290,7 +290,7 @@ async def test_real_aborted_stream_is_recorded_with_an_estimate(runtime_agent) -
         bus.subscribe(AgentEventType.STREAM_THINK_DELTA, _count)
         loop = await runtime_agent(model=make_llm(max_tokens=4000, temperature=0.7), store=store,
                                  event_bus=bus, config=AgentLoopConfig(
-                                     system_prompt="S", max_rounds=1, compactor=None,
+                                     system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
                                      retry_policy=None))
         receipt = await loop.runtime.client.send(loop.target, '请写一篇至少 3000 字的连续小说，一直写下去。', message_id='stream', actor=loop.actor)
         for _ in range(3000):

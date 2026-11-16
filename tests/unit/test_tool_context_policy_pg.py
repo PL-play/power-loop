@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 from urllib.parse import urlparse
@@ -5,6 +6,8 @@ from urllib.parse import urlparse
 import pytest
 
 from power_loop.runtime.store.factory import open_store
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 
 @pytest.mark.asyncio
@@ -14,7 +17,7 @@ async def test_auxiliary_stats_atomic_replay_pg():
         pytest.skip('requires explicit isolated PG DSN')
     assert urlparse(dsn).path.endswith('_test')
     store = await open_store(dsn, table_prefix='plcontexttest_')
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     try:
         usage = {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}
         await asyncio.gather(*(store.record_auxiliary_usage(sid, 'attempt', usage) for _ in range(8)))
@@ -32,7 +35,7 @@ async def test_auxiliary_stats_revision_order_pg():
         pytest.skip('requires explicit isolated PG DSN')
     assert urlparse(dsn).path.endswith('_test')
     store = await open_store(dsn, table_prefix='plcontexttest_')
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     try:
         await store.record_auxiliary_usage(sid, 'corrected', {}, revision=1)
         known = {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}

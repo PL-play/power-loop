@@ -26,6 +26,8 @@ from power_loop.runtime.tool_contracts import (
 from power_loop.runtime.tool_truncation import truncate_view
 from power_loop.tools import create_default_tool_registry
 from power_loop.tools.registry import ToolRegistry
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 
 @pytest.fixture(params=['sqlite', 'postgres'])
@@ -191,7 +193,7 @@ async def test_alias_archive_restart_and_group_recall_preserve_originals(store):
 
     from power_loop.runtime.tool_archive import recall_group
     registry = registry_for('bash', 'inspect_original', wrapped=True)
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     history, seqs = [], []
     original = source('inspect_original')
     for index in range(2):

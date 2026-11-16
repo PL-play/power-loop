@@ -17,10 +17,11 @@ import pytest
 
 from power_loop import (
     MAX_SPAWN_DEPTH,
-    AgentSpec,
+    RuntimeRequestError,
     SessionStore,
 )
-from power_loop._vendor.llm_client.interface import LLMResponse
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -43,24 +44,22 @@ async def test_default_is_module_constant() -> None:
         await s.close()
 
 
-async def test_open_accepts_custom_limit() -> None:
-    s = await SessionStore.open(":memory:", max_spawn_depth=1)
-    try:
-        assert s.max_spawn_depth == 1
-        root = await s.create_session()
-        child = await s.create_session(parent_session_id=root)  # depth 1 == limit: ok
-        with pytest.raises(ValueError, match="exceeds max 1"):
-            await s.create_session(parent_session_id=child)  # depth 2 > 1: rejected
-    finally:
-        await s.close()
+async def test_open_accepts_custom_limit(registry_store) -> None:
+    s, _ = registry_store
+    s.max_spawn_depth = 1
+    assert s.max_spawn_depth == 1
+    root = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
+    child = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, parent_session_id=root)  # depth 1 == limit: ok
+    with pytest.raises(RuntimeRequestError, match="exceeds max 1"):
+        await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, parent_session_id=child)  # depth 2 > 1: rejected
 
 
 async def test_higher_limit_allows_deeper_chain() -> None:
     s = await SessionStore.open(":memory:", max_spawn_depth=5)
     try:
-        cur = await s.create_session()
+        cur = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         for _ in range(5):  # would blow the default of 3
-            cur = await s.create_session(parent_session_id=cur)
+            cur = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, parent_session_id=cur)
         assert s.max_spawn_depth == 5
     finally:
         await s.close()
@@ -81,11 +80,23 @@ def test_property_setter_validates(store: SessionStore) -> None:
 
 @pytest.mark.parametrize("depth", [1, 2, 9])
 async def test_runtime_uses_explicit_store_depth_without_overriding_it(store, runtime_agent, depth):
-    from tests.unit.test_subagent import _child, _Scripted
+    import json
+
+    from power_loop import AgentLoopConfig
+    from power_loop.tools.registry import ToolRegistry
+    from power_loop.tools.spawn_agent import register_spawn_agent
+    from tests.unit.test_subagent_sessions_215 import ParentAndChild
+
     store.max_spawn_depth = depth
-    agent, child = await _child(runtime_agent, store, _Scripted(responses=[LLMResponse(raw_text="child")]),
-        AgentSpec(name="child", system_prompt="P", lifecycle="linked"))
-    assert child["status"] == "completed"
+    registry = ToolRegistry()
+    register_spawn_agent(registry)
+    agent = await runtime_agent(model=ParentAndChild(), store=store, registry=registry,
+                                config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2)
+    result = await agent.send("delegate")
+    assert result.status == "completed"
+    await agent.drain()
+    rows = await store.load_all_messages(agent.target.session_id)
+    child = json.loads(next(row.content for row in rows if row.tool_call_id == "spawn"))
     assert store.max_spawn_depth == depth
     row = await store.get_session(child["session_id"])
-    assert row.spawn_depth == 1 and row.parent_session_id == agent.target.session_id
+    assert row.parent_session_id == agent.target.session_id

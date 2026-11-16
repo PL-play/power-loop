@@ -1,6 +1,6 @@
 """power-loop 3.0 — loop-level coverage of the REAL fold strategies (not the deterministic test
-stub), the fold-timeout / soft-fail paths, agentic note-writing, and the custom-fold-under-verbatim
-adapter. Closes the review's test gaps #9/#10/#21/#32 + the async-fold-out-of-lock behavior.
+stub), the fold-timeout / soft-fail paths and agentic note-writing. Closes the review's test
+gaps #9/#10/#21/#32 + the async-fold-out-of-lock behavior.
 """
 
 from __future__ import annotations
@@ -13,8 +13,10 @@ import pytest
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.runtime.fold import AgenticFold, FoldContext, FoldResult, LLMSummaryFold
-from power_loop.runtime.representation import ProjectedRepresentation, VerbatimRepresentation
+from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 from tests.unit.test_stateful_loop import _echo_registry, _Scripted
 
 
@@ -135,46 +137,6 @@ async def test_projection_fold_soft_fail_returns_none(store: SessionStore, runti
     assert {r.send_index for r in await store.load_project_messages(sid) if r.kind == "project"} == {1, 2, 3}
 
 
-# ── #21: a CUSTOM FoldStrategy under VERBATIM goes through the in-place adapter end-to-end ──
-
-
-@dataclass
-class _CustomVerbatimFold:
-    keep_last_sends: int = 1
-    trigger_ratio: float = 0.5
-    summary_max_tokens: int = 500
-    fold_id: str = "custom-verbatim"
-    seen: int = 0
-
-    async def fold(self, rows, *, context: FoldContext) -> FoldResult | None:
-        # exercised via FoldStrategyCompactor._summarize_async (verbatim in-place path)
-        object.__setattr__(self, "seen", self.seen + 1)
-        return FoldResult(content={"summary": "CUSTOM-VERBATIM-SUMMARY"}, folded_to_send=1)
-
-
-@pytest.mark.asyncio
-async def test_verbatim_custom_fold_via_adapter_compacts(store: SessionStore, monkeypatch, runtime_agent) -> None:
-    # conftest loads .env (CONTEXT_COMPACT_THRESHOLD=50000) which the in-place compactor honors as
-    # an absolute override; clear it so the verbatim fold triggers at max_tokens × trigger_ratio.
-    monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
-    fold = _CustomVerbatimFold()
-    llm = _Scripted(responses=[LLMResponse(raw_text=f"r{i}") for i in range(1, 7)])
-    loop = await runtime_agent(
-        model=llm, store=store, registry=_echo_registry(),
-        config=AgentLoopConfig(
-            system_prompt="S", max_rounds=2, representation=VerbatimRepresentation(),
-            fold_strategy=fold, max_tokens=10,  # tiny → in-place compactor triggers
-        ),
-    )
-    sid = loop.target.session_id
-    for i in range(1, 6):
-        assert (await loop.send(f"m{i}")).status == "completed"
-    comps = await store.list_compactions(sid)
-    assert comps, "custom fold under verbatim should compact in place via the adapter"
-    assert fold.seen >= 1  # the custom strategy's fold() actually ran
-    note = next((m for m in await store.load_active_messages(sid) if m.name == "compact_note"), None)
-    assert note is not None and "CUSTOM-VERBATIM-SUMMARY" in (note.content or "")
-
 
 # ── concurrency: two loops sharing the store, REAL (awaiting) fold, optimistic commit ──
 
@@ -212,7 +174,7 @@ def test_default_fold_timeout_present() -> None:
 
 @pytest.mark.asyncio
 async def test_commit_projection_fold_stale_skip_and_supersede(store: SessionStore, runtime_agent) -> None:
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     rows1 = [("user", {"human": ["q1"]}, None), ("project", {"tools": [], "final_text": "a1"}, None)]
     prior, _ = await store.write_send_projection_rows(
         sid, send_index=1, rows=rows1, source_seq_lo=None, source_seq_hi=None, projector_version=1,
@@ -276,6 +238,6 @@ async def test_factory_memory_is_available_to_custom_fold_and_next_session(runti
     assert any('BLUEHERON' in str(message) for message in memory.saved)
     from .test_memory_recall_hook import _RecLLM
     model = _RecLLM()
-    second = await runtime_agent(model=model, config=AgentLoopConfig(compactor=None, memory=memory))
+    second = await runtime_agent(model=model, config=AgentLoopConfig(context_budget_tokens=10**9, memory=memory))
     assert (await second.send('Recall the project')).status == 'completed'
     assert 'Retained fact: BLUEHERON' in str(model.seen)

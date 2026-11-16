@@ -112,8 +112,8 @@ async def store():
 @pytest.fixture
 async def agent_factory(store):
     agents = []
-    async def start(model=None, registry=None, config=None):
-        agent = await RunningAgent(store, model or _Scripted(), registry, config).start()
+    async def start(model=None, registry=None, config=None, *, options=None):
+        agent = await RunningAgent(store, model or _Scripted(), registry, config, options=options).start()
         agents.append(agent)
         return agent
     yield start
@@ -127,7 +127,9 @@ async def test_new_session_then_send_persists_user_message(store, agent_factory)
     result = await agent.send('hello')
     assert result.status == 'completed' and result.final_text == 'hi back'
     rows = await store.load_active_messages(agent.target.session_id)
-    assert [(r.role, r.content) for r in rows] == [('user', 'hello'), ('assistant', 'hi back')]
+    assert [r.role for r in rows] == ['user', 'assistant']
+    assert json.loads(rows[0].content)['items'][0]['content'] == 'hello'
+    assert rows[1].content == 'hi back'
     assert [r.send_index for r in rows] == [1, 1]
     assert not any('send_index' in m or '_inbox' in m for m in model.calls[0])
 
@@ -143,18 +145,24 @@ async def test_multimodal_and_json_strings_round_trip(store, agent_factory, body
     await agent.send(body)
     await agent.send('next')
     expected = body if isinstance(body, str) else body['content']
-    assert any(m.get('content') == expected for m in model.calls[1])
+    # The raw audit keeps the exact stored body; the next model call sees its PROJECTION.
     rows = await store.load_active_messages(agent.target.session_id)
     assert rows[0].role == 'user'
-    assert (rows[0].content if isinstance(body, str) else json.loads(rows[0].content)) == expected
+    assert json.loads(rows[0].content)['items'][0]['content'] == body
+    projected = "\n".join(str(m.get('content', '')) for m in model.calls[1])
+    if isinstance(expected, str):
+        assert expected in projected
+    else:
+        assert 'look' in projected and '[image]' in projected
+        assert 'base64' not in projected
 
 
 @pytest.mark.parametrize('history', [True, False])
 async def test_subsequent_send_history_option(store, agent_factory, history):
     model = _Scripted()
-    agent = await agent_factory(model)
+    agent = await agent_factory(model, options=RequestOptions(history=history))
     await agent.send('previous secret')
-    result = await agent.send('current', options=RequestOptions(history=history))
+    result = await agent.send('current')
     assert result.status == 'completed'
     assert any('previous secret' in str(m.get('content', '')) for m in model.calls[1]) is history
     assert {r.send_index for r in await store.load_active_messages(agent.target.session_id)} == {1, 2}
@@ -195,7 +203,7 @@ async def test_custom_runtime_projector_and_tool_context(store, agent_factory, e
     registry.register(ToolDefinition('write', 'write state', input_schema={
         'type': 'object', 'properties': {'text': {'type': 'string'}}}, pricing=Free('fixture')), write_state)
     model = _Scripted([_tool_resp('c1', 'write', '{"text":"VISIBLE"}'), LLMResponse(raw_text='done')])
-    agent = await agent_factory(model, registry, AgentLoopConfig(compactor=None,
+    agent = await agent_factory(model, registry, AgentLoopConfig(context_budget_tokens=10**9,
         runtime_projectors=(_CustomProjector(),) if enabled else ()))
     assert (await agent.send('write')).status == 'completed'
     assert await store.get_runtime_state(agent.target.session_id, 'custom') == {'text': 'VISIBLE'}
@@ -208,8 +216,9 @@ async def test_prompt_and_empty_tool_subset_are_applied(agent_factory):
             self.request = request
             return await super().complete(request, **kwargs)
     model = Capture()
-    agent = await agent_factory(model, _echo_registry(), AgentLoopConfig(system_prompt='default', compactor=None))
-    await agent.send('question', options=RequestOptions(system_prompt='frozen override', tools=()))
+    agent = await agent_factory(model, _echo_registry(), AgentLoopConfig(system_prompt='default', context_budget_tokens=10**9))
+    await agent.new_session(options=RequestOptions(system_prompt='frozen override', tools=()))
+    await agent.send('question')
     assert 'frozen override' in model.request.system_prompt
     assert {t['function']['name'] for t in model.request.tools} == {'pass_turn'}
 
@@ -223,11 +232,14 @@ async def test_prompt_and_empty_tool_subset_are_applied(agent_factory):
 async def test_structured_result_is_stored_with_original_text(agent_factory, text, status, error):
     model = _Scripted([LLMResponse(raw_text=text)])
     agent = await agent_factory(model)
-    result = await agent.send('JSON please', options=RequestOptions(response_format={
+    await agent.new_session(options=RequestOptions(response_format={
         'type': 'json_schema', 'json_schema': {'name': 'answer',
             'schema': {'type': 'object', 'required': ['answer'], 'properties': {'answer': {'type': 'number'}}}},
     }))
-    assert result.status == status and result.error == error and result.final_text == text
+    result = await agent.send('JSON please')
+    assert result.status == status and result.final_text == text
+    assert (error.split(": ", 1)[1] in result.error) if error else result.error is None
+    assert result.error_code == ("structured_output" if error else None)
     assert result.structured_output == ({'answer': 42} if status == 'completed' else None)
     reread = await agent.runtime.client.wait(result.input_ref, actor=agent.actor,
                                             deadline_ms=int(time.time()*1000)+1000)
@@ -243,19 +255,24 @@ async def test_skills_profile_is_preserved(tmp_path, agent_factory):
             self.request = request
             return await super().complete(request, **kwargs)
     model = Capture()
-    agent = await agent_factory(model, config=AgentLoopConfig(compactor=None, skills_dir=str(tmp_path)))
+    agent = await agent_factory(model, config=AgentLoopConfig(context_budget_tokens=10**9, skills_dir=str(tmp_path)))
     await agent.send('hello')
     assert 'Runtime test skill' in model.request.system_prompt
 
 
-async def test_two_facades_serialize_and_keep_own_result(agent_factory):
+async def test_two_facades_wait_for_their_inputs_in_one_batch(agent_factory):
     model = _Scripted([LLMResponse(raw_text='first'), LLMResponse(raw_text='second')])
     agent = await agent_factory(model)
     second = StatefulAgentLoop(runtime=agent.runtime)
     try:
+        from power_loop.agent.stateful_loop import _session_sync
+        async with _session_sync(agent.target.session_id).lock:
+            for message_id, text in (("m1", "one"), ("two", "two")):
+                await agent.runtime.client.send(agent.target, text, message_id=message_id, actor=agent.actor)
         first_result, second_result = await asyncio.gather(agent.send('one'), second.send(agent.target, 'two',
             message_id='two', actor=agent.actor, deadline_ms=__import__('time').time_ns() // 1000000 + 10000))
-        assert (first_result.final_text, second_result.final_text) == ('first', 'second')
+        assert (first_result.final_text, second_result.final_text) == ('first', 'first')
+        assert first_result.send_index == second_result.send_index == 1 and len(model.calls) == 1
         assert first_result.input_ref != second_result.input_ref
     finally:
         await second.aclose()
@@ -265,7 +282,7 @@ async def test_model_error_is_a_readable_failed_result(agent_factory):
     class Broken(_Scripted):
         async def complete(self, request, **kwargs):
             raise RuntimeError('provider failed')
-    agent = await agent_factory(Broken(), config=AgentLoopConfig(compactor=None, max_rounds=1))
+    agent = await agent_factory(Broken(), config=AgentLoopConfig(context_budget_tokens=10**9, max_rounds=1))
     result = await agent.send('fail')
     assert result.status == 'failed'
     assert result.error is not None

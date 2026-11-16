@@ -56,7 +56,7 @@ def echo_registry(seen):
 async def test_idle_send_completes_without_job(registry_store):
     store, _ = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, compactor=None)).start()
+    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
     try:
         result = await agent.send("hello")
         assert result.status == "completed"
@@ -81,7 +81,7 @@ async def test_tool_loop_runs_and_records_pending_atomically(registry_store):
     seen = []
     model = EchoModel(tool_rounds=2)
     agent = await RunningAgent(store, model, echo_registry(seen),
-                               config=AgentLoopConfig(max_rounds=6, compactor=None)).start()
+                               config=AgentLoopConfig(max_rounds=6, context_budget_tokens=10**9)).start()
     try:
         result = await agent.send("run tools")
         assert result.status == "completed"
@@ -160,7 +160,7 @@ async def test_busy_followup_is_read_at_next_boundary_not_one_round_late(registr
                                      pricing=Free("fixture")), gate)
     model = GatedToolModel()
     agent = await RunningAgent(store, model, registry,
-                               config=AgentLoopConfig(max_rounds=6, compactor=None)).start()
+                               config=AgentLoopConfig(max_rounds=6, context_budget_tokens=10**9)).start()
     try:
         sending = asyncio.create_task(agent.send("first"))
         await entered.wait()
@@ -191,7 +191,7 @@ async def test_busy_followup_is_read_at_next_boundary_not_one_round_late(registr
 async def test_twenty_backlog_inputs_merge_into_one_send(registry_store):
     store, _ = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, compactor=None)).start()
+    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
     try:
         # Hold notifications so the worker cannot claim until all 20 are accepted; then
         # one discovery scan claims the whole backlog as a single batch (one run).
@@ -207,7 +207,11 @@ async def test_twenty_backlog_inputs_merge_into_one_send(registry_store):
                 agent.target, f"item {i}", message_id=f"b{i}", actor=agent.actor)
             refs.append(receipt.input_ref)
         await agent.runtime.worker.recover()
-        result = await agent.runtime.client.wait(refs[0], actor=agent.actor, deadline_ms=None)
+        # Notifications are held, so the client cannot receive a completion event.
+        # Design 216 S03 has no periodic result poll: worker discovery runs the batch,
+        # then the caller reads the durable result explicitly.
+        await agent.drain(after_input=refs[0])
+        result = await agent.runtime.client.inputs.get_result(refs[0], actor=agent.actor)
         assert result.status == "completed" and result.send_index == 1
         assert model.calls == 1  # one model run for the whole batch
         rows = await store.load_all_messages(agent.target.session_id)
@@ -219,12 +223,16 @@ async def test_twenty_backlog_inputs_merge_into_one_send(registry_store):
         await agent.aclose()
 
 
-async def test_notification_loss_still_completes_via_scan(registry_store):
-    """A lost activation notification must not lose the input: the periodic unfinished
-    scan picks it up (design 215 §9.2)."""
+async def test_notification_loss_is_recovered_by_explicit_read(registry_store):
+    """Lost notifications never lose the input or the durable result.
+
+    Worker work-discovery still runs the send (design 215 §9.2). Design 216 S03 removes
+    the client's periodic result poll, so a waiter without a deadline would stay pending;
+    the supported recovery is an explicit read of the original InputRef.
+    """
     store, _ = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, compactor=None)).start()
+    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
     try:
         # Drop every notification by failing the transport publish.
         async def lost_publish(packet):
@@ -236,7 +244,8 @@ async def test_notification_loss_still_completes_via_scan(registry_store):
         assert receipt.notification == "failed"
         # Force the discovery path the worker uses on its periodic scan.
         await agent.runtime.worker.recover()
-        result = await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=None)
+        await agent.drain(after_input=receipt.input_ref)
+        result = await agent.runtime.client.inputs.get_result(receipt.input_ref, actor=agent.actor)
         assert result.status == "completed" and result.final_text == "done"
     finally:
         await agent.aclose()
@@ -256,7 +265,7 @@ async def test_cancel_active_run_stops_at_checkpoint(registry_store):
                                      pricing=Free("fixture")), gate)
     model = GatedToolModel()
     agent = await RunningAgent(store, model, registry,
-                               config=AgentLoopConfig(max_rounds=6, compactor=None)).start()
+                               config=AgentLoopConfig(max_rounds=6, context_budget_tokens=10**9)).start()
     try:
         sending = asyncio.create_task(agent.send("first"))
         await entered.wait()
@@ -276,7 +285,7 @@ async def test_cancel_active_run_stops_at_checkpoint(registry_store):
 async def test_continue_completed_session_is_a_new_send(registry_store):
     store, _ = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, compactor=None)).start()
+    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
     try:
         first = await agent.send("one")
         second = await agent.send("two")
@@ -294,7 +303,7 @@ async def test_detached_client_waits_without_in_memory_result(registry_store):
     """A brand-new client/store connection waits on the durable result (design 215 §5.3)."""
     store, connect = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, compactor=None)).start()
+    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
     try:
         receipt = await agent.runtime.client.send(agent.target, "hello", message_id="m1", actor=agent.actor)
         # A detached client over a fresh connection to the same database.
@@ -303,10 +312,155 @@ async def test_detached_client_waits_without_in_memory_result(registry_store):
         from power_loop.agent.runtime_transport import MemoryMessageTransport
         detached = RuntimeClient(store=other_store, transport=MemoryMessageTransport(),
                                  namespace=agent.runtime.namespace)
-        result = await detached.wait(receipt.input_ref, actor=agent.actor, deadline_ms=None)
+        # This client's in-process transport never sees the worker's notification. The
+        # absolute deadline is the documented recovery: one final read of the durable
+        # result (no periodic poll).
+        from power_loop.agent.runtime_store import now_ms
+        result = await detached.wait(receipt.input_ref, actor=agent.actor,
+                                     deadline_ms=now_ms() + 2000)
         assert result.status == "completed" and result.final_text == "done"
         assert result.usage["total_tokens"] == 5
         await detached.aclose()
         await other_store.close()
+    finally:
+        await agent.aclose()
+
+
+async def _touch_updates(store, action):
+    """Run ACTION under the existing SQL profiler and count activity writes."""
+    from .test_send_sql_profile import Profiled
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+    try:
+        profiled.records.clear()
+        result = await action()
+    finally:
+        store._db = original
+    touches = sum(
+        1 for record in profiled.records
+        if record["sql"].lstrip().upper().startswith("UPDATE")
+        and "SESSIONS SET UPDATED_AT" in record["sql"].upper()
+    )
+    return result, touches
+
+
+async def _set_session_updated_at(store, sid, value_ms):
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET updated_at=? WHERE session_id=?",
+        (int(value_ms), sid),
+    )
+
+
+async def test_recent_consecutive_sends_do_not_rewrite_activity_time(registry_store):
+    from power_loop.agent.runtime_store import now_ms
+    store, _ = registry_store
+    agent = await RunningAgent(store, EchoModel(),
+                               config=AgentLoopConfig(max_rounds=4,
+                                                      context_budget_tokens=10**9)).start()
+    sid = agent.target.session_id
+    try:
+        for index in range(3):
+            # Legally recent session activity, prepared outside the measured request.
+            await _set_session_updated_at(store, sid, now_ms())
+            result, touches = await _touch_updates(store, lambda i=index: agent.send(f"short {i}"))
+            assert result.status == "completed"
+            assert touches == 0, (index, touches)
+    finally:
+        await agent.aclose()
+
+
+async def test_expired_activity_time_still_writes(registry_store):
+    from power_loop.agent.runtime_store import now_ms
+    store, _ = registry_store
+    agent = await RunningAgent(store, EchoModel(),
+                               config=AgentLoopConfig(max_rounds=4,
+                                                      context_budget_tokens=10**9)).start()
+    sid = agent.target.session_id
+    try:
+        await _set_session_updated_at(store, sid, now_ms() - 2000)
+        result, touches = await _touch_updates(store, lambda: agent.send("expired"))
+        assert result.status == "completed"
+        assert touches == 1
+    finally:
+        await agent.aclose()
+
+
+async def test_model_runtime_crossing_the_interval_still_writes(registry_store):
+    from power_loop.agent.runtime_store import now_ms
+    store, _ = registry_store
+
+    class SlowModel(EchoModel):
+        async def complete(self, request, **kwargs):
+            await asyncio.sleep(1.05)
+            return await super().complete(request, **kwargs)
+
+    agent = await RunningAgent(store, SlowModel(),
+                               config=AgentLoopConfig(max_rounds=2,
+                                                      context_budget_tokens=10**9)).start()
+    sid = agent.target.session_id
+    try:
+        await _set_session_updated_at(store, sid, now_ms())
+        result, touches = await _touch_updates(store, lambda: agent.send("slow"))
+        assert result.status == "completed"
+        assert touches == 1
+    finally:
+        await agent.aclose()
+
+
+async def test_new_worker_gets_activity_time_from_its_own_claim(registry_store):
+    from power_loop.agent.runtime_store import now_ms
+    store, _ = registry_store
+    first = await RunningAgent(store, EchoModel(),
+                               config=AgentLoopConfig(max_rounds=4,
+                                                      context_budget_tokens=10**9)).start()
+    target = first.target
+    sid = target.session_id
+    try:
+        assert (await first.send("first", message_id="first")).status == "completed"
+        await first.aclose()
+        await _set_session_updated_at(store, sid, now_ms())
+        second = await RunningAgent(store, EchoModel(),
+                                    config=AgentLoopConfig(max_rounds=4,
+                                                           context_budget_tokens=10**9)).start(
+            target=target)
+        try:
+            result, touches = await _touch_updates(store, lambda: second.send("second", message_id="second"))
+            assert result.status == "completed"
+            assert touches == 0
+        finally:
+            await second.aclose()
+    finally:
+        await first.aclose()  # also releases if an assertion failed before the explicit close
+
+
+async def test_has_pending_is_boolean_and_session_scoped(registry_store):
+    store, _ = registry_store
+    agent = await RunningAgent(store, EchoModel(),
+                               config=AgentLoopConfig(max_rounds=2,
+                                                      context_budget_tokens=10**9)).start()
+    port = __import__("power_loop.agent.runtime_store", fromlist=["RuntimeInputStore"]).RuntimeInputStore(store)
+    sid = agent.target.session_id
+    try:
+        assert await agent.runtime.worker._has_pending(sid) is False
+        await port.accept(agent.target, "waiting", message_id="waiting", actor=agent.actor)
+        await store._db.execute(
+            f"UPDATE {store.t.follow_up_queue} SET status='waiting_continuation',"
+            "delivered_at=1,delivered_seq=1,delivered_send_index=1 "
+            "WHERE session_id=? AND item_id='waiting'", (sid,),
+        )
+        assert await agent.runtime.worker._has_pending(sid) is False
+        await port.accept(agent.target, "one", message_id="one", actor=agent.actor)
+        assert await agent.runtime.worker._has_pending(sid) is True
+        await port.accept(agent.target, "two", message_id="two", actor=agent.actor)
+        assert await agent.runtime.worker._has_pending(sid) is True
+        other = await port.create_session(agent.descriptor, actor=agent.actor)
+        await port.accept(other, "other", message_id="other", actor=agent.actor)
+        # Clear this session's pending rows; another session's pending input must not count.
+        await store._db.execute(
+            f"UPDATE {store.t.follow_up_queue} SET status='void',terminal_status='cancelled',"
+            "completed_at=1 WHERE session_id=? AND status='pending'", (sid,),
+        )
+        assert await agent.runtime.worker._has_pending(sid) is False
     finally:
         await agent.aclose()

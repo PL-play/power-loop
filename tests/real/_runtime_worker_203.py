@@ -24,7 +24,7 @@ async def main():
     factory=RegistryRuntimeFactory()
     async def build(descriptor,context):
         return ExecutionEnvironment(make_llm(max_tokens=2048,temperature=0),ToolRegistry(),
-            AgentLoopConfig(max_rounds=3,max_tokens=2048,compactor=None))
+            AgentLoopConfig(max_rounds=3,max_tokens=2048,context_budget_tokens=10**9))
     factory.register('real.agent@1',build)
     runtime=Runtime(store=store,factory=factory,node_id='isolated-real')
     actor=TrustedActor('isolated-test','host',None)

@@ -91,7 +91,7 @@ class SkillsModel(LLMService):
 
 async def main():
     for skills in [(SKILL_PYTHON,), (SKILL_PYTHON, SKILL_SECURITY)]:
-        config = AgentLoopConfig(system_prompt=build_system_prompt(*skills), max_rounds=1, compactor=None)
+        config = AgentLoopConfig(system_prompt=build_system_prompt(*skills), max_rounds=1, context_budget_tokens=10**9)
         async with demo_runtime(SkillsModel(), config=config) as (runtime, loop, target, actor):
             result = await loop.send(target, 'Write a typed greeting function', message_id='skill', actor=actor,
                                      deadline_ms=int(time.time()*1000)+10000)

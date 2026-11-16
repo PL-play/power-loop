@@ -17,6 +17,8 @@ import pytest
 from power_loop import CancellationToken, LLMRetryPolicy, SessionStore, StoreBlackboard
 from power_loop.contracts.errors import LLMTimeout
 from power_loop.runtime.retry import with_retry
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -68,8 +70,8 @@ async def test_total_timeout_allows_a_fast_call() -> None:
 async def test_close_session_clears_normal_descendant_resources() -> None:
     store = await SessionStore.open(":memory:")
     try:
-        sid = await store.create_session()
-        child = await store.create_session(parent_session_id=sid)
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
+        child = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, parent_session_id=sid)
         for target in (sid, child):
             await store.append_message(target, role="user", content="retained history")
             await store.add_note(target, "note")

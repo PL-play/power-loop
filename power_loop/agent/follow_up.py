@@ -128,6 +128,25 @@ def is_batch_content(content: Any) -> bool:
     return isinstance(content, Mapping) and content.get("version") == 1 and isinstance(content.get("items"), list)
 
 
+def render_batch_content(merged: Mapping[str, Any]) -> str | list[dict[str, Any]]:
+    """Keep image blocks as model inputs while retaining batch source markers."""
+    items = merged["items"]
+    bodies = [item["content"].get("content") if isinstance(item["content"], Mapping)
+              else item["content"] for item in items]
+    if not any(_non_text_blocks(body) for body in bodies):
+        return render_batch_text(merged)
+    if len(items) == 1 and items[0]["kind"] == "user" and items[0]["priority"] == "normal":
+        return bodies[0]
+    blocks = []
+    for item, body in zip(items, bodies, strict=True):
+        blocks.append({"type": "text", "text": _batch_header(item)})
+        if isinstance(body, list):
+            blocks.extend(body)
+        else:
+            blocks.append({"type": "text", "text": _batch_item_text(item["content"])})
+    return blocks
+
+
 def _merge_plain(payloads: list[str | LoopMessage]) -> LoopMessage | None:
     """Like :func:`merge_follow_up_inputs` but WITHOUT the ``<follow_up>`` envelope — the input
     of a fresh send is the send's own input, not steering into someone else's run."""

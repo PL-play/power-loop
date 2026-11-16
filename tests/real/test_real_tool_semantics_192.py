@@ -35,7 +35,7 @@ async def test_real_model_reads_skill_using_actual_registered_alias(tmp_path, re
     store = await SessionStore.open(str(tmp_path / 'skill.db'))
     loop = await runtime_agent(model=provider, store=store, registry=registry,
         runtime_env=RuntimeEnv(workspace_dir=tmp_path, skills_dir=skills),
-        config=AgentLoopConfig(skills_dir=str(skills), max_tokens=2048, max_rounds=3, compactor=None,
+        config=AgentLoopConfig(skills_dir=str(skills), max_tokens=2048, max_rounds=3, context_budget_tokens=10**9,
                                retry_policy=LLMRetryPolicy(max_attempts=1)))
 
     async def prompt(ctx):
@@ -74,7 +74,7 @@ async def test_real_yield_requires_actual_effect_and_statistics_capability(tmp_p
         FunctionRuntimeTool(handler, ToolRuntimeContract('example.yield', capabilities=('task.yield.v1',))) if implemented else handler)
     provider, store = BoundedProvider(limit=1 if implemented else 2), await SessionStore.open(str(tmp_path / 'yield.db'))
     loop = await runtime_agent(model=provider, store=store, registry=registry,
-        config=AgentLoopConfig(max_tokens=2048, max_rounds=3, compactor=None, retry_policy=LLMRetryPolicy(max_attempts=1)))
+        config=AgentLoopConfig(max_tokens=2048, max_rounds=3, context_budget_tokens=10**9, retry_policy=LLMRetryPolicy(max_attempts=1)))
 
     async def schema(ctx):
         ctx.tools = [registry.get(name).definition.to_openai_tool()] if provider.calls == 0 else []

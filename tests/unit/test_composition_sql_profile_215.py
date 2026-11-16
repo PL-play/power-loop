@@ -22,6 +22,57 @@ from .test_send_sql_profile import Profiled, _category, _counts
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
+async def _session_runs(store, db, sid):
+    """Actual run coordinates from persisted messages, with state as cross-check.
+
+    `send_index` on the messages of one session is the run coordinate; distinct values
+    are actual runs. `session_state.send_index` is recorded separately as a
+    cross-check, not used to replace the message evidence.
+    """
+    rows = await db.fetchall(
+        f"SELECT DISTINCT send_index FROM {store.t.messages} "
+        "WHERE session_id=? AND send_index IS NOT NULL ORDER BY send_index", (sid,))
+    state = await db.fetchone(
+        f"SELECT send_index FROM {store.t.session_state} WHERE session_id=?", (sid,))
+    return {
+        "session_id": sid,
+        "send_indexes": [int(row["send_index"]) for row in rows],
+        "state_send_index": int(state["send_index"]) if state is not None else None,
+    }
+
+
+async def _run_evidence(store, db, parent_sid):
+    """Parent, sub-agent children, workflow drivers and leaves, with actual R."""
+    sessions = await db.fetchall(
+        f"SELECT session_id,session_kind,parent_session_id FROM {store.t.sessions}")
+    children = [row for row in sessions
+                if row["parent_session_id"] == parent_sid and row["session_kind"] == "agent"]
+    drivers = [row for row in sessions
+               if row["parent_session_id"] == parent_sid and row["session_kind"] == "workflow_driver"]
+    driver_ids = {row["session_id"] for row in drivers}
+    leaves = [row for row in sessions
+              if row["parent_session_id"] in driver_ids and row["session_kind"] == "agent"]
+    parent = await _session_runs(store, db, parent_sid)
+    child_runs = [await _session_runs(store, db, row["session_id"]) for row in children]
+    driver_runs = [await _session_runs(store, db, row["session_id"]) for row in drivers]
+    leaf_runs = [await _session_runs(store, db, row["session_id"]) for row in leaves]
+    return {
+        "parent": parent,
+        "children": child_runs,
+        "drivers": driver_runs,
+        "leaves": leaf_runs,
+        "counts": {
+            "parent_R": len(parent["send_indexes"]),
+            "children_R": sum(len(item["send_indexes"]) for item in child_runs),
+            "drivers_R": sum(len(item["send_indexes"]) for item in driver_runs),
+            "leaves_R": sum(len(item["send_indexes"]) for item in leaf_runs),
+            "children_sessions": len(child_runs),
+            "driver_sessions": len(driver_runs),
+            "leaf_sessions": len(leaf_runs),
+        },
+    }
+
+
 class TreeModel(LLMService):
     def __init__(self, count, arrival):
         self.count = count
@@ -68,7 +119,7 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
     registry = ToolRegistry()
     register_spawn_agent(registry)
     runner = await RunningAgent(
-        store, model, registry, AgentLoopConfig(compactor=None), capacity=5,
+        store, model, registry, AgentLoopConfig(context_budget_tokens=10**9), capacity=5,
     ).start()
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
@@ -167,6 +218,10 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
         counts = _counts(records, tx_sites, profiled.tx_categories)
         assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
         writes = await meter.report() if meter else None
+        run_evidence = await _run_evidence(store, original, runner.target.session_id)
+        follow_up_claims = sum(
+            1 for record in records
+            if any("claim_follow_up" in site for site in record["chain"]))
         if output := os.environ.get("P215_COMPOSITION_OUT"):
             with open(output, "a") as stream:
                 stream.write(json.dumps({
@@ -179,6 +234,14 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
                     "transactions": profiled.transactions,
                     "writes": writes,
                     "elapsed_s": elapsed,
+                    "runs": run_evidence,
+                    "follow_up_claim_sql": follow_up_claims,
+                    "model_calls": {
+                        "parent_M": model.parent_calls,
+                        "children_M": count,
+                        "total_M": model.parent_calls + count,
+                        "note": "parent_M counts complete() calls, not runs",
+                    },
                     "records": records,
                     "tx_sites": tx_sites,
                 }) + "\n")
@@ -235,7 +298,7 @@ async def test_workflow_tree_sql_profile(registry_store, count):
     registry = ToolRegistry()
     register_workflow_tool(registry)
     runner = await RunningAgent(
-        store, model, registry, AgentLoopConfig(compactor=None), capacity=5,
+        store, model, registry, AgentLoopConfig(context_budget_tokens=10**9), capacity=5,
     ).start()
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
@@ -275,6 +338,10 @@ async def test_workflow_tree_sql_profile(registry_store, count):
             ) for record in journal_records
         )
         writes = await meter.report() if meter else None
+        run_evidence = await _run_evidence(store, original, runner.target.session_id)
+        follow_up_claims = sum(
+            1 for record in records
+            if any("claim_follow_up" in site for site in record["chain"]))
         if output := os.environ.get("P215_COMPOSITION_OUT"):
             with open(output, "a") as stream:
                 stream.write(json.dumps({
@@ -286,6 +353,15 @@ async def test_workflow_tree_sql_profile(registry_store, count):
                     "transactions": profiled.transactions,
                     "writes": writes,
                     "elapsed_s": elapsed,
+                    "runs": run_evidence,
+                    "follow_up_claim_sql": follow_up_claims,
+                    "model_calls": {
+                        "parent_M": model.parent_calls,
+                        "leaves_M": count,
+                        "driver_M": 0,
+                        "total_M": model.parent_calls + count,
+                        "note": "driver does not call a model; parent_M is complete() calls, not runs",
+                    },
                     "records": records,
                     "tx_sites": tx_sites,
                 }) + "\n")
@@ -340,7 +416,7 @@ async def test_combined_long_loop_children_workflow_sql_profile(registry_store):
     register_spawn_agent(registry)
     register_workflow_tool(registry)
     runner = await RunningAgent(store, model, registry,
-                                AgentLoopConfig(compactor=None, max_rounds=32), capacity=10).start()
+                                AgentLoopConfig(context_budget_tokens=10**9, max_rounds=32), capacity=10).start()
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
     store._db = profiled = Profiled(original, meter)
@@ -372,12 +448,26 @@ async def test_combined_long_loop_children_workflow_sql_profile(registry_store):
         counts = _counts(records, tx_sites, profiled.tx_categories)
         assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
         writes = await meter.report() if meter else None
+        run_evidence = await _run_evidence(store, original, runner.target.session_id)
+        follow_up_claims = sum(
+            1 for record in records
+            if any("claim_follow_up" in site for site in record["chain"]))
         if output := os.environ.get("P215_COMPOSITION_OUT"):
             with open(output, "a") as stream:
                 stream.write(json.dumps({"db": original.dialect.name,
                     "scenario": "combined_16_tools_4_children_4_leaves", "total_sql": len(records),
                     "counts": counts, "transactions": profiled.transactions, "writes": writes,
-                    "elapsed_s": time.monotonic() - started, "records": records, "tx_sites": tx_sites}) + "\n")
+                    "elapsed_s": time.monotonic() - started, "runs": run_evidence,
+                    "follow_up_claim_sql": follow_up_claims,
+                    "model_calls": {
+                        "parent_M": model.calls,
+                        "children_M": 4,
+                        "leaves_M": 4,
+                        "driver_M": 0,
+                        "total_M": model.calls + 8,
+                        "note": "child/leaf calls are counted as one each; parent_M is complete() calls",
+                    },
+                    "records": records, "tx_sites": tx_sites}) + "\n")
     finally:
         store._db = original
         await runner.aclose()

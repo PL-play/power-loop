@@ -11,7 +11,6 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from power_loop import RequestOptions
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.runtime.fold import LLMSummaryFold
@@ -32,11 +31,11 @@ class _UnavailableSummary(_Scripted):
         return LLMResponse(raw_text="")
 
 
-async def _loop(runtime_agent, store, llm, *, cap, fold=None):
+async def _loop(runtime_agent, store, llm, *, cap, fold=None, max_rounds=2):
     return await runtime_agent(
         model=llm, store=store, registry=_echo_registry(),
         config=AgentLoopConfig(
-            system_prompt="S", max_rounds=2, representation=ProjectedRepresentation(),
+            system_prompt="S", max_rounds=max_rounds, representation=ProjectedRepresentation(),
             max_context_rows=cap,
             # Isolate the history cap when summary generation declines. Successful
             # row-triggered folding is covered by test_context_fold_rows.
@@ -90,7 +89,7 @@ async def test_history_limit_is_explicit_beyond_previous_defaults(store: Session
                               ("project", {"final_text": f"history-answer-{send:04d}"})):
             await store.upsert_project_message(sid, send_index=send, kind=kind, content=content,
                                                projector_version=1)
-    await store.set_runtime_state(sid, "send_index", 211)
+    await store._db.execute(f"UPDATE {store.t.session_state} SET send_index=? WHERE session_id=?", (211, sid))
     try:
         assert (await loop.send("current")).status == "completed"
         prompt = str(llm.calls[0])
@@ -143,10 +142,10 @@ async def test_cap_counts_history_only_not_the_current_send(store: SessionStore,
         _tool_call("t1"), _tool_call("t2"), _tool_call("t3"), _tool_call("t4"),
         LLMResponse(raw_text="done"),
     ])
-    loop = await _loop(runtime_agent, store, llm, cap=4)
+    loop = await _loop(runtime_agent, store, llm, cap=4, max_rounds=8)
     for i in range(1, 4):
         await loop.send(f"u{i}")
-    await loop.send("u4", options=RequestOptions(max_rounds=8))
+    await loop.send("u4")
 
     non_system = [m for m in llm.calls[-1] if m.get("role") != "system"]
     joined = "\n".join(str(m.get("content")) for m in non_system)

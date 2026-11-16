@@ -11,7 +11,7 @@ import pytest
 
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.types import AgentLoopConfig
-from power_loop.runtime.history_projector import DefaultDeterministicProjector, IdentityProjector
+from power_loop.runtime.history_projector import DefaultDeterministicProjector
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.store.types import ProjectMessageRow
@@ -28,31 +28,6 @@ def _pmr(send_index, kind, content, **kw):
         compact_from_send=kw.get("compact_from_send"), compact_to_send=kw.get("compact_to_send"),
         projector_version=1, token_estimate=None, created_at=0,
     )
-
-
-# ── B7 + B10: legacy IdentityProjector must route verbatim + never-fold + render compacts ──
-
-
-def test_b7_identity_projector_routes_verbatim_never_folds_renders_compact() -> None:
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        cfg = AgentLoopConfig(history_projector=IdentityProjector(), max_tokens=50)
-    assert cfg.projection_representation is None  # verbatim path (not the projection-fold path)
-    assert cfg.resolve_compactor() is None  # never-fold (keep_last_sends==0)
-    # render must surface a compact's summary, not silently drop it (the data-loss root cause)
-    rendered = IdentityProjector().render([_pmr(5, "compact", {"summary": "OLD"})])
-    assert rendered == [{"role": "user", "content": "OLD"}]
-
-
-def test_b10_keep_zero_projection_projector_folds_aggressively_not_four() -> None:
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        cfg = AgentLoopConfig(history_projector=DefaultDeterministicProjector(keep_last_sends=0), max_tokens=50)
-    assert cfg.fold_strategy.keep_last_sends == 1  # 0 → clamp to floor 1, NOT silently 4
 
 
 # ── B9: recall_send #N labels must appear in projected render ──

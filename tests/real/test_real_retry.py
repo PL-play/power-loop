@@ -26,7 +26,7 @@ async def test_real_new_input_can_continue_after_unknown_without_replaying_origi
     bus.subscribe(None, events.append)
     agent = await runtime_agent(model=model, event_bus=bus,
         config=AgentLoopConfig(system_prompt='Reply in one short sentence.',
-            max_rounds=1, max_tokens=2048, temperature=0, compactor=None))
+            max_rounds=1, max_tokens=2048, temperature=0, context_budget_tokens=10**9))
     original = await agent.send('Reply OK.', message_id='original')
     assert original.status == 'failed' and model.calls == 1
     reread = await agent.runtime.client.wait(original.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
@@ -39,7 +39,7 @@ async def test_real_new_input_can_continue_after_unknown_without_replaying_origi
 @pytest.mark.asyncio
 async def test_unknown_provider_outcome_is_not_synthetic_success(runtime_agent):
     model = _FlakyWrap(make_llm(max_tokens=2048, temperature=0), fail_first=100)
-    agent = await runtime_agent(model=model, config=AgentLoopConfig(max_rounds=1, compactor=None))
+    agent = await runtime_agent(model=model, config=AgentLoopConfig(max_rounds=1, context_budget_tokens=10**9))
     result = await agent.send('anything')
     assert result.status == 'failed' and model.calls == 1
     assert result.error and not result.final_text

@@ -193,7 +193,7 @@ async def test_projection_write_failure_does_not_fail_send(registry_store, monke
     # Force projection mode so the end-of-send projection path is exercised.
     from power_loop.runtime.representation import ProjectedRepresentation
     agent = await RunningAgent(store, EchoModel(),
-                               config=AgentLoopConfig(max_rounds=4, compactor=None,
+                               config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9,
                                                       representation=ProjectedRepresentation())).start()
     try:
         result = await agent.send("go")

@@ -20,10 +20,7 @@ from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.runtime_store import now_ms
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.runtime.fold import FoldResult
-from power_loop.runtime.history_projector import (
-    DefaultDeterministicProjector,
-    IdentityProjector,
-)
+from power_loop.runtime.history_projector import DefaultDeterministicProjector
 from power_loop.runtime.store.store import SessionStore
 from tests.unit.test_stateful_loop import _echo_registry, _Scripted, _tool_resp
 
@@ -148,33 +145,15 @@ async def test_unknown_pending_tool_is_not_replayed_and_keeps_its_send_index(sto
 
 
 @pytest.mark.asyncio
-async def test_default_mode_writes_no_projections(store: SessionStore, runtime_agent) -> None:
+async def test_default_mode_writes_projections(store: SessionStore, runtime_agent) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="hi")])
     loop = await runtime_agent(
         model=llm, store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=2),
-    )  # no projector → default (verbatim + compactor); zero behavior change
+    )
     sid = loop.target.session_id
     await loop.send("hi")
-    assert await store.load_project_messages(sid) == []
-
-
-@pytest.mark.asyncio
-async def test_identity_projector_matches_verbatim(store: SessionStore, runtime_agent) -> None:
-    base_llm, ident_llm = _two_send_script(), _two_send_script()
-    base = await runtime_agent(
-        model=base_llm, store=store, registry=_echo_registry(),
-        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
-    )
-    await base.send('first')
-    nb = len(base_llm.calls)
-    await base.send('second')
-    await base.aclose()
-    ident = await _projector_loop(runtime_agent, store, ident_llm, IdentityProjector())
-    await ident.send('first')
-    ni = len(ident_llm.calls)
-    await ident.send('second')
-    # IdentityProjector reproduces verbatim history → send 2's request is byte-identical.
-    assert ident_llm.calls[ni] == base_llm.calls[nb]
+    assert {(r.send_index, r.kind) for r in await store.load_project_messages(sid)} == {
+        (1, "user"), (1, "project")}
 
 
 @pytest.mark.asyncio
@@ -276,20 +255,6 @@ async def test_memory_headroom_lowers_projection_fold_trigger(store: SessionStor
 
 
 @pytest.mark.asyncio
-async def test_identity_projector_never_compacts(store: SessionStore, runtime_agent) -> None:
-    llm = _Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 6)])
-    loop = await _projector_loop(runtime_agent, store, llm, IdentityProjector())
-    sid = loop.target.session_id
-    for i in range(1, 5):
-        await loop.send(f"m{i}")
-    assert await store.latest_project_compact(sid) is None  # keep_last_sends=0 → never folds
-
-
-
-
-
-
-@pytest.mark.asyncio
 async def test_rebuilt_worker_projects_same_session_consistently(store: SessionStore, runtime_agent) -> None:
     # The locked write path keeps ONE coherent projection when two loops share a store on the same
     # session: every send projected exactly once, no duplicate (send_index,kind) rows, one compact
@@ -313,9 +278,9 @@ async def test_rebuilt_worker_projects_same_session_consistently(store: SessionS
 
 
 def test_config_explicit_representation_and_fold_axes():
-    cfg = AgentLoopConfig(representation=DefaultDeterministicProjector(), compactor=None)
-    assert cfg.projection_representation is not None
-    assert cfg.resolve_compactor() is None
+    cfg = AgentLoopConfig(representation=DefaultDeterministicProjector(), context_budget_tokens=10**9)
+    assert cfg.representation is not None
+    assert cfg.fold_strategy is not None
 
 
 def test_config_max_tokens_revalidates_on_reassignment() -> None:
@@ -366,7 +331,7 @@ async def test_projection_composes_with_memory_recall(store: SessionStore, runti
     loop = await runtime_agent(
         model=llm, store=store, registry=_echo_registry(),
         config=AgentLoopConfig(
-            system_prompt="S", max_rounds=4, compactor=None,
+            system_prompt="S", max_rounds=4, context_budget_tokens=10**9,
             representation=DefaultDeterministicProjector(),
             memory=_StubMemory(text="MEMORY: user prefers terse replies"),
         ),
@@ -380,15 +345,15 @@ async def test_projection_composes_with_memory_recall(store: SessionStore, runti
     assert "done1" in joined and "second" in joined          # projected past + current send
 
 
-# ── pre-release hardening: reader verbatim fallback + fold-failure degradation + config ──
+# ── reliability: lazy projection repair + fold-failure degradation ──
 
 
 @pytest.mark.asyncio
-async def test_missing_projection_row_falls_back_to_verbatim(store: SessionStore, runtime_agent) -> None:
+async def test_missing_projection_row_is_repaired_lazily(store: SessionStore, runtime_agent) -> None:
     # A best-effort end-of-send projection write can fail/crash, leaving a past send with rows in
-    # pl_messages but none in pl_project_messages. The reader must render that send VERBATIM from
-    # the audit log, not silently drop it from context forever.
-    llm = _two_send_script()  # send 1 has a tool call → verbatim carries tool_calls
+    # pl_messages but none in pl_project_messages. The reader rebuilds that send's projection
+    # from the audit log and feeds the rebuilt projection, never the raw protocol rows.
+    llm = _two_send_script()  # send 1 has a tool call → the audit log carries tool_calls
     # migrate=False so we exercise the per-send VERBATIM FALLBACK path specifically (with migration
     # on, an empty projection table would instead trigger the one-time migration).
     loop = await _projector_loop(runtime_agent, store, llm, DefaultDeterministicProjector())
@@ -413,9 +378,9 @@ async def test_missing_projection_row_falls_back_to_verbatim(store: SessionStore
 
 
 @pytest.mark.asyncio
-async def test_stale_projector_version_falls_back_to_verbatim(store: SessionStore, runtime_agent) -> None:
+async def test_stale_projector_version_is_rebuilt_with_the_current_projection(store: SessionStore, runtime_agent) -> None:
     # Bumping the projector version between runs must not silently mis-render rows written by the
-    # old version: a past send whose projection rows carry a different version renders verbatim.
+    # old version: a past send whose projection rows carry a different version is rebuilt.
     loop1 = await _projector_loop(runtime_agent, store, _two_send_script(), DefaultDeterministicProjector(version=1))
     sid = loop1.target.session_id
     await loop1.send("first")
@@ -468,25 +433,28 @@ async def test_compact_failure_degrades_to_no_fold(store: SessionStore, runtime_
 
 
 @pytest.mark.asyncio
-async def test_switch_projection_to_default_is_safe(store: SessionStore, runtime_agent) -> None:
-    # Inverse switch (projection → default): projection NEVER marks pl_messages rows inactive, so
-    # reopening in default mode sees the FULL verbatim history (nothing lost); the now-stale
-    # projection rows are simply ignored.
-    proj = await _projector_loop(runtime_agent, store, _two_send_script(), DefaultDeterministicProjector())
-    sid = proj.target.session_id
-    await proj.send("first")
-    assert await store.load_project_messages(sid)  # projection rows exist
-
-    base_llm = _Scripted(responses=[LLMResponse(raw_text="done2")])
-    await proj.aclose()
-    base = await runtime_agent(target=proj.target,
-        model=base_llm, store=store, registry=_echo_registry(),
-        config=AgentLoopConfig(system_prompt="S", max_rounds=4),  # default: no projector
+async def test_default_config_uses_the_projection_layer(store: SessionStore, runtime_agent) -> None:
+    # The library default is the projection representation: a second send on a default-configured
+    # loop must read send 1's stored projection, not raw pl_messages rows.
+    first = await runtime_agent(
+        model=_Scripted([LLMResponse(raw_text="done1")]), store=store, registry=_echo_registry(),
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
     )
-    r = await base.send("second", message_id="verbatim")
-    assert r.status == "completed"  # no crash
-    joined = "\n".join(str(m.get("content", "")) for m in base_llm.calls[0])
-    assert "first" in joined and "done1" in joined  # full verbatim history (nothing lost)
+    sid = first.target.session_id
+    await first.send("first")
+    assert await store.load_project_messages(sid)
+    await first.aclose()
+
+    llm2 = _Scripted([LLMResponse(raw_text="done2")])
+    second = await runtime_agent(target=first.target, model=llm2, store=store,
+                                 registry=_echo_registry(),
+                                 config=AgentLoopConfig(system_prompt="S", max_rounds=4))
+    r = await second.send("second", message_id="second")
+    assert r.status == "completed"
+    joined = "\n".join(str(m.get("content", "")) for m in llm2.calls[0])
+    assert "first" in joined and "done1" in joined
+    assert not any("tool_calls" in m for m in llm2.calls[0])
+    await second.aclose()
 
 
 @pytest.mark.asyncio
@@ -505,45 +473,6 @@ async def test_orphan_tool_row_sanitized_from_prompt(store: SessionStore, runtim
     assert r.status == "completed"  # not bricked
     assert not any(m.get("tool_call_id") == "ghost" for m in llm.calls[0])  # orphan never sent
     assert any(m.tool_call_id == "ghost" for m in await store.load_all_messages(sid))  # audit intact
-
-
-@pytest.mark.asyncio
-async def test_repair_corrupt_history_deactivates_orphan_row(store: SessionStore, runtime_agent) -> None:
-    # With repair_corrupt_history=True the dropped orphan row is durably deactivated (state=DROPPED):
-    # gone from the active history, still present in the full audit (repaired, not deleted).
-    llm = _Scripted(responses=[LLMResponse(raw_text="ok")])
-    loop = await runtime_agent(
-        model=llm, store=store, registry=_echo_registry(),
-        config=AgentLoopConfig(system_prompt="S", max_rounds=2, repair_corrupt_history=True),
-    )
-    sid = loop.target.session_id
-    await store.append_message(sid, role="tool", tool_call_id="ghost", content="orphan")
-    await loop.send("hi")
-    assert not any(m.tool_call_id == "ghost" for m in await store.load_active_messages(sid))  # deactivated
-    assert any(m.tool_call_id == "ghost" for m in await store.load_all_messages(sid))  # audit kept
-
-
-
-
-
-
-
-
-
-
-def test_config_rejects_nonpositive_max_tokens_with_projector() -> None:
-    for bad in (0, -10):
-        with pytest.raises(ValueError, match="max_tokens"):
-            AgentLoopConfig(
-                representation=DefaultDeterministicProjector(), compactor=None, max_tokens=bad
-            )
-    # post-construction reassignment is re-validated AND rolled back on failure
-    cfg = AgentLoopConfig(
-        representation=DefaultDeterministicProjector(), compactor=None, max_tokens=8000
-    )
-    with pytest.raises(ValueError, match="max_tokens"):
-        cfg.max_tokens = 0
-    assert cfg.max_tokens == 8000  # rolled back, config still valid
 
 
 @pytest.mark.asyncio

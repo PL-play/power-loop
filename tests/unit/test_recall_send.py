@@ -7,6 +7,7 @@ pl_messages is the immutable audit log (the projection never deletes it).
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -22,6 +23,8 @@ from power_loop.core.agent_context import (
 from power_loop.runtime.store.store import SessionStore
 from power_loop.tools import create_default_tool_registry
 from power_loop.tools.default_tools import run_recall_send
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 
 def _amake(rows):
@@ -69,7 +72,7 @@ async def _seed_two_sends(store: SessionStore, sid: str) -> None:
 
 @pytest.mark.asyncio
 async def test_recall_send_returns_full_detail(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     await _seed_two_sends(store, sid)
     with _active(store, sid):
         out = await run_recall_send(1)
@@ -81,7 +84,7 @@ async def test_recall_send_returns_full_detail(store: SessionStore) -> None:
 
 @pytest.mark.asyncio
 async def test_recall_send_accepts_string_index(store: SessionStore) -> None:
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await _seed_two_sends(store, sid)
     with _active(store, sid):
         out = await run_recall_send("1")  # tool args may arrive as strings
@@ -90,7 +93,7 @@ async def test_recall_send_accepts_string_index(store: SessionStore) -> None:
 
 @pytest.mark.asyncio
 async def test_recall_send_missing_send(store: SessionStore) -> None:
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     with _active(store, sid):
         out = await run_recall_send(99)
     assert "No messages found for send #99" in out
@@ -101,7 +104,7 @@ async def test_recall_send_truncation_keeps_tool_calls_suffix(store: SessionStor
     # A long body must not eat the [tool_calls: …] suffix — else a tool-bearing send looks
     # tool-free in the inspector (regression for #13: truncate body THEN append suffix).
     from power_loop.tools.default_tools import RECALL_SEND_CONTENT_CHARS
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.append_message(
         sid, role="assistant", content="x" * (RECALL_SEND_CONTENT_CHARS + 500),
         tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
@@ -115,7 +118,7 @@ async def test_recall_send_truncation_keeps_tool_calls_suffix(store: SessionStor
 @pytest.mark.asyncio
 async def test_recall_send_tolerates_malformed_tool_calls(store: SessionStore) -> None:
     # A non-dict "function" must not raise (recall_send always returns a string).
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.append_message(
         sid, role="assistant", content="hmm",
         tool_calls=[{"id": "c1", "function": "not-a-dict", "name": "weird"}], send_index=1,
@@ -130,7 +133,7 @@ async def test_recall_send_truncation_multiple_tool_calls(store: SessionStore) -
     # The [tool_calls: a, b, c] suffix must list ALL tool names (comma-joined) and survive
     # truncation of a long body.
     from power_loop.tools.default_tools import RECALL_SEND_CONTENT_CHARS
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.append_message(
         sid, role="assistant", content="y" * (RECALL_SEND_CONTENT_CHARS + 200),
         tool_calls=[
@@ -157,7 +160,7 @@ def test_recall_send_registered_in_default_tools() -> None:
 
 
 async def test_recall_send_seq_returns_single_row_in_full_with_its_call(store):
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.append_message(sid, role="user", content="do X", send_index=1)
     await store.append_message(
         sid, role="assistant",
@@ -187,7 +190,7 @@ async def test_recall_send_seq_caps_huge_row_and_counts_remainder(store, monkeyp
     import power_loop.tools.default_tools as dt
 
     monkeypatch.setattr(dt, "RECALL_SEND_ROW_CHARS", 50)
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.append_message(sid, role="user", content="go", send_index=1)
     await store.append_message(sid, role="assistant", content="x" * 200, send_index=1)
     rows = await store.load_all_messages(sid)
@@ -200,7 +203,7 @@ async def test_recall_send_seq_caps_huge_row_and_counts_remainder(store, monkeyp
 @pytest.mark.asyncio
 async def test_send_level_listing_fits_one_budget(store):
     import json
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     for i in range(8):
         await store.append_message(sid, role="tool", content="x" * 9000, name=f"t{i}", send_index=3)
     with _active(store, sid):

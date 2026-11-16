@@ -23,6 +23,8 @@ from power_loop.runtime.store.schema import (
 )
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.store.types import SubagentLifecycle
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -32,7 +34,7 @@ pytestmark = pytest.mark.unit
 
 async def test_set_pending_empty_dict_normalizes_to_none():
     s = await SessionStore.open(":memory:")
-    sid = await s.create_session(session_id="s")
+    sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     await s.set_pending(sid, {"round_index": 3})
     assert (await s.get_state(sid)).pending == {"round_index": 3}
     # An empty (falsy) dict must round-trip to None, not {} — matches the legacy oracle.
@@ -48,7 +50,7 @@ async def test_set_pending_empty_dict_normalizes_to_none():
 
 async def test_timer_and_note_ids_sequential_under_lock_state():
     s = await SessionStore.open(":memory:")
-    sid = await s.create_session(session_id="s")
+    sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     t1 = await s.create_timer(sid, due_at=1, note="a")
     t2 = await s.create_timer(sid, due_at=2, note="b")
     assert (t1.timer_id, t2.timer_id) == (1, 2)
@@ -239,7 +241,7 @@ async def test_open_with_malicious_prefix_raises():
 
 async def test_close_session_tree_returns_linked_subtree_ids():
     s = await SessionStore.open(":memory:")
-    p = await s.create_session(session_id="p")
+    p = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
     c1 = await s.create_session(
         session_id="c1", parent_session_id="p", lifecycle=SubagentLifecycle.LINKED
     )
@@ -260,7 +262,7 @@ async def test_close_session_tree_returns_linked_subtree_ids():
 
 async def test_close_session_count_unchanged_by_id_collection():
     s = await SessionStore.open(":memory:")
-    await s.create_session(session_id="p")
+    await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
     await s.create_session(
         session_id="c1", parent_session_id="p", lifecycle=SubagentLifecycle.LINKED
     )
@@ -289,7 +291,7 @@ async def test_maintenance_ops_raise_after_close(tmp_path):
 async def test_concurrent_file_handles_serialize_not_deadlock(tmp_path):
     path = str(tmp_path / "c3.db")
     seed = await SessionStore.open(path, schema=SchemaPolicy.AUTO_CREATE)
-    sid = await seed.create_session(session_id="s")
+    sid = await seed.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     await seed.close()
 
     # Two independent handles to the SAME file → independent in-process write locks, so they
@@ -317,7 +319,7 @@ async def test_concurrent_file_handles_serialize_not_deadlock(tmp_path):
 
 async def test_close_session_no_cascade_keeps_children_and_reparents():
     s = await SessionStore.open(":memory:")
-    await s.create_session(session_id="driver")
+    await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="driver")
     await s.create_session(
         session_id="leaf1", parent_session_id="driver", lifecycle=SubagentLifecycle.LINKED
     )

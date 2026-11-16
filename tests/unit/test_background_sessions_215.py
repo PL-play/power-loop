@@ -69,7 +69,7 @@ async def test_execute_freezes_original_tool_and_routes_result(registry_store, t
         slow,
     )
     runner = await RunningAgent(
-        store, BackgroundParent(), registry, AgentLoopConfig(compactor=None),
+        store, BackgroundParent(), registry, AgentLoopConfig(context_budget_tokens=10**9),
     ).start()
     try:
         assert (await runner.send("start background")).status == "completed"
@@ -115,7 +115,7 @@ async def test_cancel_background_handler(registry_store, tmp_path):
     )
     runner = await RunningAgent(
         store, BackgroundParent(), registry,
-        AgentLoopConfig(compactor=None, stop_policy=StopPolicy(abort_tool_s=0.01)),
+        AgentLoopConfig(context_budget_tokens=10**9, stop_policy=StopPolicy(abort_tool_s=0.01)),
     ).start()
     try:
         await runner.send("start")
@@ -151,7 +151,7 @@ async def test_crash_after_execute_is_interrupted_and_not_replayed(registry_stor
         slow,
     )
     runner = await RunningAgent(
-        store, BackgroundParent(), registry, AgentLoopConfig(compactor=None),
+        store, BackgroundParent(), registry, AgentLoopConfig(context_budget_tokens=10**9),
     ).start()
     original_final = runner.runtime.worker.inputs.final
     crashed = False
@@ -197,7 +197,7 @@ async def test_shell_process_tag_uses_session_and_send(registry_store, tmp_path)
         store,
         BackgroundParent("printf '%s' \"$POWER_LOOP_BACKGROUND_SESSION\""),
         registry,
-        AgentLoopConfig(compactor=None),
+        AgentLoopConfig(context_budget_tokens=10**9),
     ).start()
     try:
         await runner.send("start shell")
@@ -237,7 +237,7 @@ async def test_background_target_context_policy_and_original_delivery(
             },
         }),
         registry,
-        AgentLoopConfig(compactor=None),
+        AgentLoopConfig(context_budget_tokens=10**9),
         runtime_env=RuntimeEnv(workspace_dir=tmp_path),
     ).start()
     engine = ToolContextEngine(

@@ -58,7 +58,7 @@ class TicketModel(LLMService):
 async def main():
     registry = ToolRegistry()
     registry.register(ToolDefinition(name='capture_ticket_context', description='Capture ticket context', pricing=Free('local')), capture_ticket_context)
-    config = AgentLoopConfig(compactor=None, runtime_projectors=(TicketProjector(),))
+    config = AgentLoopConfig(context_budget_tokens=10**9, runtime_projectors=(TicketProjector(),))
     async with demo_runtime(TicketModel(), registry, config=config) as (runtime, loop, target, actor):
         await runtime.store.set_runtime_state(target.session_id, 'meta', {'customer':'Ada'})
         result = await loop.send(target, 'Capture ticket', message_id='ticket', actor=actor, deadline_ms=int(time.time()*1000)+10000)

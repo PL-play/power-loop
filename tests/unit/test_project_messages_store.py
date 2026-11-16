@@ -9,18 +9,21 @@ here: cascade-delete and refusal of old formats during ordinary opening.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 
 import pytest
 
 from power_loop.runtime.store.store import SessionStore
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 
 async def exercise_hook_events_crud(store: SessionStore) -> None:
     """Backend-agnostic CRUD conformance for the hook_events audit table: append a message with a
     hook injection → it lands as a linked event; per-session monotonic event_id; filter by
     message_seq; cleanup via close_session_tree. create_session mints a fresh id (shared-DB safe)."""
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     hi = {"hook_point": "LLM_BEFORE", "hook": "builtin.memory_recall", "position": "tail",
           "kind": "inject", "payload": {"v": 1, "items": [{"name": "memory_0", "chars": 5}]}}
     seq1 = await store.append_message(
@@ -103,7 +106,7 @@ async def test_project_messages_crud_sqlite(store: SessionStore) -> None:
 
 @pytest.mark.asyncio
 async def test_close_session_cascades_project_messages(store: SessionStore) -> None:
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.upsert_project_message(sid, send_index=1, kind="project", content={"x": 1})
     assert await store.load_project_messages(sid)
     await store.close_session(sid)
@@ -115,7 +118,7 @@ async def exercise_export_import_send_index(store: SessionStore) -> None:
     intact (incl. a NULL legacy row), so projection still partitions by send after a restore.
     Distinct session ids → safe against a shared, freshly-truncated DB (run on PG/MySQL too)."""
     sid = "ei_si_src"
-    await store.create_session(session_id=sid, system_prompt="S")
+    await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR, session_id=sid)
     await store.append_message(sid, role="user", content="u1", send_index=1)
     await store.append_message(sid, role="assistant", content="a1", send_index=1)
     await store.append_message(sid, role="user", content="u2", send_index=2)
@@ -142,7 +145,7 @@ async def test_v1_store_is_refused_without_rewriting_originals(tmp_path) -> None
     from power_loop.runtime.store.schema import StoreSchemaError
     path = str(tmp_path / "m.db")
     s = await SessionStore.open(path)
-    sid = await s.create_session()
+    sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await s.append_message(sid, role="user", content="original")
     async with s._db.transaction() as tx:
         await tx.execute("DROP VIEW pl_usage_rounds")
@@ -167,7 +170,7 @@ async def test_v2_store_is_refused_without_rewriting_originals(tmp_path) -> None
     from power_loop.runtime.store.schema import StoreSchemaError
     path = str(tmp_path / "h.db")
     s = await SessionStore.open(path)
-    sid = await s.create_session()
+    sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await s.append_message(sid, role="user", content="original", send_index=7)
     async with s._db.transaction() as tx:
         await tx.execute("DROP TABLE pl_hook_events")
@@ -189,7 +192,7 @@ async def test_load_active_messages_can_filter_to_one_send(store: SessionStore) 
     而每个 send 都要为一小段做一次 O(会话) 的读。send_index=None 的行（compact note）
     不属于任何 send，必须排除——与它替代的那句 Python 过滤语义一致。
     """
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await store.append_message(sid, role="user", content="s1-u", round_index=0, send_index=1)
     await store.append_message(sid, role="assistant", content="s1-a", round_index=1, send_index=1)
     await store.append_message(sid, role="user", content="s2-u", round_index=0, send_index=2)

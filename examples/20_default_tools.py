@@ -46,7 +46,7 @@ async def main():
         (skills/'demo'/'SKILL.md').write_text('---\nname: demo\ndescription: example skill\n---\nSay skill-loaded.\n')
         registry = create_default_tool_registry(workspace_dir=workspace, skills_dir=skills)
         async with demo_runtime(ToolsModel(), registry, runtime_env=RuntimeEnv(workspace_dir=workspace, skills_dir=skills),
-                config=AgentLoopConfig(max_rounds=12, compactor=None)) as (runtime, loop, target, actor):
+                config=AgentLoopConfig(max_rounds=12, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
             result = await loop.send(target, 'Exercise the configured tools', message_id='tools', actor=actor,
                                      deadline_ms=int(time.time()*1000)+15000)
             assert result.status == 'completed'

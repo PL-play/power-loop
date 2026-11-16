@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 async def test_explicit_continuation_reuses_sibling_and_recomputes_tail(registry_store):
     store, _ = registry_store
     model = Model()
-    runner = await RunningAgent(store, model, config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         root = {
             "type": "sequence",
@@ -94,7 +94,7 @@ async def test_explicit_resume_gets_its_own_automatic_continuation(registry_stor
         ),
         progress,
     )
-    runner = await RunningAgent(store, model, registry, config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, registry, config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         a, b = leaf("A"), leaf("B")
         a["spec"].update(max_rounds=1, tools=["progress"])

@@ -58,7 +58,7 @@ async def test_blocking_store_write_does_not_freeze_event_loop(runtime_agent) ->
 
         db._b_exec = slow_b_exec  # type: ignore[method-assign]
 
-        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
 
         ticks = 0
         stop = False
@@ -97,7 +97,7 @@ async def test_blocking_active_history_read_does_not_freeze_event_loop(runtime_a
 
         db._b_fetchall = slow_b_fetchall  # type: ignore[method-assign]
 
-        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
 
         ticks = 0
         stop = False

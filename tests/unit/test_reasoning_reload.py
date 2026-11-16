@@ -4,7 +4,6 @@ from copy import deepcopy
 import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, RequestOptions
-from power_loop.runtime.history_projector import IdentityProjector
 from tests.unit.test_request_sanitize import StrictModel, assert_valid_request, call
 from tests.unit.test_stateful_loop import _echo_registry
 
@@ -22,7 +21,9 @@ class ThinkingModel(StrictModel):
     async def complete(self, request, **kwargs):
         assert_valid_request(request.to_messages())
         for msg in request.messages:
-            if msg['role'] == 'assistant':
+            if msg['role'] == 'assistant' and msg.get('tool_calls'):
+                # Projected historical sends are plain text (no tool protocol), so the
+                # tool-mode reasoning contract applies to the live tool-call turns only.
                 key = msg.get('content') or msg['tool_calls'][0]['id']
                 if key.startswith('[degraded:'):
                     assert 'reasoning_content' not in msg
@@ -42,12 +43,10 @@ class ThinkingModel(StrictModel):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('action', ['send', 'resume'])
-@pytest.mark.parametrize('projected', [False, True])
-async def test_reasoning_survives_reload(registry_store, action, projected, runtime_agent):  # noqa: F811
+async def test_reasoning_survives_reload(registry_store, action, runtime_agent):  # noqa: F811
     store, connect = registry_store
     model = ThinkingModel(interrupt=action == 'resume')
-    config = AgentLoopConfig(model='deepseek-flash', compactor=None,
-        history_projector=IdentityProjector() if projected else None)
+    config = AgentLoopConfig(model='deepseek-flash', context_budget_tokens=10**9)
     loop = await runtime_agent(model=model, store=store, registry=_echo_registry(), config=config,
         allowed_models=['deepseek-flash', 'another-model'])
     sid = loop.target.session_id
@@ -64,8 +63,8 @@ async def test_reasoning_survives_reload(registry_store, action, projected, runt
     await reopened.aclose()
     other = StrictModel()
     switched = await runtime_agent(model=other, store=reopened.runtime.store, registry=_echo_registry(),
-        config=AgentLoopConfig(model='another-model', compactor=None,
-            history_projector=IdentityProjector() if projected else None), target=loop.target)
-    assert (await switched.send('switch', message_id='switch',
-        options=RequestOptions(model='another-model'))).status == 'completed'
+        config=AgentLoopConfig(model='another-model', context_budget_tokens=10**9),
+        target=loop.target)
+    await switched.new_session(options=RequestOptions(model='another-model'))
+    assert (await switched.send('switch', message_id='switch')).status == 'completed'
     assert all('reasoning_content' not in m for m in other.requests[-1])

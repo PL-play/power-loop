@@ -144,7 +144,11 @@ class SQLiteSink:
         self.send_rows: list[Any] = []
         # The seq of the last assistant turn written; the worker passes it to final() as
         # the result message so final stamps that row instead of writing a duplicate.
+        # ``last_assistant_meta`` is the exact meta that append_message persisted for that
+        # row (content encoding, reasoning and per-round usage), so final merges the result
+        # fields without re-reading the row it just wrote.
         self.last_assistant_seq: int | None = None
+        self.last_assistant_meta: dict[str, Any] | None = None
 
     def _capture_row(self, seq, role, message, round_index, send_index):
         from power_loop.runtime.store.types import MessageRow, MessageState
@@ -270,6 +274,13 @@ class SQLiteSink:
             self._history_ord.append(seq)
             self._capture_row(seq, "assistant", message, round_index, message.get("send_index"))
             self.last_assistant_seq = seq
+            # Mirror exactly what append_message wrote: it folds the round usage into meta
+            # under _round_usage before persisting, while ``meta`` above is the base.
+            stored_meta = dict(meta or {})
+            if usage:
+                from power_loop.runtime.store.message_usage import META_KEY
+                stored_meta[META_KEY] = _usage_columns(usage)
+            self.last_assistant_meta = stored_meta
             if usage:
                 self._usage_written.add(round_index)
             if tool_calls:

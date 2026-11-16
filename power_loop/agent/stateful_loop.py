@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
+from power_loop.agent.runtime_types import RuntimeRequestError
 from power_loop.agent.sink import (
     CONTENT_ENCODING_JSON,
     CONTENT_ENCODING_META_KEY,
@@ -68,6 +69,7 @@ from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.history_sanitize import align_tool_calls
 from power_loop.runtime.store.schema import SchemaPolicy
 from power_loop.runtime.store.store import (
+    _PROJECT_KIND_ORDER,
     DEFAULT_DB_PATH,
     DEFAULT_TABLE_PREFIX,
     MAX_SPAWN_DEPTH,
@@ -130,6 +132,9 @@ class StatefulResult:
     texts: list[dict[str, Any]] = field(default_factory=list)
     #: design 215: seq of this send's last assistant row — the result message final() stamps.
     result_seq: int | None = None
+    #: The exact meta persisted for that assistant row (reasoning, round usage). final()
+    #: merges the result fields into it instead of reading the row back.
+    result_meta: dict[str, Any] | None = None
 
 
 class _SyncLoopRunner:
@@ -1138,6 +1143,10 @@ class _ExecutionLoop:
                 # seed the cursor so the loop's first append takes the conditional fast
                 # path instead of a locking read (design 215 §P2.4 per-round budget).
                 reads.next_seq = batch.message_seq + 1
+                # The claim's post-lock session row already tells us when the session was last
+                # active. Seed the existing touch throttle with that fact; a scope holding a
+                # newer value keeps it. No extra read/cache: the claim write fence still runs.
+                reads.touched = max(reads.touched, batch.session_updated_at)
                 return await self._run_session_send_impl(
                     sid, batch=batch, ownership=ownership, send=send, config=config,
                     tool_registry=tool_registry, hooks=hooks, event_bus=event_bus,
@@ -1147,151 +1156,101 @@ class _ExecutionLoop:
         finally:
             _SESSION_SEND.reset(token)
 
-    async def _record_history_mode(
-        self, store: SessionStore, sid: str, config: AgentLoopConfig, projector: Any,
-    ) -> None:
-        """Record the first execution's representation without changing its descriptor."""
-        meta = await store.get_runtime_state(sid, 'meta', default={})
-        if 'history_mode' not in meta:
-            fold = config.fold_strategy
-            await store.set_runtime_state(sid, 'meta', {
-                **meta,
-                'history_mode': 'projection' if projector is not None else 'default',
-                'projector_version': int(getattr(projector, 'version', 0) or 0) if projector else None,
-                'projector_trigger_ratio': float(getattr(fold, 'trigger_ratio', 0) or 0) if projector else None,
-                'projector_keep_last_sends': int(getattr(fold, 'keep_last_sends', 0) or 0) if projector else None,
-            })
-
     async def _run_session_send_impl(
         self, sid: str, *, batch, ownership, send, config, tool_registry, hooks, event_bus,
         stop_event, system_prompt, max_rounds, response_format, with_history, boundary=None,
     ) -> StatefulResult:
         store = self.store
-        projector = config.projection_representation
+        projector = config.representation
         current_send_index = batch.send_index
-        await self._record_history_mode(store, sid, config, projector)
-        projection_active = with_history and projector is not None
         sink = SQLiteSink(store, sid)
         sink.send_index = current_send_index
 
-        # ── ONE entry history read (design 215 §8.1). Projection mode renders finished
-        # sends from pl_project_messages and falls back to raw only for a missing/stale
-        # projection; verbatim mode reads the active window once. The current send's raw
-        # rows (the claim's merged user message) seed the in-memory projection capture. ──
-        current_raw_rows: list[Any] = []
+        # ── ONE bounded entry read from the projection layer (design 216 §7.4). Past sends
+        # reach the model only through their stored projections; the current send's raw rows
+        # are the claim's merged user message plus everything appended in memory below. ──
+        # The claim already returned the merged user row it wrote in this send's transaction
+        # (content, seq, send_index, meta). Seed it instead of selecting the row back.
+        claim_row = batch.user_row
+        current_raw_rows: list[Any] = [claim_row]
         if not with_history:
-            own = [r for r in await store.load_active_messages(sid, send_index=current_send_index)
-                   if r.name != "compact_note"]
-            current_raw_rows = own
-            history = [_row_to_loop_message(r) for r in own]
-            hist_seqs: list[int | None] = [r.seq for r in own]
+            history = [_row_to_loop_message(claim_row)]
+            hist_seqs: list[int | None] = [claim_row.seq]
             hist_ords: list[int | None] = list(hist_seqs)
-        elif projection_active:
-            active_rows = [
-                *await store.load_unsent_messages(sid),
-                *await store.load_active_messages(sid, send_index=current_send_index),
-            ]
-            legacy_rows = [r for r in active_rows if r.send_index is None and r.name != "compact_note"]
-            current_raw_rows = [r for r in active_rows
-                                if r.send_index == current_send_index and r.name != "compact_note"]
+        else:
             version = int(getattr(projector, "version", 0) or 0)
-            active_by_send: dict[int, list[Any]] = {}
-            for r in active_rows:
-                if r.send_index is not None and r.name != "compact_note":
-                    active_by_send.setdefault(r.send_index, []).append(r)
-            compact = await store.latest_project_compact(sid)
-            cutoff = compact.compact_to_send if compact is not None else None
             cap = getattr(config, "max_context_rows", None)
-            limit = int(cap) + 2 if cap and int(cap) > 0 else None
-            raw = await store.load_project_messages(
-                sid, after_send_index=cutoff, **({"last_rows": limit} if limit is not None else {}))
-            proj_rows = [r for r in raw if r.send_index < current_send_index]
-            if limit is not None and len(raw) >= limit and proj_rows:
-                oldest = min(r.send_index for r in proj_rows)
-                proj_rows = [r for r in proj_rows if r.send_index != oldest]
-            window_lo = (min(r.send_index for r in proj_rows)
-                         if limit is not None and proj_rows else (cutoff or 0) + 1)
-            if limit is not None:
-                window_lo = max(window_lo, current_send_index - limit)
-            have = {r.send_index for r in proj_rows if int(r.projector_version or 0) == version}
-            for si in range(window_lo, current_send_index):
-                if si not in have:
-                    rows = [r for r in await store.load_active_messages(sid, send_index=si)
-                            if r.name != "compact_note"]
-                    if rows:
-                        active_by_send[si] = rows
-            cur_proj_by_send: dict[int, list[Any]] = {}
-            for r in proj_rows:
-                if int(r.projector_version or 0) == version:
-                    cur_proj_by_send.setdefault(r.send_index, []).append(r)
-            # Self-heal sends whose end-of-send projection never landed (crash). The heal
-            # write carries the owner fence so a stale owner cannot publish a projection.
-            _lo0 = compact.compact_to_send if compact is not None else 0
-            _missing = [si for si in sorted(active_by_send)
-                        if (_lo0 or 0) < si < current_send_index and si not in cur_proj_by_send]
-            if _missing:
-                healed_any = False
-                for si in _missing:
-                    if await self._heal_send_projection(
-                            store, sid, send_index=si, rows=active_by_send[si], projector=projector,
-                            ownership=ownership):
-                        healed_any = True
-                if healed_any:
-                    raw = await store.load_project_messages(
-                        sid, after_send_index=cutoff,
-                        **({"last_rows": limit} if limit is not None else {}))
-                    proj_rows = [r for r in raw if r.send_index < current_send_index]
-                    cur_proj_by_send = {}
-                    for r in proj_rows:
-                        if int(r.projector_version or 0) == version:
-                            cur_proj_by_send.setdefault(r.send_index, []).append(r)
+            send_limit = int(cap) + 1 if cap and int(cap) > 0 else None
+            window = await store.load_projection_window(
+                sid, current_send_index=current_send_index, send_limit=send_limit)
+            compact = window.compact
+            cutoff = compact.compact_to_send if compact is not None else 0
+            # Group the window rows ONCE by send. Rendering then walks each send's rows in
+            # order; never scan the whole projection list per send.
+            by_send: dict[int, list[Any]] = {}
+            for row in window.rows:
+                by_send.setdefault(int(row.send_index), []).append(row)
+            for rows in by_send.values():
+                rows.sort(key=lambda r: _PROJECT_KIND_ORDER.get(r.kind, 9))
+            for si in range(int(window.window_lo), current_send_index):
+                rows = by_send.get(si, [])
+                current_rows = [r for r in rows if int(r.projector_version or 0) == version]
+                stale = len(current_rows) != len(rows)  # at least one stale/other-version row
+                if current_rows and not stale:
+                    continue
+                # A send with any stale row must be rebuilt even if a sibling row is current;
+                # a send with no rows at all is only rebuilt when original audit rows exist.
+                raw = [r for r in await store.load_active_messages(sid, send_index=si)
+                       if r.name != "compact_note"]
+                if not raw:
+                    if stale:
+                        raise RuntimeRequestError(
+                            "projection_unavailable",
+                            f"send {si}: stale projection has no active audit rows to rebuild it",
+                        )
+                    continue  # truly empty index: no projection and no raw history
+                try:
+                    repaired = await self._heal_send_projection(
+                        store, sid, send_index=si, rows=raw, projector=projector,
+                        ownership=ownership)
+                except Exception as exc:
+                    raise RuntimeRequestError(
+                        "projection_unavailable",
+                        f"send {si}: projection repair failed: {exc}",
+                    ) from exc
+                if not repaired:
+                    raise RuntimeRequestError(
+                        "projection_unavailable",
+                        f"send {si}: projection repair produced no rows",
+                    )
+                by_send[si] = list(repaired)
+            flat_rows = [r for si2 in sorted(by_send) for r in by_send[si2]
+                         if cutoff < si2 < current_send_index]
             if hasattr(projector, "stamp_render_context"):
-                projector.stamp_render_context(proj_rows, current_send_index)
+                projector.stamp_render_context(flat_rows, current_send_index)
             compact_msgs: list[LoopMessage] = []
             if compact is not None:
                 compact_msgs.extend(projector.render([compact]))
-            lo = cutoff or 0
-            send_chunks: list[list[LoopMessage]] = []
-            for si2 in sorted(s for s in {*active_by_send, *cur_proj_by_send} if lo < s < current_send_index):
-                rows_for_send = cur_proj_by_send.get(si2)
-                send_chunks.append(
-                    list(projector.render(rows_for_send)) if rows_for_send
-                    else [_row_to_loop_message(m) for m in active_by_send.get(si2, [])])
-            legacy_msgs = [_row_to_loop_message(r) for r in legacy_rows]
-            current_msgs = [_row_to_loop_message(r) for r in current_raw_rows]
-            kept_legacy_rows = legacy_rows
+            send_chunks: list[list[LoopMessage]] = [
+                list(projector.render(by_send[si2]))
+                for si2 in sorted(by_send) if cutoff < si2 < current_send_index
+            ]
+            current_msgs = [_row_to_loop_message(claim_row)]
             if cap and int(cap) > 0:
-                chunks: list[list[LoopMessage]] = [legacy_msgs, *send_chunks]
-                total = sum(len(c) for c in chunks)
+                # The cap counts rendered MESSAGES and drops whole sends from the oldest end;
+                # a send is never split. The entry read itself is already bounded by send.
+                total = len(compact_msgs) + sum(len(c) for c in send_chunks)
                 drop = 0
-                while drop < len(chunks) and total > int(cap):
-                    total -= len(chunks[drop])
+                while drop < len(send_chunks) and total > int(cap):
+                    total -= len(send_chunks[drop])
                     drop += 1
-                if drop > 0:
-                    legacy_msgs, kept_legacy_rows = [], []
-                    send_chunks = chunks[drop:]
+                if drop:
+                    send_chunks = send_chunks[drop:]
             prefix_msgs = [m for chunk in send_chunks for m in chunk]
-            history = legacy_msgs + compact_msgs + prefix_msgs + current_msgs
-            hist_seqs = ([r.seq for r in kept_legacy_rows]
-                         + [None] * (len(compact_msgs) + len(prefix_msgs))
-                         + [r.seq for r in current_raw_rows])
+            history = compact_msgs + prefix_msgs + current_msgs
+            hist_seqs = ([None] * (len(compact_msgs) + len(prefix_msgs))
+                         + [claim_row.seq])
             hist_ords = list(hist_seqs)
-        else:
-            active_rows = await store.load_active_messages(sid)
-            _cap = getattr(config, "max_context_rows", None)
-            if _cap and int(_cap) > 0:
-                _hist_idx = [i for i, r in enumerate(active_rows)
-                             if getattr(r, "name", None) != "compact_note"
-                             and r.send_index is not None and r.send_index < current_send_index]
-                _over = len(_hist_idx) - int(_cap)
-                if _over > 0:
-                    _drop = set(_hist_idx[:_over])
-                    active_rows = [r for i, r in enumerate(active_rows) if i not in _drop]
-            current_raw_rows = [r for r in active_rows if r.send_index == current_send_index]
-            history = [_row_to_loop_message(r) for r in active_rows]
-            hist_seqs = [r.seq for r in active_rows]
-            hist_ords = [int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
-                         else r.seq for r in active_rows]
 
         current_raw_rows = [_render_batch_row(r) for r in current_raw_rows]
         history = _render_batch_history(history)
@@ -1301,7 +1260,7 @@ class _ExecutionLoop:
             await store.deactivate_messages(sid, dropped_seqs)
         sink.init_history_seqs(hist_seqs, hist_ords)
         sink.send_rows = list(current_raw_rows)
-        for row in (active_rows if with_history else current_raw_rows):
+        for row in current_raw_rows:
             sink.remember_input(row.seq, row.role, row.content, row.meta)
 
         effective_sp = system_prompt if system_prompt is not None else config.system_prompt
@@ -1350,7 +1309,7 @@ class _ExecutionLoop:
 
         # ── End-of-send projection FROM MEMORY (design 215 §P2.4): no re-read of the
         # current send's raw rows. The derived write carries the owner fence + coverage. ──
-        if projection_active:
+        if with_history:
             try:
                 await self._write_session_projection(
                     store, sid, send_index=current_send_index, rows=sink.send_rows,
@@ -1366,7 +1325,7 @@ class _ExecutionLoop:
             pending_tool_calls=result.pending_tool_calls, usage=result.usage, tool_calls=result.tool_calls,
             passed=result.passed, pass_reason=result.pass_reason,
             new_input_after_pass=result.new_input_after_pass, texts=result.texts,
-            result_seq=sink.last_assistant_seq,
+            result_seq=sink.last_assistant_seq, result_meta=sink.last_assistant_meta,
         )
 
     async def _write_session_projection(
@@ -1423,40 +1382,45 @@ class _ExecutionLoop:
         rows: list[Any],
         projector: Representation,
         ownership=None,
-    ) -> bool:
-        """Project + persist ONE past send that has no current-version projection rows (6.9.0).
+    ) -> list[ProjectMessageRow]:
+        """Project + persist ONE past send that has no current-version projection rows.
 
         Used at context-build time for sends whose end-of-send projection never ran (killed
         mid-flight) or was written by another projector version. Deterministic, no LLM, no fold
-        (the fold still only runs at end-of-send). Returns True when rows were written. Never
-        raises — a failure keeps the caller's verbatim fallback."""
-        try:
-            projected = projector.project_send(
-                rows, send_index=send_index, tool_registry=getattr(self, "tool_registry", None)
+        (the fold still only runs at end-of-send). Returns the rows that are now usable for
+        rendering. A failure is raised to the caller, which turns it into
+        ``projection_unavailable`` before the first model call; it is never replaced with raw
+        history."""
+        version = int(getattr(projector, "version", 0) or 0)
+        projected = projector.project_send(
+            rows, send_index=send_index, tool_registry=getattr(self, "tool_registry", None)
+        )
+        from power_loop.runtime.tool_context import active_engine
+        engine = active_engine.get()
+        if engine is not None:
+            projected = await engine.prepare_projection(projected, rows, send_index)
+        if not projected.rows:
+            return []
+        await store.write_send_projection_rows(
+            sid, send_index=send_index,
+            rows=[(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows],
+            source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
+            projector_version=version, load_snapshot=False, ownership=ownership,
+        )
+        logger.info(
+            "projection self-heal: session %s send %d projected lazily (%d raw rows)",
+            sid, send_index, len(rows),
+        )
+        return [
+            ProjectMessageRow(
+                session_id=sid, send_index=int(send_index), kind=pr.kind, content=pr.content,
+                rendered_text=pr.rendered_text, source_seq_lo=projected.source_seq_lo,
+                source_seq_hi=projected.source_seq_hi, compact_from_send=None,
+                compact_to_send=None, projector_version=version, token_estimate=None,
+                created_at=0, completed_through_send_index=int(send_index),
             )
-            from power_loop.runtime.tool_context import active_engine
-            engine = active_engine.get()
-            if engine is not None:
-                projected = await engine.prepare_projection(projected, rows, send_index)
-            if not projected.rows:
-                return False
-            await store.write_send_projection_rows(
-                sid, send_index=send_index,
-                rows=[(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows],
-                source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
-                projector_version=int(getattr(projector, "version", 0) or 0),
-                load_snapshot=False, ownership=ownership,
-            )
-            logger.info(
-                "projection self-heal: session %s send %d projected lazily (%d raw rows)",
-                sid, send_index, len(rows),
-            )
-            return True
-        except Exception:  # noqa: BLE001 — heal is best-effort; verbatim fallback still works
-            logger.warning(
-                "projection self-heal failed for session %s send %d", sid, send_index, exc_info=True
-            )
-            return False
+            for pr in projected.rows
+        ]
 
 
     async def _plan_and_run_projection_fold(
@@ -1585,7 +1549,7 @@ def _render_batch_row(row: MessageRow) -> MessageRow:
 
     The raw message keeps the JSON for audit; the model reads the equivalent text
     (design 215 §7.3). Non-batch rows pass through unchanged."""
-    from power_loop.agent.follow_up import is_batch_content, render_batch_text
+    from power_loop.agent.follow_up import is_batch_content, render_batch_content
     if row.role != "user" or (row.meta or {}).get(CONTENT_ENCODING_META_KEY) != CONTENT_ENCODING_JSON:
         return row
     try:
@@ -1594,16 +1558,19 @@ def _render_batch_row(row: MessageRow) -> MessageRow:
         return row
     if not is_batch_content(content):
         return row
+    rendered = render_batch_content(content)
+    if isinstance(rendered, list):
+        return replace(row, content=json.dumps(rendered, ensure_ascii=False))
     meta = {k: v for k, v in (row.meta or {}).items() if k != CONTENT_ENCODING_META_KEY}
-    return replace(row, content=render_batch_text(content), meta=meta)
+    return replace(row, content=rendered, meta=meta)
 
 
 def _render_batch_history(history: list[LoopMessage]) -> list[LoopMessage]:
-    from power_loop.agent.follow_up import is_batch_content, render_batch_text
+    from power_loop.agent.follow_up import is_batch_content, render_batch_content
     out = []
     for msg in history:
         if msg.get("role") == "user" and is_batch_content(msg.get("content")):
-            out.append({**msg, "content": render_batch_text(msg["content"])})
+            out.append({**msg, "content": render_batch_content(msg["content"])})
         else:
             out.append(msg)
     return out
@@ -1657,10 +1624,15 @@ class StatefulAgentLoop:
         return await self.runtime.open_session(descriptor, actor=actor)
 
     async def send(self, target, body, *, message_id, actor, priority="normal", deadline_ms=None):
-        """Convenience: accept the input and wait for its durable result."""
-        receipt = await self.client.send(target, body, message_id=message_id, actor=actor,
-                                         priority=priority, deadline_ms=deadline_ms)
-        return await self.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline_ms)
+        """Accept once, then wait through the subscription opened before submission."""
+        output = await self.client.send_and_subscribe(
+            target, body, message_id=message_id, actor=actor, priority=priority,
+            deadline_ms=deadline_ms,
+        )
+        try:
+            return await output.wait(deadline_ms=deadline_ms)
+        finally:
+            await output.aclose()
 
     async def wait(self, input_ref, *, actor, deadline_ms=None):
         return await self.client.wait(input_ref, actor=actor, deadline_ms=deadline_ms)

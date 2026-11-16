@@ -64,7 +64,7 @@ class DishModel(LLMService):
 async def main():
     registry = ToolRegistry()
     registry.register(LOOKUP_TOOL, lookup_dish)
-    async with demo_runtime(DishModel(), registry, config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+    async with demo_runtime(DishModel(), registry, config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
         result = await loop.send(target, "What is Bangkok's signature dish?", message_id='dish-1', actor=actor,
                                  deadline_ms=int(time.time()*1000)+10000)
         assert result.status == 'completed' and result.final_text == 'pad thai'

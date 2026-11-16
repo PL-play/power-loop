@@ -15,7 +15,7 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 async def test_real_shutdown_retains_known_usage_and_rejects_new_work(runtime_agent, record_property):
     provider = BoundedProvider(limit=3)
     agent = await runtime_agent(model=provider,
-        config=AgentLoopConfig(max_rounds=2, max_tokens=2048, compactor=None))
+        config=AgentLoopConfig(max_rounds=2, max_tokens=2048, context_budget_tokens=10**9))
     try:
         result = await agent.send('Reply exactly 42 in plain assistant text, without tools or pass_turn.')
         assert result.final_text.strip() == '42' and provider.calls == 1
@@ -41,7 +41,7 @@ async def test_real_shutdown_cancels_original_inflight_request(runtime_agent, re
         return await work
     monkeypatch.setattr(provider, 'complete', started)
     agent = await runtime_agent(model=provider,
-        config=AgentLoopConfig(max_rounds=2, max_tokens=2048, compactor=None))
+        config=AgentLoopConfig(max_rounds=2, max_tokens=2048, context_budget_tokens=10**9))
     client = agent.runtime.client
     try:
         receipt = await client.send(agent.target, 'Write a detailed arithmetic explanation without tools.',

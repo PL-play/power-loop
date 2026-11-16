@@ -197,7 +197,7 @@ async def test_builtin_hook_auto_registered_when_memory_set(runtime_agent) -> No
     try:
         llm = _RecLLM()
         loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
-                max_rounds=1, compactor=None,
+                max_rounds=1, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "fact"}]),
             ))
         await _run(loop)
@@ -216,7 +216,7 @@ async def test_host_can_disable_memory_for_subsequent_executions(runtime_agent) 
     try:
         llm = _RecLLM()
         loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
-                max_rounds=1, compactor=None,
+                max_rounds=1, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "fact"}]),
             ))
         await _run(loop)
@@ -237,7 +237,7 @@ async def test_builtin_memory_hook_flag_off_skips_registration(runtime_agent) ->
     store = await SessionStore.open(":memory:")
     try:
         loop = await runtime_agent(model=_RecLLM(), store=store, config=AgentLoopConfig(
-                max_rounds=1, compactor=None, builtin_memory_hook=False,
+                max_rounds=1, context_budget_tokens=10**9, builtin_memory_hook=False,
                 memory=_FakeProvider(to_recall=[{"content": "fact"}]),
             ))
         await _run(loop)
@@ -257,7 +257,7 @@ async def test_builtin_memory_hook_runs_after_host_llm_before_hook(runtime_agent
     try:
         llm = _RecLLM()
         loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
-                max_rounds=1, compactor=None,
+                max_rounds=1, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "the-note"}]),
             ))
 
@@ -294,7 +294,7 @@ async def test_host_can_preregister_under_builtin_name_and_loop_does_not_clobber
 
         llm = _RecLLM()
         loop = await runtime_agent(model=llm, store=store, hooks=hooks, config=AgentLoopConfig(
-                max_rounds=1, compactor=None,
+                max_rounds=1, context_budget_tokens=10**9,
                 memory=_FakeProvider(to_recall=[{"content": "builtin-note"}]),
             ))
         # exactly one handler under the name (loop didn't add the builtin alongside)

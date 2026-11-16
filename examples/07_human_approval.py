@@ -156,7 +156,7 @@ async def run_with_policy(confirm_fn: ConfirmFn, prompt: str) -> str:
     registry = ToolRegistry()
     registry.register(BASH_TOOL, fake_bash)
     async with demo_runtime(ApprovalModel(), registry, hooks=build_hook(confirm_fn),
-            config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+            config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
         result = await loop.send(target, prompt, message_id='approval', actor=actor,
                                  deadline_ms=int(time.time()*1000)+10000)
         assert result.status == 'completed'

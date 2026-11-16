@@ -30,7 +30,7 @@ async def test_real_steer_cuts_a_long_generation(tmp_path):
                 return callback(text)
         return await complete(request,**{**kwargs,'on_chunk_delta_text':delta})
     model.complete=stream
-    async with live_agent(tmp_path,model,config=AgentLoopConfig(max_rounds=3,max_tokens=6000,compactor=None)) as runner:
+    async with live_agent(tmp_path,model,config=AgentLoopConfig(max_rounds=3,max_tokens=6000,context_budget_tokens=10**9)) as runner:
         receipt=await runner.runtime.client.send(runner.target,'写一篇至少5000字的小说，一直写下去。',message_id='novel',actor=runner.actor)
         await asyncio.wait_for(started.wait(),60)
         status=await runner.runtime.client.inspect(receipt.input_ref,actor=runner.actor)
@@ -71,7 +71,7 @@ async def test_real_steer_preserves_tool_policy_and_provider_format(tmp_path,int
     state={'started':asyncio.Event()}
     registry=_slow_registry(interrupt,state)
     config=AgentLoopConfig(system_prompt='Use research when requested; honor corrections without repeating the original call.',
-        max_rounds=4,max_tokens=2048,compactor=None)
+        max_rounds=4,max_tokens=2048,context_budget_tokens=10**9)
     async with live_agent(tmp_path,model,registry,config) as runner:
         receipt=await runner.runtime.client.send(runner.target,'Research electric bikes.',message_id='research',actor=runner.actor)
         await asyncio.wait_for(state['started'].wait(),60)

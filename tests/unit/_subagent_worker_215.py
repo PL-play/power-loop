@@ -87,7 +87,7 @@ async def main():
     factory = RegistryRuntimeFactory()
 
     async def build(descriptor, context):
-        return ExecutionEnvironment(Model(), registry, AgentLoopConfig(max_rounds=4, compactor=None))
+        return ExecutionEnvironment(Model(), registry, AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9))
 
     factory.register(
         "test.agent@215", build,

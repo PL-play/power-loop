@@ -32,20 +32,28 @@ class ProjectionFoldSnapshot:
     revision: str
 
 
+def parse_state(value_json):
+    """Parse a runtime-state JSON value; malformed statistics are rebuilt, never trusted."""
+    try:
+        value = json.loads(value_json) if value_json is not None else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 async def read_state(store, reader, sid):
     row = await reader.fetchone(
         f"SELECT value_json FROM {store.t.session_runtime_state} WHERE session_id=? AND state_key=?",
         (sid, STATE_KEY),
     )
-    try:
-        value = json.loads(row["value_json"]) if row else None
-    except (TypeError, ValueError):
-        return None  # malformed derived statistics must be rebuilt, never trusted
-    return value if isinstance(value, dict) else None
+    return parse_state(row["value_json"] if row else None)
 
 
 async def _put(store, writer, sid, key, value):
-    await store.signal_changes(writer, sid, "runtime")
+    # This is private DERIVED state (fold statistics and their key owners). No runtime
+    # projector polls these keys, so bumping session_state.runtime_version here would wake
+    # every runtime-state reader (e.g. Todo) for a value that did not change. Readers of the
+    # derived state query it directly under the session lock.
     sql = store._db.dialect.upsert(
         store.t.session_runtime_state, ("session_id", "state_key"), ("value_json", "updated_at"),
     )
@@ -57,10 +65,14 @@ def _invalid(state):
             or (state or {}).get("obsolete")}
 
 
-async def invalidate(store, tx, sid):
-    """Caller holds the session lock; all projection mutations invalidate the same revision."""
-    state = _invalid(await read_state(store, tx, sid))
-    await _put(store, tx, sid, STATE_KEY, state)
+async def invalidate(store, tx, sid, state=None):
+    """Caller holds the session lock; all projection mutations invalidate the same revision.
+
+    ``state`` lets a caller that already read the statistics in its lock statement reuse it.
+    """
+    if state is None:
+        state = await read_state(store, tx, sid)
+    await _put(store, tx, sid, STATE_KEY, _invalid(state))
 
 
 def _keys(rows, policy):
@@ -104,12 +116,17 @@ def _base_state(store, sid, policy, cutoff):
             "sends": 0, "maximum": 0}
 
 
-def _matches(store, sid, state, policy, cutoff):
+def _state_ok(store, sid, state, policy):
+    """Statistics written for this store/session/policy by a current code path."""
     return (isinstance(state, dict) and state.get("v") == 2
             and state.get("store_id") == store.store_id and state.get("session_id") == sid
-            and state.get("policy") == policy.fingerprint and state.get("cutoff") == cutoff
+            and state.get("policy") == policy.fingerprint
             and isinstance(state.get("generation"), str)
             and all(type(state.get(k)) is int and state[k] >= 0 for k in ("tokens", "sends", "maximum")))
+
+
+def _matches(store, sid, state, policy, cutoff):
+    return _state_ok(store, sid, state, policy) and state.get("cutoff") == cutoff
 
 
 async def _changed_rows(store, tx, sid, state, policy, maximum, owners):
@@ -175,20 +192,38 @@ async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi,
         compact_from_send=None, compact_to_send=None, projector_version=projector_version,
         token_estimate=None, created_at=0, completed_through_send_index=send_index,
     ) for kind, content, text in rows]
+    now = time.time_ns() // 1_000_000
     async with store._db.transaction() as tx:
-        await store._db.dialect.lock_state(tx, store.t.session_state, sid)
-        await store.fence_owner_tx(tx, sid, ownership)
-        state = await read_state(store, tx, sid)
-        compact = await tx.fetchone(
-            f"SELECT compact_to_send FROM {store.t.project_messages} WHERE session_id=? AND kind='compact' "
-            "ORDER BY send_index DESC LIMIT 1", (sid,),
+        # Lock the state row first; the owner fields come from that locked row, while the
+        # mutable statistics are read in a fresh statement after the lock. A joined snapshot
+        # taken while waiting does not become fresh when the lock is granted on PostgreSQL.
+        locked = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+        store.fence_owner_row(locked, sid, ownership)
+        # After the lock, one statement returns the statistics and the cold-path facts. This is
+        # fresh (no pre-wait join snapshot): the compact subquery uses the (session_id,kind)
+        # coverage index, and any_send stops at the first row of the session index. Hot saves
+        # pay these bounded probes but issue no extra statement.
+        compact_cte = ("WITH compact AS (" if store._db.dialect.name == "mysql"
+                       else "WITH compact AS MATERIALIZED (")
+        facts = await tx.fetchone(
+            f"{compact_cte}SELECT * FROM {store.t.project_messages} "
+            "WHERE session_id=? AND kind='compact') "
+            f"SELECT (SELECT value_json FROM {store.t.session_runtime_state} "
+            "WHERE session_id=? AND state_key=?) AS stats_json, "
+            "(SELECT compact_to_send FROM compact ORDER BY send_index DESC LIMIT 1) "
+            "AS compact_to_send, "
+            f"(SELECT send_index FROM {store.t.project_messages} WHERE session_id=? LIMIT 1) AS any_send",
+            (sid, sid, STATE_KEY, sid),
         )
-        cutoff = compact["compact_to_send"] if compact is not None else None
-        if policy is not None and state is None and compact is None:
-            exists = await tx.fetchone(
-                f"SELECT send_index FROM {store.t.project_messages} WHERE session_id=? LIMIT 1", (sid,),
-            )
-            if exists is None:
+        state = parse_state(facts["stats_json"] if facts is not None else None)
+        # A valid statistics row is written under this same session lock and any fold/rewrite
+        # invalidates it, so its cutoff is current; the compact/any_send probes are ignored on
+        # this healthy path and only retained for the cold/rebuild decision below.
+        if policy is not None and _state_ok(store, sid, state, policy):
+            cutoff = state.get("cutoff")
+        else:
+            cutoff = facts["compact_to_send"] if facts is not None else None
+            if policy is not None and state is None and facts is not None and facts["any_send"] is None:
                 state = _base_state(store, sid, policy, cutoff)
         updated = None
         if (policy is not None and new_rows and all(r.kind in ("user", "project") for r in new_rows)
@@ -198,13 +233,14 @@ async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi,
                 updated = await _advance(store, tx, sid, state, projector, policy, new_rows, send_index)
             except (KeyError, TypeError, ValueError):
                 logger.warning("projection fold statistics require rebuilding for %s", sid, exc_info=True)
-        for row in new_rows:
-            await store._upsert_project_message_tx(
-                tx, sid, send_index=send_index, kind=row.kind, content=row.content,
-                rendered_text=row.rendered_text, source_seq_lo=source_seq_lo, source_seq_hi=source_seq_hi,
-                projector_version=projector_version, now=time.time_ns() // 1_000_000,
-                completed_through_send_index=send_index,
-            )
+        if new_rows:
+            await store._upsert_project_messages_tx(tx, [(
+                sid, int(send_index), row.kind,
+                _dumps(row.content if row.content is not None else {}),
+                _nul_safe(row.rendered_text),
+                source_seq_lo, source_seq_hi, None, None,
+                int(projector_version), None, int(send_index), now,
+            ) for row in new_rows])
         if updated is None:
             updated = _invalid(state)
         else:

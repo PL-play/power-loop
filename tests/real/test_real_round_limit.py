@@ -34,7 +34,7 @@ async def test_hit_round_limit_returns_and_persists_summary(runtime_agent) -> No
             config=AgentLoopConfig(
                 system_prompt=("This is a long multi-step job. Call the `step` tool to make "
                                "progress, and keep calling it until the job is done."),
-                max_rounds=1, max_tokens=384, temperature=0, compactor=None),
+                max_rounds=1, max_tokens=384, temperature=0, context_budget_tokens=10**9),
         )
         sid = loop.target.session_id
         r = await loop.send("Begin the multi-step job and keep going.", )

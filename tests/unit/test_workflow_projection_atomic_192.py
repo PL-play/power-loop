@@ -12,7 +12,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def test_driver_admission_rollback_has_no_orphan_session_or_input(registry_store, monkeypatch):
     store, _ = registry_store
-    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     original = journal.put
 
     async def fail(store, tx, sid, key, value):
@@ -35,7 +35,7 @@ async def test_driver_admission_rollback_has_no_orphan_session_or_input(registry
 
 async def test_graph_state_is_separate_from_messages_and_has_no_job_columns(registry_store):
     store, _ = registry_store
-    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         handle = await runner.runtime.client.workflow(
             runner.target, {"name": "schema", "root": leaf("A")}, message_id="schema", actor=runner.actor,

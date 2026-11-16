@@ -29,7 +29,7 @@ async def test_real_subagent_emits_lifecycle_events(runtime_agent):
     registry.register(ToolDefinition('delegate', 'Host child command', pricing=Free('composite')), delegate)
     agent = await runtime_agent(model=make_llm(max_tokens=256, temperature=0), registry=registry,
         event_bus=bus, command=('delegate', {}),
-        config=AgentLoopConfig(system_prompt='parent', max_rounds=2, max_tokens=256, temperature=0, compactor=None))
+        config=AgentLoopConfig(system_prompt='parent', max_rounds=2, max_tokens=256, temperature=0, context_budget_tokens=10**9))
     result = await agent.send('Run child')
     child = json.loads(result.final_text)
     assert result.status == child['status'] == 'completed'

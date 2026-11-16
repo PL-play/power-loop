@@ -37,7 +37,7 @@ async def test_real_withdrawn_input_never_reaches_provider(runtime_agent,record_
     async def no_tools(ctx):
         ctx.tools=[]
     hooks.register(HookPoint.LLM_BEFORE,no_tools,name='test.reply-only')
-    agent=await runtime_agent(model=provider,hooks=hooks,config=AgentLoopConfig(compactor=None,max_rounds=3,max_tokens=2048,
+    agent=await runtime_agent(model=provider,hooks=hooks,config=AgentLoopConfig(context_budget_tokens=10**9,max_rounds=3,max_tokens=2048,
         system_prompt='Return READY in assistant text.'))
     client=agent.runtime.client
     try:

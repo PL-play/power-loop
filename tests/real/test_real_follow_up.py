@@ -16,7 +16,7 @@ pytestmark = pytest.mark.asyncio
 async def test_idle_follow_up_steers_the_reply(runtime_agent):
     agent = await runtime_agent(model=make_llm(max_tokens=256, temperature=0),
         config=AgentLoopConfig(system_prompt='Answer briefly in English.',
-            max_rounds=1, max_tokens=256, temperature=0, compactor=None))
+            max_rounds=1, max_tokens=256, temperature=0, context_budget_tokens=10**9))
     await agent.send('Name a primary color.')
     steer = "Forget the previous color. Reply with exactly one word — the color 'teal'."
     receipt = await agent.runtime.client.send(agent.target, steer, message_id='idle-followup', actor=agent.actor)
@@ -37,7 +37,7 @@ async def test_inflight_follow_up_is_queued_merged_and_steers(runtime_agent):
         input_schema={'type':'object', 'properties':{}}, pricing=Free('test')), wait_tool)
     agent = await runtime_agent(model=make_llm(max_tokens=384, temperature=0), registry=registry,
         config=AgentLoopConfig(system_prompt='First call the wait tool exactly once, then answer the user.',
-            max_rounds=4, max_tokens=384, temperature=0, compactor=None))
+            max_rounds=4, max_tokens=384, temperature=0, context_budget_tokens=10**9))
     first = await agent.runtime.client.send(agent.target, 'Name a fruit.', message_id='fruit', actor=agent.actor)
     try:
         await asyncio.wait_for(entered.wait(), 60)

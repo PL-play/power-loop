@@ -256,7 +256,7 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore, runti
     loop = await runtime_agent(model=llm, store=store, registry=create_default_tool_registry(include=["note"], bind=False), config=AgentLoopConfig(
             system_prompt="S",
             max_rounds=3,
-            compactor=None,
+            context_budget_tokens=10**9,
             memory=SQLiteNoteMemory(store),
         ))
     sid = loop.target.session_id

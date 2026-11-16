@@ -115,16 +115,14 @@ async def test_retention_off_keeps_images(tmp_path, runtime_agent):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("projected", [True, False])
-async def test_cross_send_image_representation(tmp_path, projected, runtime_agent):
-    """Projected history is text; verbatim history currently restores untracked attachments."""
-    from power_loop.runtime.representation import ProjectedRepresentation, VerbatimRepresentation
+async def test_cross_send_image_representation(tmp_path, runtime_agent):
+    """Finished sends reach the model as text projections; only the fresh image is live."""
+    from power_loop.runtime.representation import ProjectedRepresentation
 
     llm = _Scripted(responses=[_tool("c1"), _tool("c2"), _resp("done"),
                               _tool("c3"), _resp("done")])
     config = AgentLoopConfig(
-        system_prompt="t", max_rounds=8,
-        representation=ProjectedRepresentation() if projected else VerbatimRepresentation(),
+        system_prompt="t", max_rounds=8, representation=ProjectedRepresentation(),
     )
     assert config.image_retention_rounds == 1
     loop = await runtime_agent(model=llm, config=config, registry=_registry(tmp_path))
@@ -135,14 +133,7 @@ async def test_cross_send_image_representation(tmp_path, projected, runtime_agen
         await loop.send("continue")
         first = _attachment_rows(llm.seen[3])
         second = _attachment_rows(llm.seen[4])
-        if projected:
-            assert first == []
-            assert len(second) == 1  # only the freshly requested picture
-        else:
-            # Characterize the gap: restored historical attachments are not registered
-            # in _image_rounds, so even the next iteration leaves both old images live.
-            assert len(first) == 2
-            assert all("attachment" in row for row in first)
-            assert all("attachment" in row for row in second[:2])
+        assert first == []
+        assert len(second) == 1  # only the freshly requested picture
     finally:
         await loop.aclose()

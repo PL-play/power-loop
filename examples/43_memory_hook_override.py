@@ -31,7 +31,7 @@ async def main():
                 ctx.messages.append({'role':'system','name':'memory_custom','content':'Be playful'})
             hooks.register(HookPoint.LLM_BEFORE, inject, name=MemoryRecallHook.NAME)
         expected = 'Bluefin' if mode == 'default' else 'Be playful' if mode == 'custom' else 'Recall'
-        config = AgentLoopConfig(compactor=None, memory=Memory(), builtin_memory_hook=mode != 'disabled')
+        config = AgentLoopConfig(context_budget_tokens=10**9, memory=Memory(), builtin_memory_hook=mode != 'disabled')
         async with demo_runtime(SeeingModel(expected, '' if mode == 'default' else 'Bluefin'),
                 config=config, hooks=hooks) as (runtime, loop, target, actor):
             result = await loop.send(target, 'Recall', message_id=mode, actor=actor, deadline_ms=int(time.time()*1000)+10000)

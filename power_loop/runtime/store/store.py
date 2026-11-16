@@ -22,7 +22,7 @@ import secrets
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from power_loop.contracts.errors import InboxClaimChanged, SessionLeaseLost
@@ -51,6 +51,19 @@ from power_loop.runtime.store.types import (
 
 DEFAULT_TABLE_PREFIX = "pl_"
 DEFAULT_MAX_SPAWN_DEPTH = 3
+
+
+@dataclass(frozen=True)
+class ProjectionWindow:
+    """One bounded history-entry read: latest compact, live projection rows, first send read.
+
+    ``window_lo`` is the first send index that must be present in ``rows``; a gap inside
+    ``[window_lo, current_send_index)`` is a missing projection and must be healed or stopped.
+    """
+
+    compact: ProjectMessageRow | None
+    rows: list[ProjectMessageRow]
+    window_lo: int
 
 # Back-compat public aliases (the names the rest of power-loop and its callers
 # import). The async store is the canonical source for these now.
@@ -372,8 +385,14 @@ class SessionStore:
             if parent_session_id is not None:
                 await self._db.dialect.lock_state(tx, self.t.session_state, parent_session_id)
                 parent = await tx.fetchone(
-                    f"SELECT tenant_id,principal_id,lifecycle FROM {self.t.sessions} WHERE session_id=?",
-                    (parent_session_id,),
+                    f"WITH RECURSIVE ancestors AS ("
+                    f"SELECT session_id,parent_session_id,tenant_id,principal_id,lifecycle,1 AS depth "
+                    f"FROM {self.t.sessions} WHERE session_id=? UNION ALL "
+                    f"SELECT s.session_id,s.parent_session_id,s.tenant_id,s.principal_id,s.lifecycle,a.depth+1 "
+                    f"FROM {self.t.sessions} s JOIN ancestors a ON s.session_id=a.parent_session_id "
+                    "WHERE a.depth<=?) SELECT tenant_id,principal_id,lifecycle,"
+                    "(SELECT MAX(depth) FROM ancestors) AS child_depth FROM ancestors WHERE depth=1",
+                    (parent_session_id, self.max_spawn_depth),
                 )
                 if parent is None:
                     from power_loop.agent.runtime_types import RuntimeRequestError
@@ -386,6 +405,9 @@ class SessionStore:
                 ):
                     from power_loop.agent.runtime_types import RuntimeRequestError
                     raise RuntimeRequestError("forbidden")
+                if parent["child_depth"] > self.max_spawn_depth:
+                    from power_loop.agent.runtime_types import RuntimeRequestError
+                    raise RuntimeRequestError("invalid_options", f"child depth exceeds max {self.max_spawn_depth}")
             await tx.execute(
                 f"INSERT INTO {self.t.sessions} ("
                 "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
@@ -621,6 +643,18 @@ class SessionStore:
             (session_id, ownership.epoch, ownership.token),
         )
         if row is None:
+            raise SessionLeaseLost(session_id)
+
+    @staticmethod
+    def fence_owner_row(row: Row, session_id: str, ownership) -> None:
+        """Fence a write whose transaction already locked and returned the state row.
+
+        Reuses the same locked row instead of a second ``SELECT ... FOR UPDATE`` on it; the
+        values are read under the session lock in the caller's transaction.
+        """
+        if ownership is None:
+            return
+        if int(row["owner_epoch"]) != int(ownership.epoch) or row["owner_token"] != ownership.token:
             raise SessionLeaseLost(session_id)
 
     async def last_assistant_ref(self, session_id: str, send_index: int):
@@ -875,7 +909,8 @@ class SessionStore:
         return sorted((_row_to_hook_event(_loads(r['value_json'])) for r in rows), key=lambda r: r.event_id)
 
     async def load_active_messages(
-        self, session_id: str, *, after_seq: int | None = None, send_index: int | None = None
+        self, session_id: str, *, after_seq: int | None = None, send_index: int | None = None,
+        before_send_index: int | None = None,
     ) -> list[MessageRow]:
         """Active messages in **logical** order (a ``compact_note`` sorts at its
         ``meta['ord']``, not its high identity ``seq``).
@@ -890,7 +925,12 @@ class SessionStore:
         read (and O(session) row objects) on every send, for a slice that is O(one send).
         In projection mode ``pl_messages`` is never compacted, so that table only grows:
         the largest real session was 2332 rows / 2.7 MB. Rows with a NULL ``send_index``
-        (compact notes) are excluded, matching the Python filter this replaces."""
+        (compact notes) are excluded, matching the Python filter this replaces.
+
+        ``before_send_index`` returns only history older than that send (plus
+        NULL-``send_index`` rows). A send entry that already has its current merged user
+        row from the claim uses this to read history without selecting its own
+        just-written row."""
         where = "WHERE session_id=? AND state=?"
         params: list[object] = [session_id, MessageState.ACTIVE.value]
         if after_seq is not None:
@@ -899,6 +939,9 @@ class SessionStore:
         if send_index is not None:
             where += " AND send_index=?"
             params.append(int(send_index))
+        if before_send_index is not None:
+            where += " AND (send_index IS NULL OR send_index<?)"
+            params.append(int(before_send_index))
         rows = await self._db.fetchall(
             f"SELECT * FROM {self.t.messages} {where} ORDER BY seq ASC", tuple(params)
         )
@@ -906,17 +949,57 @@ class SessionStore:
         messages.sort(key=_logical_order_key)
         return messages
 
-    async def load_unsent_messages(self, session_id: str) -> list[MessageRow]:
-        """Active rows with no ``send_index``: rows predating send indexing and in-place
-        ``compact_note`` rows. Lets a reader assemble history without scanning every send."""
+    async def load_projection_window(
+        self, session_id: str, *, current_send_index: int, send_limit: int | None = None,
+    ) -> ProjectionWindow:
+        """The compact row plus the live projection sends after its cursor, in ONE bounded read.
+
+        Replaces the former ``latest_project_compact`` + full ``load_project_messages`` pair on the
+        normal history entry (~two statements) and no longer reads NULL-``send_index`` rows: the
+        unique projection contract does not load pre-send-index legacy history.
+
+        ``send_limit`` bounds the read by whole SENDS (not rows), so the caller's row cap can never
+        split a send. The absolute recent lower bound is ``current_send_index - send_limit``: it
+        determines both the read and the caller's repair window even when no projection rows exist
+        at all. Without a cap the read is bounded only by the fold cursor, which is the honest
+        limit of an uncompacted history (reported by S07 measurements).
+        """
+        table = self.t.project_messages
+        if int(current_send_index) <= 1:
+            # No finished send can exist before send 1, so there is nothing to read.
+            return ProjectionWindow(None, [], 1)
+        # Split the tiny compact set from the recent send range so the range predicate is an
+        # actual index search, not a residual filter over every row of the session. SQLite must
+        # materialize the compact CTE; otherwise the optimizer expands it and falls back to the
+        # session-prefix scan (verified by the R1 window-work probe). MySQL has no AS MATERIALIZED
+        # and uses an ordinary CTE + UNION ALL; PG supports the same shape.
+        cte = ("WITH compact AS (" if self._db.dialect.name == "mysql"
+               else "WITH compact AS MATERIALIZED (")
+        send_limit = None if send_limit is None else max(1, int(send_limit))
+        lo = (max(1, int(current_send_index) - send_limit)
+              if send_limit is not None else None)
+        params: list[Any] = [session_id, session_id]
+        range_filter = ""
+        if lo is not None:
+            range_filter = " AND send_index>=?"
+            params.append(lo)
         rows = await self._db.fetchall(
-            f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? AND send_index IS NULL "
-            "ORDER BY seq ASC",
-            (session_id, MessageState.ACTIVE.value),
+            f"{cte}"
+            f"SELECT * FROM {table} WHERE session_id=? AND kind='compact') "
+            "SELECT * FROM compact UNION ALL "
+            f"SELECT * FROM {table} WHERE session_id=?{range_filter} "
+            "AND send_index > COALESCE((SELECT MAX(send_index) FROM compact), -1)",
+            tuple(params),
         )
-        messages = [_row_to_message(r) for r in rows]
-        messages.sort(key=_logical_order_key)
-        return messages
+        out = [_row_to_project_message(r) for r in rows]
+        out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
+        compact = max((r for r in out if r.kind == "compact"), key=lambda r: r.send_index, default=None)
+        cutoff = compact.compact_to_send if compact is not None else None
+        window_lo = (cutoff or 0) + 1
+        if lo is not None:
+            window_lo = max(window_lo, lo)
+        live = [r for r in out if r.kind != "compact" and int(r.send_index) < int(current_send_index)]
+        return ProjectionWindow(compact, live, window_lo)
 
     async def load_all_messages(self, session_id: str) -> list[MessageRow]:
         rows = await self._db.fetchall(
@@ -937,11 +1020,6 @@ class SessionStore:
 
         table = self.t.messages if source == "messages" else self.t.project_messages
         coord = "seq" if source == "messages" else "id"
-        if source == "projection" and _fetchall is None:
-            from power_loop.runtime.store.schema import _column_exists
-            async with self._db.transaction() as tx:
-                if not await _column_exists(tx, self._db.dialect.name, table, "id"):
-                    raise ValueError("projection_ids_unavailable: legacy schema; no migration performed")
         where = f"session_id=? AND {coord}>=? AND {coord}>?"
         params: list[Any] = [session_id, lo, after]
         if hi is not None:
@@ -975,11 +1053,6 @@ class SessionStore:
                 "WHERE session_id=? AND seq>?", (session_id, after_seq or 0),
             )
         elif source == "projection":
-            from power_loop.runtime.store.schema import _column_exists
-            if _fetchone is None:
-                async with self._db.transaction() as tx:
-                    if not await _column_exists(tx, self._db.dialect.name, self.t.project_messages, "id"):
-                        raise ValueError("projection_ids_unavailable: legacy schema")
             where = "session_id=?"
             params: tuple[Any, ...] = (session_id,)
             if after_seq is not None:
@@ -1130,7 +1203,24 @@ class SessionStore:
     ) -> None:
         """Upsert one projection row on an OPEN transaction (so several rows + a compact fold can
         share one atomic, lockable transaction). See :meth:`upsert_project_message`."""
-        sql = self._db.dialect.upsert(
+        await self._upsert_project_messages_tx(tx, [(
+            session_id, int(send_index), kind,
+            _dumps(content if content is not None else {}), _nul_safe(rendered_text),
+            source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
+            int(projector_version), token_estimate, int(completed_through_send_index), now,
+        )])
+
+    async def _upsert_project_messages_tx(self, tx: Transaction, rows: Sequence[tuple]) -> None:
+        """One real multi-row UPSERT for a send's user/project rows.
+
+        The rows tuple order is ``(session_id, send_index, kind, content_json, rendered_text,
+        source_seq_lo, source_seq_hi, compact_from_send, compact_to_send, projector_version,
+        token_estimate, completed_through_send_index, created_at)``. Callers already hold the
+        session lock; this is one ``execute``, not a per-row loop pretending to be one statement.
+        """
+        if not rows:
+            return
+        sql = self._db.dialect.upsert_many(
             self.t.project_messages,
             ("session_id", "send_index", "kind"),
             (
@@ -1138,17 +1228,13 @@ class SessionStore:
                 "compact_from_send", "compact_to_send", "projector_version", "token_estimate",
                 "completed_through_send_index",
             ),
+            rows=len(rows),
             insert_only_cols=("created_at",),
         )
-        await tx.execute(
-            sql,
-            (
-                session_id, int(send_index), kind,
-                _dumps(content if content is not None else {}), _nul_safe(rendered_text),
-                source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
-                int(projector_version), token_estimate, int(completed_through_send_index), now,
-            ),
-        )
+        params: list[Any] = []
+        for row in rows:
+            params.extend(row)
+        await tx.execute(sql, tuple(params))
 
     async def upsert_project_message(
         self,
@@ -1310,18 +1396,21 @@ class SessionStore:
         """
         now = _now_ms()
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            await self.fence_owner_tx(tx, session_id, ownership)
             from .projection_fold import invalidate, read_state
+            # Lock the state row first; the statistics are a mutable fact and must be read
+            # with a fresh statement AFTER the lock, not from a join snapshot taken while
+            # waiting for it (PostgreSQL keeps the pre-wait row version of an unlocked join).
+            locked = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            self.fence_owner_row(locked, session_id, ownership)
+            state = await read_state(self, tx, session_id)
             if expected_projection_revision is not None:
-                state = await read_state(self, tx, session_id)
                 if state is None or state["revision"] != expected_projection_revision:
                     return False
             cur = await self._query_latest_project_compact(tx.fetchone, session_id)
             cur_to = cur.compact_to_send if cur is not None else None
             if cur_to != expected_prior_to_send:
                 return False  # a concurrent fold advanced the cursor; our snapshot/fold is stale
-            await invalidate(self, tx, session_id)
+            await invalidate(self, tx, session_id, state=state)
             # Delete any SUPERSEDED compact rows (send_index < the new compact): a rolled-forward
             # fold folds the prior compact's content INTO the new one, so older compacts are never
             # read again (the reader uses the latest compact + after-cursor rows). Without this they

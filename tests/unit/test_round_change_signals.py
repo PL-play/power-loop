@@ -16,6 +16,8 @@ from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.change_signals import COLUMNS
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 from ._change_signal_crash_worker import write
 
@@ -39,7 +41,7 @@ async def payload(store, sid, kind):
 @pytest.mark.parametrize("stage", ["after_signal", "before_commit"])
 async def test_process_death_rolls_back_signal_and_payload_together(registry_store, tmp_path, kind, stage):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     backend = store._db.dialect.name
     dsn = str(tmp_path / "registry.db") if backend == "sqlite" else os.environ[
         "POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
@@ -66,7 +68,7 @@ async def test_process_death_rolls_back_signal_and_payload_together(registry_sto
 @pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
 async def test_signal_and_payload_share_failed_or_unknown_commit(registry_store, monkeypatch, kind, fault):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     transaction = store._db.transaction
 
     @asynccontextmanager
@@ -200,7 +202,7 @@ async def test_pass_turn_accepts_late_append_without_losing_it(registry_store, m
 
 async def test_concurrent_writers_advance_counter_without_losing_input(registry_store):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     other = await connect(schema="verify")
     await asyncio.wait_for(asyncio.gather(*(
         (store if number % 2 else other).inbox_put(sid, [{"item_id": str(number), "content": str(number)}])

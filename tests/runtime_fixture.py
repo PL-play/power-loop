@@ -1,7 +1,7 @@
 """Test composition of the public message runtime; no direct execution entry."""
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from power_loop import (
@@ -50,9 +50,9 @@ class ScriptedModel(LLMService):
 
 
 class RunningAgent:
-    def __init__(self, store, model, registry=None, config=None, *, hooks=None, runtime_env=None, process_control=None, capacity=1, command=None, event_bus=None, allowed_models=None, coordinator=None, transport=None):
+    def __init__(self, store, model, registry=None, config=None, *, hooks=None, runtime_env=None, process_control=None, capacity=1, command=None, event_bus=None, allowed_models=None, coordinator=None, transport=None, options=None):
         self.owns_transport = transport is None
-        self.config = config or AgentLoopConfig(compactor=None)
+        self.config = config or AgentLoopConfig(context_budget_tokens=10**9)
         self.hooks = hooks or AgentHooks()
         self.model = model
         self.registry = registry
@@ -71,10 +71,12 @@ class RunningAgent:
                                capacity=capacity, recovery_interval_s=None, coordinator=coordinator, transport=transport)
         self.loop = StatefulAgentLoop(runtime=self.runtime)
         self.actor = TrustedActor('test', 'host', None)
-        options = {f.name: getattr(self.config, f.name) for f in fields(RequestOptions)
-                   if hasattr(self.config, f.name)}
+        descriptor_config = {f.name: getattr(self.config, f.name) for f in fields(RequestOptions)
+                             if hasattr(self.config, f.name)}
+        if options is not None:
+            descriptor_config.update({k: v for k, v in plain(options).items() if v is not None})
         self.descriptor = RuntimeDescriptor(2, 'agent', 'fixture.agent@215', None,
-            'fixture.tools@215', 'fixture.hooks@215', 'fixture.resources@215', plain(options), {})
+            'fixture.tools@215', 'fixture.hooks@215', 'fixture.resources@215', plain(descriptor_config), {})
         self.counter = 0
 
     async def start(self, *, target=None):
@@ -82,7 +84,13 @@ class RunningAgent:
         self.target = target if target is not None else await self.loop.new_session(self.descriptor, actor=self.actor)
         return self
 
-    async def send(self, body, *, options=None, message_id=None, priority="normal"):
+    async def new_session(self, *, options):
+        descriptor = replace(self.descriptor, config={**dict(self.descriptor.config),
+            **{k: v for k, v in plain(options).items() if v is not None}})
+        self.target = await self.loop.new_session(descriptor, actor=self.actor)
+        return self.target
+
+    async def send(self, body, *, message_id=None, priority="normal"):
         self.counter += 1
         result = await self.loop.send(self.target, body, message_id=message_id or f'm{self.counter}',
                                      actor=self.actor, deadline_ms=now_ms() + 120000, priority=priority)

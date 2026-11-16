@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -64,10 +66,23 @@ def main():
     parser.add_argument("mode", choices=["suite", "containers", "pytest"])
     parser.add_argument("--db", choices=["sqlite", "postgres", "mysql"])
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-clean", action="store_true")
     args, extra = parser.parse_known_args()
     output = args.output.resolve()
     (output / "raw").mkdir(parents=True, exist_ok=True)
     env = environment()
+    dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
+    if args.require_clean and dirty:
+        raise RuntimeError("final P8 verification requires a committed SDK tree")
+    import power_loop
+    source = {
+        "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip(),
+        "dirty": bool(dirty), "import_path": power_loop.__file__,
+        "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)).hexdigest(),
+        "python": sys.version, "mode": args.mode, "database": args.db, "pytest_arguments": extra,
+    }
+    (output / f"source-{args.mode}-{args.db or 'all'}.json").write_text(json.dumps(source, indent=2))
     os.environ.update(env)
     os.chdir(ROOT)
     sys.path.insert(0, str(ROOT))

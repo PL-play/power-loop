@@ -17,7 +17,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def test_admission_retry_keeps_one_driver_and_original_result(registry_store):
     store, _ = registry_store
-    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     spec = {"name": "once", "root": leaf("A")}
     try:
         first = await runner.runtime.client.workflow(runner.target, spec, message_id="run", actor=runner.actor)
@@ -52,7 +52,7 @@ async def test_admission_retry_keeps_one_driver_and_original_result(registry_sto
 async def test_retry_uses_original_frozen_driver_descriptor(registry_store, options):
     store, _ = registry_store
     runner = await RunningAgent(
-        store, Model(), config=AgentLoopConfig(compactor=None, temperature=0.25),
+        store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9, temperature=0.25),
     ).start()
     client = runner.runtime.client
     spec = {"name": "frozen", "root": leaf("A")}

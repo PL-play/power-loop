@@ -7,6 +7,10 @@ import uuid
 from dataclasses import dataclass
 
 from power_loop.contracts.errors import SessionLeaseLost
+from power_loop.runtime.store.types import (
+    MessageRow as StoredMessageRow,
+)
+from power_loop.runtime.store.types import MessageState
 
 from .runtime_types import (
     PROTOCOL_VERSION,
@@ -41,8 +45,48 @@ class InputRecord:
     meta: dict
 
 
+_RESULT_INPUT_COLUMNS = (
+    "session_id", "item_id", "kind", "status", "terminal_status",
+    "result_seq", "result_send_index", "error_code", "error_detail",
+    "result_delivery_error", "delivered_send_index", "continuation_of",
+)
+
+
+@dataclass(frozen=True)
+class ResultInput:
+    """The narrow input view needed to resolve and report a durable result."""
+    ref: InputRef
+    row: dict
+
+
+@dataclass(frozen=True)
+class ResultRead:
+    """One authorized read of a target input and its durable result.
+
+    ``record is None`` means the target authorized the caller but the input does not
+    exist (``before_send=True`` keeps this state; public ``get_result`` raises).
+    ``resolved`` is the newest continuation input when the requested input is a
+    continuation chain member, otherwise the same record. ``result`` is non-None only
+    for a terminal resolved input. The records are internal narrow result views, not
+    full InputRecords.
+    """
+    ref: InputRef
+    target: TargetRef
+    session: dict
+    record: ResultInput | None
+    resolved: ResultInput | None
+    result: Result | None
+
+
 @dataclass(frozen=True)
 class ClaimedBatch:
+    """One atomically claimed input snapshot.
+
+    The claim transaction already knows everything the worker and loop need to start the
+    send: the frozen descriptor/identity read under the state lock, and the merged user row
+    it wrote (content, seq, send_index, meta). Returning them here keeps the healthy path
+    from re-reading its own session/state and its own just-written user message.
+    """
     target: TargetRef
     send_index: int
     message_seq: int
@@ -51,6 +95,19 @@ class ClaimedBatch:
     owner_token: str
     owner_node_id: str
     owner_boot_id: str
+    descriptor: RuntimeDescriptor
+    tenant_id: str
+    principal_id: str
+    parent_session_id: str | None
+    user_row: StoredMessageRow
+    # The frozen direct-parent route read under the claim's state lock. It is creation
+    # metadata, so the claim snapshot is the authoritative value final needs; final never
+    # re-reads the session for it. ``None`` is the real "no route" case, not a default.
+    result_route: dict | None
+    #: The session's ``updated_at`` from the same post-lock batch read. It is the activity
+    #: time the claim actually saw, handed to this run's existing touch throttle; it is not a
+    #: long-lived cache and does not replace the owner/touch conditional writes.
+    session_updated_at: int
     inbox_version: int = 0
 
 
@@ -62,6 +119,13 @@ class FinalBatch:
     result_activation: TargetRef | None = None
 
 
+class _TargetAlreadyCreated(Exception):
+    """A concurrent request inserted the deterministic target after this call read it
+    absent. Private and narrow: it only drives one re-entry into the ordinary
+    existing-target path after the first transaction has exited and released its locks.
+    """
+
+
 class RuntimeInputStore:
     """The only schema-17 execution storage port used by P1."""
 
@@ -71,6 +135,28 @@ class RuntimeInputStore:
         self.state = store.t.session_state
         self.inbox_item_limit = inbox_item_limit
         self.inbox_byte_limit = inbox_byte_limit
+        # One row for the target session, its addressed input and that input's result
+        # message. Aliases keep the three tables' overlapping columns apart. The message
+        # join carries both halves of the address so it cannot land on another send.
+        self._result_sql = (
+            "SELECT s.session_id AS session_id,s.tenant_id AS tenant_id,"
+            "s.principal_id AS principal_id,s.parent_session_id AS parent_session_id,"
+            "q.item_id AS input_item_id,q.kind AS input_kind,q.status AS input_status,"
+            "q.terminal_status AS input_terminal_status,"
+            "q.result_seq AS input_result_seq,"
+            "q.result_send_index AS input_result_send_index,"
+            "q.error_code AS input_error_code,q.error_detail AS input_error_detail,"
+            "q.result_delivery_error AS input_result_delivery_error,"
+            "q.delivered_send_index AS input_delivered_send_index,"
+            "q.continuation_of AS input_continuation_of,"
+            "m.id AS result_message_id,m.content AS result_content,"
+            "m.meta_json AS result_meta_json "
+            f"FROM {store.t.sessions} s "
+            f"LEFT JOIN {self.q} q ON q.session_id=s.session_id AND q.item_id=? "
+            f"LEFT JOIN {store.t.messages} m ON m.session_id=q.session_id "
+            "AND m.seq=q.result_seq AND m.send_index=q.result_send_index "
+            "WHERE s.session_id=?"
+        )
 
     @property
     def db(self):
@@ -80,15 +166,16 @@ class RuntimeInputStore:
         if ref.store_id != self.store.store_id:
             raise RuntimeRequestError("wrong_store")
 
-    async def _db_now(self, reader):
+    def _now_sql(self):
         name = self.db.dialect.name
         if name == "sqlite":
-            sql = "SELECT CAST(strftime('%s','now') AS INTEGER)*1000 AS now"
-        elif name == "postgres":
-            sql = "SELECT floor(extract(epoch from clock_timestamp())*1000)::bigint AS now"
-        else:
-            sql = "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS SIGNED) AS now"
-        return int((await reader.fetchone(sql))["now"])
+            return "CAST(strftime('%s','now') AS INTEGER)*1000"
+        if name == "postgres":
+            return "floor(extract(epoch from clock_timestamp())*1000)::bigint"
+        return "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS SIGNED)"
+
+    async def _db_now(self, reader):
+        return int((await reader.fetchone(f"SELECT {self._now_sql()} AS now"))["now"])
 
     async def create_session(
         self, descriptor: RuntimeDescriptor, *, actor, parent=None, result_route=None,
@@ -127,14 +214,40 @@ class RuntimeInputStore:
         )
         return TargetRef(self.store.store_id, sid)
 
+    async def _lock_creation_parent_tx(self, tx, parent, actor, *, existing_id=None):
+        """Lock the parent and an existing deterministic target in session_id order,
+        then read/authorize the parent and check lifecycle/cancel under that lock."""
+        from power_loop.contracts.errors import CancellationRequested
+
+        lock_ids = {parent.session_id}
+        if existing_id is not None:
+            lock_ids.add(existing_id)
+        states = {}
+        for sid in sorted(lock_ids):
+            try:
+                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
+            except ValueError as exc:
+                if sid == parent.session_id:
+                    raise RuntimeRequestError("not_found") from exc
+                # The only other id in this set is the existing deterministic target.
+                # A public cancel/close/retention cleanup can remove it between the
+                # re-entry read and this lock; report the creation conflict instead of
+                # leaking the storage layer's ValueError.
+                raise RuntimeRequestError("creation_conflict") from exc
+        parent_session = await self.authorize(tx, parent, actor)
+        if parent_session["lifecycle"] != "open":
+            raise RuntimeRequestError("session_closed")
+        parent_state = states[parent.session_id]
+        if parent_state["cancel_send_index"] is not None:
+            raise CancellationRequested(parent_state["cancel_reason"] or "cancelled")
+        return parent_session
+
     async def create_child(
         self, descriptor: RuntimeDescriptor, *, parent: TargetRef, actor, call_ref,
         tool_call_id: str, body, cancel_propagation="linked", result_kind="agent_result",
         require_assistant_call=True,
     ):
         """Atomically create the deterministic child and accept its original start input."""
-        from power_loop.contracts.errors import CancellationRequested
-
         self.check_store(parent)
         if actor.session_id != parent.session_id:
             raise RuntimeRequestError("forbidden", "child creation requires the direct parent actor")
@@ -162,67 +275,90 @@ class RuntimeInputStore:
             parent.store_id, parent.session_id, call_ref.to_dict(), tool_call_id,
             descriptor, start,
         ])
-        async with self.db.transaction() as tx:
-            parent_session = await self.authorize(tx, parent, actor)
-            existing = await tx.fetchone(
-                f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,)
-            )
-            lock_ids = {parent.session_id}
-            if existing is not None:
-                lock_ids.add(session_id)
-            states = {}
-            for sid in sorted(lock_ids):
-                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
-            parent_state = states[parent.session_id]
-            if parent_state["cancel_send_index"] is not None:
-                raise CancellationRequested(parent_state["cancel_reason"] or "cancelled")
-            if existing is None:
-                if require_assistant_call:
-                    call = await tx.fetchone(
-                        f"SELECT tool_calls_json FROM {self.store.t.messages} "
-                        "WHERE session_id=? AND seq=? AND role='assistant'",
-                        (parent.session_id, call_ref.seq),
+        for attempt in range(2):
+            try:
+                async with self.db.transaction() as tx:
+                    existing = await tx.fetchone(
+                        f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?",
+                        (session_id,),
                     )
-                    calls = json.loads(call["tool_calls_json"] or "[]") if call is not None else []
-                    if not any(item.get("id") == tool_call_id for item in calls):
-                        raise RuntimeRequestError("forbidden", "original assistant tool call not found")
-                database_now = await self._db_now(tx)
-                await tx.execute(
-                    f"INSERT INTO {self.store.t.sessions} ("
-                    "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
-                    "descriptor_hash,creation_identity_hash,creation_call_ref_json,creation_tool_call_id,"
-                    "start_input_message_id,tenant_id,principal_id,result_route_json,cancel_propagation,"
-                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        session_id, parent.session_id, actor.session_id, descriptor.kind,
-                        canonical(descriptor), sha256_canonical(descriptor), identity,
-                        canonical(call_ref.to_dict()), tool_call_id, start.message_id,
-                        parent_session["tenant_id"], parent_session["principal_id"],
-                        canonical(route), cancel_propagation, database_now, database_now,
-                    ),
-                )
-                await tx.execute(
-                    f"INSERT INTO {self.state} (session_id) VALUES (?)", (session_id,)
-                )
-            else:
-                expected = {
-                    "parent_session_id": parent.session_id,
-                    "descriptor_hash": sha256_canonical(descriptor),
-                    "creation_identity_hash": identity,
-                    "creation_call_ref_json": canonical(call_ref.to_dict()),
-                    "creation_tool_call_id": tool_call_id,
-                    "start_input_message_id": start.message_id,
-                    "result_route_json": canonical(route),
-                    "cancel_propagation": cancel_propagation,
-                }
-                if any(existing[key] != value for key, value in expected.items()):
-                    raise RuntimeRequestError("creation_conflict")
-            receipt = await self._accept_tx(
-                tx, target, body, start, self.request_hash(target, body, "normal"),
-                canonical(body), actor=actor, priority="normal", deadline_ms=None,
-                kind="user", result_kind=None,
-            )
-        return target, start, receipt
+                    parent_session = await self._lock_creation_parent_tx(
+                        tx, parent, actor,
+                        existing_id=(session_id if existing is not None else None),
+                    )
+                    if existing is None:
+                        if attempt:
+                            raise RuntimeRequestError("creation_conflict")
+                        if require_assistant_call:
+                            call = await tx.fetchone(
+                                f"SELECT tool_calls_json FROM {self.store.t.messages} "
+                                "WHERE session_id=? AND seq=? AND role='assistant'",
+                                (parent.session_id, call_ref.seq),
+                            )
+                            calls = (
+                                json.loads(call["tool_calls_json"] or "[]")
+                                if call is not None else []
+                            )
+                            if not any(item.get("id") == tool_call_id for item in calls):
+                                raise RuntimeRequestError(
+                                    "forbidden", "original assistant tool call not found")
+                        database_now = await self._db_now(tx)
+                        changed = await tx.execute(
+                            f"INSERT INTO {self.store.t.sessions} ("
+                            "session_id,parent_session_id,created_by_session_id,session_kind,"
+                            "descriptor_json,descriptor_hash,creation_identity_hash,"
+                            "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
+                            "tenant_id,principal_id,result_route_json,cancel_propagation,"
+                            "created_at,updated_at) "
+                            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
+                            f"WHERE NOT EXISTS (SELECT 1 FROM {self.store.t.sessions} "
+                            "WHERE session_id=?)",
+                            (
+                                session_id, parent.session_id, actor.session_id, descriptor.kind,
+                                canonical(descriptor), sha256_canonical(descriptor), identity,
+                                canonical(call_ref.to_dict()), tool_call_id, start.message_id,
+                                parent_session["tenant_id"], parent_session["principal_id"],
+                                canonical(route), cancel_propagation, database_now, database_now,
+                                session_id,
+                            ),
+                        )
+                        if changed != 1:
+                            if attempt == 0:
+                                raise _TargetAlreadyCreated
+                            raise RuntimeRequestError("creation_conflict")
+                        receipt = await self._start_new_session_tx(
+                            tx, target, body, start, database_now=database_now,
+                        )
+                    else:
+                        expected = {
+                            "parent_session_id": parent.session_id,
+                            "descriptor_hash": sha256_canonical(descriptor),
+                            "creation_identity_hash": identity,
+                            "creation_call_ref_json": canonical(call_ref.to_dict()),
+                            "creation_tool_call_id": tool_call_id,
+                            "start_input_message_id": start.message_id,
+                            "result_route_json": canonical(route),
+                            "cancel_propagation": cancel_propagation,
+                        }
+                        if any(existing[key] != value for key, value in expected.items()):
+                            raise RuntimeRequestError("creation_conflict")
+                        # A retry of a deterministic create keeps the ordinary accept path:
+                        # it verifies the existing session/input instead of assuming
+                        # first-create.
+                        receipt = await self._accept_tx(
+                            tx, target, body, start, self.request_hash(target, body, "normal"),
+                            canonical(body), actor=actor, priority="normal", deadline_ms=None,
+                            kind="user", result_kind=None,
+                        )
+                return target, start, receipt
+            except _TargetAlreadyCreated:
+                if attempt:
+                    raise
+                # The conditional INSERT hit the winner's committed row. The transaction
+                # has exited and released the parent lock; re-enter once through the
+                # ordinary existing-target verification.
+                continue
+        raise RuntimeRequestError("creation_conflict")
 
     async def create_workflow_session(
         self, descriptor: RuntimeDescriptor, *, parent: TargetRef, actor,
@@ -235,8 +371,6 @@ class RuntimeInputStore:
         A driver run journal may be included here because its worker must never discover
         a runnable driver without its frozen run coordinates.
         """
-        from power_loop.contracts.errors import CancellationRequested
-
         self.check_store(parent)
         if (target.store_id, start.store_id, start.session_id) != (
             self.store.store_id, self.store.store_id, target.session_id
@@ -252,58 +386,82 @@ class RuntimeInputStore:
             "workflow_session", parent.store_id, parent.session_id,
             target.session_id, descriptor, start,
         ])
-        async with self.db.transaction() as tx:
-            await self.authorize(tx, parent, actor)
-            parent_state = await self.db.dialect.lock_state(tx, self.state, parent.session_id)
-            if parent_state["cancel_send_index"] is not None:
-                raise CancellationRequested(parent_state["cancel_reason"] or "cancelled")
-            existing = await tx.fetchone(
-                f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?",
-                (target.session_id,),
-            )
-            if existing is not None:
-                await self.db.dialect.lock_state(tx, self.state, target.session_id)
-            if existing is None:
-                database_now = await self._db_now(tx)
-                await tx.execute(
-                    f"INSERT INTO {self.store.t.sessions} ("
-                    "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
-                    "descriptor_hash,creation_identity_hash,creation_call_ref_json,creation_tool_call_id,"
-                    "start_input_message_id,tenant_id,principal_id,result_route_json,cancel_propagation,"
-                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        target.session_id, parent.session_id, actor.session_id, descriptor.kind,
-                        canonical(descriptor), sha256_canonical(descriptor), identity,
-                        canonical(actor.call_ref.to_dict()) if actor.call_ref is not None else None,
-                        actor.tool_call_id, start.message_id,
-                        actor.tenant_id, actor.principal_id, canonical(route), cancel_propagation,
-                        database_now, database_now,
-                    ),
-                )
-                await tx.execute(f"INSERT INTO {self.state} (session_id) VALUES (?)", (target.session_id,))
-            else:
-                expected = {
-                    "parent_session_id": parent.session_id,
-                    "descriptor_hash": sha256_canonical(descriptor),
-                    "creation_identity_hash": identity,
-                    "start_input_message_id": start.message_id,
-                    "result_route_json": canonical(route),
-                    "cancel_propagation": cancel_propagation,
-                }
-                if any(existing[key] != value for key, value in expected.items()):
-                    raise RuntimeRequestError("creation_conflict")
-            receipt = await self._accept_tx(
-                tx, target, body, start, self.request_hash(target, body, "normal"),
-                canonical(body), actor=actor, priority="normal", deadline_ms=None,
-                kind="user", result_kind=None,
-            )
-            if run_journal is not None and existing is None:
-                from power_loop.workflow import journal
+        for attempt in range(2):
+            try:
+                async with self.db.transaction() as tx:
+                    existing = await tx.fetchone(
+                        f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?",
+                        (target.session_id,),
+                    )
+                    await self._lock_creation_parent_tx(
+                        tx, parent, actor,
+                        existing_id=(target.session_id if existing is not None else None),
+                    )
+                    if existing is None:
+                        if attempt:
+                            raise RuntimeRequestError("creation_conflict")
+                        database_now = await self._db_now(tx)
+                        changed = await tx.execute(
+                            f"INSERT INTO {self.store.t.sessions} ("
+                            "session_id,parent_session_id,created_by_session_id,session_kind,"
+                            "descriptor_json,descriptor_hash,creation_identity_hash,"
+                            "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
+                            "tenant_id,principal_id,result_route_json,cancel_propagation,"
+                            "created_at,updated_at) "
+                            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
+                            f"WHERE NOT EXISTS (SELECT 1 FROM {self.store.t.sessions} "
+                            "WHERE session_id=?)",
+                            (
+                                target.session_id, parent.session_id, actor.session_id,
+                                descriptor.kind, canonical(descriptor),
+                                sha256_canonical(descriptor), identity,
+                                canonical(actor.call_ref.to_dict())
+                                if actor.call_ref is not None else None,
+                                actor.tool_call_id, start.message_id,
+                                actor.tenant_id, actor.principal_id, canonical(route),
+                                cancel_propagation, database_now, database_now,
+                                target.session_id,
+                            ),
+                        )
+                        if changed != 1:
+                            if attempt == 0:
+                                raise _TargetAlreadyCreated
+                            raise RuntimeRequestError("creation_conflict")
+                        receipt = await self._start_new_session_tx(
+                            tx, target, body, start, database_now=database_now,
+                        )
+                    else:
+                        expected = {
+                            "parent_session_id": parent.session_id,
+                            "descriptor_hash": sha256_canonical(descriptor),
+                            "creation_identity_hash": identity,
+                            "start_input_message_id": start.message_id,
+                            "result_route_json": canonical(route),
+                            "cancel_propagation": cancel_propagation,
+                        }
+                        if any(existing[key] != value for key, value in expected.items()):
+                            raise RuntimeRequestError("creation_conflict")
+                        receipt = await self._accept_tx(
+                            tx, target, body, start, self.request_hash(target, body, "normal"),
+                            canonical(body), actor=actor, priority="normal", deadline_ms=None,
+                            kind="user", result_kind=None,
+                        )
+                    if run_journal is not None and existing is None:
+                        from power_loop.workflow import journal
 
-                await journal.put(
-                    self.store, tx, target.session_id, journal.run_key(start.message_id), run_journal,
-                )
-        return target, start, receipt
+                        await journal.put(
+                            self.store, tx, target.session_id,
+                            journal.run_key(start.message_id), run_journal,
+                        )
+                return target, start, receipt
+            except _TargetAlreadyCreated:
+                if attempt:
+                    raise
+                # The conditional INSERT hit the winner's committed row. The first
+                # transaction has exited and released the parent lock; re-enter once
+                # through the ordinary existing-target verification.
+                continue
+        raise RuntimeRequestError("creation_conflict")
 
     def _result_route(self, parent, route, child_id):
         if route is None:
@@ -331,9 +489,8 @@ class RuntimeInputStore:
             raise RuntimeRequestError("not_found")
         return row
 
-    async def authorize(self, reader, target, actor):
-        self.check_store(target)
-        session = await self._session(reader, target.session_id)
+    async def _authorize_known(self, reader, target, actor, session):
+        """Apply the existing actor contract to an already-read target session row."""
         if (session["tenant_id"], session["principal_id"]) != (
             actor.tenant_id, actor.principal_id
         ):
@@ -346,6 +503,11 @@ class RuntimeInputStore:
                     raise RuntimeRequestError("forbidden")
                 sid = ancestor["parent_session_id"]
                 ancestor = await self._session(reader, sid)
+
+    async def authorize(self, reader, target, actor):
+        self.check_store(target)
+        session = await self._session(reader, target.session_id)
+        await self._authorize_known(reader, target, actor, session)
         return session
 
     def record(self, row):
@@ -404,45 +566,67 @@ class RuntimeInputStore:
         except (Exception, asyncio.CancelledError) as exc:
             raise StoreError(ref) from exc
 
+    def _pending_bytes_sql(self, alias):
+        if self.db.dialect.name == "sqlite":
+            return (f"LENGTH(CAST({alias}.content_json AS BLOB))"
+                    f"+LENGTH(CAST({alias}.meta_json AS BLOB))")
+        return f"OCTET_LENGTH({alias}.content_json)+OCTET_LENGTH({alias}.meta_json)"
+
+    async def _accept_read(self, tx, session_id, item_id):
+        """Session facts plus the input, pending count/bytes and database time.
+
+        Runs after the state lock. The session row is the row source, so a missing
+        target session (no row, not_found) stays distinct from an existing session
+        with no matching input (one row with the input columns NULL).
+        """
+        pending = "q2.session_id=? AND q2.status IN ('pending','waiting_continuation')"
+        row = await tx.fetchone(
+            "SELECT s.tenant_id AS tenant_id,s.principal_id AS principal_id,"
+            "s.parent_session_id AS parent_session_id,s.lifecycle AS lifecycle,"
+            "q.id AS id,q.session_id AS session_id,q.item_id AS item_id,"
+            "q.status AS status,q.content_json AS content_json,q.meta_json AS meta_json,"
+            "q.request_hash AS request_hash,q.result_send_index AS result_send_index,"
+            "q.delivered_send_index AS delivered_send_index,q.error_detail AS error_detail,"
+            "p.pending_count AS pending_count,p.pending_bytes AS pending_bytes,"
+            f"{self._now_sql()} AS db_now "
+            f"FROM {self.store.t.sessions} s LEFT JOIN {self.q} q "
+            "ON q.session_id=s.session_id AND q.item_id=? "
+            "CROSS JOIN ("
+            f"SELECT COUNT(*) AS pending_count,"
+            f"COALESCE(SUM({self._pending_bytes_sql('q2')}),0) AS pending_bytes "
+            f"FROM {self.q} q2 WHERE {pending}"
+            ") p WHERE s.session_id=?",
+            (item_id, session_id, session_id),
+        )
+        if row is None:
+            raise RuntimeRequestError("not_found")
+        return row
+
     async def _accept_tx(
         self, tx, target, body, ref, digest, content, *, actor, priority, deadline_ms,
         kind, result_kind, activations=None,
     ):
+        self.check_store(target)
         try:
             state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
         except ValueError as exc:
             raise RuntimeRequestError("not_found") from exc
-        session = await self.authorize(tx, target, actor)
-        if session["lifecycle"] != "open":
+        current = await self._accept_read(tx, target.session_id, ref.message_id)
+        await self._authorize_known(tx, target, actor, current)
+        if current["lifecycle"] != "open":
             raise RuntimeRequestError("session_closed")
-        old = await self.input(tx, ref)
-        if old is not None:
+        if current["id"] is not None:
+            old = self.record(current)
             if old.row["request_hash"] != digest:
                 raise RuntimeRequestError("request_conflict")
             return self.receipt(old)
-        count = await tx.fetchone(
-            f"SELECT COUNT(*) AS n FROM {self.q} "
-            "WHERE session_id=? AND status IN ('pending','waiting_continuation')",
-            (target.session_id,),
-        )
-        if int(count["n"]) >= self.inbox_item_limit:
+        if int(current["pending_count"]) >= self.inbox_item_limit:
             raise CapacityError()
-        if self.db.dialect.name == "sqlite":
-            size_sql = (
-                "SELECT COALESCE(SUM(LENGTH(CAST(content_json AS BLOB))"
-                "+LENGTH(CAST(meta_json AS BLOB))),0) AS n FROM " + self.q + " "
-                "WHERE session_id=? AND status IN ('pending','waiting_continuation')"
-            )
-        else:
-            size_sql = (
-                "SELECT COALESCE(SUM(OCTET_LENGTH(content_json)+OCTET_LENGTH(meta_json)),0) AS n FROM "
-                + self.q + " WHERE session_id=? AND status IN ('pending','waiting_continuation')"
-            )
-        size = int((await tx.fetchone(size_sql, (target.session_id,)))["n"])
         meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
-        if size + len(content.encode()) + len(meta.encode()) > self.inbox_byte_limit:
+        if (int(current["pending_bytes"]) + len(content.encode()) + len(meta.encode())
+                > self.inbox_byte_limit):
             raise CapacityError()
-        database_now = await self._db_now(tx)
+        database_now = int(current["db_now"])
         if deadline_ms is not None and deadline_ms <= database_now:
             raise RuntimeRequestError("deadline_expired")
         execution_state = state["execution_state"]
@@ -476,6 +660,41 @@ class RuntimeInputStore:
             activations.append(target)
         return self.receipt(InputRecord(ref, row, {}), new=True)
 
+    async def _start_new_session_tx(self, tx, target, body, ref, *, database_now):
+        """Write the state row and start input of a session created in this transaction.
+
+        Only the first-create path calls this, after it has authorized and locked the
+        parent and inserted the empty session row. There is no old input, pending count or
+        bytes to read, and the known idle->queued transition is initialized directly as
+        ``queued``/inbox_version=1 instead of being written as a second UPDATE. The
+        input's own byte size is still checked; an empty inbox does not accept any input.
+        """
+        content = canonical(body)
+        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        if self.inbox_item_limit <= 0:
+            raise CapacityError()
+        if len(content.encode()) + len(meta.encode()) > self.inbox_byte_limit:
+            raise CapacityError()
+        await tx.execute(
+            f"INSERT INTO {self.state} (session_id,execution_state,inbox_version) "
+            "VALUES (?,'queued',1)",
+            (target.session_id,),
+        )
+        await tx.execute(
+            f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
+            "meta_json,request_hash,result_kind,created_at,expires_at) "
+            "VALUES (?,?,'user','normal','pending',?,?,?,NULL,?,NULL)",
+            (
+                target.session_id, ref.message_id, content, meta,
+                self.request_hash(target, body, "normal"), database_now,
+            ),
+        )
+        row = {
+            "session_id": target.session_id, "item_id": ref.message_id, "status": "pending",
+            "delivered_send_index": None, "result_send_index": None, "error_detail": None,
+        }
+        return self.receipt(InputRecord(ref, row, {}), new=True)
+
     async def accept_result(self, child_target, result: Result, *, result_kind):
         """Trusted delivery using only the child's frozen direct-parent route."""
         self.check_store(child_target)
@@ -485,15 +704,34 @@ class RuntimeInputStore:
                 return None
             route = json.loads(session["result_route_json"])
             target = TargetRef(**route["target"])
+            states = {}
             for sid in sorted({child_target.session_id, target.session_id}):
-                await self.db.dialect.lock_state(tx, self.state, sid)
+                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
             activations = []
             ref, error = await self._route_result_tx(
                 tx, session, route, result, result_kind, await self._db_now(tx), activations,
+                parent_state=states[target.session_id],
             )
             return ref, error, activations[0] if activations else None
 
-    async def claim(self, target, *, node_id, boot_id, ttl_s=30.0, _owner_token=None) -> ClaimedBatch | None:
+    async def claim(
+        self, target, *, node_id, boot_id, ttl_s=30.0, _owner_token=None,
+        can_execute=None,
+    ) -> ClaimedBatch | None:
+        """Claim the queued input snapshot and install the owner fence atomically.
+
+        The state lock is the only pre-write read. The batch statement that follows it is
+        executed after the lock is held, so every fact it returns (descriptor/identity,
+        lifecycle, pending rows and database time) is a post-lock fact. ``can_execute`` is
+        a cheap synchronous predicate: it runs after that read and before the owner UPDATE,
+        so a node that cannot build the descriptor leaves the input for a capable node and
+        never becomes the owner (design 215 §9.4).
+
+        No separate MAX read: accept commits its inbox row only while holding the same
+        state lock, so the pending rows returned here are already a stable snapshot. The
+        delivered UPDATE names exactly those row ids; later input stays pending for the
+        next boundary.
+        """
         self.check_store(target)
         if ttl_s <= 0:
             raise RuntimeRequestError("invalid_options", "ttl_s")
@@ -503,28 +741,46 @@ class RuntimeInputStore:
                 state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
                 if state["execution_state"] != "queued":
                     return None
-                # Repair any unresolved tool calls from an interrupted prior run BEFORE
-                # the new merged user message, stamped with that run's send_index.
+                rows = await tx.fetchall(
+                    "SELECT q.id AS id,q.item_id AS item_id,q.kind AS kind,"
+                    "q.priority AS priority,q.content_json AS content_json,"
+                    "q.meta_json AS meta_json,s.lifecycle AS lifecycle,"
+                    "s.descriptor_json AS descriptor_json,s.tenant_id AS tenant_id,"
+                    "s.principal_id AS principal_id,s.parent_session_id AS parent_session_id,"
+                    "s.result_route_json AS result_route_json,"
+                    "s.updated_at AS session_updated_at,"
+                    f"{self._now_sql()} AS db_now "
+                    f"FROM {self.q} q JOIN {self.store.t.sessions} s "
+                    "ON s.session_id=q.session_id "
+                    "WHERE q.session_id=? AND q.status='pending' "
+                    "ORDER BY CASE q.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.id",
+                    (target.session_id,),
+                )
+                if not rows:
+                    return None
+                first = rows[0]
+                if first["lifecycle"] != "open":
+                    return None
+                descriptor = RuntimeDescriptor(**json.loads(first["descriptor_json"]))
+                if can_execute is not None and not can_execute(descriptor):
+                    return None
+                # Capability is settled above; only a node that can execute repairs the
+                # interrupted run's unresolved tool calls. Repair stays ahead of the new
+                # merged user message and keeps that run's send_index.
                 repaired = await self._repair_pending_tx(
                     tx, target.session_id, int(state["send_index"]), state)
-                snapshot = await tx.fetchone(
-                    f"SELECT COALESCE(MAX(id),0) AS id FROM {self.q} "
-                    "WHERE session_id=? AND status='pending'", (target.session_id,),
+                # The batch read's time is the normal-path clock. If repair appended rows,
+                # re-read after it so the lease deadline is not shortened by repair work.
+                database_now = int(first["db_now"]) if not repaired else await self._db_now(tx)
+                refs = tuple(
+                    InputRef(target.store_id, target.session_id, row["item_id"])
+                    for row in rows
                 )
-                if not int(snapshot["id"]):
-                    return None
-                rows = await tx.fetchall(
-                    f"SELECT * FROM {self.q} WHERE session_id=? AND status='pending' AND id<=? "
-                    "ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,id",
-                    (target.session_id, snapshot["id"]),
-                )
-                refs = tuple(InputRef(target.store_id, target.session_id, row["item_id"]) for row in rows)
                 context["refs"] = refs
                 token = _owner_token or uuid.uuid4().hex
                 send_index = int(state["send_index"]) + 1
                 seq = int(state["next_seq"]) + repaired
                 epoch = int(state["owner_epoch"]) + 1
-                database_now = await self._db_now(tx)
                 deadline = database_now + int(ttl_s * 1000)
                 changed = await tx.execute(
                     f"UPDATE {self.state} SET execution_state='running',send_index=?,"
@@ -541,9 +797,13 @@ class RuntimeInputStore:
                 if changed != 1:
                     return None
                 merged = self.merge_batch(rows)
-                message_id = await self._insert_message(
-                    tx, target.session_id, seq, "user", canonical(merged),
-                    {"content_encoding": "json", "input_refs": [plain(ref) for ref in refs]},
+                content = canonical(merged)
+                message_meta = {
+                    "content_encoding": "json",
+                    "input_refs": [plain(ref) for ref in refs],
+                }
+                await self._insert_message(
+                    tx, target.session_id, seq, "user", content, message_meta,
                     send_index, database_now,
                 )
                 ids = [int(row["id"]) for row in rows]
@@ -555,11 +815,26 @@ class RuntimeInputStore:
                 )
                 if delivered != len(ids):
                     raise SessionLeaseLost(target.session_id)
+                user_row = StoredMessageRow(
+                    session_id=target.session_id, seq=seq, role="user", name=None,
+                    content=content, tool_calls=None, tool_call_id=None, round_index=None,
+                    state=MessageState.ACTIVE, meta=message_meta, created_at=database_now,
+                    send_index=send_index,
+                )
                 batch = ClaimedBatch(
                     target, send_index, seq, refs, epoch, token, node_id, boot_id,
-                    int(state["inbox_version"]),
+                    descriptor=descriptor, tenant_id=first["tenant_id"],
+                    principal_id=first["principal_id"],
+                    parent_session_id=first["parent_session_id"],
+                    user_row=user_row,
+                    result_route=(
+                        json.loads(first["result_route_json"])
+                        if first["result_route_json"] else None
+                    ),
+                    inbox_version=int(state["inbox_version"]),
+                    session_updated_at=int(first["session_updated_at"]),
                 )
-                context.update(batch=batch, message_id=message_id)
+                context.update(batch=batch)
                 return batch
         except (Exception, asyncio.CancelledError) as exc:
             recovered = await self._claim_after_unknown(target, context)
@@ -636,7 +911,29 @@ class RuntimeInputStore:
         self.check_store(target)
         return await self.db.fetchone(
             f"SELECT execution_state,active_send_index,owner_epoch,owner_token,"
-            f"inbox_version,cancel_send_index,cancel_reason FROM {self.state} WHERE session_id=?",
+            f"inbox_version,background_version,runtime_version,cancel_send_index,cancel_reason "
+            f"FROM {self.state} WHERE session_id=?",
+            (target.session_id,),
+        )
+
+    async def session_entry(self, target):
+        """Session identity/control facts and DB time in one read.
+
+        Only used by the non-queued claim path and by topologies that must decide
+        acquire/recover before claim. It is never on the healthy queued claim path,
+        which gets the same facts from the post-lock batch read. The time is a hint for
+        deciding whether to attempt recovery; ``recover`` re-reads it under the lock.
+        """
+        self.check_store(target)
+        return await self.db.fetchone(
+            "SELECT s.lifecycle AS lifecycle,s.descriptor_json AS descriptor_json,"
+            "s.tenant_id AS tenant_id,s.principal_id AS principal_id,"
+            "s.parent_session_id AS parent_session_id,"
+            "st.execution_state AS execution_state,"
+            "st.owner_lease_until_ms AS owner_lease_until_ms,"
+            f"{self._now_sql()} AS db_now "
+            f"FROM {self.store.t.sessions} s JOIN {self.state} st "
+            "ON st.session_id=s.session_id WHERE s.session_id=?",
             (target.session_id,),
         )
 
@@ -644,9 +941,10 @@ class RuntimeInputStore:
         """Atomically claim the pending inbox snapshot into the RUNNING send.
 
         Same atomic boundary as :meth:`claim` but fenced on the live owner: lock the
-        state, verify running + active_send_index + epoch/token, snapshot MAX(id), write
-        one merged user message and bind every input to this send_index. Returns
-        ``(refs, seq, merged)`` or ``None`` when nothing is pending or the fence moved.
+        state, verify running + active_send_index + epoch/token, read the pending batch and
+        DB time once, write one merged user message and bind every input to this
+        send_index. Returns ``(refs, seq, merged, version)`` or ``None`` when nothing is
+        pending or the fence moved.
         """
         self.check_store(batch.target)
         async with self.db.transaction() as tx:
@@ -658,23 +956,23 @@ class RuntimeInputStore:
                 or state["owner_token"] != batch.owner_token
             ):
                 raise SessionLeaseLost(batch.target.session_id)
-            snapshot = await tx.fetchone(
-                f"SELECT COALESCE(MAX(id),0) AS id FROM {self.q} "
-                "WHERE session_id=? AND status='pending'", (batch.target.session_id,),
-            )
-            if not int(snapshot["id"]):
-                return None
             rows = await tx.fetchall(
-                f"SELECT * FROM {self.q} WHERE session_id=? AND status='pending' AND id<=? "
-                "ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,id",
-                (batch.target.session_id, snapshot["id"]),
+                "SELECT q.id AS id,q.item_id AS item_id,q.kind AS kind,"
+                "q.priority AS priority,q.content_json AS content_json,"
+                "q.meta_json AS meta_json,"
+                f"{self._now_sql()} AS db_now FROM {self.q} q "
+                "WHERE q.session_id=? AND q.status='pending' "
+                "ORDER BY CASE q.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.id",
+                (batch.target.session_id,),
             )
+            if not rows:
+                return None
             refs = tuple(
                 InputRef(batch.target.store_id, batch.target.session_id, row["item_id"])
                 for row in rows
             )
             seq = int(state["next_seq"])
-            database_now = await self._db_now(tx)
+            database_now = int(rows[0]["db_now"])
             merged = self.merge_batch(rows)
             changed = await tx.execute(
                 f"UPDATE {self.state} SET next_seq=next_seq+1,inbox_version=inbox_version "
@@ -797,18 +1095,32 @@ class RuntimeInputStore:
         return appended
 
     async def _insert_message(self, tx, session_id, seq, role, content, meta, send_index, created_at):
+        """Insert one claim/final message row.
+
+        Every internal caller addresses the row by its already-allocated ``seq`` (claim,
+        follow-up claim and final all return the seq, not a global row id), so no
+        ``LAST_INSERT_ID()`` round trip is needed here. The public
+        ``SessionStore.append_message`` builds a real ``MessageRef`` and keeps its own id
+        read.
+        """
         sql = (
             f"INSERT INTO {self.store.t.messages} (session_id,seq,role,content,meta_json,"
             "send_index,created_at) VALUES (?,?,?,?,?,?,?)"
         )
-        params = (session_id, seq, role, content, canonical(meta), send_index, created_at)
-        if self.db.dialect.name == "mysql":
-            await tx.execute(sql, params)
-            return int((await tx.fetchone("SELECT LAST_INSERT_ID() AS id"))["id"])
-        row = await tx.fetchone(sql + " RETURNING id", params)
-        return int(row["id"])
+        await tx.execute(
+            sql, (session_id, seq, role, content, canonical(meta), send_index, created_at)
+        )
 
     async def _claim_after_unknown(self, target, context):
+        """Return the original batch if the unknown commit actually landed.
+
+        ``context["batch"]`` is only populated after the state UPDATE, merged-message
+        INSERT and delivered UPDATE all returned, so its ``user_row`` is exactly the row
+        those statements wrote. The checks below prove the same transaction committed
+        (running + matching epoch/token + every input delivered to this send/seq); an
+        uncommitted attempt rolled all of it back and returns None. This recovery-only
+        read stays out of the healthy claim path.
+        """
         if "batch" not in context:
             return None
         batch = context["batch"]
@@ -837,6 +1149,7 @@ class RuntimeInputStore:
     async def final(
         self, batch: ClaimedBatch, *, consumed=None, status="completed", final_text="",
         usage=None, structured_output=None, error=None, error_code=None, result_seq=None,
+        assistant_meta=None,
     ) -> FinalBatch:
         # consumed=None means "every input delivered to this send" — including follow-ups
         # claimed at loop boundaries, which share send_index but are not in the original
@@ -851,7 +1164,7 @@ class RuntimeInputStore:
             async with self.db.transaction() as tx:
                 return await self._final_tx(
                     tx, batch, consumed, status, final_text, usage or {},
-                    structured_output, error, error_code, result_seq,
+                    structured_output, error, error_code, result_seq, assistant_meta,
                 )
         except (RuntimeRequestError, SessionLeaseLost):
             raise
@@ -863,10 +1176,12 @@ class RuntimeInputStore:
 
     async def _final_tx(
         self, tx, batch, consumed, status, final_text, usage, structured_output,
-        error, error_code, result_seq=None,
+        error, error_code, result_seq=None, assistant_meta=None,
     ):
-        session = await self._session(tx, batch.target.session_id)
-        route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
+        # The claim read the frozen route with the state lock; the session row is not read
+        # again here. A live run also passes the meta of the assistant row it just appended,
+        # so the result fields are merged without a second read of that row.
+        route = batch.result_route
         lock_ids = [batch.target.session_id]
         if route is not None:
             lock_ids.append(route["target"]["session_id"])
@@ -890,7 +1205,7 @@ class RuntimeInputStore:
         unconsumed_ids = [ref.message_id for ref in batch.input_refs if ref not in consumed]
         result_ref, delivery_error = None, None
         activations = []
-        database_now = await self._db_now(tx)
+        database_now = None
         # The running loop appends assistant turns in real time and passes the seq of its
         # LAST assistant row as ``result_seq``: that row IS the result message (design 215
         # §5.3), so final stamps its meta instead of writing a duplicate. A storage-only
@@ -901,35 +1216,28 @@ class RuntimeInputStore:
             result_seq = int(state["next_seq"])
         reuse_message = result_seq is not None and not write_message
         if consumed and route is not None:
+            # Result delivery needs the clock before it inserts into the parent inbox.
+            database_now = await self._db_now(tx)
+            child_session = {
+                "session_id": batch.target.session_id,
+                "tenant_id": batch.tenant_id,
+                "principal_id": batch.principal_id,
+                "parent_session_id": batch.parent_session_id,
+            }
             route_result = Result(
                 consumed[0], batch.target, status, batch.send_index, result_seq,
                 final_text, usage, structured_output, error, error_code,
             )
             result_ref, delivery_error = await self._route_result_tx(
-                tx, session, route, route_result, route["result_kind"], database_now,
-                activations,
+                tx, child_session, route, route_result, route["result_kind"], database_now,
+                activations, parent_state=states[route["target"]["session_id"]],
             )
         next_seq = int(state["next_seq"]) + int(write_message)
-        next_state = "idle"
-        pending = await tx.fetchone(
-            f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? AND status='pending'",
-            (batch.target.session_id,),
+        next_state, state_now = await self._finish_final_state_tx(
+            tx, batch, next_seq=next_seq, has_unconsumed=bool(unconsumed_ids),
         )
-        has_pending = bool(int(pending["n"])) or bool(unconsumed_ids)
-        next_state = "queued" if has_pending else "idle"
-        changed = await tx.execute(
-            f"UPDATE {self.state} SET execution_state=?,active_send_index=NULL,"
-            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-            "cancel_send_index=NULL,cancel_reason=NULL,next_seq=? "
-            "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
-            "AND owner_epoch=? AND owner_token=?",
-            (
-                next_state, next_seq, batch.target.session_id, batch.send_index,
-                batch.owner_epoch, batch.owner_token,
-            ),
-        )
-        if changed != 1:
-            raise SessionLeaseLost(batch.target.session_id)
+        if database_now is None:
+            database_now = state_now
         result_meta = {
             "usage": plain(usage), "structured_output": plain(structured_output),
             "error": error, "error_code": error_code,
@@ -942,11 +1250,16 @@ class RuntimeInputStore:
             )
         elif reuse_message:
             # Merge into the loop's assistant row, preserving reasoning/round-usage meta.
-            row = await tx.fetchone(
-                f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
-                (batch.target.session_id, result_seq),
-            )
-            meta = json.loads(row["meta_json"] or "{}") if row is not None else {}
+            # The live run passes that exact meta from the append; recovery/cancel callers
+            # without the in-memory fact keep the stored read.
+            if assistant_meta is None:
+                row = await tx.fetchone(
+                    f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
+                    (batch.target.session_id, result_seq),
+                )
+                meta = json.loads(row["meta_json"] or "{}") if row is not None else {}
+            else:
+                meta = dict(assistant_meta)
             meta.update(result_meta)
             await tx.execute(
                 f"UPDATE {self.store.t.messages} SET meta_json=? WHERE session_id=? AND seq=?",
@@ -984,8 +1297,56 @@ class RuntimeInputStore:
             activations[0] if activations else None,
         )
 
+    async def _finish_final_state_tx(self, tx, batch, *, next_seq, has_unconsumed):
+        """Release the owner and set the next state in one conditional write.
+
+        SQLite/PostgreSQL decide ``idle`` vs ``queued`` from an EXISTS in the same UPDATE
+        and take the database time from RETURNING, so the ordinary no-route final needs no
+        separate pending or clock read. MySQL has no RETURNING: it reads the pending flag
+        and database time once after the lock, then runs the same conditional UPDATE. The
+        owner fence is unchanged; a stale owner still updates zero rows.
+        """
+        owner = (
+            "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
+            "AND owner_epoch=? AND owner_token=?"
+        )
+        owner_values = (
+            batch.target.session_id, batch.send_index, batch.owner_epoch, batch.owner_token,
+        )
+        if self.db.dialect.name == "mysql":
+            pending = await tx.fetchone(
+                f"SELECT EXISTS(SELECT 1 FROM {self.q} WHERE session_id=? AND status='pending') "
+                f"AS has_pending,{self._now_sql()} AS db_now",
+                (batch.target.session_id,),
+            )
+            next_state = (
+                "queued" if bool(int(pending["has_pending"])) or has_unconsumed else "idle"
+            )
+            changed = await tx.execute(
+                f"UPDATE {self.state} SET execution_state=?,active_send_index=NULL,"
+                "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+                "cancel_send_index=NULL,cancel_reason=NULL,next_seq=? " + owner,
+                (next_state, next_seq, *owner_values),
+            )
+            if changed != 1:
+                raise SessionLeaseLost(batch.target.session_id)
+            return next_state, int(pending["db_now"])
+        row = await tx.fetchone(
+            f"UPDATE {self.state} SET execution_state=CASE WHEN EXISTS("
+            f"SELECT 1 FROM {self.q} WHERE session_id=? AND status='pending') OR ? "
+            "THEN 'queued' ELSE 'idle' END,active_send_index=NULL,"
+            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+            f"cancel_send_index=NULL,cancel_reason=NULL,next_seq=? {owner} "
+            f"RETURNING execution_state,{self._now_sql()} AS db_now",
+            (batch.target.session_id, has_unconsumed, next_seq, *owner_values),
+        )
+        if row is None:
+            raise SessionLeaseLost(batch.target.session_id)
+        return row["execution_state"], int(row["db_now"])
+
     async def _route_result_tx(
         self, tx, child_session, route, result, result_kind, database_now, activations=None,
+        parent_state=None,
     ):
         child_target = TargetRef(self.store.store_id, child_session["session_id"])
         route_start = InputRef(**route["input_ref"])
@@ -1001,43 +1362,34 @@ class RuntimeInputStore:
         }
         ref = InputRef(target.store_id, target.session_id, message_id)
         try:
-            parent_session = await self._session(tx, target.session_id)
+            # One post-lock read of the parent serves the route's whole delivery decision:
+            # current lifecycle/identity, the idempotency input and the pending count/bytes
+            # (the same aggregate accept uses). The state row was already locked by the
+            # caller and is passed in, so it is not read a second time here.
+            current = await self._accept_read(tx, target.session_id, message_id)
             if (
-                parent_session["lifecycle"] != "open"
-                or parent_session["tenant_id"] != child_session["tenant_id"]
-                or parent_session["principal_id"] != child_session["principal_id"]
+                current["lifecycle"] != "open"
+                or current["tenant_id"] != child_session["tenant_id"]
+                or current["principal_id"] != child_session["principal_id"]
                 or child_session["parent_session_id"] != target.session_id
                 or target.store_id != self.store.store_id
             ):
-                raise RuntimeRequestError("session_closed" if parent_session["lifecycle"] != "open" else "forbidden")
+                raise RuntimeRequestError(
+                    "session_closed" if current["lifecycle"] != "open" else "forbidden")
             digest = self.request_hash(target, body, "normal")
-            old = await self.input(tx, ref)
-            parent_state = await tx.fetchone(
-                f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
-            )
+            old = self.record(current) if current["id"] is not None else None
+            if parent_state is None:
+                parent_state = await tx.fetchone(
+                    f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
+                )
             execution_state = parent_state["execution_state"]
             if old is None:
-                count = await tx.fetchone(
-                    f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
-                    "AND status IN ('pending','waiting_continuation')", (target.session_id,),
-                )
-                if int(count["n"]) >= self.inbox_item_limit:
+                if int(current["pending_count"]) >= self.inbox_item_limit:
                     raise CapacityError()
-                if self.db.dialect.name == "sqlite":
-                    size_sql = (
-                        "SELECT COALESCE(SUM(LENGTH(CAST(content_json AS BLOB))"
-                        "+LENGTH(CAST(meta_json AS BLOB))),0) AS n FROM " + self.q + " "
-                        "WHERE session_id=? AND status IN ('pending','waiting_continuation')"
-                    )
-                else:
-                    size_sql = (
-                        "SELECT COALESCE(SUM(OCTET_LENGTH(content_json)+OCTET_LENGTH(meta_json)),0) AS n FROM "
-                        + self.q + " WHERE session_id=? AND status IN ('pending','waiting_continuation')"
-                    )
                 content = canonical(body)
                 meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
-                size = int((await tx.fetchone(size_sql, (target.session_id,)))["n"])
-                if size + len(content.encode()) + len(meta.encode()) > self.inbox_byte_limit:
+                if (int(current["pending_bytes"]) + len(content.encode()) + len(meta.encode())
+                        > self.inbox_byte_limit):
                     raise CapacityError()
                 next_state = "queued" if execution_state == "idle" else execution_state
                 if (
@@ -1235,11 +1587,21 @@ class RuntimeInputStore:
             )
 
     async def _continuation_child(self, reader, record):
-        return await reader.fetchone(
-            f"SELECT * FROM {self.q} WHERE session_id=? AND continuation_of=? "
-            "ORDER BY continuation_index DESC LIMIT 1",
+        row = await reader.fetchone(
+            "SELECT q.session_id AS session_id,q.item_id AS input_item_id,"
+            "q.kind AS input_kind,q.status AS input_status,"
+            "q.terminal_status AS input_terminal_status,"
+            "q.result_seq AS input_result_seq,"
+            "q.result_send_index AS input_result_send_index,"
+            "q.error_code AS input_error_code,q.error_detail AS input_error_detail,"
+            "q.result_delivery_error AS input_result_delivery_error,"
+            "q.delivered_send_index AS input_delivered_send_index,"
+            "q.continuation_of AS input_continuation_of "
+            f"FROM {self.q} q WHERE q.session_id=? AND q.continuation_of=? "
+            "ORDER BY q.continuation_index DESC LIMIT 1",
             (record.ref.session_id, record.ref.message_id),
         )
+        return self._result_input(row) if row is not None else None
 
     async def _continuation_root(self, reader, record):
         current = record
@@ -1263,7 +1625,7 @@ class RuntimeInputStore:
             child = await self._continuation_child(reader, current)
             if child is None:
                 return current
-            current = self.record(child)
+            current = child
         raise CapacityError("workflow continuation chain limit exceeded")
 
     async def _recover_workflow_tx(
@@ -1408,6 +1770,7 @@ class RuntimeInputStore:
             raise RuntimeRequestError("invalid_options", "InputRef subtree")
         target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
         activations = []
+        completed_refs = []
         async with self.db.transaction() as tx:
             session = await self.authorize(tx, target, actor)
             route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
@@ -1426,10 +1789,12 @@ class RuntimeInputStore:
                 if record.row["kind"] == "workflow_continue" or record.row["status"] == "waiting_continuation":
                     receipt = await self._cancel_workflow_input_tx(
                         tx, session, state, record, reason, database_now, activations,
+                        completed_refs,
                     )
                 else:
                     receipt = await self._cancel_input_tx(
                         tx, session, state, record, reason, database_now, activations,
+                        completed_refs,
                     )
             elif state["execution_state"] in {"running", "recovering"}:
                 active = state["active_send_index"]
@@ -1440,10 +1805,16 @@ class RuntimeInputStore:
                 )
                 receipt = Receipt(None, target, None, False, "cancel_requested", active, "not_needed", reason)
             else:
-                pending_rows = await tx.fetchall(
-                    f"SELECT * FROM {self.q} WHERE session_id=? AND status='pending' ORDER BY id",
+                unfinished_rows = await tx.fetchall(
+                    f"SELECT * FROM {self.q} WHERE session_id=? "
+                    "AND status IN ('pending','waiting_continuation') ORDER BY id",
                     (target.session_id,),
                 )
+                pending_rows = [row for row in unfinished_rows if row["status"] == "pending"]
+                waiting_by_item = {
+                    row["item_id"]: row for row in unfinished_rows
+                    if row["status"] == "waiting_continuation"
+                }
                 changed = 0
                 for row in pending_rows:
                     record = self.record(row)
@@ -1457,12 +1828,22 @@ class RuntimeInputStore:
                             tx, session, route, cancelled, route["result_kind"], database_now,
                             activations,
                         )
-                    changed += await tx.execute(
+                    affected = await tx.execute(
                         f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
                         "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
                         "WHERE session_id=? AND item_id=? AND status='pending'",
                         (reason, delivery_error, database_now, target.session_id, record.ref.message_id),
                     )
+                    changed += affected
+                    if affected:
+                        completed_refs.append(record.ref)
+                        parent_id = row["continuation_of"]
+                        while parent_id in waiting_by_item:
+                            parent = waiting_by_item.pop(parent_id)
+                            completed_refs.append(InputRef(
+                                self.store.store_id, target.session_id, parent_id,
+                            ))
+                            parent_id = parent["continuation_of"]
                 if not pending_rows and route is not None:
                     start = await self.input(tx, InputRef(**route["input_ref"]))
                     if start is not None and start.row["terminal_status"] is not None:
@@ -1486,20 +1867,22 @@ class RuntimeInputStore:
             )
             for row in rows:
                 child = TargetRef(self.store.store_id, row["session_id"])
-                _receipt, child_activations = await self.cancel(
+                _receipt, child_activations, child_completed = await self.cancel(
                     child, actor=actor, scope="subtree", reason=reason, _with_activation=True,
                 )
                 activations.extend(child_activations)
+                completed_refs.extend(child_completed)
         if _with_activation:
-            return receipt, activations
+            return receipt, activations, completed_refs
         return receipt
 
     async def _cancel_workflow_input_tx(
         self, tx, session, state, record, reason, database_now, activations,
+        completed_refs,
     ):
         """Resolve cancel(original) to the newest continuation, then close its chain."""
         root = await self._continuation_root(tx, record)
-        latest = await self._latest_continuation(tx, record)
+        latest = await self._latest_continuation(tx, self._result_input_from_record(record))
         target = TargetRef(self.store.store_id, record.ref.session_id)
         if latest.row["terminal_status"] is not None:
             return self.receipt(record, state="already_finished")
@@ -1539,15 +1922,21 @@ class RuntimeInputStore:
         )
         if changed != 1:
             raise SessionLeaseLost(target.session_id)
+        completed_refs.append(latest.ref)
         ancestors = []
+        closed_refs = []
         current = latest
         while current.row["continuation_of"] is not None:
             current = await self.input(tx, InputRef(
                 current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
             ))
             ancestors.append(current.ref.message_id)
+            if current.row["status"] == "waiting_continuation" and current.row["terminal_status"] is None:
+                closed_refs.append(current.ref)
         if record.ref.message_id not in ancestors:
             ancestors.append(record.ref.message_id)
+            if record.row["status"] == "waiting_continuation" and record.row["terminal_status"] is None:
+                closed_refs.append(record.ref)
         if ancestors:
             await tx.execute(
                 f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
@@ -1557,6 +1946,7 @@ class RuntimeInputStore:
                 "AND status='waiting_continuation' AND terminal_status IS NULL",
                 (reason, delivery_error, database_now, target.session_id, *ancestors),
             )
+            completed_refs.extend(closed_refs)
         remaining = await tx.fetchone(
             f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
             "AND status IN ('pending','waiting_continuation')",
@@ -1619,6 +2009,7 @@ class RuntimeInputStore:
 
     async def _cancel_input_tx(
         self, tx, session, state, record, reason, database_now, activations=None,
+        completed_refs=None,
     ):
         row = record.row
         ref = record.ref
@@ -1660,6 +2051,8 @@ class RuntimeInputStore:
                     row, status="void", terminal_status="cancelled", error_detail=reason,
                     result_delivery_error=delivery_error,
                 )
+                if completed_refs is not None:
+                    completed_refs.append(ref)
                 return self.receipt(InputRecord(ref, row, record.meta), state="voided", reason=reason)
         active = state["active_send_index"]
         if (
@@ -1768,35 +2161,106 @@ class RuntimeInputStore:
                 row["continuation_index"],
             )
 
-    async def get_result(self, ref, *, actor):
-        target = TargetRef(ref.store_id, ref.session_id)
-        async with self.db.read_snapshot() as reader:
-            await self.authorize(reader, target, actor)
-            record = await self.input(reader, ref)
-            if record is None:
-                raise RuntimeRequestError("not_found")
-            if record.row["status"] == "waiting_continuation" or record.row["kind"] == "workflow_continue":
-                record = await self._latest_continuation(reader, record)
-            if record.row["terminal_status"] is None:
-                return None
-            row = record.row
-            final_text, usage, structured = "", {}, None
-            if row["result_seq"] is not None:
+    def _input_row(self, row):
+        values = {key[6:]: value for key, value in row.items() if key.startswith("input_")}
+        values["session_id"] = row["session_id"]
+        return values
+
+    def _result_input(self, row):
+        values = self._input_row(row)
+        return ResultInput(
+            InputRef(self.store.store_id, values["session_id"], values["item_id"]),
+            {name: values[name] for name in _RESULT_INPUT_COLUMNS},
+        )
+
+    @staticmethod
+    def _result_input_from_record(record):
+        return ResultInput(
+            record.ref,
+            {name: record.row[name] for name in _RESULT_INPUT_COLUMNS},
+        )
+
+    async def _result_state(self, reader, ref, target, actor, *, follow_continuation):
+        row = await reader.fetchone(self._result_sql, (ref.message_id, ref.session_id))
+        if row is None:
+            raise RuntimeRequestError("not_found")
+        session = {
+            "session_id": row["session_id"],
+            "tenant_id": row["tenant_id"],
+            "principal_id": row["principal_id"],
+            "parent_session_id": row["parent_session_id"],
+        }
+        await self._authorize_known(reader, target, actor, session)
+        if row["input_item_id"] is None:
+            return ResultRead(ref, target, session, None, None, None), False
+        record = self._result_input(row)
+        continuation = (
+            record.row["status"] == "waiting_continuation"
+            or record.row["kind"] == "workflow_continue"
+        )
+        if continuation and not follow_continuation:
+            return ResultRead(ref, target, session, record, record, None), True
+        resolved = await self._latest_continuation(reader, record) if continuation else record
+        result = await self._terminal_result(reader, ref, target, record, resolved, row)
+        return ResultRead(ref, target, session, record, resolved, result), False
+
+    async def _terminal_result(self, reader, ref, target, record, resolved, row):
+        terminal = resolved.row["terminal_status"]
+        if terminal is None:
+            return None
+        final_text, usage, structured = "", {}, None
+        result_seq = resolved.row["result_seq"]
+        if result_seq is not None:
+            if resolved is record:
+                found = row["result_message_id"] is not None
+                content, meta_json = row["result_content"], row["result_meta_json"]
+            else:
                 message = await reader.fetchone(
                     f"SELECT content,meta_json FROM {self.store.t.messages} "
                     "WHERE session_id=? AND seq=? AND send_index=?",
-                    (ref.session_id, row["result_seq"], row["result_send_index"]),
+                    (ref.session_id, result_seq, resolved.row["result_send_index"]),
                 )
-                if message is not None:
-                    final_text = message["content"] or ""
-                    meta = json.loads(message["meta_json"] or "{}")
-                    usage = meta.get("usage") or {}
-                    structured = meta.get("structured_output")
-            return Result(
-                ref, target, row["terminal_status"], row["result_send_index"], row["result_seq"],
-                final_text, usage, structured, row["error_detail"], row["error_code"],
-                row["result_delivery_error"],
+                found = message is not None
+                content = message["content"] if found else None
+                meta_json = message["meta_json"] if found else None
+            if found:
+                final_text = content or ""
+                meta = json.loads(meta_json or "{}")
+                usage = meta.get("usage") or {}
+                structured = meta.get("structured_output")
+        return Result(
+            ref, target, terminal, resolved.row["result_send_index"], result_seq,
+            final_text, usage, structured, resolved.row["error_detail"],
+            resolved.row["error_code"], resolved.row["result_delivery_error"],
+        )
+
+    async def read_result_state(self, ref, *, actor) -> ResultRead:
+        """Authorize and read the addressed input plus its durable result.
+
+        A normal root read is one SELECT over the session, the addressed input and its
+        result message, so it is already a single snapshot. Ancestor authorization and
+        continuation chains need more rows; those keep the original read-snapshot
+        semantics and their extra reads are counted separately.
+        """
+        self.check_store(ref)
+        target = TargetRef(ref.store_id, ref.session_id)
+        if actor.session_id is None or actor.session_id == ref.session_id:
+            state, continuation = await self._result_state(
+                self.db, ref, target, actor, follow_continuation=False,
             )
+            if not continuation:
+                return state
+        async with self.db.read_snapshot() as reader:
+            state, _ = await self._result_state(
+                reader, ref, target, actor, follow_continuation=True,
+            )
+        return state
+
+    async def get_result(self, ref, *, actor):
+        state = await self.read_result_state(ref, actor=actor)
+        if state.record is None:
+            raise RuntimeRequestError("not_found")
+        return state.result
 
     async def messages(self, target, *, actor, after_seq=None, limit=20):
         if not 1 <= limit <= 100:
@@ -1848,17 +2312,28 @@ class RuntimeInputStore:
             return packets, None
         if binding.channel != "output":
             return [], cursor
+        # Bound to a session: filter before LIMIT so another session cannot fill the
+        # page. The cursor is the full ordering key (completed_at, id); a plain
+        # ``completed_at >= t AND id > i`` comparison would skip a later timestamp
+        # with a smaller id.
+        where, params = ["terminal_status IS NOT NULL"], []
+        if cursor is not None:
+            completed_at, row_id = cursor
+            where.append("(completed_at>? OR (completed_at=? AND id>?))")
+            params.extend((completed_at, completed_at, row_id))
+        if binding.session_id is not None:
+            where.append("session_id=?")
+            params.append(binding.session_id)
+        params.append(limit)
         rows = await self.db.fetchall(
-            f"SELECT session_id,item_id,terminal_status,result_send_index,completed_at "
-            f"FROM {self.q} WHERE terminal_status IS NOT NULL AND completed_at>? "
+            "SELECT id,session_id,item_id,terminal_status,result_send_index,completed_at "
+            f"FROM {self.q} WHERE {' AND '.join(where)} "
             "ORDER BY completed_at,id LIMIT ?",
-            (cursor or 0, limit),
+            tuple(params),
         )
         packets = []
         next_cursor = cursor
         for row in rows:
-            if binding.session_id is not None and row["session_id"] != binding.session_id:
-                continue
             ref = InputRef(self.store.store_id, row["session_id"], row["item_id"])
             packets.append(TransportPacket(
                 PROTOCOL_VERSION, binding.namespace, row["item_id"],
@@ -1866,5 +2341,5 @@ class RuntimeInputStore:
                 {"kind": "completed", "session_id": row["session_id"],
                  "send_index": row["result_send_index"], "status": row["terminal_status"]},
             ))
-            next_cursor = int(row["completed_at"])
+            next_cursor = (int(row["completed_at"]), int(row["id"]))
         return packets, next_cursor

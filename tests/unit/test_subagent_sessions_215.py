@@ -66,7 +66,7 @@ async def test_create_retry_wait_result_and_continue(registry_store):
     store, _ = registry_store
     model, registry = ParentAndChild(), ToolRegistry()
     register_spawn_agent(registry)
-    runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         parent = await runner.send("delegate")
         assert parent.status == "completed"
@@ -121,11 +121,11 @@ async def test_notifications_lost_still_runs_child_and_routes_result_by_polling(
     coordinator = MemorySessionOwnershipCoordinator()
     transport = MemoryMessageTransport()
     parent = await RunningAgent(
-        store, ParentAndChild(), ToolRegistry(), AgentLoopConfig(compactor=None), capacity=3,
+        store, ParentAndChild(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9), capacity=3,
         coordinator=coordinator, transport=transport,
     ).start()
     child = await RunningAgent(
-        other, ParentAndChild(), ToolRegistry(), AgentLoopConfig(compactor=None), capacity=3,
+        other, ParentAndChild(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9), capacity=3,
         coordinator=coordinator, transport=transport,
     ).start()
     register_spawn_agent(parent.registry)
@@ -242,7 +242,7 @@ async def test_same_tool_call_retries_one_child_and_grant_cannot_expand(registry
         FunctionRuntimeTool(twice, ToolRuntimeContract("test.subagent", background_allowed=False)),
     )
     model = ParentAndChild()
-    runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         await runner.send("delegate twice")
         [(first, second)] = seen

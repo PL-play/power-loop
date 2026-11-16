@@ -64,10 +64,10 @@ async def test_round_limit_final_call_routes_through_call_llm(runtime_agent) -> 
                                LLMResponse(raw_text="summary", content_text="summary")])
     loop = await runtime_agent(
         model=llm, registry=reg, event_bus=bus,
-        config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=1, context_budget_tokens=10**9),
     )
     res = await loop.send("go")
-    assert res.status == "interrupted" and res.error == "hit_round_limit"
+    assert res.status == "failed" and res.error_code == "hit_round_limit"
     starts = sum(1 for e in events if e.type == AgentEventType.STREAM_STARTED)
     completes = sum(1 for e in events if e.type == AgentEventType.STREAM_COMPLETED)
     # round-0 call AND the final summary call both route through call_llm → 2 each.
@@ -86,11 +86,11 @@ async def test_round_limit_summary_is_persisted_to_transcript(runtime_agent) -> 
     store = await SessionStore.open(":memory:")
     loop = await runtime_agent(
         model=llm, store=store, registry=reg,
-        config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=1, context_budget_tokens=10**9),
     )
     sid = loop.target.session_id
     res = await loop.send("go")
-    assert res.status == "interrupted" and res.error == "hit_round_limit"
+    assert res.status == "failed" and res.error_code == "hit_round_limit"
     msgs = await store.load_active_messages(sid)
     assert any(m.role == "assistant" and m.content == "here is my summary" for m in msgs), msgs
     await loop.aclose()
@@ -120,7 +120,7 @@ async def test_call_llm_emits_stream_completed_on_failure(runtime_agent) -> None
     loop = await runtime_agent(
         model=_FailLLM(), event_bus=bus,
         config=AgentLoopConfig(
-            system_prompt="o", max_rounds=2, compactor=None,
+            system_prompt="o", max_rounds=2, context_budget_tokens=10**9,
             retry_policy=LLMRetryPolicy(max_attempts=2, backoff_initial=0.001, backoff_max=0.002),
         ),
     )

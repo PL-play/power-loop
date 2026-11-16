@@ -84,7 +84,7 @@ async def test_tool_after_break_resolves_remaining_tool_calls(runtime_agent) -> 
     ])
     loop = await runtime_agent(
         model=llm, registry=reg, hooks=hooks,
-        config=AgentLoopConfig(system_prompt="o", max_rounds=4, compactor=None),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=4, context_budget_tokens=10**9),
     )
     sid = loop.target.session_id
     result = await loop.send("go")

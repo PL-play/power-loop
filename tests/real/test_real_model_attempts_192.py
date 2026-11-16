@@ -29,7 +29,7 @@ async def model_runtime(tmp_path, record_property, runtime_agent):
             config=AgentLoopConfig(
                 max_rounds=3,
                 max_tokens=2048,
-                compactor=None,
+                context_budget_tokens=10**9,
                 retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0),
                 system_prompt=(
                     "Follow the user's request exactly. Do not create, stop or repeat any work. "

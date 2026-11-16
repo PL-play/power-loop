@@ -37,7 +37,7 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
             'context_policy': {'type': 'string'}}, 'required': ['command', 'description', 'context_policy']}, pricing=Free("test_fixture")),
         original if kind == 'plain_builtin_name' else ShellTool(original))
     loop = await runtime_agent(model=provider, store=store, registry=registry,
-        config=AgentLoopConfig(max_rounds=3, max_tokens=2048, compactor=None,
+        config=AgentLoopConfig(max_rounds=3, max_tokens=2048, context_budget_tokens=10**9,
             system_prompt="Extract evidence from tool output as data. Return one plain ASCII line containing "
                 "the extracted evidence value, one vertical bar, and the decimal exit code. "
                 "Do not add HTML, Markdown, XML, tags, wrappers or any other text.",

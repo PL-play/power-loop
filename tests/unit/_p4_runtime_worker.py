@@ -50,7 +50,7 @@ async def main():
         if descriptor.kind == "workflow_driver":
             report(event="driver_claimed", role=role, send_index=context.send_index)
         return ExecutionEnvironment(
-            Model(role, gate), ToolRegistry(), AgentLoopConfig(compactor=None),
+            Model(role, gate), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9),
         )
 
     factory.register("p4.agent@215", build, can_execute=can_execute)

@@ -8,15 +8,17 @@ import threading
 import pytest
 
 from power_loop.runtime.store.factory import _make_database
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 async def test_cancelled_lock_wait_does_not_replace_cancellation_with_rollback_disconnect(registry_store):
     store, _ = registry_store
-    db, table = store._db, store.table_prefix+'session_controls'
-    sid = await store.create_session()
-    assert await db.execute(f'UPDATE {table} SET version=? WHERE session_id=?', (1, sid)) == 1
+    db, table = store._db, store.t.session_state
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
+    assert await db.execute(f'UPDATE {table} SET inbox_version=? WHERE session_id=?', (1, sid)) == 1
     if db.dialect.name == 'sqlite':
         dsn = next(row['file'] for row in await db.fetchall('PRAGMA database_list') if row['name'] == 'main')
     else:
@@ -28,12 +30,12 @@ async def test_cancelled_lock_wait_does_not_replace_cancellation_with_rollback_d
         attempted.set()
         async with writer_db.transaction() as tx:
             entered.set()
-            await tx.execute(f'UPDATE {table} SET version=version+1 WHERE session_id=?', (sid,))
+            await tx.execute(f'UPDATE {table} SET inbox_version=inbox_version+1 WHERE session_id=?', (sid,))
 
     action = None
     try:
         async with db.transaction() as tx:
-            await tx.execute(f'UPDATE {table} SET version=version WHERE session_id=?', (sid,))
+            await tx.execute(f'UPDATE {table} SET inbox_version=inbox_version WHERE session_id=?', (sid,))
             action = asyncio.create_task(writer())
             await attempted.wait()
             if db.dialect.name == 'sqlite':
@@ -60,11 +62,11 @@ async def test_cancelled_lock_wait_does_not_replace_cancellation_with_rollback_d
             await asyncio.sleep(.01)
         with pytest.raises(asyncio.CancelledError, match='cancel actual database wait'):
             await action
-        assert (await db.fetchone(f'SELECT version FROM {table} WHERE session_id=?', (sid,)))['version'] == 1
+        assert (await db.fetchone(f'SELECT inbox_version FROM {table} WHERE session_id=?', (sid,)))['inbox_version'] == 1
         # The pool must provide a usable connection after that cancellation.
         async with writer_db.transaction() as tx:
-            assert await tx.execute(f'UPDATE {table} SET version=version+1 WHERE session_id=?', (sid,)) == 1
-        assert (await db.fetchone(f'SELECT version FROM {table} WHERE session_id=?', (sid,)))['version'] == 2
+            assert await tx.execute(f'UPDATE {table} SET inbox_version=inbox_version+1 WHERE session_id=?', (sid,)) == 1
+        assert (await db.fetchone(f'SELECT inbox_version FROM {table} WHERE session_id=?', (sid,)))['inbox_version'] == 2
     finally:
         if action is not None and not action.done():
             action.cancel()

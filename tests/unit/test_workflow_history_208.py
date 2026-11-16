@@ -21,7 +21,7 @@ async def test_current_workflow_logs_preserve_selected_source_and_safe_export(re
     model=_Scripted([LLMResponse(raw_text='ANSWER-42')])
     registry=ToolRegistry()
     register_workflow_tool(registry)
-    agent=await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None,
+    agent=await RunningAgent(store,model,registry,AgentLoopConfig(context_budget_tokens=10**9,
         representation=ProjectedRepresentation()),runtime_env=RuntimeEnv(workspace_dir=tmp_path)).start()
     try:
         handle=await agent.runtime.client.workflow(agent.target,{'name':'history','root':{

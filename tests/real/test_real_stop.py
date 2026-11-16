@@ -21,7 +21,7 @@ async def test_real_stop_mid_generation_is_fast_and_leaves_a_valid_transcript(ru
     bus.subscribe(AgentEventType.STREAM_DELTA, count)
     bus.subscribe(AgentEventType.STREAM_THINK_DELTA, count)
     agent = await runtime_agent(model=make_llm(max_tokens=6000, temperature=.7), event_bus=bus,
-        config=AgentLoopConfig(system_prompt='你是作家。', max_rounds=3, max_tokens=6000, compactor=None))
+        config=AgentLoopConfig(system_prompt='你是作家。', max_rounds=3, max_tokens=6000, context_budget_tokens=10**9))
     client = agent.runtime.client
     receipt = await client.send(agent.target, '写一篇至少 5000 字的小说。', message_id='long', actor=agent.actor)
     async with asyncio.timeout(60):
@@ -48,7 +48,7 @@ async def test_real_subtree_stop_reaches_original_running_subagent(runtime_agent
     register_spawn_agent(registry)
     agent = await runtime_agent(model=make_llm(max_tokens=2048, temperature=0), registry=registry,
         config=AgentLoopConfig(system_prompt='Follow the requested native tool call exactly.',
-            max_rounds=4, max_tokens=2048, compactor=None))
+            max_rounds=4, max_tokens=2048, context_budget_tokens=10**9))
     client = agent.runtime.client
     receipt = await client.send(agent.target,
         'Call spawn_agent once with task="Call slow_lookup for solar panels.", tools=["slow_lookup"], '

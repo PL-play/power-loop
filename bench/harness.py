@@ -94,11 +94,11 @@ async def _composition(store: SessionStore, latency_s: float):
     async def build(descriptor, context):
         return ExecutionEnvironment(FakeLLM(latency_s=latency_s), None,
             config=AgentLoopConfig(max_rounds=1, compactor=None))
-    factory.register('bench.agent@1', build)
+    factory.register('bench.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id="bench", capacity=32, recovery_interval_s=None)
     await runtime.worker.start()
     return runtime, StatefulAgentLoop(runtime=runtime), RuntimeDescriptor(
-        1, 'agent', 'bench.agent@1', None, 'bench.tools@1', 'bench.hooks@1', 'bench.resources@1', {}, {}), TrustedActor('bench','host',None)
+        2, 'agent', 'bench.agent@215', None, 'bench.tools@215', 'bench.hooks@215', 'bench.resources@215', {}, {}), TrustedActor('bench','host',None)
 
 
 async def _close(runtime, loop):

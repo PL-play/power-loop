@@ -24,7 +24,7 @@ async def test_single_send_returns_meaningful_reply(runtime_agent) -> None:
             config=AgentLoopConfig(
                 system_prompt="You are a concise assistant. Reply in English.",
                 max_rounds=1, temperature=0.2, max_tokens=256,
-                compactor=None,
+                context_budget_tokens=10**9,
             ),
         )
         q = "In one sentence, explain what HTTP stands for."
@@ -60,7 +60,7 @@ async def test_multi_turn_carries_session_history(runtime_agent) -> None:
                     "Answer briefly in English."
                 ),
                 max_rounds=1, max_tokens=256, temperature=0,
-                compactor=None,
+                context_budget_tokens=10**9,
             ),
         )
         sid = loop.target.session_id
@@ -93,7 +93,7 @@ async def test_close_session_removes_history_from_store(runtime_agent) -> None:
             config=AgentLoopConfig(
                 system_prompt="Reply in one word.",
                 max_rounds=1, max_tokens=128, temperature=0,
-                compactor=None,
+                context_budget_tokens=10**9,
             ),
         )
         r = await loop.send("Say OK.")

@@ -98,14 +98,14 @@ async def test_background_run_refuses_side_effecting_tools_with_the_way_out(tmp_
         assert result.status == "completed"
         msg = next(m.content for m in await store.load_all_messages(agent.target.session_id)
                    if m.role == "tool" and m.tool_call_id == "refused")
-        assert not await store._db.fetchall(f"SELECT job_id FROM {store.table_prefix}jobs WHERE kind='background_tool'")
+        assert not await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions} WHERE session_kind='background'")
     finally:
         await agent.aclose()
         await store.close()
 
-    assert "不能后台跑" in msg and "副作用" in msg          # 为什么不行
-    assert "没有声明可以后台跑" in msg                       # 说的是「没标」，不是断定它有副作用
-    assert "直接调用 write_file 就行" in msg                # 这件事该怎么做
+    assert "invalid_options" in msg and "write_file" in msg          # 为什么不行
+    assert "does not allow background execution" in msg                       # 说的是「没标」，不是断定它有副作用
+    assert "Available:" in msg                # 这件事该怎么做
     assert "design_reference(download/get/list)" in msg      # 哪些行（含 action 粒度）
     assert "see_image" in msg
-    assert "background_run" not in msg.split("可以后台跑的是：")[1]   # 不推荐自己包自己
+    assert "background_run" not in msg.split("Available:")[1]   # 不推荐自己包自己

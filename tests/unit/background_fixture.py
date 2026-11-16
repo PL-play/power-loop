@@ -10,7 +10,7 @@ async def start_background(store, registry, tool, arguments, *, runtime_env):
     registry.register(registered.definition, registered.handler)
     runner = await RunningAgent(store, BackgroundParent(arguments={
         'action':'tool', 'tool':tool, 'args':arguments}), registry,
-        AgentLoopConfig(compactor=None), runtime_env=runtime_env).start()
+        AgentLoopConfig(context_budget_tokens=10**9), runtime_env=runtime_env).start()
     await runner.send('start')
     row = next(m for m in await store.load_all_messages(runner.target.session_id)
                if m.tool_call_id == 'background')

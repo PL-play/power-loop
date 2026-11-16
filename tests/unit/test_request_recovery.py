@@ -82,7 +82,7 @@ async def test_recovery_stops_within_original_budget(ending, kind, delays, expec
     store = await open_store(":memory:", schema="tasks")
     timeout = (1 if ending == "cancel" else .15 if len(delays) == 3 else .05)
     loop = await runtime_agent(model=SlowRepair(kind), store=store,
-        config=AgentLoopConfig(compactor=None, delegation_policy="single_level",
+        config=AgentLoopConfig(context_budget_tokens=10**9, delegation_policy="single_level",
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, total_timeout=timeout)))
     try:
         sid = loop.target.session_id
@@ -115,7 +115,7 @@ async def test_rejected_history_recovers_once(registry_store, kind, fails_twice,
     store, _ = registry_store
     model = RepairModel(kind, fails_twice=fails_twice)
     loop = await runtime_agent(model=model, store=store,  registry=_echo_registry(),
-        config=AgentLoopConfig(compactor=None, delegation_policy="single_level", max_tokens=20,
+        config=AgentLoopConfig(context_budget_tokens=10**9, delegation_policy="single_level", max_tokens=20,
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, give_up_on=None)))
     try:
         sid = loop.target.session_id
@@ -167,7 +167,7 @@ def test_request_rejection_classifier(status, detail, expected):
 @pytest.mark.parametrize("old_history", [False, True])
 async def test_uncompressible_request_fails_without_identical_retry(tmp_path, old_history, runtime_agent):
     model = RepairModel("context", summary_fails=True)
-    loop = await runtime_agent(model=model, config=AgentLoopConfig(compactor=None))
+    loop = await runtime_agent(model=model, config=AgentLoopConfig(context_budget_tokens=10**9))
     try:
         sid = loop.target.session_id
         if old_history:

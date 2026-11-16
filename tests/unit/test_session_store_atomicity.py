@@ -6,6 +6,8 @@ from __future__ import annotations
 import pytest
 
 from power_loop import SessionStore
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -13,7 +15,7 @@ pytestmark = pytest.mark.unit
 async def test_write_block_rolls_back_on_failure():
     s = await SessionStore.open(":memory:")
     try:
-        sid = await s.create_session()
+        sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         # A multi-write transaction that raises partway through MUST roll back the
         # partial write.
         with pytest.raises(RuntimeError):
@@ -32,7 +34,7 @@ async def test_write_block_rolls_back_on_failure():
 async def test_write_block_commits_on_success():
     s = await SessionStore.open(":memory:")
     try:
-        sid = await s.create_session()
+        sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         async with s._db.transaction() as tx:
             await tx.execute(
                 f"INSERT INTO {s.t.session_runtime_state}"
@@ -50,7 +52,7 @@ async def test_leading_select_then_dml_rolls_back_atomically():
     the transaction block covers every write in it."""
     s = await SessionStore.open(":memory:")
     try:
-        sid = await s.create_session()
+        sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         await s.append_message(sid, role="user", content="first")
         before_row = await s._db.fetchone(
             f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)

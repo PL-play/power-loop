@@ -52,7 +52,7 @@ async def test_pending_is_interrupted_then_send_works(runtime_agent) -> None:
                     "the user's new request."
                 ),
                 max_rounds=2, max_tokens=2048, temperature=0.2,
-                compactor=None,
+                context_budget_tokens=10**9,
             ),
             registry=_noop_registry(),
         )

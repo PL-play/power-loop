@@ -1,4 +1,9 @@
-"""First execution records mutable inspection data outside the frozen descriptor."""
+"""The execution records no history-mode metadata; the real projection version is the fact.
+
+Design 216 removed ``_record_history_mode``: after the projection-only unification the mode is
+constant, so the loop must not touch user runtime metadata on every send. What remains observable
+is the actual ``projector_version`` stamped on the projection rows.
+"""
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -6,7 +11,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from power_loop import AgentLoopConfig
-from power_loop.runtime.history_projector import DefaultDeterministicProjector
 from tests.runtime_fixture import RunningAgent, ScriptedModel
 
 from .session_native_fixture import DESCRIPTOR
@@ -14,11 +18,9 @@ from .session_native_fixture import DESCRIPTOR
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize('projected', [False, True])
-async def test_first_send_records_history_mode_once_without_changing_descriptor(registry_store, projected, monkeypatch):
+async def test_user_metadata_survives_sends_without_mode_writes(registry_store, monkeypatch):
     store, connect = registry_store
-    config = AgentLoopConfig(compactor=None,
-        **({"representation": DefaultDeterministicProjector()} if projected else {}))
+    config = AgentLoopConfig()
     agent = await RunningAgent(store, ScriptedModel([]), config=config).start()
     try:
         sid = agent.target.session_id
@@ -26,21 +28,23 @@ async def test_first_send_records_history_mode_once_without_changing_descriptor(
         await store.set_runtime_state(sid, 'meta', {'customer': 'Ada'})
         writes = []
         original = store.set_runtime_state
+
         async def record(sid, key, value):
             if key == 'meta':
                 writes.append(value)
             await original(sid, key, value)
+
         monkeypatch.setattr(store, 'set_runtime_state', record)
         assert (await agent.send('first')).status == 'completed'
+        assert (await agent.send('second')).status == 'completed'
         peer = await connect()
         meta = await peer.get_runtime_state(sid, 'meta')
-        assert meta['history_mode'] == ('projection' if projected else 'default')
-        assert meta['projector_version'] == (int(config.projection_representation.version) if projected else None)
-        assert meta['customer'] == 'Ada'
-        assert (await agent.send('second')).status == 'completed'
-        assert await peer.get_runtime_state(sid, 'meta') == meta
-        assert len(writes) == 1
+        assert meta == {'customer': 'Ada'}
+        assert writes == []  # the loop never rewrites mode/trigger/keep metadata
         assert (await peer.get_session(sid)).descriptor == before
+        # The version that actually rendered history comes from the projection rows.
+        rows = await peer.load_project_messages(sid)
+        assert rows and {r.projector_version for r in rows} == {config.representation.version}
     finally:
         await agent.aclose()
 

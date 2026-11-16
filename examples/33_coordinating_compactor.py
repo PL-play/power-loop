@@ -56,7 +56,7 @@ async def main():
                                      actor=actor, deadline_ms=int(time.time()*1000)+10000)
             assert result.status == 'completed'
         assert any(CODENAME in text for text in memory.captured)
-    async with demo_runtime(FactModel(), config=AgentLoopConfig(compactor=None, memory=memory)) as (runtime, loop, target, actor):
+    async with demo_runtime(FactModel(), config=AgentLoopConfig(context_budget_tokens=10**9, memory=memory)) as (runtime, loop, target, actor):
         result = await loop.send(target, 'Recall the codename', message_id='recall', actor=actor, deadline_ms=int(time.time()*1000)+10000)
         assert result.status == 'completed' and result.final_text == CODENAME
         print(result.final_text)

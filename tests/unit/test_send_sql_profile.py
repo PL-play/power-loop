@@ -104,11 +104,27 @@ def _category(chain, sql=""):
     if ("runtime.store.store:append_message" in chain
             and re.match(r"update \S*sessions set updated_at", normalized)):
         return "periodic"
-    # Inspection metadata is ordinary storage, outside accept/claim/final control.
-    # Keep every statement in total_sql; classify by its actual live caller.
-    if "agent.stateful_loop:_record_history_mode" in chain:
-        return "message"
     if "agent.runtime_store:_db_now" in chain:
+        return "session_control"
+    # Accept's post-lock session/input/capacity/time read is control SQL. Its SELECT
+    # list exceeds the profile's 240-char capture before the table names.
+    if "agent.runtime_store:_accept_read" in chain:
+        return "session_control"
+    # Claim's post-lock batch read also joins the session identity; its SELECT list is
+    # longer than the 240-char capture before either table name. Attribute it by call
+    # site; the claim's UPDATE/INSERT statements still classify by their own tables.
+    if normalized.startswith("select q.id as id") and any(
+        site in chain for site in ("agent.runtime_store:claim", "agent.runtime_store:claim_follow_up")
+    ):
+        return "session_control"
+    if "agent.runtime_store:session_entry" in chain:
+        return "session_control"
+    # The merged result read spans sessions, the addressed input and its result
+    # message; its SELECT list is longer than the profile's 240-char SQL capture.
+    # Attribute that statement by its live caller; the separate continuation result
+    # message read below is still an ordinary message read.
+    if ("agent.runtime_store:_result_state" in chain
+            and "agent.runtime_store:_terminal_result" not in chain):
         return "session_control"
     if normalized.startswith("select last_insert_id()"):
         return "message"
@@ -302,7 +318,7 @@ async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
         "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("fixture")), echo)
     model = _ProfileModel(models, tools_per_round)
     agent = await RunningAgent(store, model, registry,
-                               AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None)).start()
+                               AgentLoopConfig(max_rounds=models + 1, max_tokens=20, context_budget_tokens=10**9)).start()
     try:
         if lose_notifications:
             async def lost(packet):
@@ -365,6 +381,19 @@ def _per_round_ceiling(db, tools_per_round):
     return base + (tools_per_round - 1) * extra
 
 
+async def test_frozen_fixed_send_budget(registry_store):
+    """P0-R2's fixed allowance includes the complete ordinary send, not only growth."""
+    store, _ = registry_store
+    records, _, sites, _, _ = await _measure(store, 1)
+    fixed = sum(_category(record["chain"], record["sql"]) != "periodic" for record in records)
+    maximum = 24 if store._db.dialect.name == "mysql" else 22
+    control_transactions = sum(any(site in {
+        "agent.runtime_store:accept", "agent.runtime_store:claim", "agent.runtime_store:final",
+    } for site in chain) for chain in sites)
+    assert control_transactions <= 3, control_transactions
+    assert fixed <= maximum, {"fixed_sql": fixed, "frozen_maximum": maximum}
+
+
 @pytest.mark.parametrize("models", [1, 2, 4, 8, 16, 32])
 @pytest.mark.parametrize("tools_per_round", [1, 4])
 async def test_send_sql_profile(registry_store, models, tools_per_round):
@@ -403,7 +432,9 @@ async def test_send_sql_independent_of_history(registry_store):
 
     def entry_rows(records):
         return sum(r.get("rows") or 0 for r in records
-                   if "load_active_messages" in " ".join(r["chain"]) and r["sql"].upper().startswith("SELECT"))
+                   if "load_projection_window" in " ".join(r["chain"])
+                   and (r["sql"].upper().startswith("SELECT")
+                        or r["sql"].upper().startswith("WITH COMPACT")))
 
     assert entry_rows(warm) > entry_rows(cold), (entry_rows(cold), entry_rows(warm))
 

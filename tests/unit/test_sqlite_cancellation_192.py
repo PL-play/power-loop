@@ -1,4 +1,5 @@
 """Real worker barriers: cancellation must not release a busy connection."""
+
 import asyncio
 import sqlite3
 import threading
@@ -8,6 +9,8 @@ import pytest
 from power_loop import SessionStore
 from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 from power_loop.runtime.store.factory import open_store
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -53,7 +56,7 @@ async def test_async_open_does_not_block_and_closes_late_connection(tmp_path, mo
             assert opened[0]._closed
         else:
             store = await task
-            assert await store.create_session()
+            assert await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
             await store.close()
     finally:
         release.set()

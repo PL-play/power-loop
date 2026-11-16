@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "12.0.0"
+__version__ = "13.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -259,7 +259,6 @@ from power_loop.runtime.representation import (
     ProjectedSend,
     ProjectionRenderConfig,
     Representation,
-    VerbatimRepresentation,
 )
 from power_loop.runtime.retry import LLMRetryPolicy, is_permanent_llm_error, with_retry
 from power_loop.runtime.runtime_state import (
@@ -428,7 +427,6 @@ __all__ = [
 	"default_runtime_projectors",
 	"get_tool_runtime_context",
 	"Representation",
-	"VerbatimRepresentation",
 	"ProjectedRepresentation",
 	"ProjectionRenderConfig",
 	"FoldStrategy",

@@ -1,13 +1,8 @@
 """Multimodal content across the storage → projection → replay boundary.
 
-Two defects are covered here, both of which fail SILENTLY (the model gets prose where an image
-was meant, and nobody sees an error):
-
-1. ``_row_to_loop_dict`` (the VERBATIM replay path) did not decode structured content, despite a
-   docstring claiming it mirrors ``stateful_loop._row_to_loop_message``. A multimodal turn
-   replayed as the literal JSON string it was stored as.
-2. ``project_send`` keeps a send's input verbatim — fine for text, ruinous for an inlined
-   ``data:`` URL, which is unreadable as text yet re-billed on every later send.
+Finished sends reach the model only through their stored projection. A multimodal input must be
+decoded once for the projection and distilled to short references: an inlined ``data:`` URL is
+unreadable as text yet re-billed on every later send.
 """
 
 from __future__ import annotations
@@ -15,11 +10,7 @@ from __future__ import annotations
 import json
 
 from power_loop.agent.sink import CONTENT_ENCODING_JSON, CONTENT_ENCODING_META_KEY, _encode_content
-from power_loop.runtime.representation import (
-    ProjectedRepresentation,
-    VerbatimRepresentation,
-    distill_multimodal_text,
-)
+from power_loop.runtime.representation import ProjectedRepresentation, distill_multimodal_text
 from power_loop.runtime.store.types import MessageRow, ProjectMessageRow, decode_row_content
 
 _JSON_META = {CONTENT_ENCODING_META_KEY: CONTENT_ENCODING_JSON}
@@ -65,31 +56,7 @@ def test_plain_text_is_not_flagged_or_decoded() -> None:
     assert decode_row_content('[{"type": "text"}]', {}) == '[{"type": "text"}]'
 
 
-# ── defect 1: verbatim replay dropped the decode ─────────────────────────────
-
-
-def test_verbatim_replay_restores_structured_content() -> None:
-    content = [{"type": "text", "text": "看这个"},
-               {"type": "image_url", "image_url": {"url": _DATA_URL}}]
-    stored, _ = _encode_content(content)
-    rows = _project_rows(VerbatimRepresentation(), [_row(1, "user", stored, _JSON_META)])
-    replayed = VerbatimRepresentation().render(rows)
-    # A list, not the JSON string it was stored as.
-    assert replayed[0]["content"] == content
-    assert not isinstance(replayed[0]["content"], str)
-
-
-def test_verbatim_replay_leaves_plain_text_alone() -> None:
-    rows = _project_rows(VerbatimRepresentation(), [_row(1, "user", "hello")])
-    assert VerbatimRepresentation().render(rows)[0]["content"] == "hello"
-
-
-def test_corrupt_payload_degrades_to_raw_text_rather_than_raising() -> None:
-    rows = _project_rows(VerbatimRepresentation(), [_row(1, "user", "{not json", _JSON_META)])
-    assert VerbatimRepresentation().render(rows)[0]["content"] == "{not json"
-
-
-# ── defect 2: projection kept base64 verbatim ────────────────────────────────
+# ── projection distills multimodal input to references ──────────────────────
 
 
 def test_attachment_block_distills_to_a_usable_reference() -> None:

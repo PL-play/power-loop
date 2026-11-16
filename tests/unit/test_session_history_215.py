@@ -60,7 +60,7 @@ async def test_200_rounds_read_history_once_at_entry(registry_store):
     store, _ = registry_store
     model = ManyRoundModel(200)
     agent = await RunningAgent(store, model, _echo_registry(),
-                               config=AgentLoopConfig(max_rounds=250, compactor=None)).start()
+                               config=AgentLoopConfig(max_rounds=250, context_budget_tokens=10**9)).start()
     original = store._db
     meter = await WriteMeter.install(original, store.table_prefix)
     await meter.reset()
@@ -70,18 +70,17 @@ async def test_200_rounds_read_history_once_at_entry(registry_store):
         result = await agent.send("go")
         assert result.status == "completed" and model.calls == 200
         messages_table = store.t.messages
-        # Raw history SELECTs issued by the SEND itself: the entry load plus final's
-        # result-meta stamp. The client's cold wait read (get_result) is excluded — it is
-        # outside the loop. Crucially there is NO per-round reload of messages.
+        # The send's only raw user row came from the claim transaction; a first send has no
+        # past history to load, and there is NO per-round reload of messages.
         history_selects = [r for r in profiled.records
                            if r["sql"].upper().startswith("SELECT") and messages_table in r["sql"]
                            and not any("get_result" in c for c in r["chain"])]
-        assert len(history_selects) == 2, [r["sql"] for r in history_selects]
-        assert any("load_active_messages" in c for c in history_selects[0]["chain"])
-        assert any("_final_tx" in c for c in history_selects[1]["chain"])
-        proj_selects = [r for r in profiled.records
-                        if r["sql"].upper().startswith("SELECT") and store.t.project_messages in r["sql"]]
-        assert proj_selects == []  # verbatim mode never reads the projection layer
+        assert history_selects == [], [r["sql"] for r in history_selects]
+        # The projection save is the only writer; on a cold session its statistics path needs
+        # at most the combined compact/existence read (the window read is skipped for send 1).
+        proj_reads = [r for r in profiled.records
+                      if r["sql"].upper().startswith("SELECT") and store.t.project_messages in r["sql"]]
+        assert len(proj_reads) <= 1, [r["sql"] for r in proj_reads]
         # Every round's raw rows are durably written: 1 user + 200 assistant + 199 tool.
         rows = await store.load_all_messages(agent.target.session_id)
         assert len(rows) == 1 + 200 + 199

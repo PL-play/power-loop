@@ -25,7 +25,7 @@ async def test_per_send_system_prompt_override_changes_behavior(runtime_agent) -
             model=make_llm(max_tokens=256, temperature=0),
             store=store,
             config=AgentLoopConfig(system_prompt="You always answer in English.",
-                                   max_rounds=1, max_tokens=256, temperature=0, compactor=None),
+                                   max_rounds=1, max_tokens=256, temperature=0, context_budget_tokens=10**9),
         )
         r = await loop.send("Say hello.", options=RequestOptions(system_prompt="You always answer ONLY in French. Never use English."))
         assert r.status == "completed"
@@ -54,7 +54,7 @@ async def test_per_send_tools_allowlist_restricts_what_model_can_call(runtime_ag
         loop = await runtime_agent(
             model=make_llm(max_tokens=384, temperature=0), store=store, registry=reg,
             config=AgentLoopConfig(system_prompt="Use whatever tools are available to comply.",
-                                   max_rounds=3, max_tokens=384, temperature=0, compactor=None),
+                                   max_rounds=3, max_tokens=384, temperature=0, context_budget_tokens=10**9),
         )
         # Only `alpha` is exposed for this send.
         r = await loop.send("Please call the beta tool, and also the alpha tool.", options=RequestOptions(tools=["alpha"]))

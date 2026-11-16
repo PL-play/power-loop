@@ -108,7 +108,7 @@ async def _run(runtime_agent, plan: list[Any], *, attempts: int = 1) -> tuple[An
     events: list[dict] = []
     bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, lambda e: events.append(dict(e.payload or {})))
     loop = await runtime_agent(model=_Script(plan), store=store, event_bus=bus, config=AgentLoopConfig(
-        system_prompt="S" * 100, max_rounds=1, compactor=None,
+        system_prompt="S" * 100, max_rounds=1, context_budget_tokens=10**9,
         retry_policy=LLMRetryPolicy(max_attempts=attempts, backoff_initial=0, total_timeout=None)))
     try:
         res = await loop.send("用户的问题" * 20)
@@ -162,7 +162,7 @@ async def test_aborted_attempt_outcome_and_partial_output(runtime_agent) -> None
     bus.subscribe(AgentEventType.STREAM_DELTA, lambda e: streaming.set())
     loop = await runtime_agent(model=_Script(["hang"]), store=store, event_bus=bus,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=1,
-                                                    compactor=None, retry_policy=None))
+                                                    context_budget_tokens=10**9, retry_policy=None))
     from power_loop.agent.runtime_store import now_ms
     receipt = await loop.runtime.client.send(loop.target, "hi", message_id="hang", actor=loop.actor)
     await asyncio.wait_for(streaming.wait(), timeout=5)
@@ -209,7 +209,7 @@ async def test_call_events_name_the_services_model_when_loop_sets_none(runtime_a
     bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, lambda e: events.append(dict(e.payload or {})))
     real = LLMTokenUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6)
     loop = await runtime_agent(model=_Named([("ok", real)]), store=store, event_bus=bus,
-                             config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+                             config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
     try:
         await loop.send("hi")
     finally:

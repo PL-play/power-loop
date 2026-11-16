@@ -103,7 +103,7 @@ def _call(name: str) -> LLMResponse:
 async def test_stop_during_the_model_call_ends_the_run_at_once(registry_store):
     store, _ = registry_store
     model = _LLM()
-    runner = await RunningAgent(store, model, config=AgentLoopConfig(system_prompt='HANG', compactor=None)).start()
+    runner = await RunningAgent(store, model, config=AgentLoopConfig(system_prompt='HANG', context_budget_tokens=10**9)).start()
     try:
         receipt = await runner.runtime.client.send(runner.target, 'write a novel', message_id='run', actor=runner.actor)
         await asyncio.wait_for(model.hanging.wait(), 10)
@@ -138,7 +138,7 @@ async def test_stop_respects_tool_interrupt_policy(registry_store, mode, finishe
     registry = ToolRegistry()
     registry.register(ToolDefinition('t','tool',interrupt=mode,pricing=Free('fixture')),work)
     runner = await RunningAgent(store, _LLM([_call('t')]), registry,
-        AgentLoopConfig(compactor=None, stop_policy=StopPolicy(finish_tool_s=.3,abort_tool_s=.1))).start()
+        AgentLoopConfig(context_budget_tokens=10**9, stop_policy=StopPolicy(finish_tool_s=.3,abort_tool_s=.1))).start()
     try:
         receipt = await runner.runtime.client.send(runner.target,'go',message_id='run',actor=runner.actor)
         await asyncio.wait_for(began.wait(),10)
@@ -163,7 +163,7 @@ async def test_subtree_cancel_reaches_child_model(registry_store, kind):
     register_spawn_agent(registry)
     if kind == 'subagent':
         model.steps = [_tool_resp('spawn','spawn_agent','{"task":"research","system_prompt":"HANG","tools":[]}')]
-    runner = await RunningAgent(store,model,registry,AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store,model,registry,AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         if kind == 'subagent':
             parent = await runner.send('delegate')

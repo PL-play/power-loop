@@ -20,7 +20,7 @@ async def test_real_workflow_cancel_uses_original_admission_without_replacement_
     registry=ToolRegistry()
     register_workflow_tool(registry, ports=WorkflowToolPorts(on_accepted=accepted.append))
     agent=await runtime_agent(model=provider, registry=registry, capacity=2,
-        config=AgentLoopConfig(max_rounds=5,max_tokens=2048,compactor=None,
+        config=AgentLoopConfig(max_rounds=5,max_tokens=2048,context_budget_tokens=10**9,
             system_prompt='Follow the requested workflow sequence exactly. Create only once. A cancel receipt is not proof of physical stop or billing settlement. Do not poll or create replacement work.'))
     sid=agent.target.session_id
     provider.root_sid,provider.hold_children=sid,True

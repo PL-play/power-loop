@@ -36,7 +36,7 @@ async def test_real_llm_sees_sqlite_runtime_state(tmp_path, runtime_agent) -> No
                     "RUNTIME_STATE_VISIBLE"
                 ),
                 max_rounds=1,
-                compactor=None,
+                context_budget_tokens=10**9,
             ))
         sid = loop.target.session_id
         await store.set_runtime_state(
@@ -77,7 +77,7 @@ async def test_real_llm_todo_tool_persists_to_sqlite(tmp_path, runtime_agent) ->
                     "After the tool result is returned, answer briefly."
                 ),
                 max_rounds=4,
-                compactor=None,
+                context_budget_tokens=10**9,
             ))
         sid = loop.target.session_id
         result = await loop.send("Create the todo now using the todo tool.")
@@ -119,7 +119,7 @@ async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path, runtim
                     "After the tool result is returned, answer briefly."
                 ),
                 max_rounds=4,
-                compactor=None,
+                context_budget_tokens=10**9,
                 runtime_projectors=(_RealCustomProjector(),),
             ))
         sid = loop.target.session_id
@@ -163,7 +163,7 @@ async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path, runtime
                     "reply with exactly: CUSTOM_PROJECTOR_VISIBLE"
                 ),
                 max_rounds=4,
-                compactor=None,
+                context_budget_tokens=10**9,
                 runtime_projectors=(_RealCustomProjector(),),
             ))
         result = await loop.send("Run the custom runtime flow.")

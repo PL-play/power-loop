@@ -73,15 +73,15 @@ async def test_factory_isolates_child_hook_state_and_closes_original_resources(r
         class Resources:
             async def aclose(self):
                 closed.append(context.input_ref)
-        return ExecutionEnvironment(Model(), registry, AgentLoopConfig(compactor=None), hooks=hooks,
+        return ExecutionEnvironment(Model(), registry, AgentLoopConfig(context_budget_tokens=10**9), hooks=hooks,
             resources=Resources(), command=None if 'child_spec' in descriptor.config else ('delegate', {}))
 
-    factory.register('guard-replacement@1', build)
+    factory.register('guard-replacement@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='factory-isolation', capacity=1,
                       timers_enabled=False, recovery_interval_s=None)
     actor = TrustedActor('guards', 'host', None)
-    descriptor = RuntimeDescriptor(1, 'agent', 'guard-replacement@1', None,
-        'builtin.empty@1', 'builtin.none@1', 'builtin.none@1', {}, {})
+    descriptor = RuntimeDescriptor(2, 'agent', 'guard-replacement@215', None,
+        'builtin.empty@215', 'builtin.none@215', 'builtin.none@215', {}, {})
     try:
         await runtime.worker.start()
         target = await runtime.open_session(descriptor, actor=actor)

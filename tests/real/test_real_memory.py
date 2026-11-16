@@ -30,7 +30,7 @@ async def test_recalled_note_reaches_and_is_used_by_live_model(runtime_agent) ->
                 max_rounds=1,
                 temperature=0,
                 max_tokens=256,
-                compactor=None,
+                context_budget_tokens=10**9,
                 memory=NoteMemory(store),
             ),
         )
@@ -68,7 +68,7 @@ async def test_note_added_midsession_surfaces_on_next_send(runtime_agent) -> Non
                 max_rounds=1,
                 temperature=0,
                 max_tokens=256,
-                compactor=None,
+                context_budget_tokens=10**9,
                 memory=NoteMemory(store),
             ),
         )
@@ -107,7 +107,7 @@ async def test_hook_events_audits_real_memory_injection(runtime_agent) -> None:
                 max_rounds=1,
                 temperature=0,
                 max_tokens=256,
-                compactor=None,
+                context_budget_tokens=10**9,
                 memory=NoteMemory(store),
                 record_hook_events="full",
             ),

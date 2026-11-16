@@ -151,7 +151,7 @@ async def test_urgent_input_at_final_boundary_runs_in_the_next_send(store, runti
     completed = _events(bus, AgentEventType.LLM_CALL_COMPLETED)
     llm = _LLM([("stream_then_gate", "Original response"), "4"])
     loop = await runtime_agent(model=llm, store=store, event_bus=bus, config=AgentLoopConfig(
-        system_prompt="S", max_rounds=3, compactor=None))
+        system_prompt="S", max_rounds=3, context_budget_tokens=10**9))
     sid = loop.target.session_id
     run = asyncio.create_task(loop.send("write me a long story"))
     await asyncio.wait_for(llm.hanging.wait(), 5)
@@ -192,7 +192,7 @@ async def test_queue_item_does_not_interrupt(store, runtime_agent) -> None:
                                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
                  lambda **kw: "ok")
     loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(
-        system_prompt="S", max_rounds=3, compactor=None))
+        system_prompt="S", max_rounds=3, context_budget_tokens=10**9))
     run = asyncio.create_task(loop.send("go"))
     await asyncio.wait_for(llm.hanging.wait(), 5)
     await loop.runtime.client.send(loop.target, "fyi", message_id="q1", actor=loop.actor)    # queue mode
@@ -215,7 +215,7 @@ async def test_session_append_during_a_tool_round_joins_the_running_send(store, 
         return await original(request, **kwargs)
     llm.complete = gated
     loop = await runtime_agent(model=llm, store=store, registry=_registry(_Probe(), interrupt="finish"), config=AgentLoopConfig(
-        system_prompt="S", max_rounds=3, compactor=None))
+        system_prompt="S", max_rounds=3, context_budget_tokens=10**9))
     first = await loop.runtime.client.send(loop.target, "go", message_id="m1", actor=loop.actor)
     await asyncio.wait_for(entered.wait(), 5)
     await loop.runtime.client.send(loop.target, "one more thing", message_id="a1", actor=loop.actor)
@@ -232,7 +232,7 @@ async def test_session_append_during_a_tool_round_joins_the_running_send(store, 
 async def test_a_steer_flag_that_cannot_clear_does_not_spin(store, runtime_agent) -> None:
     llm = _LLM(["fine"])
     loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(
-        system_prompt="S", max_rounds=2, compactor=None))
+        system_prompt="S", max_rounds=2, context_budget_tokens=10**9))
     from power_loop.agent.runtime_transport import TransportPacket
     await loop.runtime.transport.publish(TransportPacket(43, loop.runtime.namespace, "stale",
                                                          loop.target, "activation"))
@@ -253,7 +253,7 @@ async def test_durable_injection_occurs_once_per_model_round_with_steering(store
     hooks.register(HookPoint.LLM_BEFORE, remind, name="t.remind")
     llm = _LLM([("stream_then_gate", "first"), "ok"])
     loop = await runtime_agent(model=llm, store=store, hooks=hooks, config=AgentLoopConfig(
-        system_prompt="S", max_rounds=3, compactor=None))
+        system_prompt="S", max_rounds=3, context_budget_tokens=10**9))
     sid = loop.target.session_id
     run = asyncio.create_task(loop.send("go"))
     await asyncio.wait_for(llm.hanging.wait(), 5)
@@ -275,7 +275,7 @@ async def _run_with_tool(runtime_agent, store, interrupt: str, *, bus: AgentEven
     loop = await runtime_agent(model=llm, store=store, registry=_registry(probe,
                              interrupt=interrupt), event_bus=bus or AgentEventBus(), capacity=2 if interrupt == "background" else 1,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=3,
-                                                    compactor=None))
+                                                    context_budget_tokens=10**9))
     sid = loop.target.session_id
     run = asyncio.create_task(loop.send("do the slow thing"))
     await asyncio.wait_for(probe.started.wait(), 5)
@@ -315,7 +315,7 @@ async def test_urgent_input_preserves_all_tools_in_the_current_round(store, runt
     loop = await runtime_agent(model=llm, store=store,
                              registry=_registry(probe, interrupt="finish"),
                              config=AgentLoopConfig(system_prompt="S", max_rounds=3,
-                                                    compactor=None))
+                                                    context_budget_tokens=10**9))
     sid = loop.target.session_id
     run = asyncio.create_task(loop.send("go"))
     await asyncio.wait_for(probe.started.wait(), 5)
@@ -360,7 +360,7 @@ async def test_boundary_cancel_waits_for_model_cleanup_and_keeps_usage(store, ru
 
     loop = await runtime_agent(model=_SlowCleanup(), store=store, event_bus=bus,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=1,
-                                                    compactor=None, retry_policy=None))
+                                                    context_budget_tokens=10**9, retry_policy=None))
     sid = loop.target.session_id
     task = asyncio.create_task(loop.send("hi"))
     await asyncio.wait_for(streaming.wait(), 5)

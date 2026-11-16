@@ -18,7 +18,7 @@ from power_loop import (
     RegistryRuntimeFactory,
     Runtime,
 )
-from power_loop.agent.runtime_store import RuntimeInputStore
+from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_types import InputRef
 
 from .session_native_fixture import ACTOR, target
@@ -42,7 +42,7 @@ def _factory(definition="test.agent@215"):
     factory = RegistryRuntimeFactory()
 
     async def build(descriptor, context):
-        return ExecutionEnvironment(EchoModel(), None, AgentLoopConfig(max_rounds=4, compactor=None))
+        return ExecutionEnvironment(EchoModel(), None, AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9))
 
     factory.register(definition, build)
     return factory
@@ -133,7 +133,7 @@ async def test_command_factory_does_not_claim_or_fail(registry_store):
     factory = RegistryRuntimeFactory()
 
     async def build(descriptor, context):
-        return ExecutionEnvironment(model, None, AgentLoopConfig(max_rounds=4, compactor=None),
+        return ExecutionEnvironment(model, None, AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9),
                                     command=("host_command", {}))
 
     factory.register("test.agent@215", build, can_execute=lambda descriptor: False)
@@ -202,6 +202,117 @@ async def test_capable_node_completes_after_incapable_node_leaves_input(registry
         await node_b.transport.aclose()
 
 
+async def test_incapable_node_does_not_recover_an_expired_run(registry_store):
+    """Capability precedes recovery too: an incapable node leaves the expired owner."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    batch = await port.claim(root, node_id="old", boot_id="old")
+    await store._db.execute(
+        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        (root.session_id,),
+    )
+    incapable = Runtime(store=store, factory=_factory("other.agent@215"), node_id="incapable",
+                        boot_id="b", recovery_interval_s=None, timers_enabled=False)
+    try:
+        await incapable.worker.start()
+        await incapable.worker.recover()
+        await asyncio.sleep(0.2)
+        state = await store._db.fetchone(
+            f"SELECT execution_state,active_send_index,owner_token FROM {store.t.session_state} "
+            "WHERE session_id=?", (root.session_id,))
+        assert state["execution_state"] == "running"
+        assert state["active_send_index"] == batch.send_index
+        status = await port.inspect(batch.input_refs[0], actor=ACTOR)
+        assert status.input_state == "delivered" and status.terminal_status is None
+        assert "test.agent@215" in incapable.worker.capability_missing
+    finally:
+        await incapable.worker.shutdown(timeout_s=2)
+        await incapable.client.aclose()
+        await incapable.transport.aclose()
+    capable = Runtime(store=store, factory=_factory(), node_id="capable", boot_id="b",
+                      recovery_interval_s=None, timers_enabled=False)
+    try:
+        await capable.worker.start()
+        await capable.worker.recover()
+        result = await capable.client.wait(batch.input_refs[0], actor=ACTOR,
+                                           deadline_ms=now_ms() + 5000)
+        assert result.status == "interrupted"
+    finally:
+        await capable.worker.shutdown(timeout_s=2)
+        await capable.client.aclose()
+        await capable.transport.aclose()
+
+
+async def test_external_coordinator_acquire_waits_for_capability(registry_store):
+    """A non-fence coordinator's acquire is not attempted by an incapable node."""
+    from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
+
+    class Counting(MemorySessionOwnershipCoordinator):
+        acquires = 0
+
+        async def acquire(self, key, **kwargs):
+            self.acquires += 1
+            return await super().acquire(key, **kwargs)
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    coordinator = Counting()
+    runtime = Runtime(store=store, factory=_factory("other.agent@215"), node_id="incapable",
+                      boot_id="b", coordinator=coordinator, recovery_interval_s=None,
+                      timers_enabled=False)
+    try:
+        await runtime.worker.start()
+        await runtime.worker.recover()
+        await asyncio.sleep(0.2)
+        assert coordinator.acquires == 0
+        state = await store._db.fetchone(
+            f"SELECT execution_state,owner_token FROM {store.t.session_state} WHERE session_id=?",
+            (root.session_id,))
+        assert state == {"execution_state": "queued", "owner_token": None}
+    finally:
+        await runtime.worker.shutdown(timeout_s=2)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
+async def test_external_coordinator_does_not_recover_before_capability(registry_store):
+    """An incapable external-coordinator node leaves an expired run untouched."""
+    from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, "go", message_id="m1", actor=ACTOR)
+    batch = await port.claim(root, node_id="old", boot_id="old")
+    await store._db.execute(
+        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        (root.session_id,),
+    )
+    coordinator = MemorySessionOwnershipCoordinator()
+    runtime = Runtime(store=store, factory=_factory("other.agent@215"), node_id="incapable",
+                      boot_id="b", coordinator=coordinator, recovery_interval_s=None,
+                      timers_enabled=False)
+    try:
+        await runtime.worker.start()
+        await runtime.worker.recover()
+        await asyncio.sleep(0.2)
+        state = await store._db.fetchone(
+            f"SELECT execution_state,active_send_index FROM {store.t.session_state} "
+            "WHERE session_id=?", (root.session_id,))
+        assert state["execution_state"] == "running"
+        assert state["active_send_index"] == batch.send_index
+        status = await port.inspect(batch.input_refs[0], actor=ACTOR)
+        assert status.input_state == "delivered" and status.terminal_status is None
+    finally:
+        await runtime.worker.shutdown(timeout_s=2)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
 async def test_build_uses_claimed_execution_context(registry_store):
     """The only build happens after claim and receives the real execution identity."""
     store, _ = registry_store
@@ -216,7 +327,7 @@ async def test_build_uses_claimed_execution_context(registry_store):
         contexts.append((context.input_ref, context.send_index,
                          context.owner_epoch, context.owner_token))
         return ExecutionEnvironment(
-            model, None, AgentLoopConfig(max_rounds=4, compactor=None))
+            model, None, AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9))
 
     factory.register("test.agent@215", build)
     runtime = Runtime(store=store, factory=factory, node_id="claimed", boot_id="b",
@@ -253,7 +364,7 @@ async def test_factory_requiring_input_ref_completes(registry_store):
         builds += 1
         assert context.input_ref is not None
         return ExecutionEnvironment(
-            CountingModel(), None, AgentLoopConfig(max_rounds=4, compactor=None))
+            CountingModel(), None, AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9))
 
     factory.register("test.agent@215", build)
     runtime = Runtime(store=store, factory=factory, node_id="input-ref", boot_id="b",
@@ -414,7 +525,7 @@ async def test_release_claim_honours_matching_cancel(registry_store):
 
     async def capable_build(descriptor, context):
         return ExecutionEnvironment(
-            model_b, None, AgentLoopConfig(max_rounds=4, compactor=None))
+            model_b, None, AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9))
 
     capable.register("test.agent@215", capable_build)
     node_b = Runtime(store=store, factory=capable, node_id="B", boot_id="B",

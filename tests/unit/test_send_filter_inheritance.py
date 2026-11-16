@@ -120,7 +120,8 @@ async def test_send_with_tools_publishes_effective_set(store: SessionStore, runt
         LLMResponse(raw_text="fin"),
     ])
     loop = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(max_rounds=3))
-    r = await loop.send("go", options=RequestOptions(tools=["probe", "a"]))
+    await loop.new_session(options=RequestOptions(tools=["probe", "a"]))
+    r = await loop.send("go")
     assert r.status == "completed"
     assert seen == [frozenset({"probe", "a"})]
     # And it is reset once the run finishes.
@@ -173,8 +174,9 @@ async def test_child_uses_frozen_grant_and_cannot_widen_it(store, runtime_agent,
                 return _tool_call('delegation', 'delegate')
             return LLMResponse(raw_text='parent done')
     model = Model([LLMResponse(raw_text='child done')])
-    runner = await runtime_agent(model=model, store=store, registry=reg, config=AgentLoopConfig(compactor=None))
-    assert (await runner.send('go', options=RequestOptions(tools=['delegate', *grant]))).status == 'completed'
+    runner = await runtime_agent(model=model, store=store, registry=reg, config=AgentLoopConfig(context_budget_tokens=10**9))
+    await runner.new_session(options=RequestOptions(tools=['delegate', *grant]))
+    assert (await runner.send('go')).status == 'completed'
     rows = await store.load_all_messages(runner.target.session_id)
     receipt = next(r.content for r in rows if r.tool_call_id == 'delegation')
     if expected is None:
@@ -213,8 +215,9 @@ async def test_child_cannot_spawn_grandchild_and_filter_is_restored(store, runti
                 return _tool_call('delegate', 'delegate')
             return LLMResponse(raw_text='parent done')
     model = Model([_tool_call('nested', 'spawnling'), LLMResponse(raw_text='child done')])
-    runner = await runtime_agent(model=model, store=store, registry=reg, config=AgentLoopConfig(compactor=None))
-    await runner.send('go', options=RequestOptions(tools=['delegate', 'spawnling', 'a']))
+    runner = await runtime_agent(model=model, store=store, registry=reg, config=AgentLoopConfig(context_budget_tokens=10**9))
+    await runner.new_session(options=RequestOptions(tools=['delegate', 'spawnling', 'a']))
+    await runner.send('go')
     [child] = await store.list_children(runner.target.session_id)
     assert not await store.list_children(child.session_id)
     rows = await store.load_all_messages(child.session_id)
@@ -233,7 +236,7 @@ async def test_workflow_submission_freezes_grant_and_clamps_leaf(store, runtime_
     from power_loop.agent.runtime_store import now_ms
     model = _Capturing([LLMResponse(raw_text='leaf out')])
     runner = await runtime_agent(model=model, store=store, registry=_registry('a', 'b', 'c'),
-                                 config=AgentLoopConfig(compactor=None))
+                                 config=AgentLoopConfig(context_budget_tokens=10**9))
     node_spec = {'name': 'leaf', 'system_prompt': 'LEAF'}
     if declared is not None:
         node_spec['tools'] = declared

@@ -91,7 +91,7 @@ class WorkflowModel(LLMService):
 async def main():
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
-        return ExecutionEnvironment(WorkflowModel(), None, AgentLoopConfig(compactor=None))
+        return ExecutionEnvironment(WorkflowModel(), None, AgentLoopConfig(context_budget_tokens=10**9))
     factory.register("example.workflow@215", build)
     store = await SessionStore.open(":memory:")
     runtime = Runtime(store=store, factory=factory, node_id="example", capacity=1)

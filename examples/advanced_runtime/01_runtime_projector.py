@@ -40,7 +40,7 @@ class IncidentModel(LLMService):
         pass
 
 async def main():
-    config = AgentLoopConfig(compactor=None, runtime_projectors=(IncidentProjector(),))
+    config = AgentLoopConfig(context_budget_tokens=10**9, runtime_projectors=(IncidentProjector(),))
     async with demo_runtime(IncidentModel(), config=config) as (runtime, loop, target, actor):
         await runtime.store.set_runtime_state(target.session_id, 'incident',
             {'severity':'SEV2','summary':'checkout latency above threshold'})

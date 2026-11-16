@@ -1,6 +1,6 @@
 """Real-LLM end-to-end for the send-context projection layer (v2).
 
-Runs several real sends with a DefaultDeterministicProjector (compactor disabled): the live
+Runs several real sends with a DefaultDeterministicProjector: the live
 provider must ACCEPT the projected plain-text history on later sends, finished sends get
 projected into pl_project_messages, older sends fold into a compact row, and recall_send
 re-expands a folded send's original detail (which always remains in pl_messages).
@@ -37,11 +37,11 @@ async def test_real_projection_compaction_and_recall(runtime_agent) -> None:
             model=llm, store=store,
             config=AgentLoopConfig(
                 system_prompt="You are terse. Reply with one short sentence.",
-                max_rounds=3, compactor=None,
+                max_rounds=3,
                 # tiny FOLD budget so the token-driven fold (budget × trigger_ratio) fires; the
                 # output cap stays roomy — a reasoning model needs it before its first word.
                 max_tokens=2048, context_budget_tokens=40,
-                history_projector=DefaultDeterministicProjector(keep_last_sends=2),
+                representation=DefaultDeterministicProjector(keep_last_sends=2),
             ),
         )
         sid = loop.target.session_id

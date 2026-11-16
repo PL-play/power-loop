@@ -1,16 +1,11 @@
-"""HistoryProjector trio: IdentityProjector (verbatim) + DefaultDeterministicProjector
-(generic structured summary via ToolDefinition.project, no LLM). Covers project_send
-(tool dispatch, fallback, truncation, follow-up list, determinism), render (no tool-protocol
-leak), the Identity round-trip, and compact()."""
+"""DefaultDeterministicProjector (a custom Representation): generic structured summary
+via ToolDefinition.project, no LLM. Covers project_send (tool dispatch, fallback,
+truncation, follow-up list, determinism), render (no tool-protocol leak) and compact()."""
 
 from __future__ import annotations
 
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.runtime.history_projector import (
-    DefaultDeterministicProjector,
-    IdentityProjector,
-    _row_to_loop_dict,
-)
+from power_loop.runtime.history_projector import DefaultDeterministicProjector
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.types import MessageRow, MessageState, ProjectMessageRow
 from power_loop.tools.registry import ToolRegistry
@@ -162,11 +157,9 @@ def test_missing_result_hook_exception_falls_back_to_missing() -> None:
     assert tools[0] == {"name": "broken", "result": "<missing>"}
 
 
-def test_identity_projector_declares_trigger_ratio() -> None:
-    # IdentityProjector satisfies the Protocol's trigger_ratio; a custom projector that OMITS it
-    # still works via the loop's getattr(..., 0.75) fallback.
-    assert IdentityProjector().trigger_ratio == 0.75
-
+def test_minimal_projector_uses_trigger_ratio_fallback() -> None:
+    # A custom projector that OMITS trigger_ratio still works via the loop's
+    # getattr(..., 0.75) fallback.
     class _MinimalProjector:
         version = 1
         keep_last_sends = 0  # no trigger_ratio attribute on purpose
@@ -224,18 +217,6 @@ def test_render_emits_plain_text_only_no_tool_protocol() -> None:
     assert "[tools] bash" in msgs[1]["content"] and "done" in msgs[1]["content"]
 
 
-def test_identity_round_trips_verbatim() -> None:
-    ip = IdentityProjector()
-    rows = [
-        _mr(1, "user", "hi"),
-        _mr(2, "assistant", tool_calls=[_tc("c1", "bash")]),
-        _mr(3, "tool", "ok", tool_call_id="c1", name="bash"),
-        _mr(4, "assistant", "done"),
-    ]
-    out = ip.project_send(rows, send_index=1, tool_registry=None)
-    assert ip.render(out.rows) == [_row_to_loop_dict(r) for r in rows]  # byte-identical history
-
-
 def test_default_compact_folds_sends() -> None:
     p = DefaultDeterministicProjector()
     rows = [
@@ -248,7 +229,6 @@ def test_default_compact_folds_sends() -> None:
     assert c is not None and c.from_send == 1 and c.to_send == 2
     assert "#1 user: a" in c.content["summary"] and "#1 agent: hi" in c.content["summary"]
     assert "#2 agent: bye" in c.content["summary"]
-    assert IdentityProjector().compact(rows) is None  # verbatim never folds
 
 
 def test_default_compact_rolls_prior_compact_forward() -> None:
@@ -287,8 +267,6 @@ def test_projector_params_validated_on_construction() -> None:
     for bad in (0.0, 1.5, -0.1, math.nan):
         with pytest.raises(ValueError, match="trigger_ratio"):
             DefaultDeterministicProjector(trigger_ratio=bad)
-        with pytest.raises(ValueError, match="trigger_ratio"):
-            IdentityProjector(trigger_ratio=bad)
     with pytest.raises(ValueError, match="keep_last_sends"):
         DefaultDeterministicProjector(keep_last_sends=-1)
     with pytest.raises(ValueError, match="version"):

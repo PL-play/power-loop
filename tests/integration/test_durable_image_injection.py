@@ -88,7 +88,7 @@ async def test_durable_injection_becomes_a_real_user_row(tmp_path, runtime_agent
         )
         loop = await runtime_agent(
             model=llm, store=store, registry=registry,
-            config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
+            config=AgentLoopConfig(system_prompt="S", max_rounds=3, context_budget_tokens=10**9),
         )
         sid = loop.target.session_id
         sid_holder["sid"] = sid
@@ -138,7 +138,7 @@ async def test_ephemeral_injection_is_not_stored(tmp_path, runtime_agent) -> Non
         )
         loop = await runtime_agent(
             model=llm, store=store, registry=registry,
-            config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
+            config=AgentLoopConfig(system_prompt="S", max_rounds=3, context_budget_tokens=10**9),
         )
         sid = loop.target.session_id
         sid_holder["sid"] = sid

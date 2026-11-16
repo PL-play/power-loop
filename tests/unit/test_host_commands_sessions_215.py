@@ -44,7 +44,7 @@ async def test_inline_child_create_send_and_consume_without_parent_assistant(reg
     from power_loop.runtime.pricing import Free
     registry.register(ToolDefinition("delegate", "inline child", pricing=Free("test")), delegate)
     runner = await RunningAgent(
-        store, model, registry, AgentLoopConfig(compactor=None), command=("delegate", {}),
+        store, model, registry, AgentLoopConfig(context_budget_tokens=10**9), command=("delegate", {}),
     ).start()
     try:
         result = await runner.send("run inline child")

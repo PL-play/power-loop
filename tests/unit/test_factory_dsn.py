@@ -7,6 +7,7 @@ raise), never silently create a SQLite file named after the DSN.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import socket
 from urllib.parse import urlparse
@@ -14,6 +15,8 @@ from urllib.parse import urlparse
 import pytest
 
 from power_loop.runtime.store.factory import _split_scheme, _sqlite_path, open_store
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -53,7 +56,7 @@ async def test_absolute_sqlite_url_opens_at_absolute_path(tmp_path) -> None:
     target = tmp_path / "owned.db"
     store = await open_store(f"sqlite:///{target}")  # tmp_path is absolute → 4-slash form
     try:
-        await store.create_session(system_prompt="x")
+        await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "x"}), actor=STORE_ACTOR)
     finally:
         await store.close()
     assert target.exists(), "absolute sqlite:// path was mangled (G4)"
@@ -98,7 +101,7 @@ async def test_driver_qualified_pg_dsn_connects(tmp_path) -> None:
     driver_dsn = PG_DSN.replace("postgresql://", "postgresql+psycopg://", 1)
     store = await open_store(driver_dsn, table_prefix="pldsn_")
     try:
-        sid = await store.create_session(system_prompt="x")
+        sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "x"}), actor=STORE_ACTOR)
         assert sid
     finally:
         await store.close()

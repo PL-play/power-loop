@@ -58,7 +58,7 @@ async def run_with_provider(label: str, config: LLMProviderConfig, question: str
 
     from _runtime import demo_runtime
     service = create_llm_service_from_config(config)
-    async with demo_runtime(service, config=AgentLoopConfig(max_tokens=300, max_rounds=1, compactor=None)) as (runtime, loop, target, actor):
+    async with demo_runtime(service, config=AgentLoopConfig(max_tokens=300, max_rounds=1, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
         result = await loop.send(target, question, message_id=label, actor=actor,
                                  deadline_ms=int(time.time()*1000)+120000)
         if result.status != 'completed':

@@ -1,11 +1,10 @@
 """Real-LLM end-to-end for the power-loop 3.0 orthogonal context model: every
 Representation × FoldStrategy combo, plus a representation mode switch.
 
-The live provider must ACCEPT the (folded) history each send and keep completing. Asserts the
-mode-appropriate compaction artifact:
-  * verbatim  → an in-place compaction recorded (compact_note in pl_messages / compactions table)
-  * projection → a derived ``compact`` row in pl_project_messages (folded via the strategy's LLM)
-AgenticFold additionally MAY persist notes (model-discretionary → checked, not hard-asserted).
+The live provider must ACCEPT the (folded) history each send and keep completing. Projection is
+the only history path: assert the derived ``compact`` row in pl_project_messages (folded via the
+strategy's LLM). AgenticFold additionally MAY persist notes
+(model-discretionary → checked, not hard-asserted).
 
 Auto-skips without a real-LLM provider env (see tests/conftest.py).
 """
@@ -24,7 +23,7 @@ from power_loop.core.agent_context import (
     set_session_id,
 )
 from power_loop.runtime.fold import AgenticFold, LLMSummaryFold
-from power_loop.runtime.representation import ProjectedRepresentation, VerbatimRepresentation
+from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
 from power_loop.tools.default_tools import run_recall_send
 from tests.real._llm import make_llm
@@ -52,44 +51,6 @@ async def _drive(loop, sid, n=5):
     for i in range(1, n + 1):
         r = await loop.send(f"Note the word apple{i} and reply OK.")
         assert r.status == "completed", f"send {i} status={r.status}"
-
-
-# ── verbatim × {default, agentic}: in-place compaction via the mapped compactor ──
-
-
-async def test_real_verbatim_llm_summary_fold(monkeypatch, runtime_agent) -> None:
-    # The in-place compactor honors CONTEXT_COMPACT_THRESHOLD (env) as an absolute override; clear
-    # it so the fold triggers at context_budget_tokens × trigger_ratio in this small test.
-    monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
-    store = await SessionStore.open(":memory:")
-    try:
-        loop = await _loop(runtime_agent, store, VerbatimRepresentation(), LLMSummaryFold(keep_last_sends=2))
-        sid = loop.target.session_id
-        await _drive(loop, sid, 5)
-        # Verbatim folds in place: a real LLM-summary compaction must have been recorded.
-        comps = await store.list_compactions(sid)
-        assert comps, "expected at least one in-place compaction"
-        assert any(m.name == "compact_note" for m in await store.load_active_messages(sid))
-    finally:
-        await loop.aclose()
-        await store.close()
-
-
-async def test_real_verbatim_agentic_fold(monkeypatch, runtime_agent) -> None:
-    monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
-    store = await SessionStore.open(":memory:")
-    try:
-        loop = await _loop(runtime_agent, store, VerbatimRepresentation(), AgenticFold(keep_last_sends=2, max_rounds=3))
-        sid = loop.target.session_id
-        await loop.send("Remember: my project is Zephyr; I prefer metric units. Reply OK.")
-        await _drive(loop, sid, 5)
-        comps = await store.list_compactions(sid)
-        assert comps, "expected at least one in-place (agentic) compaction"
-        notes = await store.list_notes(sid)  # model-discretionary
-        assert isinstance(notes, list)
-    finally:
-        await loop.aclose()
-        await store.close()
 
 
 # ── projection × {default, agentic}: derived-layer fold via the strategy's LLM call ──

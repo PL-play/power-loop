@@ -116,7 +116,7 @@ async def test_bad_stored_history_can_continue(tmp_path, messages, action, runti
     else:
         model = StrictModel()
     loop = await runtime_agent(model=model, registry=registry,
-        config=AgentLoopConfig(system_prompt='system', compactor=None))
+        config=AgentLoopConfig(system_prompt='system', context_budget_tokens=10**9))
     store = loop.runtime.store
     if action == 'child_resume':
         await loop.send('delegate')

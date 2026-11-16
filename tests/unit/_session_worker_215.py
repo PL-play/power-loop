@@ -46,7 +46,7 @@ async def main():
 
         async def build(descriptor, context):
             return ExecutionEnvironment(EchoModel(), None,
-                                        AgentLoopConfig(max_rounds=4, compactor=None))
+                                        AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9))
 
         factory.register("test.agent@215", build)
         runtime = Runtime(store=store, factory=factory, node_id="B", boot_id="B",

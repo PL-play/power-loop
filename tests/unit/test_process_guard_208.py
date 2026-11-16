@@ -88,7 +88,7 @@ async def test_lock_connection_loss_stops_admission(registry_store,active):
             pass
     factory=RegistryRuntimeFactory()
     async def build(descriptor,context):
-        return ExecutionEnvironment(Model(),None,AgentLoopConfig(compactor=None))
+        return ExecutionEnvironment(Model(),None,AgentLoopConfig(context_budget_tokens=10**9))
     factory.register('test.agent@215',build)
     runtime=Runtime(store=store,factory=factory,node_id='lost',timers_enabled=False)
     await runtime.worker.start()

@@ -69,7 +69,7 @@ async def test_single_call_emits_paired_started_completed_with_usage(runtime_age
     try:
         bus = AgentEventBus()
         seen = _collect(bus)
-        loop = await runtime_agent(model=_UsageLLM(), store=store, event_bus=bus, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+        loop = await runtime_agent(model=_UsageLLM(), store=store, event_bus=bus, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
         await loop.send("hi")
 
         started = seen[AgentEventType.LLM_CALL_STARTED]
@@ -96,7 +96,7 @@ async def test_stream_events_balanced_across_unknown_result_and_new_requests(run
         for et in counts:
             bus.subscribe(et, lambda e: counts.__setitem__(e.type, counts[e.type] + 1))
         loop = await runtime_agent(model=_UsageLLM(fail_first=2), store=store, event_bus=bus, config=AgentLoopConfig(
-                system_prompt="S", max_rounds=1, compactor=None,
+                system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
                 retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
             ))
         outcomes = [await loop.send("hi", message_id=f"new-request-{i}") for i in range(3)]
@@ -118,7 +118,7 @@ async def test_new_requests_after_unknown_result_are_individually_visible(runtim
         bus = AgentEventBus()
         seen = _collect(bus)
         loop = await runtime_agent(model=_UsageLLM(fail_first=2), store=store, event_bus=bus, config=AgentLoopConfig(
-                system_prompt="S", max_rounds=1, compactor=None,
+                system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
                 retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
             ))
         outcomes = [await loop.send("hi", message_id=f"new-request-{i}") for i in range(3)]
@@ -167,7 +167,7 @@ async def test_completed_event_carries_the_prompt_cache_split(runtime_agent) -> 
     try:
         bus = AgentEventBus()
         seen = _collect(bus)
-        loop = await runtime_agent(model=_CacheUsageLLM(), store=store, event_bus=bus, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+        loop = await runtime_agent(model=_CacheUsageLLM(), store=store, event_bus=bus, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
         await loop.send("hi")
 
         done = seen[AgentEventType.LLM_CALL_COMPLETED][-1]
@@ -187,7 +187,7 @@ async def test_cache_fields_are_none_when_the_provider_omits_them(runtime_agent)
     try:
         bus = AgentEventBus()
         seen = _collect(bus)
-        loop = await runtime_agent(model=_UsageLLM(), store=store, event_bus=bus, config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+        loop = await runtime_agent(model=_UsageLLM(), store=store, event_bus=bus, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
         await loop.send("hi")
         done = seen[AgentEventType.LLM_CALL_COMPLETED][-1]
         assert done.prompt_tokens == 11

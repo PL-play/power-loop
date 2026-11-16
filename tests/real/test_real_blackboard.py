@@ -36,7 +36,7 @@ async def test_real_agent_posts_to_shared_board() -> None:
                 system_prompt=("You coordinate with a teammate through a shared board. To record "
                                "anything, you MUST call the board tool with action='post' — that "
                                "is the only way to write to the board."),
-                max_rounds=4, max_tokens=512, temperature=0, compactor=None),
+                max_rounds=4, max_tokens=512, temperature=0, context_budget_tokens=10**9),
         )
         loop.descriptor = replace(loop.descriptor, config={**loop.descriptor.config, 'name': 'alice'})
         await loop.start()

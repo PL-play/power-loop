@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def test_sequence(registry_store):
     store, _ = registry_store
-    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
@@ -31,7 +31,7 @@ async def test_sequence(registry_store):
 @pytest.mark.parametrize("shape,expected", [("parallel", 2), ("foreach", 4), ("loop", 2), ("branch", 2)])
 async def test_graph_shapes_have_distinct_saved_nodes(registry_store, shape, expected):
     store, _ = registry_store
-    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     if shape == "parallel":
         root = {"type": "parallel", "branches": [leaf("A"), leaf("B")]}
     elif shape == "foreach":
@@ -113,7 +113,7 @@ async def test_model_submission_returns_receipt_and_delivers_to_parent(registry_
                 )
             return LLMResponse(raw_text="parent finished")
 
-    runner = await RunningAgent(store, Parent(), registry, AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Parent(), registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         result = await runner.send("run")
         assert result.status == "completed"
@@ -175,7 +175,7 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
             return LLMResponse(raw_text="B done")
 
     model = Delegating()
-    runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
     a = leaf("A")
     a["spec"].update(tools=["spawn_agent"], max_rounds=5)
     try:
@@ -215,7 +215,7 @@ async def test_failure_policy_uses_new_attempt_and_keeps_usage(registry_store, p
             return LLMResponse(raw_text=text)
 
     model = Failing()
-    runner = await RunningAgent(store, model, config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     node = leaf("A")
     node["output_schema"] = {
         "name": "answer",
@@ -259,7 +259,7 @@ async def test_loop_reuses_sessions_and_renders_dependency_output(registry_store
             assert any(f"revision-{calls[name]}" in str(m.get("content")) for m in request.messages)
             return LLMResponse(raw_text=json.dumps({"pass": calls[name] == 2}))
 
-    runner = await RunningAgent(store, Reviewing(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Reviewing(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     dev, review = leaf("dev"), leaf("review")
     dev["spec"]["system_prompt"] = "{{input}}"
     review["inputs_from"] = ["dev"]

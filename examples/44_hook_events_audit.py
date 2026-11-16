@@ -39,7 +39,7 @@ class NoteModel(LLMService):
 
 async def main() -> dict:
     store = await SessionStore.open(":memory:")
-    config = AgentLoopConfig(max_rounds=1, compactor=None, memory=NoteMemory(store), record_hook_events='full')
+    config = AgentLoopConfig(max_rounds=1, context_budget_tokens=10**9, memory=NoteMemory(store), record_hook_events='full')
     async with demo_runtime(NoteModel(), store=store, config=config) as (runtime, loop, target, actor):
         sid = target.session_id
         await store.add_note(sid, "The user's project codename is 'Bluefin'.")

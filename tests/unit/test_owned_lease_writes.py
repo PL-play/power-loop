@@ -10,18 +10,20 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionLeaseLost
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator, hold_session_ownership
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 def owner(store):
     return SimpleNamespace(store=store, task_runtime=None, _owner_id="test-owner",
-        config=AgentLoopConfig(compactor=None), session_coordinator=MemorySessionOwnershipCoordinator(),
+        config=AgentLoopConfig(context_budget_tokens=10**9), session_coordinator=MemorySessionOwnershipCoordinator(),
         _cache_invalidate=lambda sid: None)
 
 
 async def test_detached_child_cannot_append_after_its_lease_scope_finishes(registry_store):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     loop = owner(store)
     release = asyncio.Event()
 
@@ -44,7 +46,7 @@ async def test_detached_child_cannot_append_after_its_lease_scope_finishes(regis
 
 async def test_old_child_cannot_reuse_the_same_loops_next_lease_or_consume_its_round(registry_store):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     loop = owner(store)
     release = asyncio.Event()
 
@@ -72,7 +74,7 @@ async def test_old_child_cannot_reuse_the_same_loops_next_lease_or_consume_its_r
 
 async def test_writer_waiting_for_a_transaction_cannot_restore_an_expired_turns_round(registry_store, monkeypatch):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     loop = owner(store)
     entered, release = asyncio.Event(), asyncio.Event()
     transaction = store._db.transaction
@@ -119,7 +121,7 @@ async def test_writer_waiting_for_a_transaction_cannot_restore_an_expired_turns_
 @pytest.mark.parametrize("operation", ["append", "pending", "round"])
 async def test_owner_epoch_rejects_a_writer_after_replacement_committed(registry_store, monkeypatch, operation):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     other = await connect(schema="verify")
     loop = owner(store)
     transaction = store._db.transaction

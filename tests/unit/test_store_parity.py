@@ -15,6 +15,8 @@ import pytest
 
 from power_loop.runtime.store.store import SessionStore as AsyncStore
 from power_loop.runtime.store.types import SubagentLifecycle as Lc
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -66,7 +68,7 @@ async def run_parity(
 
 
 async def scn_messages(st: Any) -> list[Any]:
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     out = [await st.append_message("s", role="user", content=f"m{i}", round_index=i)
            for i in range(5)]
     out.append(await st.record_compaction(
@@ -76,7 +78,7 @@ async def scn_messages(st: Any) -> list[Any]:
 
 
 async def scn_timers(st: Any) -> list[Any]:
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     out: list[Any] = []
     out.append((await st.create_timer("s", due_at=1000, note="a")).timer_id)
     out.append((await st.create_timer("s", due_at=2000, note="b", interval_s=60)).timer_id)
@@ -92,7 +94,7 @@ async def scn_timers(st: Any) -> list[Any]:
 
 
 async def scn_notes(st: Any) -> list[Any]:
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     out: list[Any] = []
     out.append((await st.add_note("s", "first")).note_id)
     out.append((await st.add_note("s", "second", pinned=True)).note_id)
@@ -105,7 +107,7 @@ async def scn_notes(st: Any) -> list[Any]:
 
 
 async def scn_usage_stats(st: Any) -> list[Any]:
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     await st.record_usage("s", round_index=0, prompt_tokens=10, completion_tokens=5,
                           total_tokens=15, model="m")
     await st.record_usage("s", round_index=0, prompt_tokens=11, completion_tokens=6,
@@ -126,7 +128,7 @@ async def scn_usage_stats(st: Any) -> list[Any]:
 
 
 async def scn_runtime_shared(st: Any) -> list[Any]:
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     out: list[Any] = []
     await st.set_runtime_state("s", "k", {"a": 1})
     out.append(await st.get_runtime_state("s", "k"))
@@ -140,7 +142,7 @@ async def scn_runtime_shared(st: Any) -> list[Any]:
 
 
 async def scn_bgtasks(st: Any) -> list[Any]:
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     out: list[Any] = []
     await st.upsert_background_task("s", task_id="t1", command="cmd", status="running")
     out.append([t.task_id for t in await st.list_unseen_background_updates("s")])
@@ -155,7 +157,7 @@ async def scn_bgtasks(st: Any) -> list[Any]:
 
 
 async def scn_cascade(st: Any) -> list[Any]:
-    await st.create_session(session_id="p")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
     await st.create_session(session_id="linked", parent_session_id="p", lifecycle=Lc.LINKED)
     await st.create_session(session_id="eph", parent_session_id="p", lifecycle=Lc.EPHEMERAL)
     await st.create_session(session_id="det", parent_session_id="p", lifecycle=Lc.DETACHED)
@@ -166,7 +168,7 @@ async def scn_cascade(st: Any) -> list[Any]:
 
 
 async def scn_export_import(st: Any) -> list[Any]:
-    await st.create_session(session_id="src")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="src")
     for i in range(3):
         await st.append_message("src", role="user", content=f"m{i}")
     await st.add_note("src", "note")
@@ -183,7 +185,7 @@ async def scn_prune(st: Any) -> list[Any]:
     that MySQL rejects (err 1235/1093) unless the subquery is materialized in a derived
     table — a backend-divergent SQL path that the other scenarios never touch, so it must
     run on EVERY backend (this is what makes the PG/MySQL conformance suites catch it)."""
-    await st.create_session(session_id="s")
+    await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
     out: list[Any] = []
     # usage rounds: keep the 2 most recent of 5 → 3 deleted
     for i in range(5):
@@ -221,7 +223,7 @@ async def exercise_large_payload(store: Any) -> None:
     big = "A" * 100_000          # 100 KiB — comfortably past MySQL's 64 KiB TEXT cap
     big_prompt = "P" * 100_000
     big_args = '{"text":"' + ("x" * 100_000) + '"}'
-    await store.create_session(session_id="big", system_prompt=big_prompt)
+    await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": big_prompt}), actor=STORE_ACTOR, session_id="big")
     await store.append_message(
         "big", role="assistant", content=big,
         tool_calls=[{"id": "c1", "function": {"name": "echo", "arguments": big_args}}],

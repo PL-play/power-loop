@@ -75,11 +75,11 @@ async def runtime_agent(tmp_path):
     agents = []
     stores = []
 
-    async def create(*, model, store=None, registry=None, config=None, hooks=None, target=None, event_bus=None, command=None, allowed_models=None, capacity=1, runtime_env=None, process_control=None):
+    async def create(*, model, store=None, registry=None, config=None, hooks=None, target=None, event_bus=None, command=None, allowed_models=None, capacity=1, runtime_env=None, process_control=None, options=None):
         if store is None:
             store = await SessionStore.open(str(tmp_path / f"runtime-{len(agents)}.db"))
             stores.append(store)
-        agent = await RunningAgent(store, model, registry, config, hooks=hooks, event_bus=event_bus, command=command, allowed_models=allowed_models, capacity=capacity, runtime_env=runtime_env, process_control=process_control).start(target=target)
+        agent = await RunningAgent(store, model, registry, config, hooks=hooks, event_bus=event_bus, command=command, allowed_models=allowed_models, capacity=capacity, runtime_env=runtime_env, process_control=process_control, options=options).start(target=target)
         agents.append(agent)
         return agent
 

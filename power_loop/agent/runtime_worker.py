@@ -283,73 +283,60 @@ class RuntimeWorker:
         external_ownership = None
         batch = None
         try:
-            session_row = await store._db.fetchone(
-                f"SELECT * FROM {store.t.sessions} WHERE session_id=?", (sid,))
-            if session_row is None or session_row["lifecycle"] != "open":
-                return
-            descriptor = RuntimeDescriptor(**json.loads(session_row["descriptor_json"]))
-            state = await store._db.fetchone(
-                f"SELECT * FROM {store.t.session_state} WHERE session_id=?", (sid,))
-            if state is None:
-                return
-
-            # Capability predicates and descriptor declarations are cheap checks only:
-            # execution resources and their claimed identity are built after ownership.
-            if descriptor.kind not in {"agent", "background", "workflow_driver"}:
-                self.capability_missing.add(descriptor.definition_ref)
-                return
-            if descriptor.kind == "workflow_driver":
-                self._drivers.add(sid)
-            try:
-                capable = self._can_build(descriptor)
-            except Exception as exc:
-                code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
-                self.last_error = {"code": code, "message": str(exc)[:500],
-                                   "definition_ref": descriptor.definition_ref}
-                self.capability_missing.add(descriptor.definition_ref)
-                return
-            if not capable:
-                self.last_error = {"code": "capability_unavailable",
-                                   "message": "factory rejected descriptor",
-                                   "definition_ref": descriptor.definition_ref}
-                self.capability_missing.add(descriptor.definition_ref)
-                return
-
-            actor = TrustedActor(session_row["tenant_id"], session_row["principal_id"], sid)
-            exec_state = state["execution_state"]
-            database_now = await self.inputs._db_now(store._db)
-            expired = (state["owner_lease_until_ms"] is not None
-                       and int(state["owner_lease_until_ms"]) <= database_now)
-            if exec_state == "recovering" or (exec_state == "running" and expired):
-                if getattr(r.coordinator, "installs_session_fence", False):
-                    recovered = await r.coordinator.recover(
-                        self.inputs, target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
-                else:
-                    recovered = await self.inputs.recover(
-                        target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
-                if recovered is None:
-                    return
-                await self._notify_results(recovered)
-                state = await store._db.fetchone(
-                    f"SELECT * FROM {store.t.session_state} WHERE session_id=?", (sid,))
-                exec_state = state["execution_state"]
-            if exec_state != "queued":
-                return
-
             if getattr(r.coordinator, "installs_session_fence", False):
+                # The claim transaction is the whole entry: under the state lock it reads
+                # the descriptor/identity and the real pending batch, checks capability
+                # before writing the owner, and returns the merged user row it wrote.
                 batch = await r.coordinator.claim(
-                    self.inputs, target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s)
+                    self.inputs, target, node_id=r.node_id, boot_id=r.boot_id,
+                    ttl_s=r.session_lease_ttl_s, can_execute=self._capable)
+                if batch is None:
+                    if not await self._recover_stale(target):
+                        return
+                    batch = await r.coordinator.claim(
+                        self.inputs, target, node_id=r.node_id, boot_id=r.boot_id,
+                        ttl_s=r.session_lease_ttl_s, can_execute=self._capable)
+                    if batch is None:
+                        return
             else:
+                # A foreign coordinator's acquire decision needs the session facts before
+                # claim. Keep this single merged entry read on that topology only; the
+                # database-fence topology gets the same facts inside claim.
+                entry = await self.inputs.session_entry(target)
+                if entry is None or entry["lifecycle"] != "open":
+                    return
+                descriptor = RuntimeDescriptor(**json.loads(entry["descriptor_json"]))
+                if descriptor.kind == "workflow_driver":
+                    self._drivers.add(sid)
+                if not self._capable(descriptor):
+                    return
+                if self._needs_recovery(entry):
+                    recovered = await self.inputs.recover(
+                        target, node_id=r.node_id, boot_id=r.boot_id,
+                        ttl_s=r.session_lease_ttl_s)
+                    if recovered is None:
+                        return
+                    await self._notify_results(recovered)
+                    if recovered.execution_state != "queued":
+                        return
+                elif entry["execution_state"] != "queued":
+                    return
                 external_ownership = await r.coordinator.acquire(
                     (store.store_id, sid), owner_id=r.node_id + "/" + r.boot_id,
                     ttl_s=r.session_lease_ttl_s, on_lost=lambda: None)
                 if external_ownership is None:
                     return
                 batch = await self.inputs.claim(
-                    target, node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
-                    _owner_token=external_ownership.token)
-            if batch is None:
-                return
+                    target, node_id=r.node_id, boot_id=r.boot_id,
+                    ttl_s=r.session_lease_ttl_s,
+                    _owner_token=external_ownership.token, can_execute=self._capable)
+                if batch is None:
+                    return
+
+            descriptor = batch.descriptor
+            if descriptor.kind == "workflow_driver":
+                self._drivers.add(sid)
+            actor = TrustedActor(batch.tenant_id, batch.principal_id, sid)
 
             # The claim installed the fence; build the local handle from it. Per-ownership
             # process caches are cleared so no seq/index survives a change of owner.
@@ -369,7 +356,7 @@ class RuntimeWorker:
                 getattr(store, cache, {}).pop(sid, None)
 
             ctx = _SessionExecution(
-                r, sid, descriptor, batch, actor, session_row["parent_session_id"]
+                r, sid, descriptor, batch, actor, batch.parent_session_id
             )
             ctx.task = asyncio.current_task()
             ctx.ownership = ownership
@@ -476,6 +463,7 @@ class RuntimeWorker:
                     batch, consumed=consumed, status=status, final_text=result.final_text,
                     usage=dict(result.usage or {}), structured_output=structured,
                     error=error, error_code=error_code, result_seq=result.result_seq,
+                    assistant_meta=result.result_meta,
                 )
                 await self._notify_results(final_batch)
                 if final_batch.execution_state == "queued":
@@ -487,6 +475,12 @@ class RuntimeWorker:
         except CancellationRequested:
             if batch is not None:
                 await self._final_cancelled(batch, ctx)
+        except RuntimeRequestError as exc:
+            # Domain refusal before any model/tool call (e.g. projection_unavailable) keeps its
+            # code and diagnostic detail instead of becoming a generic internal_error.
+            log.warning("session send stopped for %s: %s", sid, exc)
+            if batch is not None:
+                await self._final_failed(batch, exc.code, str(exc))
         except Exception:
             log.exception("session send failed for %s", sid)
             if batch is not None:
@@ -518,6 +512,63 @@ class RuntimeWorker:
             # input arrived during teardown (the other side of the idle handoff).
             if batch is not None and await self._has_pending(sid):
                 self._activate(sid)
+
+    def _capable(self, descriptor):
+        """Cheap, synchronous capability decision used before any owner is written.
+
+        The claim passes this as ``can_execute``; it must not build resources, call the
+        model/tools or await external work. A descriptor this node cannot execute leaves
+        the input pending for a capable node instead of acquiring and then failing it.
+        """
+        if descriptor.kind not in {"agent", "background", "workflow_driver"}:
+            self.capability_missing.add(descriptor.definition_ref)
+            return False
+        try:
+            capable = self._can_build(descriptor)
+        except Exception as exc:
+            code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
+            self.last_error = {"code": code, "message": str(exc)[:500],
+                               "definition_ref": descriptor.definition_ref}
+            self.capability_missing.add(descriptor.definition_ref)
+            return False
+        if not capable:
+            self.last_error = {"code": "capability_unavailable",
+                               "message": "factory rejected descriptor",
+                               "definition_ref": descriptor.definition_ref}
+            self.capability_missing.add(descriptor.definition_ref)
+        return capable
+
+    @staticmethod
+    def _needs_recovery(entry):
+        """True for a recovering row or a running row whose committed lease expired."""
+        state = entry["execution_state"]
+        expired = (entry["owner_lease_until_ms"] is not None
+                   and int(entry["owner_lease_until_ms"]) <= int(entry["db_now"]))
+        return state == "recovering" or (state == "running" and expired)
+
+    async def _recover_stale(self, target):
+        """Terminate an interrupted run before a fresh claim.
+
+        Runs only after the queued claim attempt returned None, so the healthy queued
+        path never pays for this read. Capability is checked before recovery, and
+        ``recover`` re-reads expiry under the state lock.
+        """
+        entry = await self.inputs.session_entry(target)
+        if entry is None or entry["lifecycle"] != "open":
+            return False
+        descriptor = RuntimeDescriptor(**json.loads(entry["descriptor_json"]))
+        if descriptor.kind == "workflow_driver":
+            self._drivers.add(target.session_id)
+        if not self._capable(descriptor) or not self._needs_recovery(entry):
+            return False
+        r = self.runtime
+        recovered = await r.coordinator.recover(
+            self.inputs, target, node_id=r.node_id, boot_id=r.boot_id,
+            ttl_s=r.session_lease_ttl_s)
+        if recovered is None:
+            return False
+        await self._notify_results(recovered)
+        return recovered.execution_state == "queued"
 
     def _can_build(self, descriptor):
         factory = self.runtime.factory
@@ -583,6 +634,10 @@ class RuntimeWorker:
                 raise SessionLeaseLost(target.session_id)
             if row["cancel_send_index"] == batch.send_index:
                 ctx.stop.cancel(row["cancel_reason"] or "cancelled")
+            from power_loop.runtime.store.change_signals import COLUMNS, reader
+            changes = reader(self.runtime.store, target.session_id)
+            if changes is not None:
+                changes.versions = tuple(row[column] for column in COLUMNS)
             if final:
                 # Final boundary only checks; final() turns remaining pending into queued.
                 return []
@@ -595,9 +650,9 @@ class RuntimeWorker:
             refs, seq, merged, version = claimed
             last_version[0] = version
             consumed.extend(refs)
-            from .follow_up import render_batch_text
+            from .follow_up import render_batch_content
             return [{
-                "role": "user", "content": render_batch_text(merged),
+                "role": "user", "content": render_batch_content(merged),
                 "_persisted_seq": seq,
                 "meta": {"input_refs": [plain(ref) for ref in refs]},
             }]
@@ -651,8 +706,9 @@ class RuntimeWorker:
 
     async def _has_pending(self, sid):
         row = await self.runtime.store._db.fetchone(
-            f"SELECT COUNT(*) AS n FROM {self.inputs.q} WHERE session_id=? AND status='pending'", (sid,))
-        return bool(int(row["n"]))
+            f"SELECT 1 AS present FROM {self.inputs.q} "
+            "WHERE session_id=? AND status='pending' LIMIT 1", (sid,))
+        return row is not None
 
     async def _pump_output(self, ctx):
         while True:

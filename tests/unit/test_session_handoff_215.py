@@ -50,7 +50,10 @@ async def test_claim_ack_loss_reuses_committed_batch_without_second_message(
     batch = await port.claim(root, node_id="a", boot_id="a")
     assert batch.send_index == 1
     monkeypatch.undo()
-    assert len((await port.messages(root, actor=ACTOR)).items) == 1
+    messages = (await port.messages(root, actor=ACTOR)).items
+    assert len(messages) == 1
+    assert (messages[0].seq, messages[0].role) == (batch.user_row.seq, "user")
+    assert messages[0].content == batch.user_row.content
     await port.final(batch, final_text="done")
     assert (await port.get_result(batch.input_refs[0], actor=ACTOR)).status == "completed"
 

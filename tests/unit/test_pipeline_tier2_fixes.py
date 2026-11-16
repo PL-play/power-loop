@@ -28,7 +28,6 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.state import ContextManager
 from power_loop.runtime.budget import estimate_tokens
-from power_loop.runtime.compact import CompactionPlan
 from power_loop.runtime.pricing import Free
 
 pytestmark = pytest.mark.unit
@@ -140,7 +139,7 @@ async def test_prepare_round_invalidates_estimate_after_microcompact(tmp_path) -
     ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)
     ctx.cache_dir = tmp_path
     p = _pipeline(
-        config=AgentLoopConfig(compactor=None, microcompact_enabled=True, microcompact_hot_tail=0,
+        config=AgentLoopConfig(context_budget_tokens=10**9, microcompact_enabled=True, microcompact_hot_tail=0,
                                microcompact_size_limit=100),
         tool_registry=ToolRegistry(), ctx=ctx,
     )
@@ -173,7 +172,7 @@ async def test_microcompact_off_by_default_does_not_spill(tmp_path) -> None:
     config.microcompact_enabled is False."""
     ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)
     ctx.cache_dir = tmp_path
-    p = _pipeline(config=AgentLoopConfig(compactor=None), tool_registry=ToolRegistry(), ctx=ctx)
+    p = _pipeline(config=AgentLoopConfig(context_budget_tokens=10**9), tool_registry=ToolRegistry(), ctx=ctx)
     await _seed_big_tool_output(p)
     primed = p._estimate_history_tokens()
     assert p._tok_len == len(p.history)  # sanity: in sync after priming
@@ -199,7 +198,7 @@ async def test_microcompact_uses_config_knobs_not_ctx_fields(tmp_path) -> None:
     ctx = ContextManager(micro_hot_tail=10, micro_size_limit=99999)
     ctx.cache_dir = tmp_path
     cfg = AgentLoopConfig(
-        compactor=None, microcompact_enabled=True,
+        context_budget_tokens=10**9, microcompact_enabled=True,
         microcompact_hot_tail=0, microcompact_size_limit=100,  # config WOULD spill
     )
     p = _pipeline(config=cfg, tool_registry=ToolRegistry(), ctx=ctx)
@@ -219,7 +218,7 @@ async def test_microcompact_spill_dir_config_overrides_cache_dir(tmp_path) -> No
     spill = tmp_path / "spill_here"
     ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)  # cache_dir left None
     cfg = AgentLoopConfig(
-        compactor=None, microcompact_enabled=True,
+        context_budget_tokens=10**9, microcompact_enabled=True,
         microcompact_hot_tail=0, microcompact_size_limit=100,
         microcompact_spill_dir=str(spill),
     )
@@ -231,38 +230,3 @@ async def test_microcompact_spill_dir_config_overrides_cache_dir(tmp_path) -> No
     assert spill.exists() and any(spill.iterdir())  # spilled to the configured dir
     tool_msg = next(m for m in p.history if m.get("role") == "tool")
     assert str(spill) in tool_msg["content"]
-
-
-# ── C22: a single-message fold invalidates the estimate ──────────────────────
-
-
-@dataclass
-class _SingleMsgFoldCompactor:
-    """Folds exactly one message into one note → history length is unchanged, so the
-    incremental estimate would stay stale without invalidation."""
-
-    fired: bool = False
-
-    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
-        if self.fired or len(messages) < 3:
-            return None
-        self.fired = True
-        return CompactionPlan(fold_start_idx=1, fold_end_idx=1, summary_text="s",
-                              before_tokens=0, after_tokens=1)
-
-
-async def test_prepare_round_invalidates_estimate_after_single_message_fold() -> None:
-    p = _pipeline(
-        llm=_Scripted(),
-        config=AgentLoopConfig(max_tokens=4000, compactor=_SingleMsgFoldCompactor()),
-        tool_registry=ToolRegistry(),
-    )
-    for _ in range(4):
-        await p._append_message({"role": "user", "content": "word " * 80})
-    primed = p._estimate_history_tokens()  # cached over 4 fat messages
-
-    await p.prepare_round(1)  # folds index 1 (one msg) → one tiny note; length unchanged
-
-    recomputed = estimate_tokens(p.history)
-    assert p._estimate_history_tokens() == recomputed  # was the stale pre-fold value
-    assert recomputed < primed

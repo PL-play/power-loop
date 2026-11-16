@@ -70,16 +70,16 @@ def _echo_registry() -> ToolRegistry:
 async def _run_rounds(runtime_agent, *, configured, override=None, append=False):
     from power_loop.agent.runtime_store import now_ms
     model = _AlwaysTool()
-    agent = await runtime_agent(model=model, registry=_echo_registry(),
-        config=AgentLoopConfig(system_prompt="t", max_rounds=configured))
     options = RequestOptions(max_rounds=override) if override is not None else None
+    agent = await runtime_agent(model=model, registry=_echo_registry(),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=configured), options=options)
     if append:
         receipt = await agent.runtime.client.send(agent.target, "finalize", message_id="append",
             actor=agent.actor)
         await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+10000)
         await agent.drain()
     else:
-        await agent.send("hi", options=options)
+        await agent.send("hi")
     return model.calls
 
 

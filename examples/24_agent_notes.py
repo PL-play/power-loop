@@ -34,7 +34,7 @@ class NotesModel(LLMService):
 async def main():
     store = await SessionStore.open(':memory:')
     policy = NotesPolicy(max_notes=20)
-    config = AgentLoopConfig(compactor=None, memory=NoteMemory(store, policy=policy), notes_policy=policy)
+    config = AgentLoopConfig(context_budget_tokens=10**9, memory=NoteMemory(store, policy=policy), notes_policy=policy)
     async with demo_runtime(NotesModel(), create_default_tool_registry(include=['note']), store=store, config=config) as (runtime, loop, target, actor):
         for index, text in enumerate(['Record my project', 'Recall my project']):
             result = await loop.send(target, text, message_id=f'note-{index}', actor=actor, deadline_ms=int(time.time()*1000)+10000)

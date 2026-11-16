@@ -33,7 +33,7 @@ async def demo_runtime(model, registry=None, *, config=None, command=None, store
     store = store or await SessionStore.open(':memory:', schema='tasks')
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
-        return ExecutionEnvironment(BorrowedModel(model), registry, config or AgentLoopConfig(compactor=None),
+        return ExecutionEnvironment(BorrowedModel(model), registry, config or AgentLoopConfig(context_budget_tokens=10**9),
             command=command if 'child_spec' not in descriptor.config else None, runtime_env=runtime_env, hooks=hooks, event_bus=event_bus)
     factory.register('example@215', build, profiles=('example.tools@215',))
     runtime = Runtime(store=store, factory=factory, node_id='example', capacity=capacity,

@@ -29,7 +29,7 @@ async def test_sessions_and_children_release_execution_memory(runtime_agent, rec
             loops.append(weakref.ref(get_current_loop()))
             return await super().complete(request, **kwargs)
     agent = await runtime_agent(model=Model(), registry=registry, command=('delegate', {}),
-                                config=AgentLoopConfig(compactor=None))
+                                config=AgentLoopConfig(context_budget_tokens=10**9))
     live_counts = []
     for batch in range(3):
         for i in range(40):

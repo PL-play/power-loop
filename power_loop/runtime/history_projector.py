@@ -5,12 +5,10 @@ compact, re-renderable projection (stored in ``pl_project_messages``), and rende
 projections back into plain-text :data:`LoopMessage`\\ s for the LLM. ``pl_messages`` is never
 modified; the projection is derived and rebuildable.
 
-The library DEFAULT is **no projector** (``AgentLoopConfig.history_projector = None`` →
-verbatim history + the in-place compactor, i.e. today's behavior). Set a projector to opt in.
-Two ship here:
+This module retains the original standalone ``DefaultDeterministicProjector`` helper. It is a
+custom ``Representation`` implementation (pass it as ``AgentLoopConfig.representation``); it is
+not the library default, which is :class:`power_loop.runtime.representation.ProjectedRepresentation`.
 
-* :class:`IdentityProjector` — stores each send's rows verbatim and renders them back
-  unchanged (history == today). For testing the seam; keeps full tool structure.
 * :class:`DefaultDeterministicProjector` — a generic, no-LLM structured summary: each tool
   call is summarized via its optional ``ToolDefinition.project`` hook (else a truncating
   fallback), rendered to terse plain text (NO OpenAI ``tool_calls`` protocol shape — so a
@@ -41,7 +39,6 @@ _NO_RESULT = object()
 
 __all__ = [
     "HistoryProjector",
-    "IdentityProjector",
     "DefaultDeterministicProjector",
     "ProjectedRow",
     "ProjectedSend",
@@ -133,24 +130,6 @@ def _parse_args(raw: Any) -> Any:
     return raw
 
 
-def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
-    """Verbatim MessageRow → LoopMessage (mirrors stateful_loop._row_to_loop_message; kept
-    local to avoid an agent→runtime import cycle)."""
-    msg: LoopMessage = {"role": row.role}
-    if row.role == "assistant" and (row.meta or {}).get("reasoning_content"):
-        msg["reasoning_content"] = row.meta["reasoning_content"]
-        msg["_reasoning_model"] = row.meta["reasoning_model"]
-    if row.content is not None:
-        msg["content"] = row.content
-    if row.tool_calls:
-        msg["tool_calls"] = list(row.tool_calls)
-    if row.tool_call_id:
-        msg["tool_call_id"] = row.tool_call_id
-    if row.name:
-        msg["name"] = row.name
-    return msg
-
-
 def _validate_projector_params(
     *, version: int, keep_last_sends: int, trigger_ratio: float
 ) -> None:
@@ -167,55 +146,6 @@ def _validate_projector_params(
         raise ValueError(f"projector keep_last_sends must be >= 0; got {keep_last_sends!r}")
     if not (trigger_ratio > 0 and trigger_ratio <= 1):
         raise ValueError(f"projector trigger_ratio must be in (0, 1]; got {trigger_ratio!r}")
-
-
-# ── Identity (verbatim; for testing the seam) ──────────────────────────────────
-
-
-@dataclass
-class IdentityProjector:
-    """Stores each send's rows verbatim and renders them back unchanged, so a session run
-    with this projector sees byte-identical history to the no-projector default. Useful to
-    prove the projection seam itself introduces no behavior change."""
-
-    kind: str = "verbatim"  # routes to the safe in-place (verbatim) path, never the projection fold
-    version: int = 1
-    keep_last_sends: int = 0  # verbatim mode never folds
-    trigger_ratio: float = 0.75  # unused (keep_last_sends==0 short-circuits folding); for Protocol parity
-
-    def __post_init__(self) -> None:
-        _validate_projector_params(
-            version=self.version,
-            keep_last_sends=self.keep_last_sends,
-            trigger_ratio=self.trigger_ratio,
-        )
-
-    def project_send(
-        self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
-    ) -> ProjectedSend:
-        seqs = [r.seq for r in send_rows]
-        return ProjectedSend(
-            rows=[ProjectedRow("project", {"messages": [_row_to_loop_dict(r) for r in send_rows]})],
-            source_seq_lo=min(seqs) if seqs else None,
-            source_seq_hi=max(seqs) if seqs else None,
-        )
-
-    def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
-        out: list[LoopMessage] = []
-        for r in rows:
-            # Defensive: even though this projector never folds, a compact row could reach render
-            # via a mode switch / legacy mapping — render its summary instead of silently dropping it
-            # (the 3.0 invariant: every representation's render MUST handle kind=='compact').
-            if getattr(r, "kind", None) == "compact":
-                summary = (r.content or {}).get("summary")
-                if summary:
-                    out.append({"role": "user", "content": str(summary)})
-                continue
-            out.extend((r.content or {}).get("messages") or [])
-        return out
-
-    def compact(self, rows: list[ProjectMessageRow]) -> ProjectedCompact | None:
-        return None  # verbatim mode never folds
 
 
 # ── Default deterministic (generic structured summary; no LLM) ──────────────────

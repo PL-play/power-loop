@@ -163,10 +163,21 @@ async def test_accept_result_uses_frozen_route_and_deduplicates(registry_store):
     parent, child, start = await _routed_child(port, "trusted-address")
     await port.accept(child, "run", message_id="start", actor=ACTOR)
     batch = await port.claim(child, node_id="A", boot_id="A")
+    assert batch.result_route == {
+        "target": {"store_id": parent.store_id, "session_id": parent.session_id},
+        "input_ref": {
+            "store_id": start.store_id, "session_id": start.session_id,
+            "message_id": start.message_id,
+        },
+        "result_kind": "agent_result",
+    }
     result = Result(start, child, "completed", batch.send_index, 2, "done", {"total_tokens": 1})
     first = await port.accept_result(child, result, result_kind="agent_result")
     second = await port.accept_result(child, result, result_kind="agent_result")
     assert first[0] == second[0] and first[1] is None and second[1] is None
+    changed = Result(start, child, "completed", batch.send_index, 2, "different")
+    conflict = await port.accept_result(child, changed, result_kind="agent_result")
+    assert conflict[0] == first[0] and conflict[1] == "request_conflict"
     rows = await store._db.fetchall(
         f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=?",
         (parent.session_id,),

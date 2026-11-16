@@ -13,7 +13,7 @@ pytestmark=[pytest.mark.real_llm,pytest.mark.asyncio]
 
 async def test_real_worker_drain_rejects_another_request_without_spending(runtime_agent,record_property):
     provider=BoundedProvider(limit=3)
-    agent=await runtime_agent(model=provider,config=AgentLoopConfig(compactor=None,max_rounds=2,max_tokens=2048))
+    agent=await runtime_agent(model=provider,config=AgentLoopConfig(context_budget_tokens=10**9,max_rounds=2,max_tokens=2048))
     try:
         result=await agent.send('Reply exactly 42 as plain assistant text without tools.')
         assert result.status=='completed' and result.final_text.strip()=='42' and provider.calls==1
@@ -37,7 +37,7 @@ async def test_real_inflight_shutdown_stops_owned_request_without_replay(runtime
         entered.set()
         return await task
     monkeypatch.setattr(provider,'complete',started)
-    agent=await runtime_agent(model=provider,config=AgentLoopConfig(compactor=None,max_rounds=2,max_tokens=2048))
+    agent=await runtime_agent(model=provider,config=AgentLoopConfig(context_budget_tokens=10**9,max_rounds=2,max_tokens=2048))
     try:
         receipt=await agent.runtime.client.send(agent.target,'Write a detailed arithmetic explanation.',message_id='original',actor=agent.actor)
         await asyncio.wait_for(entered.wait(),30)

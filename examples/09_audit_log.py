@@ -90,7 +90,7 @@ async def main():
     registry.register(ECHO_TOOL, echo_handler)
     try:
         async with demo_runtime(EchoModel(), registry, event_bus=bus,
-                config=AgentLoopConfig(max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+                config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
             result = await loop.send(target, 'echo demo', message_id='audit', actor=actor,
                                      deadline_ms=int(time.time()*1000)+10000)
             assert result.status == 'completed'

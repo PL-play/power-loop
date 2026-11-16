@@ -7,6 +7,8 @@ import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage
 from power_loop.agent.sink import SQLiteSink
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 from .test_send_sql_profile import Profiled
 
@@ -20,7 +22,7 @@ async def usage_rows(store, sid):
 @pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
 async def test_failed_or_unknown_message_commit_has_the_same_usage_outcome(registry_store, monkeypatch, fault):
     store, connect = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     sink = SQLiteSink(store, sid)
     sink.send_index = 1
     transaction = store._db.transaction
@@ -44,7 +46,7 @@ async def test_failed_or_unknown_message_commit_has_the_same_usage_outcome(regis
 
 async def test_round_end_is_idempotent_after_usage_commits_with_message(registry_store):
     store, _ = registry_store
-    sid = await store.create_session()
+    sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     sink = SQLiteSink(store, sid)
     sink.send_index = 1
     usage = {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12}
@@ -80,7 +82,7 @@ async def test_empty_response_rounds_keep_usage_and_private_accounting_never_rea
             pass
 
     model = Model()
-    loop = await runtime_agent(model=model, store=store, config=AgentLoopConfig(max_rounds=3, compactor=None))
+    loop = await runtime_agent(model=model, store=store, config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9))
     try:
         sid = loop.target.session_id
         assert (await loop.send("respond")).status == "completed"

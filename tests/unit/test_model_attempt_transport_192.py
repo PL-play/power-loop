@@ -53,7 +53,7 @@ async def test_unknown_provider_result_is_not_retried_by_any_transport_layer(run
     service._client = openai.AsyncOpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="local-test-only", timeout=5,
         max_retries=1, http_client=openai.DefaultAsyncHttpxClient(trust_env=False))
     agent = await runtime_agent(model=service,
-        config=AgentLoopConfig(max_rounds=2, max_tokens=100, compactor=None,
+        config=AgentLoopConfig(max_rounds=2, max_tokens=100, context_budget_tokens=10**9,
             retry_policy=LLMRetryPolicy(max_attempts=1, backoff_initial=0)))
     try:
         async with asyncio.timeout(30):

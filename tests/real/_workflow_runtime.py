@@ -5,7 +5,7 @@ from power_loop.agent.runtime_store import now_ms
 
 async def run_workflow(runtime_agent, spec):
     agent = await runtime_agent(model=create_llm_service_from_env(),
-        config=AgentLoopConfig(system_prompt='orchestrator', max_rounds=4, compactor=None))
+        config=AgentLoopConfig(system_prompt='orchestrator', max_rounds=4, context_budget_tokens=10**9))
     handle = await agent.runtime.client.workflow(agent.target, spec, message_id='workflow', actor=agent.actor)
     result = await handle.wait(deadline_ms=now_ms()+300000)
     await agent.drain()

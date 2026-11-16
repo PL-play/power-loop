@@ -16,11 +16,7 @@ from power_loop.runtime.fold import (
     LLMSummaryFold,
     NoteOp,
 )
-from power_loop.runtime.representation import (
-    ProjectedRepresentation,
-    ProjectionRenderConfig,
-    VerbatimRepresentation,
-)
+from power_loop.runtime.representation import ProjectedRepresentation, ProjectionRenderConfig
 from power_loop.runtime.store.types import MessageRow, MessageState, ProjectMessageRow
 
 # ── fixtures ──────────────────────────────────────────────────────────────
@@ -55,35 +51,6 @@ class _ScriptLLM:
     async def complete(self, request: LLMRequest) -> LLMResponse:
         self.calls.append(request)
         return self.responses.pop(0)
-
-
-# ── VerbatimRepresentation ─────────────────────────────────────────────────
-
-
-def test_verbatim_roundtrip_byte_identical():
-    rep = VerbatimRepresentation()
-    assert (rep.kind, rep.version) == ("verbatim", 1)
-    send = [
-        _mr(1, "user", content="hi"),
-        _mr(2, "assistant", content="hello", tool_calls=[_tc("a", "grep", "{}")]),
-        _mr(3, "tool", content="result", tool_call_id="a"),
-    ]
-    projected = rep.project_send(send, send_index=1, tool_registry=None)
-    assert projected.source_seq_lo == 1 and projected.source_seq_hi == 3
-    # one project row carrying the verbatim message list
-    rows = [_pmr(1, projected.rows[0].kind, projected.rows[0].content)]
-    rendered = rep.render(rows)
-    assert rendered == [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello", "tool_calls": [_tc("a", "grep", "{}")]},
-        {"role": "tool", "content": "result", "tool_call_id": "a"},
-    ]
-
-
-def test_verbatim_renders_compact_row():
-    rep = VerbatimRepresentation()
-    rows = [_pmr(5, "compact", {"summary": "older stuff folded"})]
-    assert rep.render(rows) == [{"role": "user", "content": "older stuff folded"}]
 
 
 # ── ProjectedRepresentation ────────────────────────────────────────────────
@@ -429,7 +396,7 @@ def test_fold_rejects_bad_summary_max_tokens():
 
 def test_representation_rejects_bad_version():
     with pytest.raises(ValueError):
-        VerbatimRepresentation(version=0)
+        ProjectedRepresentation(version=0)
 
 
 def test_representation_max_chars_zero_means_unlimited():

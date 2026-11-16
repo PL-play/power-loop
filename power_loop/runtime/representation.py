@@ -5,14 +5,14 @@ and rendered back to the LLM. It is **build + render only** — it NEVER decides
 (that is :mod:`power_loop.runtime.fold`'s :class:`FoldStrategy`). The two axes are independent:
 any representation composes with any fold strategy.
 
-Two ship here:
+The library ships one built-in representation:
 
-* :class:`VerbatimRepresentation` (``kind="verbatim"``) — records each send's rows verbatim and
-  renders them back unchanged, so history is byte-identical to a no-projection run (below the
-  fold threshold). Its ``render`` ALSO renders ``compact`` rows (a fold can apply under verbatim).
 * :class:`ProjectedRepresentation` (``kind="projection"``) — a generic, no-LLM per-send
   structured summary: each tool call is summarized via its optional ``ToolDefinition.project``
   hook (else a truncating fallback), rendered to terse plain text with NO tool-protocol shape.
+  This is also the ``AgentLoopConfig`` default: finished sends reach the model only through
+  their stored projection. The verbatim representation and the in-place compactor mode it used
+  were removed (design 216); ``pl_messages`` remains the immutable audit/recall source.
 
 Custom representations implement the :class:`Representation` Protocol (kind/version + project_send
 + render) and are passed straight into config — no inheritance required.
@@ -45,7 +45,6 @@ _NO_RESULT = object()
 
 __all__ = [
     "Representation",
-    "VerbatimRepresentation",
     "ProjectedRepresentation",
     "ProjectionRenderConfig",
     "ProjectedRow",
@@ -106,8 +105,8 @@ class Representation(Protocol):
     """How a finished send is recorded into ``pl_project_messages`` and rendered back. Build +
     render only; never folds. ``kind`` is stamped on every row (``representation_kind`` column);
     the reader renders a row only when its ``(kind, version)`` matches the active representation,
-    else falls back to verbatim — so two representations never mis-render each other's rows.
-    ``version`` (>= 1) is the secondary compat key within a kind."""
+    else rebuilds that send's projection with the current representation — two representations
+    never mis-render each other's rows. ``version`` (>= 1) is the secondary compat key."""
 
     kind: str
     version: int
@@ -143,27 +142,6 @@ def _parse_args(raw: Any) -> Any:
         except (TypeError, ValueError):
             return raw
     return raw
-
-
-def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
-    """Verbatim MessageRow → LoopMessage (mirrors stateful_loop._row_to_loop_message; kept local
-    to avoid an agent→runtime import cycle).
-
-    Structured (multimodal) content is decoded back into its original list/dict. Without this
-    the verbatim path replayed a row's content as the LITERAL JSON STRING it was stored as —
-    the model got ``'[{"type": "image_url", ...}]'`` as prose instead of an image, silently.
-    The docstring above claimed to mirror ``_row_to_loop_message``; this is the part it did
-    not mirror."""
-    msg: LoopMessage = {"role": row.role}
-    if row.content is not None:
-        msg["content"] = decode_row_content(row.content, getattr(row, "meta", None))
-    if row.tool_calls:
-        msg["tool_calls"] = list(row.tool_calls)
-    if row.tool_call_id:
-        msg["tool_call_id"] = row.tool_call_id
-    if row.name:
-        msg["name"] = row.name
-    return msg
 
 
 #: Any ``data:<mime>;base64,…`` payload. As TEXT this is unreadable to the model and unbounded
@@ -257,47 +235,6 @@ def _render_compact_row(row: ProjectMessageRow) -> LoopMessage:
     (a fold can apply under any representation), so it is rendered uniformly."""
     text = row.rendered_text or (row.content or {}).get("summary") or ""
     return {"role": "user", "content": str(text)}
-
-
-# ── Verbatim (byte-identical history; renders compact rows too) ──────────────────
-
-
-@dataclass
-class VerbatimRepresentation:
-    """Records each send's rows verbatim and renders them back unchanged, so history is
-    byte-identical to a no-projection run below the fold threshold. Unlike the old
-    ``IdentityProjector`` it does NOT short-circuit folding (folding is an orthogonal concern now)
-    and its ``render`` handles ``compact`` rows produced by whatever fold strategy is configured."""
-
-    kind: str = "verbatim"
-    version: int = 1
-
-    def __post_init__(self) -> None:
-        _validate_representation_params(version=self.version)
-
-    def project_send(
-        self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
-    ) -> ProjectedSend:
-        seqs = [r.seq for r in send_rows]
-        return ProjectedSend(
-            rows=[ProjectedRow("project", {"messages": [_row_to_loop_dict(r) for r in send_rows]})],
-            source_seq_lo=min(seqs) if seqs else None,
-            source_seq_hi=max(seqs) if seqs else None,
-        )
-
-    def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
-        out: list[LoopMessage] = []
-        for r in rows:
-            if r.kind == "compact":
-                out.append(_render_compact_row(r))
-            else:  # user / project verbatim rows carry the raw message list
-                out.extend((r.content or {}).get("messages") or [])
-        return out
-
-    def fold_statistics_policy(self) -> ProjectionFoldPolicy | None:
-        if type(self) is not VerbatimRepresentation:
-            return None
-        return ProjectionFoldPolicy.for_renderer(self, config={})
 
 
 # ── Projection (generic structured summary; no LLM) ─────────────────────────────

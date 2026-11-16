@@ -17,6 +17,8 @@ import pytest
 
 from power_loop.runtime.store.schema import _STORE_TABLES
 from power_loop.runtime.store.task_schema import TASK_TABLES
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytest.importorskip("aiomysql")
 
@@ -113,7 +115,7 @@ async def test_mysql_old_format_is_refused_without_implicit_widening() -> None:
     prefix = _MIG_PREFIX + secrets.token_hex(4) + "_"
     store = await open_store(MYSQL_DSN, table_prefix=prefix)
     try:
-        sid = await store.create_session()
+        sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         await store.append_message(sid, role="assistant", content="original", send_index=1)
         before = await store._db.fetchall(f"SELECT * FROM {prefix}messages")
         await store._db.execute(f"ALTER TABLE {prefix}messages MODIFY content TEXT")

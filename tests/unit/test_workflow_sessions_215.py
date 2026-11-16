@@ -6,14 +6,20 @@ import json
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse
-from power_loop.agent.runtime_store import now_ms
-from power_loop.agent.runtime_types import InputRef, TargetRef
+from power_loop import (
+    AgentLoopConfig,
+    LLMResponse,
+    MemoryMessageTransport,
+    RuntimeClient,
+)
+from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
+from power_loop.agent.runtime_types import InputRef, RuntimeRequestError, TargetRef
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import register_workflow_tool
 from tests.runtime_fixture import RunningAgent
 
 from ._workflow_fixture_203 import Model, leaf
+from .session_native_fixture import ACTOR, target
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -39,7 +45,7 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
 
     registry = ToolRegistry()
     register_workflow_tool(registry)
-    runner = await RunningAgent(store, Parent(), registry, AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Parent(), registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         parent = await asyncio.wait_for(runner.send("run"), 10)
         assert parent.status == "completed"
@@ -122,7 +128,7 @@ async def test_crash_after_node_create_before_journal_aligns_without_stopping_le
         return await original_put(*args)
 
     monkeypatch.setattr(journal, "put", crash_after_create)
-    runner = await RunningAgent(store, Waiting(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Waiting(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         handle = await runner.runtime.client.workflow(
             runner.target, {"name": "create gap", "root": leaf("A")},
@@ -191,7 +197,7 @@ async def _crash_before_aggregate(store, monkeypatch):
 
     monkeypatch.setattr(workflow_runner, "_complete_driver", crash)
     model = OneLeaf()
-    runner = await RunningAgent(store, model, config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, model, config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     handle = await runner.runtime.client.workflow(
         runner.target, {"name": "aggregate gap", "root": leaf("A")},
         message_id="aggregate-gap", actor=runner.actor,
@@ -280,7 +286,7 @@ async def test_interrupted_node_is_not_business_retried(registry_store):
                 raise asyncio.CancelledError("node process lost")
             return LLMResponse(raw_text="parent acknowledged")
 
-    runner = await RunningAgent(store, Interrupted(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Interrupted(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         node = leaf("A")
         node["retry"] = {"max_attempts": 2, "on": ["failed"]}
@@ -322,7 +328,7 @@ async def test_original_cancel_running_continuation_cancels_current_send(registr
                 return LLMResponse(raw_text="A done")
             return LLMResponse(raw_text="parent acknowledged")
 
-    runner = await RunningAgent(store, Waiting(), config=AgentLoopConfig(compactor=None)).start()
+    runner = await RunningAgent(store, Waiting(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
@@ -397,7 +403,7 @@ async def test_halt_late_result_is_journaled_without_advancing_finished_graph(re
                 return LLMResponse(raw_text="late B")
             return LLMResponse(raw_text="parent acknowledged")
 
-    runner = await RunningAgent(store, Halt(), config=AgentLoopConfig(compactor=None), capacity=2).start()
+    runner = await RunningAgent(store, Halt(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2).start()
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
@@ -433,3 +439,49 @@ async def test_halt_late_result_is_journaled_without_advancing_finished_graph(re
     finally:
         release.set()
         await runner.aclose()
+
+
+async def test_public_workflow_rejects_closed_parent_and_keeps_existing_driver(
+    registry_store,
+):
+    """The public workflow entry uses the same creation check: an independent driver
+    lets the parent close, then a second workflow call on the closed parent is rejected
+    without touching the existing driver, its journal or start input."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    parent = await target(port, "closed-workflow-parent")
+    client = RuntimeClient(store=store, transport=MemoryMessageTransport())
+    spec = {"name": "independent driver", "root": leaf("A")}
+    first = await client.workflow(
+        parent, spec, message_id="first-run", actor=ACTOR,
+    )
+    await port.close(parent, actor=ACTOR)
+    # Deterministic retry of the existing driver is rejected by the parent lifecycle
+    # before the creation identity/idempotency check.
+    with pytest.raises(RuntimeRequestError) as retried:
+        await client.workflow(parent, spec, message_id="first-run", actor=ACTOR)
+    assert retried.value.code == "session_closed"
+    # A new driver under the same closed parent is rejected as well.
+    with pytest.raises(RuntimeRequestError) as rejected:
+        await client.workflow(
+            parent, {"name": "after close", "root": leaf("A")},
+            message_id="second-run", actor=ACTOR,
+        )
+    assert rejected.value.code == "session_closed"
+    drivers = await store._db.fetchall(
+        f"SELECT session_id,lifecycle FROM {store.t.sessions} "
+        "WHERE parent_session_id=? AND session_kind='workflow_driver' "
+        "ORDER BY session_id", (parent.session_id,),
+    )
+    assert [row["session_id"] for row in drivers] == [first.target.session_id]
+    assert drivers[0]["lifecycle"] == "open"
+    start = await store._db.fetchone(
+        f"SELECT status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (first.target.session_id, first.input_ref.message_id),
+    )
+    assert start == {"status": "pending"}
+    journal = await store._db.fetchone(
+        f"SELECT COUNT(*) AS n FROM {store.t.session_runtime_state} WHERE session_id=?",
+        (first.target.session_id,),
+    )
+    assert int(journal["n"]) == 1

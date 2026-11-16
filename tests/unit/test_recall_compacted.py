@@ -6,6 +6,7 @@ filters, most-recent cap, session isolation, active rows excluded.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -20,6 +21,8 @@ from power_loop.core.agent_context import (
 )
 from power_loop.runtime.store.store import SessionStore
 from power_loop.tools.default_tools import RECALL_COMPACTED_CONTENT_CHARS, run_recall_compacted
+from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
+from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
 pytestmark = pytest.mark.unit
 
@@ -52,7 +55,7 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 async def test_returns_folded_rows_and_excludes_active(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     seqs = await _seed(store, sid, contents=[
         ("user", "first question about apples"),
         ("assistant", "apples are red"),
@@ -73,7 +76,7 @@ async def test_returns_folded_rows_and_excludes_active(store: SessionStore) -> N
 
 
 async def test_query_filter_is_case_insensitive_substring(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     seqs = await _seed(store, sid, contents=[
         ("user", "tell me about APPLES"),
         ("assistant", "a fruit"),
@@ -91,7 +94,7 @@ async def test_query_filter_is_case_insensitive_substring(store: SessionStore) -
 
 
 async def test_seq_range_filter(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     seqs = await _seed(store, sid, contents=[
         ("user", "alpha"), ("assistant", "one"),
         ("user", "beta"), ("assistant", "two"),
@@ -107,7 +110,7 @@ async def test_seq_range_filter(store: SessionStore) -> None:
 
 
 async def test_limit_caps_to_most_recent(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     contents = [("user" if i % 2 == 0 else "assistant", f"folded-{i}") for i in range(10)]
     seqs = await _seed(store, sid, contents=contents)
     await store.record_compaction(sid, from_seq=seqs[0], to_seq=seqs[-1],
@@ -123,7 +126,7 @@ async def test_limit_caps_to_most_recent(store: SessionStore) -> None:
 
 
 async def test_empty_when_nothing_compacted(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     await _seed(store, sid, contents=[("user", "only active"), ("assistant", "reply")])
     with _active(store, sid):
         out = await run_recall_compacted()
@@ -131,8 +134,8 @@ async def test_empty_when_nothing_compacted(store: SessionStore) -> None:
 
 
 async def test_session_isolation(store: SessionStore) -> None:
-    sid_a = await store.create_session(system_prompt="A")
-    sid_b = await store.create_session(system_prompt="B")
+    sid_a = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "A"}), actor=STORE_ACTOR)
+    sid_b = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "B"}), actor=STORE_ACTOR)
     a = await _seed(store, sid_a, contents=[("user", "secret-A"), ("assistant", "ra")])
     b = await _seed(store, sid_b, contents=[("user", "secret-B"), ("assistant", "rb")])
     await store.record_compaction(sid_a, from_seq=a[0], to_seq=a[1],
@@ -154,7 +157,7 @@ async def test_no_active_session_raises(store: SessionStore) -> None:
 
 
 async def test_long_content_is_truncated(store: SessionStore) -> None:
-    sid = await store.create_session(system_prompt="S")
+    sid = await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR)
     big = "x" * (RECALL_COMPACTED_CONTENT_CHARS + 500)
     seqs = await _seed(store, sid, contents=[("user", big), ("assistant", "ok")])
     await store.record_compaction(sid, from_seq=seqs[0], to_seq=seqs[1],

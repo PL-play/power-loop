@@ -184,7 +184,7 @@ async def test_rebuilt_worker_preserves_prompts_and_history(mode, tmp_path, monk
             return result
     for rebuild in (False, True):
         store = await SessionStore.open(str(tmp_path / f"{rebuild}.db"))
-        config = AgentLoopConfig(system_prompt="S", max_rounds=8, compactor=None)
+        config = AgentLoopConfig(system_prompt="S", max_rounds=8, context_budget_tokens=10**9)
         registry, options = None, None
         if mode in {"fold", "fold_once"}:
             model = _FoldLLM(tool_rounds=3)
@@ -203,14 +203,14 @@ async def test_rebuilt_worker_preserves_prompts_and_history(mode, tmp_path, monk
                 config.memory = _FixedMemory()
         # Resource ports are reconstructed by the current factory each time.
         env = RuntimeEnv(workspace_dir=tmp_path, home_dir=tmp_path)
-        agent = await RunningAgent(store, model, registry, config, runtime_env=env).start()
+        agent = await RunningAgent(store, model, registry, config, runtime_env=env, options=options).start()
         try:
             for i, body in enumerate(("one", "two", "three")):
                 if rebuild and i:
                     target = agent.target
                     await agent.aclose()
-                    agent = await RunningAgent(store, model, registry, config, runtime_env=env).start(target=target)
-                result = await agent.send(body, options=options, message_id=f"input-{i}")
+                    agent = await RunningAgent(store, model, registry, config, runtime_env=env, options=options).start(target=target)
+                result = await agent.send(body, message_id=f"input-{i}")
                 assert result.status == "completed"
             rows = await store.load_active_messages(agent.target.session_id)
             results.append((model.calls, [(row.role, row.content, row.name) for row in rows]))
@@ -224,7 +224,7 @@ async def test_rebuilt_worker_preserves_prompts_and_history(mode, tmp_path, monk
 async def test_fresh_worker_and_other_writer_preserve_full_history(registry_store):
     store, connect = registry_store
     model = _SeqLLM(responses=[LLMResponse(raw_text="a1"), LLMResponse(raw_text="a2")])
-    config = AgentLoopConfig(compactor=None)
+    config = AgentLoopConfig(context_budget_tokens=10**9)
     first = await RunningAgent(store, model, config=config).start()
     target = first.target
     await first.send("u1", message_id="first")
@@ -236,29 +236,42 @@ async def test_fresh_worker_and_other_writer_preserve_full_history(registry_stor
     last = await RunningAgent(store, model, config=config).start(target=target)
     try:
         assert (await last.send("u3", message_id="last")).status == "completed"
-        assert [(m["role"], m["content"]) for m in model.calls[-1]["messages"]] == [
-            ("user", "u1"), ("assistant", "a1"), ("user", "u2"), ("assistant", "b1"), ("user", "u3")]
+        messages = model.calls[-1]["messages"]
+        # Finished sends reach the model as stored projections (plain text), in order.
+        assert [m["role"] for m in messages] == [
+            "user", "assistant", "user", "assistant", "user"]
+        contents = "\n".join(str(m.get("content", "")) for m in messages)
+        for text in ("u1", "a1", "u2", "b1", "u3"):
+            assert text in contents
+        assert not any("tool_calls" in m for m in messages)
     finally:
         await last.aclose()
 
 
 async def test_unknown_pending_tool_alignment_survives_worker_rebuild(runtime_agent):
-    first = await runtime_agent(model=_SeqLLM(), config=AgentLoopConfig(compactor=None))
+    first = await runtime_agent(model=_SeqLLM(), config=AgentLoopConfig(context_budget_tokens=10**9))
     store, target = first.runtime.store, first.target
-    await store.append_message(target.session_id, role="user", content="prior")
-    await store.append_message(target.session_id, role="assistant", content="", tool_calls=[{
+    await store.append_message(target.session_id, role="user", content="prior", send_index=1)
+    await store.append_message(target.session_id, role="assistant", content="", send_index=1,
+                               tool_calls=[{
         "id":"old-call", "type":"function", "function":{"name":"echo", "arguments":"{}"}}])
+    await store._db.execute(
+        f"UPDATE {store.t.session_state} SET send_index=1 WHERE session_id=?",
+        (target.session_id,),
+    )
     await first.aclose()
     called = []
     registry = _echo_registry()
     registry.register(registry.get("echo").definition, lambda **kw: called.append(kw), overwrite=True)
     model = _SeqLLM(responses=[LLMResponse(raw_text="continued")])
     fresh = await runtime_agent(model=model, store=store, registry=registry,
-                                config=AgentLoopConfig(compactor=None), target=target)
+                                config=AgentLoopConfig(context_budget_tokens=10**9), target=target)
     assert (await fresh.send("new input")).final_text == "continued"
     assert not called
-    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "old-call" and
-               "结果未知" in m["content"] for m in model.calls[0]["messages"])
+    messages = model.calls[0]["messages"]
+    # The unfinished past send is projected, never replayed as a dangling tool protocol.
+    assert not any(m.get("tool_call_id") == "old-call" for m in messages)
+    assert any("<missing>" in str(m.get("content", "")) for m in messages)
 
 
 async def test_appended_input_is_visible_after_worker_rebuild(runtime_agent):
@@ -273,7 +286,7 @@ async def test_appended_input_is_visible_after_worker_rebuild(runtime_agent):
                 await release.wait()
             return await super().complete(request, **kwargs)
     model = Blocked(responses=[LLMResponse(raw_text="r1"), LLMResponse(raw_text="r2")])
-    agent = await runtime_agent(model=model, config=AgentLoopConfig(compactor=None))
+    agent = await runtime_agent(model=model, config=AgentLoopConfig(context_budget_tokens=10**9))
     task = asyncio.create_task(agent.send("first"))
     await asyncio.wait_for(entered.wait(), 5)
     appended = await agent.runtime.client.send(agent.target, "steer", message_id="steer", actor=agent.actor)
@@ -284,7 +297,7 @@ async def test_appended_input_is_visible_after_worker_rebuild(runtime_agent):
     await agent.aclose()
     next_model = _SeqLLM(responses=[LLMResponse(raw_text="done")])
     fresh = await runtime_agent(model=next_model, store=agent.runtime.store, target=agent.target,
-                                config=AgentLoopConfig(compactor=None))
+                                config=AgentLoopConfig(context_budget_tokens=10**9))
     await fresh.send("second", message_id="second")
     assert any(m["role"] == "user" and "steer" in m["content"] for m in next_model.calls[0]["messages"])
 

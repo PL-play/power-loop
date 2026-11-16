@@ -95,7 +95,7 @@ async def main():
     api = MockMemoryAPI()
     memory = HttpMemoryProvider('example-user', api)
     for index in range(2):
-        async with demo_runtime(MemoryModel(), config=AgentLoopConfig(memory=memory, compactor=None)) as (runtime, loop, target, actor):
+        async with demo_runtime(MemoryModel(), config=AgentLoopConfig(memory=memory, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
             result = await loop.send(target, 'Remember' if index == 0 else 'Recall', message_id=f'memory-{index}',
                 actor=actor, deadline_ms=int(time.time()*1000)+10000)
             assert result.status == 'completed'

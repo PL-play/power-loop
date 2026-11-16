@@ -23,10 +23,10 @@ async def test_empty_pass_cannot_recover_text_from_before_the_latest_input(regis
     registry.register(ToolDefinition(name='correct', description='Queue correction',
         input_schema={'type':'object'}, pricing=Free('test_fixture')), correct)
     agent = await runtime_agent(model=model, store=store, registry=registry,
-        config=AgentLoopConfig(max_rounds=3, compactor=None))
+        config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9))
     result = await agent.send('Return 42, then apply any correction.')
     assert result.status == 'completed' and model.calls == 2
     assert result.final_text == ''
     rows = await store.load_all_messages(agent.target.session_id)
     assert any(row.role == 'assistant' and row.content == '42' for row in rows)
-    assert any(row.name == 'follow_up' and '43' in row.content for row in rows)
+    assert any(row.role == 'user' and '43' in row.content for row in rows)

@@ -236,41 +236,6 @@ def test_recall_carries_the_hosts_ref_through(tmp_path) -> None:
     assert images == [(str(p), "file_uuid=491b-abc")]
 
 
-def test_switching_to_a_text_only_model_does_not_break_a_verbatim_replay(tmp_path) -> None:
-    """回归：换模型后 verbatim 重放历史里的图，曾让整个 send 抛异常、会话彻底不可用。"""
-    import json
-
-    from power_loop.agent.sink import _encode_content
-    from power_loop.runtime.representation import ProjectMessageRow, VerbatimRepresentation
-    from power_loop.runtime.store.types import MessageRow
-
-    p = tmp_path / "hist.png"
-    p.write_bytes(_png(16, 16))
-    stored, _ = _encode_content([
-        {"type": "text", "text": "看这张图"},
-        {"type": "attachment", "attachment": create_attachment_ref(str(p), ref="file_uuid=u-9")},
-    ])
-    row = MessageRow(session_id="s", seq=1, role="user", name=None, content=stored,
-                     tool_calls=None, tool_call_id=None, round_index=0, state="active",
-                     meta={"content_encoding": "json"}, created_at=0, send_index=1)
-    rep = VerbatimRepresentation()
-    ps = rep.project_send([row], send_index=1, tool_registry=None)
-    stored_rows = [ProjectMessageRow(
-        session_id="s", send_index=1, kind=r.kind, content=r.content, rendered_text=None,
-        source_seq_lo=1, source_seq_hi=1, compact_from_send=None, compact_to_send=None,
-        projector_version=1, token_estimate=None, created_at=0) for r in ps.rows]
-
-    from power_loop._vendor.llm_client.interface import LLMRequest
-
-    replayed = rep.render(stored_rows)
-    out = LLMRequest(messages=replayed, model="m").to_messages(
-        coerce_capabilities(None, model="deepseek-v4-flash")  # 换成看不了图的模型
-    )
-    blob = json.dumps(out, ensure_ascii=False)
-    assert "image_url" not in blob          # 没有图片被硬发出去
-    assert "file_uuid=u-9" in blob          # 但找回原图的坐标还在
-    assert "没有看到" in blob                # 且模型知道自己没看到
-
 def test_durable_and_ephemeral_are_separated(tmp_path) -> None:
     """默认 durable：图留在这个 send 里，别在看一眼之后就消失。
 

@@ -145,7 +145,7 @@ class Node:
         ), touch)
         return ExecutionEnvironment(
             Model(self, descriptor, context), registry,
-            AgentLoopConfig(max_rounds=250, compactor=None,
+            AgentLoopConfig(max_rounds=250, context_budget_tokens=10**9,
                             **({"representation": ProjectedRepresentation()}
                                if descriptor.config.get("projected") else {})),
             runtime_env=RuntimeEnv.from_env(workspace_dir=self.workspace, home_dir=self.workspace),

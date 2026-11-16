@@ -181,7 +181,7 @@ async def main():
             store = await SessionStore.open(path)
             bus, events = build_event_bus()
             async with demo_runtime(ChatModel(), registry, store=store, target=target, hooks=hooks, event_bus=bus,
-                    config=AgentLoopConfig(memory=memory, max_rounds=3, compactor=None)) as (runtime, loop, target, actor):
+                    config=AgentLoopConfig(memory=memory, max_rounds=3, context_budget_tokens=10**9)) as (runtime, loop, target, actor):
                 result = await loop.send(target, 'Weather and remember Alan' if index == 0 else 'Continue our conversation',
                     message_id=f'chat-{index}', actor=actor, deadline_ms=int(time.time()*1000)+10000)
                 assert result.status == 'completed'

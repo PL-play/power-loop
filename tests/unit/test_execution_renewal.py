@@ -51,7 +51,7 @@ async def running(store, coordinator, *, hooks=None, ttl_s=.3):
     model, factory = WaitingModel(), RegistryRuntimeFactory()
     async def build(descriptor, context):
         assert context.owner_epoch > 0 and context.owner_token
-        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(compactor=None))
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
     factory.register('test.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='test', coordinator=coordinator,
         session_lease_ttl_s=ttl_s, recovery_interval_s=None, hooks=hooks, hook_timeout_s=.03)
@@ -147,7 +147,7 @@ async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_sto
     hooks.register(HookPoint.TOOL_ERROR, replace_error)
     registry.register(ToolDefinition('lose', 'lose permission', input_schema={'type': 'object', 'properties': {}},
                                      pricing=Free('test')), lose)
-    agent = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None), hooks=hooks).start()
+    agent = await RunningAgent(store, model, registry, AgentLoopConfig(context_budget_tokens=10**9), hooks=hooks).start()
     try:
         result = await agent.send('go')
         assert result.status == 'interrupted', result

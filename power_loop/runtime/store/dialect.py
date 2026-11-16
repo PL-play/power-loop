@@ -21,6 +21,10 @@ class Dialect(Protocol):
         self, table: str, key_cols: Sequence[str], val_cols: Sequence[str], *,
         add_cols: Sequence[str] = (), insert_only_cols: Sequence[str] = (),
     ) -> str: ...
+    def upsert_many(
+        self, table: str, key_cols: Sequence[str], val_cols: Sequence[str], *, rows: int,
+        add_cols: Sequence[str] = (), insert_only_cols: Sequence[str] = (),
+    ) -> str: ...
     async def lock_state(self, tx: Transaction, state_table: str, session_id: str) -> Row: ...
 
 
@@ -38,6 +42,10 @@ class SqliteDialect:
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
+
+    def upsert_many(self, table, key_cols, val_cols, *, rows, add_cols=(), insert_only_cols=()):
+        return _onconflict_upsert_many(
+            table, key_cols, val_cols, rows, add_cols, insert_only_cols)
 
     async def lock_state(self, tx, state_table, session_id):
         return await _locked_state(tx, state_table, session_id, "")
@@ -65,6 +73,10 @@ class PostgresDialect:
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
 
+    def upsert_many(self, table, key_cols, val_cols, *, rows, add_cols=(), insert_only_cols=()):
+        return _onconflict_upsert_many(
+            table, key_cols, val_cols, rows, add_cols, insert_only_cols)
+
     async def lock_state(self, tx, state_table, session_id):
         return await _locked_state(tx, state_table, session_id, " FOR UPDATE")
 
@@ -85,12 +97,17 @@ class MySQLDialect:
         )
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
+        return self.upsert_many(
+            table, key_cols, val_cols, rows=1, add_cols=add_cols,
+            insert_only_cols=insert_only_cols)
+
+    def upsert_many(self, table, key_cols, val_cols, *, rows, add_cols=(), insert_only_cols=()):
         cols = [*key_cols, *val_cols, *add_cols, *insert_only_cols]
-        placeholders = ",".join("?" * len(cols))
+        placeholders = ",".join("(" + ",".join("?" * len(cols)) + ")" for _ in range(rows))
         sets = [f"{c}=new_row.{c}" for c in val_cols]
         sets += [f"{c}={table}.{c}+new_row.{c}" for c in add_cols]
         return (
-            f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders}) AS new_row "
+            f"INSERT INTO {table} ({','.join(cols)}) VALUES {placeholders} AS new_row "
             f"ON DUPLICATE KEY UPDATE {','.join(sets)}"
         )
 
@@ -115,12 +132,16 @@ def _insert_conflict(table, cols):
 
 
 def _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols):
+    return _onconflict_upsert_many(table, key_cols, val_cols, 1, add_cols, insert_only_cols)
+
+
+def _onconflict_upsert_many(table, key_cols, val_cols, rows, add_cols, insert_only_cols):
     cols = [*key_cols, *val_cols, *add_cols, *insert_only_cols]
-    placeholders = ",".join("?" * len(cols))
+    placeholders = ",".join("(" + ",".join("?" * len(cols)) + ")" for _ in range(rows))
     sets = [f"{c}=excluded.{c}" for c in val_cols]
     sets += [f"{c}={table}.{c}+excluded.{c}" for c in add_cols]
     return (
-        f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders}) "
+        f"INSERT INTO {table} ({','.join(cols)}) VALUES {placeholders} "
         f"ON CONFLICT ({','.join(key_cols)}) DO UPDATE SET {','.join(sets)}"
     )
 

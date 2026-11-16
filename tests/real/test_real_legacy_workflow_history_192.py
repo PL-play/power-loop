@@ -19,7 +19,7 @@ async def test_real_current_workflow_history_projection_and_export(runtime_agent
     provider,registry=BoundedProvider(limit=18),ToolRegistry()
     register_workflow_tool(registry)
     agent=await runtime_agent(model=provider,registry=registry,runtime_env=RuntimeEnv(workspace_dir=tmp_path),
-        config=AgentLoopConfig(compactor=None,max_rounds=4,max_tokens=2048,representation=ProjectedRepresentation(),
+        config=AgentLoopConfig(context_budget_tokens=10**9,max_rounds=4,max_tokens=2048,representation=ProjectedRepresentation(),
             system_prompt='Make exactly the requested workflow call once, then reply in assistant text. Do not create, resume or poll work.'))
     leaf={'type':'agent','id':'calculate','input':'Compute 19+23.',
         'spec':{'name':'calculate','system_prompt':'Return only the arithmetic answer in assistant text.','tools':[],'max_rounds':2}}

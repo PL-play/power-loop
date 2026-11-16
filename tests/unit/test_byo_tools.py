@@ -49,7 +49,7 @@ def _registry(*names: str) -> ToolRegistry:
 
 async def _loop(runtime_agent, store, llm, registry, *, memory=None, **kwargs):
     return await runtime_agent(model=llm, store=store, registry=registry,
-        config=AgentLoopConfig(system_prompt="S", max_rounds=6, compactor=None, memory=memory), **kwargs)
+        config=AgentLoopConfig(system_prompt="S", max_rounds=6, context_budget_tokens=10**9, memory=memory), **kwargs)
 
 
 @pytest.mark.asyncio

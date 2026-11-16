@@ -119,7 +119,7 @@ async def test_final_boundary_leaves_new_input_for_next_send_and_closes_both_rou
     ])
     loop = await runtime_agent(
         model=llm, store=store, event_bus=bus,
-        config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4, context_budget_tokens=10**9),
     )
     send_task = asyncio.create_task(loop.send("start"))
     # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
@@ -268,7 +268,7 @@ async def test_idle_append_is_driven_without_host_flush_and_original_id_deduplic
     from power_loop.agent.runtime_store import now_ms
     llm = _GateLLM(responses=[LLMResponse(raw_text="handled stranded steering")])
     llm.release_first.set()
-    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(compactor=None))
+    loop = await runtime_agent(model=llm, store=store, config=AgentLoopConfig(context_budget_tokens=10**9))
     receipt = await loop.runtime.client.send(loop.target, "stranded card submission", message_id="card-1", actor=loop.actor)
     result = await loop.runtime.client.wait(receipt.input_ref, actor=loop.actor, deadline_ms=now_ms()+10000)
     assert result.status == "completed"
@@ -282,7 +282,7 @@ async def test_idle_append_is_driven_without_host_flush_and_original_id_deduplic
 async def test_empty_activation_and_busy_append_do_not_start_duplicate_execution(store, runtime_agent):
     from power_loop.agent.runtime_transport import TransportPacket
     llm = _GateLLM(responses=[_tool_resp("c1", "echo", '{"text":"x"}'), LLMResponse(raw_text="ok")])
-    loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(), config=AgentLoopConfig(compactor=None))
+    loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(), config=AgentLoopConfig(context_budget_tokens=10**9))
     await loop.runtime.worker.recover()
     assert not llm.calls
     send_task = asyncio.create_task(loop.send("start"))

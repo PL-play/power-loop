@@ -1,6 +1,8 @@
 """Subagent creation and ordinary TargetRef/InputRef continuation."""
 from __future__ import annotations
 
+import asyncio
+import contextvars
 from typing import Any
 
 from power_loop.runtime.recall import dumps
@@ -23,7 +25,7 @@ async def run_inline(spec, task, *, parent_loop):
     receipt = await start(parent_loop, spec, task)
     worker = parent_loop._runtime_worker
     if getattr(parent_loop, "_host_command", None) is not None:
-        await worker._run_session_owned(receipt["session_id"])
+        await asyncio.create_task(worker._run_session(receipt["session_id"]), context=contextvars.Context())
     _, actor = await tool_actor(parent_loop)
     result = await worker.runtime.client.wait(
         InputRef(**receipt["input_ref"]), actor=actor, deadline_ms=now_ms() + 1800000

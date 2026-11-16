@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import os
-import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from power_loop.runtime.stop_policy import StopPolicy
-
-#: Distinguishes "caller passed nothing" from an explicit None on the deprecated 2.x kwargs.
-_UNSET: Any = object()
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,28 +22,13 @@ LoopMessage = dict[str, Any]
 
 
 def _default_representation() -> Representation:
-    from power_loop.runtime.representation import VerbatimRepresentation
-    return VerbatimRepresentation()
+    from power_loop.runtime.representation import ProjectedRepresentation
+    return ProjectedRepresentation()
 
 
 def _default_fold_strategy() -> FoldStrategy:
     from power_loop.runtime.fold import LLMSummaryFold
     return LLMSummaryFold()
-
-
-def _fold_from_legacy_projector(proj: Any) -> FoldStrategy:
-    """Seed the default LLM fold from a DEPRECATED ``history_projector``'s knobs so a legacy
-    projector's ``keep_last_sends`` / ``trigger_ratio`` keep taking effect (e.g. DeepTalk's
-    admin-configured projection settings). Without this the mapped fold would silently use
-    ``LLMSummaryFold`` defaults (4 / 0.75) and ignore the operator's config."""
-    from power_loop.runtime.fold import LLMSummaryFold
-    # Only a MISSING/None keep falls back to 4; an explicit 0 means "keep ~none" (fold aggressively)
-    # → clamp to the validator's floor of 1, NOT silently to 4 (B10). (A verbatim keep==0 projector is
-    # routed to never-fold in _map_legacy_axes and never reaches here.)
-    keep_raw = getattr(proj, "keep_last_sends", None)
-    keep = 4 if keep_raw is None else max(1, int(keep_raw))
-    trigger = float(getattr(proj, "trigger_ratio", 0.75) or 0.75)
-    return LLMSummaryFold(keep_last_sends=keep, trigger_ratio=trigger)
 
 
 def _default_runtime_projectors() -> tuple[RuntimeProjector, ...]:
@@ -83,12 +64,11 @@ class AgentLoopConfig:
     max_tokens_per_run: int | None = None
     #: Context handling = REPRESENTATION × FOLD_STRATEGY (power-loop 3.0), two orthogonal axes.
     #:
-    #: ``representation`` — how each finished send is recorded/rendered:
-    #:   * ``VerbatimRepresentation`` (default): full messages, byte-identical history.
-    #:   * ``ProjectedRepresentation``: a per-send terse plain-text projection (send-context
-    #:     projection), original detail kept in ``pl_messages`` (recall_send re-expands).
+    #: ``representation`` — how each finished send is recorded/rendered. The library default is
+    #: ``ProjectedRepresentation``: a per-send terse plain-text projection (send-context
+    #: projection), with the original detail kept in ``pl_messages`` (recall_send re-expands it).
     #: Custom representations implement the ``Representation`` Protocol.
-    representation: Representation = _UNSET  # resolved in __post_init__ (default or legacy-mapped)
+    representation: Representation = field(default_factory=_default_representation)
     #: Optional history-row cap. The SDK default is unlimited (None); 0 also means unlimited.
     #: A positive value explicitly limits history, independently of token/fold budgets.
     #: History normally runs from the fold
@@ -137,27 +117,14 @@ class AgentLoopConfig:
     #:   * ``LLMSummaryFold`` (default): one LLM summary call, no side effects.
     #:   * ``AgenticFold``: LLM + a bounded tool loop that persists durable facts as notes.
     #:   * custom: any ``FoldStrategy`` Protocol impl.
-    #: Works under EITHER representation. Folds are always LLM-backed (no deterministic/never-fold).
+    #: Folds are always LLM-backed (no deterministic/never-fold).
     #: Trigger + keep-recent come from the strategy (``trigger_ratio`` / ``keep_last_sends``);
     #: the fold always keeps whole sends (never splits an atomic tool-call/result pair).
-    fold_strategy: FoldStrategy = _UNSET  # resolved in __post_init__ (default or legacy-mapped)
+    fold_strategy: FoldStrategy = field(default_factory=_default_fold_strategy)
     #: Wall-clock bound (seconds) on a single fold's LLM/agentic call. The fold runs OUTSIDE the
     #: store lock, but a hung provider would still stall the end-of-send path; on timeout the fold
     #: soft-fails (rows committed, no compact this send — retried next send). None disables.
     fold_timeout_s: float | None = 120.0
-    # ── deprecated 2.x kwargs (accepted + mapped onto the two axes in __post_init__) ──
-    # The public API is representation × fold_strategy; these keep existing call sites + DeepTalk
-    # working until migrated. A future major drops them.
-    compactor: Any = _UNSET
-    history_projector: Any = _UNSET
-    #: Internal, not API: what a deprecated ``compactor=`` resolved to, and the fold this config
-    #: seeded itself. They are FIELDS (not plain attributes) so ``dataclasses.replace`` — which the
-    #: loop runs for every per-send override — carries them. As attributes they were dropped:
-    #: ``compactor=None`` (never compact) or ``compactor=AgenticMemoryCompactor(...)`` silently
-    #: became the seeded default fold's DefaultCompactor on any send with an override, e.g. a
-    #: session whose stored system prompt differs from the config's.
-    _legacy_verbatim_compactor: Any = field(default=_UNSET, repr=False, compare=False)
-    _seeded_fold: Any = field(default=None, repr=False, compare=False)
     #: History-repair backstop (the always-on prompt sanitizer in `align_tool_calls` realigns
     #: tool-call/result pairing before every LLM call regardless). When True, the orphan
     #: tool-result rows that sanitizer drops are ALSO physically deactivated in the store
@@ -280,7 +247,6 @@ class AgentLoopConfig:
     def __post_init__(self) -> None:
         if self.delegation_policy not in ("legacy", "single_level"):
             raise ValueError("delegation_policy must be legacy or single_level")
-        self._map_legacy_axes()
         self._validate_context_config()
         # record_hook_events is a closed enum; normalize case and reject typos loudly (consistent
         # with the file's loud-config convention) rather than silently capturing nothing.
@@ -294,63 +260,6 @@ class AgentLoopConfig:
         # Mark init complete so __setattr__ starts re-validating reassignments (the dataclass
         # is mutable; a post-hoc reassignment of an axis or max_tokens must stay valid).
         object.__setattr__(self, "_initialized", True)
-
-    def _map_legacy_axes(self) -> None:
-        """Resolve representation/fold_strategy, mapping the deprecated 2.x ``history_projector`` /
-        ``compactor`` kwargs onto them (NEW fields win
-        when explicitly set). A legacy ``compactor`` (incl. ``None`` = no compaction) under verbatim
-        is preserved EXACTLY via ``_legacy_verbatim_compactor`` so old behavior is unchanged; a
-        legacy projector becomes the projection representation (its fold is now the fold_strategy)."""
-        legacy_proj = self.history_projector
-        legacy_comp = self.compactor
-        fold_was_unset = self.fold_strategy is _UNSET
-        # On dataclasses.replace the fold is no longer _UNSET — it is the one WE seeded. It only
-        # counts as the caller's choice when replace() swapped in a different object.
-        fold_still_seeded = self._seeded_fold is not None and self.fold_strategy is self._seeded_fold
-        if legacy_proj is not _UNSET or legacy_comp is not _UNSET:
-            warnings.warn(
-                "AgentLoopConfig: history_projector / compactor are deprecated; use "
-                "representation / fold_strategy.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-        if self.representation is _UNSET:
-            rep = legacy_proj if legacy_proj not in (_UNSET, None) else _default_representation()
-            object.__setattr__(self, "representation", rep)
-        if fold_was_unset:
-            # Seed the fold from a legacy projector's knobs so its keep_last_sends / trigger_ratio
-            # keep taking effect (DeepTalk admin config); else the library default.
-            fs = (
-                _fold_from_legacy_projector(legacy_proj)
-                if legacy_proj not in (_UNSET, None)
-                else _default_fold_strategy()
-            )
-            object.__setattr__(self, "fold_strategy", fs)
-            object.__setattr__(self, "_seeded_fold", fs)
-        elif not fold_still_seeded:
-            object.__setattr__(self, "_seeded_fold", None)
-        # A legacy verbatim compactor (incl. an explicit None = no compaction) is preserved exactly
-        # via resolve_compactor — but ONLY on the pure-legacy path (no projector AND no explicit
-        # new fold_strategy). If the caller set fold_strategy explicitly, the new axis wins and a
-        # stray legacy compactor= must NOT silently disable it.
-        if legacy_comp is not _UNSET and legacy_proj in (_UNSET, None) and fold_was_unset:
-            object.__setattr__(self, "_legacy_verbatim_compactor", legacy_comp)
-        elif (
-            legacy_proj not in (_UNSET, None)
-            and fold_was_unset
-            and getattr(legacy_proj, "kind", None) == "verbatim"
-            and getattr(legacy_proj, "keep_last_sends", 1) == 0  # exact 0 (NOT `or 1`, which 0 defeats)
-        ):
-            # A legacy NEVER-FOLD projector (IdentityProjector: kind='verbatim', keep_last_sends==0)
-            # maps to never-fold (compactor=None) — NOT a folding fold_strategy. Else it would fold
-            # (the seeder coerces keep 0→positive) and, on the old projection path, drop the compact
-            # (B7 data loss). Routes via resolve_compactor's verbatim branch (kind=='verbatim').
-            object.__setattr__(self, "_legacy_verbatim_compactor", None)
-        elif fold_still_seeded and self._legacy_verbatim_compactor is not _UNSET:
-            pass  # dataclasses.replace of a config that already resolved one — keep it
-        else:
-            object.__setattr__(self, "_legacy_verbatim_compactor", _UNSET)
-        object.__setattr__(self, "history_projector", _UNSET)
 
     def _validate_context_config(self) -> None:
         if self.representation is None or self.fold_strategy is None:
@@ -378,57 +287,6 @@ class AgentLoopConfig:
                 raise
         else:
             super().__setattr__(name, value)
-
-    # ── internal resolution (3.0): map the two axes onto the loop's two mechanisms ──
-    # Projection-style representations drive the derived-layer path (fold via fold_strategy at
-    # end-of-send); verbatim drives the in-place compactor path (fold_strategy mapped to a
-    # Compactor whose span selection already keeps atomic tool pairs / keep_last_n intact).
-    @property
-    def projection_representation(self) -> Any | None:
-        """The representation when it's projection-style (renders per-send projections), else None
-        (verbatim → in-place fold path)."""
-        rep = self.representation
-        return rep if getattr(rep, "kind", "projection") != "verbatim" else None
-
-    def resolve_compactor(self) -> Any | None:
-        """Verbatim mode → an in-place ``Compactor`` mapped from ``fold_strategy``; projection mode
-        → ``None`` (projection folds at end-of-send via ``fold_strategy``). Constructed fresh per
-        call (cheap)."""
-        # Projection folds at end-of-send via fold_strategy — never an in-place compactor. Checked
-        # FIRST so a post-init switch to a projection representation can't leave a stale legacy
-        # verbatim compactor active (which would double-fold alongside the derived-layer fold).
-        if getattr(self.representation, "kind", "projection") != "verbatim":
-            return None
-        # A deprecated verbatim ``compactor=`` (incl. None) is honored verbatim, so legacy
-        # call sites keep their EXACT old compaction behavior.
-        legacy = getattr(self, "_legacy_verbatim_compactor", _UNSET)
-        if legacy is not _UNSET:
-            return legacy
-        from power_loop.runtime.fold import AgenticFold, LLMSummaryFold
-
-        fs = self.fold_strategy
-        if isinstance(fs, AgenticFold):
-            from power_loop.runtime.compact import AgenticMemoryCompactor
-
-            return AgenticMemoryCompactor(
-                keep_last_n=fs.keep_last_sends,
-                trigger_ratio=fs.trigger_ratio,
-                summary_max_tokens=fs.summary_max_tokens,
-                max_rounds=fs.max_rounds,
-            )
-        if isinstance(fs, LLMSummaryFold):
-            from power_loop.runtime.compact import DefaultCompactor
-
-            return DefaultCompactor(
-                keep_last_n=fs.keep_last_sends,
-                trigger_ratio=fs.trigger_ratio,
-                summary_max_tokens=fs.summary_max_tokens,
-            )
-        # A custom FoldStrategy under verbatim → adapt it onto the in-place Compactor interface
-        # (DefaultCompactor's span selection keeps atomic tool pairs / keep_last_n intact).
-        from power_loop.runtime.fold_adapter import FoldStrategyCompactor
-
-        return FoldStrategyCompactor(fs, max_tokens=self.max_tokens)
 
 
 @dataclass

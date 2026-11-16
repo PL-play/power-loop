@@ -68,7 +68,7 @@ async def _run_child(runtime_agent, store, model, spec, *, bus=None, registry=No
     reg.register(ToolDefinition(name="delegate", description="delegate",
         input_schema={"type":"object", "properties":{}}, pricing=Free("test_fixture")), delegate)
     agent = await runtime_agent(model=model, store=store, registry=reg, event_bus=bus,
-        config=AgentLoopConfig(compactor=None), command=("delegate", {}))
+        config=AgentLoopConfig(context_budget_tokens=10**9), command=("delegate", {}))
     result = await agent.send("go")
     assert result.status == "completed", result
     await agent.drain()
