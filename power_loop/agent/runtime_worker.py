@@ -57,6 +57,10 @@ class _SessionExecution:
         self.loop = None
         self.closing = False
         self.shutdown_interrupted = False
+        # The ordinary LLM boundary extends this same run-local list. None means
+        # claim/factory or a non-LLM path has not established that consumption fact.
+        self.consumed: list[InputRef] | None = None
+        self.wake_pending = False
         self.output: asyncio.Queue = asyncio.Queue(maxsize=256)
         option_values = descriptor.config.get("child_options", descriptor.config)
         self.options = RequestOptions(**{
@@ -162,8 +166,15 @@ class RuntimeWorker:
                 await self.shutdown(timeout_s=0)
                 return
 
-    def _activate(self, sid):
-        if self._closing or sid in self._active:
+    def _activate(self, sid, input_ref=None, *, cancelled=False):
+        if self._closing:
+            return
+        if sid in self._active:
+            ctx = self._active[sid]
+            if ctx is not None and ctx.consumed is not None \
+                    and input_ref is not None and not cancelled \
+                    and input_ref not in ctx.consumed:
+                ctx.wake_pending = True
             return
         if len(self._pending) >= 1024 and sid not in self._pending:
             self._overflow = True
@@ -192,10 +203,13 @@ class RuntimeWorker:
         while not self._closed:
             try:
                 async for delivery in subscription:
-                    # Notifications are a pure latency optimization: they only wake the
-                    # dispatcher. Correctness never depends on them (a lost notification
-                    # is covered by the periodic unfinished scan and the boundary read).
-                    self._activate(delivery.packet.target.session_id)
+                    # Hints carry no durable input. Lost hints rely on a live boundary
+                    # or unfinished discovery (explicit recover if the scan is disabled).
+                    packet = delivery.packet
+                    self._activate(
+                        packet.target.session_id, packet.input_ref,
+                        cancelled=bool((packet.payload or {}).get("cancelled")),
+                    )
                     await delivery.ack()
             except Exception:
                 log.exception("runtime %s subscription disconnected", binding.channel)
@@ -282,6 +296,7 @@ class RuntimeWorker:
         ownership = None
         external_ownership = None
         batch = None
+        normal_final = None
         try:
             if getattr(r.coordinator, "installs_session_fence", False):
                 # The claim transaction is the whole entry: under the state lock it reads
@@ -436,12 +451,12 @@ class RuntimeWorker:
                 loop._owner_id = r.node_id + "/" + r.boot_id
                 ctx.loop = loop
 
-                consumed = list(batch.input_refs)
                 if env.command is not None:
                     from power_loop.runtime.host_commands import run_session
                     result = await run_session(loop, ctx, env.command)
                     consumed = None
                 else:
+                    consumed = ctx.consumed = list(batch.input_refs)
                     result = await loop._run_session_send(
                         sid, batch=batch, ownership=ownership, config=config,
                         tool_registry=env.tool_registry, hooks=env.hooks, event_bus=bus,
@@ -465,9 +480,9 @@ class RuntimeWorker:
                     error=error, error_code=error_code, result_seq=result.result_seq,
                     assistant_meta=result.result_meta,
                 )
+                if env.command is None:
+                    normal_final = final_batch
                 await self._notify_results(final_batch)
-                if final_batch.execution_state == "queued":
-                    self._activate(sid)
         except SessionLeaseLost:
             # Another owner took over; stop quietly. No compensation writes.
             if ctx is not None:
@@ -508,9 +523,13 @@ class RuntimeWorker:
             self._active.pop(sid, None)
             if env is not None:
                 await env.aclose()
-            # Final already released the owner in its transaction. Re-activate if new
-            # input arrived during teardown (the other side of the idle handoff).
-            if batch is not None and await self._has_pending(sid):
+            # A normal final reports its pending snapshot; real new notifications
+            # bridge the interval after that snapshot and before active.pop. After
+            # pop the ordinary dispatcher waits on the same session lock for aclose.
+            if normal_final is not None and ctx is not None and ctx.consumed is not None:
+                if normal_final.execution_state == "queued" or ctx.wake_pending:
+                    self._activate(sid)
+            elif batch is not None and await self._has_pending(sid):
                 self._activate(sid)
 
     def _capable(self, descriptor):

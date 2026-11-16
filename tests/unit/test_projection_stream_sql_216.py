@@ -586,8 +586,24 @@ async def test_normal_worker_held_history_20(registry_store):
 # ── projection health / missing / repair failure ────────────────────────────
 
 
-async def test_projection_health_and_repair_paths(registry_store):
+async def test_projection_health_and_repair_paths(registry_store, monkeypatch):
+    from power_loop.runtime.store import projection_fold
+
     store, _ = registry_store
+    windows, saved = [], []
+    load, persist = store.load_projection_window, projection_fold.persist
+
+    async def load_window(*args, **kwargs):
+        window = await load(*args, **kwargs)
+        windows.append(window)
+        return window
+
+    async def save(*args, **kwargs):
+        saved.append((kwargs["send_index"], kwargs.get("window")))
+        return await persist(*args, **kwargs)
+
+    monkeypatch.setattr(store, "load_projection_window", load_window)
+    monkeypatch.setattr(projection_fold, "persist", save)
     model = StreamModel(text="done")
     cfg = _config()
     agent = await RunningAgent(store, model, _echo_registry(), cfg).start()
@@ -600,6 +616,8 @@ async def test_projection_health_and_repair_paths(registry_store):
         first = await agent.send("question one")
         assert first.status == "completed"
         await agent.drain()
+        assert saved == [(1, windows[0])]
+        assert saved[0][1] is windows[0]
         project_rows = await _projection_rows(store, sid)
         assert {row["kind"] for row in project_rows} == {"user", "project"}
         assert all(int(row["projector_version"]) == 1 for row in project_rows)
@@ -616,6 +634,8 @@ async def test_projection_health_and_repair_paths(registry_store):
               extra={"heal": False, "fallback": False,
                      "compact_rows": await _compact_count(store, sid, original)})
         assert second.status == "completed"
+        assert saved[-1][1] is windows[-1] and windows[-1] is not windows[0]
+        assert "__pl_projection_fold" not in model.requests[-1]
         # Missing projection: delete send 1's rows; the next send must heal them.
         await store._db.execute(
             f"DELETE FROM {store.t.project_messages} WHERE session_id=? AND send_index=1", (sid,))
@@ -639,6 +659,14 @@ async def test_projection_health_and_repair_paths(registry_store):
         assert third.status == "completed"
         assert {row["kind"] for row in healed_rows} == {"user", "project"}
         assert heal_records, "expected the missing projection to be healed"
+        assert saved[-1] == (3, None)  # Actual heal writes invalidate the save facts.
+        assert "question one" in model.requests[-1]  # Repaired rows still reach this model call.
+        # An empty historical index has nothing to heal and keeps the original window facts.
+        await original.execute(
+            f"UPDATE {store.t.session_state} SET send_index=4 WHERE session_id=?", (sid,))
+        assert (await agent.send("after empty index")).status == "completed"
+        await agent.drain()
+        assert saved[-1][0] == 5 and saved[-1][1] is windows[-1]
         # Repair failure: the send stops with projection_unavailable before its model call.
         await original.execute(
             f"DELETE FROM {store.t.project_messages} WHERE session_id=? AND send_index=2", (sid,))
@@ -657,7 +685,7 @@ async def test_projection_health_and_repair_paths(registry_store):
             await failing_agent.drain()
             _emit("projection_repair_failed_stopped", db=original.dialect.name,
                   cfg=failing_cfg, transport=failing_agent.runtime.transport,
-                  kind="send_loop_wait", history=3, models=0, tools=0,
+                  kind="send_loop_wait", history=5, models=0, tools=0,
                   deltas={"text": 0, "think": 0},
                   notifications={"completed": "normal"},
                   elapsed_s=time.monotonic() - started,

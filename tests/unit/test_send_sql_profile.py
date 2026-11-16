@@ -1,7 +1,7 @@
 """Session-native whole-send SQL budget, attributed by call site (design 215 P2).
 
-Replaces the pre-215 job-path profile. The measurement harness (Profiled / _category /
-_counts) is unchanged; the scenarios now drive the accept/claim/final session worker.
+Replaces the pre-215 job-path profile; scenarios drive the accept/claim/final session worker.
+Runtime-state INSERTs classify by their write target, including projection guards (C02-R1).
 B = G0-R3 frozen baseline, S = P2 start, N = this HEAD. Set P215_PROFILE_OUT to emit one
 JSON record per case for the B/S/N report. legacy_job_control must be 0; billing is 0 in
 the SDK (the 214 charge event lives in the agent host, P6).
@@ -106,13 +106,12 @@ def _category(chain, sql=""):
         return "periodic"
     if "agent.runtime_store:_db_now" in chain:
         return "session_control"
-    # Accept's post-lock session/input/capacity/time read is control SQL. Its SELECT
-    # list exceeds the profile's 240-char capture before the table names.
+    # Accept's post-lock session/input/capacity/time join is a control operation,
+    # including the input data it reads.
     if "agent.runtime_store:_accept_read" in chain:
         return "session_control"
-    # Claim's post-lock batch read also joins the session identity; its SELECT list is
-    # longer than the 240-char capture before either table name. Attribute it by call
-    # site; the claim's UPDATE/INSERT statements still classify by their own tables.
+    # Claim's post-lock batch read also joins the session identity. Attribute that
+    # control read by call site; UPDATE/INSERT still classify by their own tables.
     if normalized.startswith("select q.id as id") and any(
         site in chain for site in ("agent.runtime_store:claim", "agent.runtime_store:claim_follow_up")
     ):
@@ -120,14 +119,17 @@ def _category(chain, sql=""):
     if "agent.runtime_store:session_entry" in chain:
         return "session_control"
     # The merged result read spans sessions, the addressed input and its result
-    # message; its SELECT list is longer than the profile's 240-char SQL capture.
-    # Attribute that statement by its live caller; the separate continuation result
-    # message read below is still an ordinary message read.
+    # message. Attribute that control read by its live caller; the separate
+    # continuation result message read below is still an ordinary message read.
     if ("agent.runtime_store:_result_state" in chain
             and "agent.runtime_store:_terminal_result" not in chain):
         return "session_control"
     if normalized.startswith("select last_insert_id()"):
         return "message"
+    # A runtime-state INSERT may probe projections in NOT EXISTS. Classify the write
+    # target before inspecting referenced message tables; window reads stay message SQL.
+    if re.match(r"insert\s+into\s+[a-z0-9_]*session_runtime_state\s*\(", normalized):
+        return "session_control"
     if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _MESSAGE_TABLES):
         return "message"
     if any(re.search(rf"(?<![a-z0-9]){table}(?![a-z0-9])", normalized) for table in _SESSION_TABLES):
@@ -179,7 +181,7 @@ class Profiled:
         return getattr(self.db, name)
 
     def note(self, sql, rows=None):
-        self.records.append({"sql": " ".join(sql.split())[:240], "chain": _sites(), "rows": rows})
+        self.records.append({"sql": " ".join(sql.split()), "chain": _sites(), "rows": rows})
 
     @staticmethod
     def _transaction_category(records, site):

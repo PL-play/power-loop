@@ -1223,6 +1223,9 @@ class _ExecutionLoop:
                         "projection_unavailable",
                         f"send {si}: projection repair produced no rows",
                     )
+                # Heal wrote projections/statistics after the window snapshot. Keep repaired
+                # rows for model assembly, but discard the old facts used by the later save.
+                window = None
                 by_send[si] = list(repaired)
             flat_rows = [r for si2 in sorted(by_send) for r in by_send[si2]
                          if cutoff < si2 < current_send_index]
@@ -1314,7 +1317,7 @@ class _ExecutionLoop:
                 await self._write_session_projection(
                     store, sid, send_index=current_send_index, rows=sink.send_rows,
                     status=result.status, projector=projector, tool_registry=effective_registry,
-                    ownership=ownership, stop_event=stop,
+                    ownership=ownership, stop_event=stop, window=window,
                 )
             except CancellationRequested:
                 raise
@@ -1330,6 +1333,7 @@ class _ExecutionLoop:
 
     async def _write_session_projection(
         self, store, sid, *, send_index, rows, status, projector, tool_registry, ownership, stop_event,
+        window=None,
     ) -> None:
         """Project the finished send from its in-memory raw rows, fenced by the owner."""
         if status == "pending_tools" or not rows:
@@ -1351,7 +1355,7 @@ class _ExecutionLoop:
             sid, send_index=send_index, rows=proj_rows_to_write,
             source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
             projector_version=version, projector=projector, keep_last_sends=keep, threshold=threshold,
-            row_threshold=row_threshold, ownership=ownership,
+            row_threshold=row_threshold, ownership=ownership, window=window,
         )
         if candidate is None:
             return

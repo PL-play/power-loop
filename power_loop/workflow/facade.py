@@ -415,9 +415,10 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
         loop, sid = get_current_loop(), get_session_id()
         if loop is None or not sid:
             raise WorkflowToolInputError("active_session_required")
-        await require_orchestration(loop, "workflow", sid=sid)
         if action == "create":
+            # The public submission boundary performs the same role check.
             return _dump((await submit_workflow(options, ports)).receipt)
+        await require_orchestration(loop, "workflow", sid=sid)
         if action == "validate":
             from .tool import _spec_summary
 

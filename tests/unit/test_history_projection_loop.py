@@ -25,6 +25,77 @@ from power_loop.runtime.store.store import SessionStore
 from tests.unit.test_stateful_loop import _echo_registry, _Scripted, _tool_resp
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projection_outcome", ["conflict", "db_error"])
+async def test_c02_projection_outcome_keeps_business_result_and_does_not_replay(
+    registry_store, runtime_agent, monkeypatch, projection_outcome,
+):
+    from contextlib import asynccontextmanager
+
+    from power_loop import ProjectedRepresentation, ToolDefinition
+    from power_loop.runtime.pricing import Free
+    from power_loop.tools.registry import ToolRegistry
+
+    from .test_projection_fold_statistics import assert_exact, cas_effects, cas_trace, is_projection_cas
+
+    store, _ = registry_store
+    effects = []
+    registry = ToolRegistry()
+    registry.register(ToolDefinition("echo", "", pricing=Free("fixture")),
+                      lambda **kw: effects.append(kw) or "tool fact")
+    model = _Scripted([LLMResponse(raw_text="seed"), _tool_resp("c2", "echo", '{"text":"once"}'),
+                       LLMResponse(raw_text="business success")])
+    projector = ProjectedRepresentation()
+    runner = await runtime_agent(store=store, model=model, registry=registry,
+        config=AgentLoopConfig(representation=projector, context_budget_tokens=10**9))
+    sid = runner.target.session_id
+    assert (await runner.send("seed")).status == "completed"
+    complete = model.complete
+    changed = []
+
+    async def competing_complete(*args, **kwargs):
+        if not changed:
+            changed.append(True)
+            await store.upsert_project_message(sid, send_index=1, kind="user", content={"input": ["corrected"]})
+        return await complete(*args, **kwargs)
+
+    original = store._db.transaction
+    error_hits = []
+
+    @asynccontextmanager
+    async def fail_cas():
+        async with original() as tx:
+            class Tx:
+                def __getattr__(self, name):
+                    return getattr(tx, name)
+
+                async def execute(self, sql, params=()):
+                    if is_projection_cas(sql):
+                        error_hits.append(True)
+                        raise ConnectionError("derived CAS failed")
+                    return await tx.execute(sql, params)
+
+            yield Tx()
+
+    with monkeypatch.context() as patch:
+        if projection_outcome == "conflict":
+            patch.setattr(model, "complete", competing_complete)
+        else:
+            patch.setattr(store._db, "transaction", fail_cas)
+        async with cas_trace(store, sid, f"business-{projection_outcome}") as probe:
+            result = await runner.send("work")
+    assert result.status == "completed" and result.final_text == "business success"
+    assert len(model.calls) == 3 and len(effects) == 1
+    if projection_outcome == "conflict":
+        assert changed and cas_effects(probe) == [0]
+        assert probe.exits.count("_ProjectionSnapshotConflict") == 1
+        await assert_exact(store, sid, projector)
+    else:
+        assert error_hits == [True] and "ConnectionError" in probe.exits
+        assert not any("AS stats_json" in r["sql"] for r in probe.records)
+        assert {r.send_index for r in await store.load_project_messages(sid)} == {1}
+
+
 @pytest.fixture
 async def store() -> AsyncIterator[SessionStore]:
     s = await SessionStore.open(":memory:")

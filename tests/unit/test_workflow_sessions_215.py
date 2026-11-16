@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -19,7 +20,7 @@ from power_loop.workflow import register_workflow_tool
 from tests.runtime_fixture import RunningAgent
 
 from ._workflow_fixture_203 import Model, leaf
-from .session_native_fixture import ACTOR, target
+from .session_native_fixture import ACTOR, DESCRIPTOR, target
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -28,10 +29,13 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
     store, _ = registry_store
 
     class Parent(Model):
+        created = False
+
         async def complete(self, request, **kwargs):
             if request.system_prompt.startswith("A"):
                 return LLMResponse(raw_text="leaf done")
-            if not any(message.get("role") == "tool" for message in request.messages):
+            if not self.created:
+                self.created = True
                 return LLMResponse(raw_text="", tool_calls=[{
                     "id": "workflow-call", "type": "function", "function": {
                         "name": "workflow",
@@ -441,8 +445,9 @@ async def test_halt_late_result_is_journaled_without_advancing_finished_graph(re
         await runner.aclose()
 
 
+@pytest.mark.parametrize("supplied", (True, False))
 async def test_public_workflow_rejects_closed_parent_and_keeps_existing_driver(
-    registry_store,
+    registry_store, supplied,
 ):
     """The public workflow entry uses the same creation check: an independent driver
     lets the parent close, then a second workflow call on the closed parent is rejected
@@ -451,21 +456,22 @@ async def test_public_workflow_rejects_closed_parent_and_keeps_existing_driver(
     port = RuntimeInputStore(store)
     parent = await target(port, "closed-workflow-parent")
     client = RuntimeClient(store=store, transport=MemoryMessageTransport())
+    kwargs = {"descriptor": DESCRIPTOR} if supplied else {}
     spec = {"name": "independent driver", "root": leaf("A")}
     first = await client.workflow(
-        parent, spec, message_id="first-run", actor=ACTOR,
+        parent, spec, message_id="first-run", actor=ACTOR, **kwargs,
     )
     await port.close(parent, actor=ACTOR)
     # Deterministic retry of the existing driver is rejected by the parent lifecycle
     # before the creation identity/idempotency check.
     with pytest.raises(RuntimeRequestError) as retried:
-        await client.workflow(parent, spec, message_id="first-run", actor=ACTOR)
+        await client.workflow(parent, spec, message_id="first-run", actor=ACTOR, **kwargs)
     assert retried.value.code == "session_closed"
     # A new driver under the same closed parent is rejected as well.
     with pytest.raises(RuntimeRequestError) as rejected:
         await client.workflow(
             parent, {"name": "after close", "root": leaf("A")},
-            message_id="second-run", actor=ACTOR,
+            message_id="second-run", actor=ACTOR, **kwargs,
         )
     assert rejected.value.code == "session_closed"
     drivers = await store._db.fetchall(
@@ -485,3 +491,43 @@ async def test_public_workflow_rejects_closed_parent_and_keeps_existing_driver(
         (first.target.session_id,),
     )
     assert int(journal["n"]) == 1
+
+
+@pytest.mark.parametrize("supplied", (True, False))
+async def test_submit_descriptor_facts_retry_conflict_and_authorization(registry_store, monkeypatch, supplied):
+    store, _ = registry_store
+    client = RuntimeClient(store=store, transport=MemoryMessageTransport())
+    port = client.inputs
+    parent = await target(port, "descriptor-parent")
+    explicit = replace(DESCRIPTOR, config={"chosen": "explicit"})
+    kwargs = {"descriptor": explicit} if supplied else {}
+    outside_parent_reads = []
+    original = port._session
+
+    async def read(reader, sid):
+        if reader is port.db and sid == parent.session_id:
+            outside_parent_reads.append(sid)
+        return await original(reader, sid)
+
+    monkeypatch.setattr(port, "_session", read)
+    spec = {"name": "descriptor facts", "root": leaf("A")}
+    first = await client.workflow(parent, spec, message_id="same", actor=ACTOR, **kwargs)
+    assert len(outside_parent_reads) == (0 if supplied else 1)
+    row = await original(port.db, first.target.session_id)
+    descriptor = json.loads(row["descriptor_json"])
+    expected = explicit if supplied else DESCRIPTOR
+    assert descriptor["kind"] == "workflow_driver"
+    assert {k: v for k, v in descriptor["config"].items() if k != "workflow"} == dict(expected.config)
+    assert descriptor["config"]["workflow"]["spec"]["name"] == spec["name"]
+    retry = await client.workflow(parent, spec, message_id="same", actor=ACTOR, **kwargs)
+    assert retry.target == first.target and retry.input_ref == first.input_ref
+    with pytest.raises(RuntimeRequestError) as conflict:
+        await client.workflow(parent, {**spec, "name": "changed"}, message_id="same", actor=ACTOR, **kwargs)
+    assert conflict.value.code == "creation_conflict"
+    with pytest.raises(RuntimeRequestError) as denied:
+        await client.workflow(parent, spec, message_id="unauthorized",
+                              actor=replace(ACTOR, tenant_id="other-tenant"), **kwargs)
+    assert denied.value.code == "forbidden"
+    children = await store._db.fetchone(
+        f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE parent_session_id=?", (parent.session_id,))
+    assert int(children["n"]) == 1

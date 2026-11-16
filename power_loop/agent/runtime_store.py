@@ -1754,12 +1754,23 @@ class RuntimeInputStore:
     async def discover_unfinished(self, *, limit=100):
         if not 1 <= limit <= 1000:
             raise RuntimeRequestError("invalid_options", "limit")
-        database_now = await self._db_now(self.db)
+        columns = "session_id,execution_state,owner_lease_until_ms"
+        order = "execution_state,owner_lease_until_ms,session_id"
+        branches = []
+        # Each state has its own index range. The global first L rows are among
+        # these three first-L sets, so the final merge sorts at most 3L candidates.
+        for state in ("queued", "recovering", "running"):
+            condition = f"execution_state='{state}'"
+            if state == "running":
+                condition += f" AND owner_lease_until_ms<=(SELECT {self._now_sql()})"
+            branches.append(
+                f"SELECT {columns} FROM (SELECT {columns} FROM {self.state} "
+                f"WHERE {condition} ORDER BY {order} LIMIT ?) AS {state}_candidates"
+            )
         rows = await self.db.fetchall(
-            f"SELECT session_id FROM {self.state} WHERE execution_state IN ('queued','recovering') "
-            "OR (execution_state='running' AND owner_lease_until_ms<=?) "
-            "ORDER BY execution_state,owner_lease_until_ms,session_id LIMIT ?",
-            (database_now, limit),
+            "SELECT session_id FROM (" + " UNION ALL ".join(branches)
+            + f") AS candidates ORDER BY {order} LIMIT ?",
+            (limit, limit, limit, limit),
         )
         return tuple(TargetRef(self.store.store_id, row["session_id"]) for row in rows)
 

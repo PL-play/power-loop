@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from power_loop.agent.runtime_store import FinalBatch, now_ms
 from power_loop.agent.runtime_types import (
+    CapacityError,
     InputRef,
     RequestOptions,
     Result,
@@ -39,9 +40,9 @@ async def submit(client, target, spec, *, message_id, actor, descriptor=None, op
     client._require_open()
     spec = WorkflowSpec.from_json(spec.to_dict() if isinstance(spec, WorkflowSpec) else spec)
     port = client.inputs
-    caller = await port._session(port.db, target.session_id)
     supplied_descriptor, supplied_options = descriptor, options
     if descriptor is None:
+        caller = await port._session(port.db, target.session_id)
         descriptor = RuntimeDescriptor(**json.loads(caller["descriptor_json"]))
     options = options or RequestOptions()
     identity = [
@@ -156,6 +157,31 @@ class DurableExecutor:
         self.plan = saved.get("continuation") or {}
         self.driver = TargetRef(ctx.store_id, ctx.session_id)
         self.actor = TrustedActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id)
+        self._nodes = None
+        self._by_input = {}
+        self._journal_lock = asyncio.Lock()
+
+    async def _load_nodes(self, reader=None):
+        """Called under the local journal lock; facts belong only to this executor."""
+        if self._nodes is not None:
+            return
+        entries = await journal.nodes(
+            self.port.store, self.port.db if reader is None else reader, self.ctx.session_id)
+        self._nodes = {}
+        for entry in entries:
+            key = journal.node_key(
+                self.driver, self.run_id, entry["path"], entry["iteration"],
+                entry["attempt"], entry["continuation_index"],
+            )
+            self._publish_node(key, entry)
+
+    def _publish_node(self, key, entry):
+        self._nodes[key] = entry
+        self._by_input[InputRef(**entry["input_ref"])] = key
+
+    def _check_capacity(self, key):
+        if key not in self._nodes and len(self._nodes) + 1 > journal.NODE_LIMIT:
+            raise CapacityError()
 
     def _coordinates(self, request):
         offset = self.plan.get("attempt_offsets", {}).get(request.node_path, 0)
@@ -240,10 +266,16 @@ class DurableExecutor:
 
     async def run_agent(self, request, *, allow_start=True):
         request, target, start, key, request_hash = self._coordinates(request)
-        saved = await journal.get(self.port.store, self.port.db, self.ctx.session_id, key)
+        async with self._journal_lock:
+            await self._load_nodes()
+            saved = self._nodes.get(key)
+            if saved is not None and saved["request_hash"] != request_hash:
+                raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
+            if saved is None:
+                if not allow_start:
+                    return {"status": "budget_exceeded", "usage": {}, "session_id": target.session_id}
+                self._check_capacity(key)
         if saved is None:
-            if not allow_start:
-                return {"status": "budget_exceeded", "usage": {}, "session_id": target.session_id}
             descriptor = self._descriptor(request)
             if request.session_id is None and request.attempt == 1 and request.continuation == 0:
                 await self.port.create_workflow_session(
@@ -262,10 +294,12 @@ class DurableExecutor:
                     target, request.body, message_id=start.message_id, actor=self.actor,
                 )
             # Fixed order: session+start committed above, journal committed below.
-            async with self.port.db.transaction() as tx:
-                await self._check_owner(tx)
-                saved = await journal.get(self.port.store, tx, self.ctx.session_id, key)
+            async with self._journal_lock:
+                saved = self._nodes.get(key)
+                if saved is not None and saved["request_hash"] != request_hash:
+                    raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
                 if saved is None:
+                    self._check_capacity(key)
                     saved = {
                         "version": 1,
                         "driver_target": plain(self.driver),
@@ -285,9 +319,10 @@ class DurableExecutor:
                         "result_input_ref": None,
                         "late_results": [],
                     }
-                    await journal.put(self.port.store, tx, self.ctx.session_id, key, saved)
-        elif saved["request_hash"] != request_hash:
-            raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
+                    async with self.port.db.transaction() as tx:
+                        await self._check_owner(tx)
+                        await journal.put(self.port.store, tx, self.ctx.session_id, key, saved)
+                    self._publish_node(key, saved)
 
         if saved.get("result") is None:
             try:
@@ -304,14 +339,14 @@ class DurableExecutor:
                         target, actor=self.actor, scope="subtree", reason="workflow branch stopped",
                     )
                 raise
-            await self._consume_results()
-            saved = await journal.get(self.port.store, self.port.db, self.ctx.session_id, key)
+            consumed = await self._consume_results(for_key=key)
+            saved = consumed.get(key, self._nodes[key])
             if saved.get("result") is None:
                 # A full driver inbox can be drained and the ordinary result re-reported
                 # without re-executing the node. Unknown external actions are not replayed.
                 await self.port.accept_result(target, result, result_kind="workflow_node_result")
-                await self._consume_results()
-                saved = await journal.get(self.port.store, self.port.db, self.ctx.session_id, key)
+                consumed = await self._consume_results(for_key=key)
+                saved = consumed.get(key, self._nodes[key])
             if saved.get("result") is None:
                 raise RuntimeRequestError("result_delivery_failed", start.message_id)
 
@@ -320,7 +355,7 @@ class DurableExecutor:
             self.driver, self.run_id, request.node_path, request.iteration_path,
             request.attempt, request.continuation + 1,
         )
-        following = await journal.get(self.port.store, self.port.db, self.ctx.session_id, next_key)
+        following = self._nodes.get(next_key)
         replayed = bool(self.plan) and int(saved.get("revision", 0)) < int(self.plan.get("revision", 0))
         return {
             **raw,
@@ -329,41 +364,40 @@ class DurableExecutor:
             "accounting_usage": {} if replayed else raw.get("usage") or {},
         }
 
-    async def _consume_results(self):
+    async def _consume_results(self, *, for_key=None):
+        async with self._journal_lock:
+            if for_key is not None and self._nodes[for_key].get("result") is not None:
+                return {for_key: self._nodes[for_key]}
+            return await self._consume_results_locked()
+
+    async def _consume_results_locked(self):
         """Consume every ready node result and journal it in one fenced transaction."""
         async with self.port.db.transaction() as tx:
             await self._check_owner(tx)
             rows = await tx.fetchall(
                 f"SELECT * FROM {self.port.q} WHERE session_id=? "
-                "AND kind='workflow_node_result' AND (status='pending' "
-                "OR (status='delivered' AND delivered_send_index=? AND terminal_status IS NULL)) "
+                "AND kind='workflow_node_result' AND terminal_status IS NULL AND completed_at IS NULL "
+                "AND (status='pending' OR (status='delivered' AND delivered_send_index=?)) "
                 "ORDER BY id LIMIT 1000",
                 (self.ctx.session_id, self.ctx.send_index),
             )
             if not rows:
-                return 0
-            entries = await journal.nodes(self.port.store, tx, self.ctx.session_id)
-            by_input = {canonical(entry["input_ref"]): (key, entry) for entry, key in zip(
-                entries,
-                [journal.node_key(
-                    self.driver, self.run_id, entry["path"], entry["iteration"],
-                    entry["attempt"], entry["continuation_index"],
-                ) for entry in entries], strict=True,
-            )}
-            run = await journal.get(
-                self.port.store, tx, self.ctx.session_id, journal.run_key(self.run_id),
-            )
-            consumed = 0
+                return {}
+            await self._load_nodes(tx)
+            updates = {}
             database_now = now_ms()
             for row in rows:
                 body = json.loads(row["content_json"])
                 source = InputRef(**body["input_ref"])
-                found = by_input.get(canonical(source))
-                if found is None:
+                key = self._by_input.get(source)
+                if key is None:
                     # The node may have committed before its journal. Recovery aligns
                     # that journal first; only then can this result advance the graph.
                     continue
-                key, entry = found
+                if key not in updates:
+                    prior = self._nodes[key]
+                    updates[key] = {**prior, "late_results": list(prior["late_results"])}
+                entry = updates[key]
                 raw = dict(body)
                 source_record = await self.port.input(tx, source)
                 if source_record is None or source_record.row["terminal_status"] is None:
@@ -373,7 +407,7 @@ class DurableExecutor:
                     raw["status"] = raw["error_code"]
                 elif raw.get("error_code") in {"unknown", "store_commit_unknown"}:
                     raw["status"] = "unknown"
-                if run.get("aggregate_delivered") or entry.get("superseded") or entry.get("result") is not None:
+                if self.saved.get("aggregate_delivered") or entry.get("superseded") or entry.get("result") is not None:
                     if not any(item.get("input_ref") == body["input_ref"] for item in entry["late_results"]):
                         entry["late_results"].append(raw)
                 else:
@@ -396,8 +430,10 @@ class DurableExecutor:
                 )
                 if changed != 1:
                     raise SessionLeaseLost(self.ctx.session_id)
-                consumed += 1
-            return consumed
+        # No await between a successful commit and publishing the transaction copies.
+        for key, entry in updates.items():
+            self._publish_node(key, entry)
+        return updates
 
     async def todo_remaining(self, sid):
         state = await self.port.store.get_runtime_state(sid, "todo") or {}
@@ -456,15 +492,21 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate):
     port = worker.inputs
     target = TargetRef(ctx.store_id, ctx.session_id)
     async with port.db.transaction() as tx:
-        session = await port._session(tx, ctx.session_id)
-        route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
+        # The claim supplied the same frozen identity/route used by ordinary final.
+        session = {
+            "session_id": ctx.session_id,
+            "tenant_id": ctx.batch.tenant_id,
+            "principal_id": ctx.batch.principal_id,
+            "parent_session_id": ctx.batch.parent_session_id,
+        }
+        route = ctx.batch.result_route
         lock_ids = {ctx.session_id}
         if route is not None:
             lock_ids.add(route["target"]["session_id"])
+        states = {}
         for sid in sorted(lock_ids):
-            state = await port.store._db.dialect.lock_state(tx, port.state, sid)
-            if sid == ctx.session_id:
-                own_state = state
+            states[sid] = await port.store._db.dialect.lock_state(tx, port.state, sid)
+        own_state = states[ctx.session_id]
         if (
             own_state["execution_state"] != "running"
             or own_state["active_send_index"] != ctx.send_index
@@ -513,6 +555,7 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate):
                     None if status == "completed" else status,
                 ),
                 route["result_kind"], database_now, activations,
+                parent_state=states[route["target"]["session_id"]],
             )
         ids = [record.ref.message_id for record in chain]
         await tx.execute(
@@ -636,15 +679,15 @@ async def run_driver(worker, ctx, env):
         content = json.loads(origin.row["content_json"])
         if isinstance(content, dict) and "workflow_resume" in content:
             resume_options = content["workflow_resume"]
-    executor = DurableExecutor(worker, ctx, env, run_id, saved)
     if saved.get("aggregate_delivered") and resume_options is None:
+        executor = DurableExecutor(worker, ctx, env, run_id, saved)
         await executor._consume_results()
         return await _finish_late(worker, ctx, list(ctx.batch.input_refs))
     if origin is None:
         raise RuntimeRequestError("workflow_origin_missing")
     if resume_options is not None and saved.get("definition_ref") != plain(origin.ref):
         saved = await _prepare_explicit(worker, ctx, saved, origin, resume_options)
-        executor = DurableExecutor(worker, ctx, env, run_id, saved)
+    executor = DurableExecutor(worker, ctx, env, run_id, saved)
     spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
     engine = WorkflowEngine(
         executor,

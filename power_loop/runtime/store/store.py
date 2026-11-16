@@ -54,6 +54,15 @@ DEFAULT_MAX_SPAWN_DEPTH = 3
 
 
 @dataclass(frozen=True)
+class ProjectionWindowStats:
+    """Raw fold statistics from the window's statement snapshot, valid for this run only."""
+
+    row_exists: bool
+    value_json: str | None
+    compact_to_send: int | None
+
+
+@dataclass(frozen=True)
 class ProjectionWindow:
     """One bounded history-entry read: latest compact, live projection rows, first send read.
 
@@ -64,6 +73,7 @@ class ProjectionWindow:
     compact: ProjectMessageRow | None
     rows: list[ProjectMessageRow]
     window_lo: int
+    stats: ProjectionWindowStats
 
 # Back-compat public aliases (the names the rest of power-loop and its callers
 # import). The async store is the canonical source for these now.
@@ -967,7 +977,7 @@ class SessionStore:
         table = self.t.project_messages
         if int(current_send_index) <= 1:
             # No finished send can exist before send 1, so there is nothing to read.
-            return ProjectionWindow(None, [], 1)
+            return ProjectionWindow(None, [], 1, ProjectionWindowStats(False, None, None))
         # Split the tiny compact set from the recent send range so the range predicate is an
         # actual index search, not a residual filter over every row of the session. SQLite must
         # materialize the compact CTE; otherwise the optimizer expands it and falls back to the
@@ -983,15 +993,34 @@ class SessionStore:
         if lo is not None:
             range_filter = " AND send_index>=?"
             params.append(lo)
+        from .projection_fold import STATE_KEY
+
+        # The constant session row guarantees exactly one header even for an empty window.
+        # Keep the statistics off the data rows: its raw JSON is returned only once.
+        projection_columns = (
+            "id", "session_id", "send_index", "kind", "content_json", "rendered_text",
+            "source_seq_lo", "source_seq_hi", "completed_through_send_index",
+            "compact_from_send", "compact_to_send", "projector_version", "token_estimate", "created_at",
+        )
+        columns = ",".join(projection_columns)
+        header_kind = "__pl_stats__"
+        header_values = {
+            "kind": f"'{header_kind}'", "content_json": "stats.value_json", "rendered_text": "stats.state_key",
+        }
+        header_columns = ",".join(header_values.get(column, "NULL") for column in projection_columns)
         rows = await self._db.fetchall(
             f"{cte}"
-            f"SELECT * FROM {table} WHERE session_id=? AND kind='compact') "
-            "SELECT * FROM compact UNION ALL "
-            f"SELECT * FROM {table} WHERE session_id=?{range_filter} "
-            "AND send_index > COALESCE((SELECT MAX(send_index) FROM compact), -1)",
-            tuple(params),
+            f"SELECT {columns} FROM {table} WHERE session_id=? AND kind='compact') "
+            f"SELECT {columns} FROM compact UNION ALL "
+            f"SELECT {columns} FROM {table} WHERE session_id=?{range_filter} "
+            "AND send_index > COALESCE((SELECT MAX(send_index) FROM compact), -1) "
+            f"UNION ALL SELECT {header_columns} FROM (SELECT ? AS session_id) AS session "
+            f"LEFT JOIN {self.t.session_runtime_state} AS stats "
+            "ON stats.session_id=session.session_id AND stats.state_key=?",
+            (*params, session_id, STATE_KEY),
         )
-        out = [_row_to_project_message(r) for r in rows]
+        header = next(r for r in rows if r["id"] is None and r["kind"] == header_kind)
+        out = [_row_to_project_message(r) for r in rows if r["id"] is not None or r["kind"] != header_kind]
         out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
         compact = max((r for r in out if r.kind == "compact"), key=lambda r: r.send_index, default=None)
         cutoff = compact.compact_to_send if compact is not None else None
@@ -999,7 +1028,10 @@ class SessionStore:
         if lo is not None:
             window_lo = max(window_lo, lo)
         live = [r for r in out if r.kind != "compact" and int(r.send_index) < int(current_send_index)]
-        return ProjectionWindow(compact, live, window_lo)
+        return ProjectionWindow(compact, live, window_lo, ProjectionWindowStats(
+            row_exists=header["rendered_text"] is not None,
+            value_json=header["content_json"], compact_to_send=cutoff,
+        ))
 
     async def load_all_messages(self, session_id: str) -> list[MessageRow]:
         rows = await self._db.fetchall(
@@ -1358,7 +1390,7 @@ class SessionStore:
         self, session_id: str, *, send_index: int, rows: list[tuple[str, Any, str | None]],
         source_seq_lo: int | None, source_seq_hi: int | None, projector_version: int,
         projector: Any, keep_last_sends: int, threshold: int, row_threshold: float | None = None,
-        ownership=None,
+        ownership=None, window: ProjectionWindow | None = None,
     ):
         """Persist projections and statistics; return a fenced fold candidate only when needed.
 
@@ -1371,7 +1403,7 @@ class SessionStore:
             self, session_id, send_index=send_index, rows=rows, source_seq_lo=source_seq_lo,
             source_seq_hi=source_seq_hi, projector_version=projector_version, projector=projector,
             keep_last_sends=keep_last_sends, threshold=threshold, row_threshold=row_threshold,
-            ownership=ownership,
+            ownership=ownership, window=window,
         )
 
     async def commit_projection_fold(

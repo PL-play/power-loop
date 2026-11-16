@@ -14,6 +14,7 @@ from power_loop.agent.runtime_types import canonical, sha256_canonical
 JOURNAL_PREFIX = "workflow:run:"
 NODE_PREFIX = "workflow:node:"
 ROUTE_KEY = "\x00workflow_route"
+NODE_LIMIT = 10000
 
 
 def run_key(run_id):
@@ -50,7 +51,9 @@ async def get(store, reader, sid, key):
     return json.loads(row["value_json"]) if row else None
 
 
-async def nodes(store, reader, sid, *, limit=10000):
+async def nodes(store, reader, sid, *, limit=None):
+    if limit is None:
+        limit = NODE_LIMIT
     rows = await reader.fetchall(
         f"SELECT state_key,value_json FROM {store.t.session_runtime_state} "
         f"WHERE session_id=? AND state_key LIKE '{NODE_PREFIX}%' "
@@ -60,7 +63,7 @@ async def nodes(store, reader, sid, *, limit=10000):
     if len(rows) > limit:
         from power_loop.agent.runtime_types import CapacityError
 
-        raise CapacityError("workflow node query limit exceeded")
+        raise CapacityError()
     return [json.loads(row["value_json"]) for row in rows]
 
 

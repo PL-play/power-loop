@@ -154,3 +154,39 @@ async def test_cap_counts_history_only_not_the_current_send(store: SessionStore,
     assert "u1" not in joined, "cap 本身仍要生效"
     assert "u4" in joined
 
+
+async def test_header_keeps_expanded_send_pairs_and_multimodal_history(registry_store, runtime_agent):
+    class Expanded(ProjectedRepresentation):
+        def render(self, rows):
+            messages = []
+            for row in rows:
+                if row.kind == "project":
+                    cid = f"history-{row.send_index}"
+                    messages.extend([
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": cid, "type": "function",
+                            "function": {"name": "echo", "arguments": "{}"}}]},
+                        {"role": "tool", "content": "expanded", "tool_call_id": cid},
+                    ])
+                messages.extend(super().render([row]))
+            return messages
+
+    store, _ = registry_store
+    llm = _Scripted([LLMResponse(raw_text=f"d{i}") for i in range(1, 4)]
+                    + [_tool_call("current-tool"), LLMResponse(raw_text="done")])
+    loop = await runtime_agent(model=llm, store=store, registry=_echo_registry(), config=AgentLoopConfig(
+        representation=Expanded(), max_context_rows=5, context_budget_tokens=10**9,
+        fold_strategy=LLMSummaryFold(keep_last_sends=10), max_rounds=3))
+    for i in range(1, 4):
+        await loop.send([{"type": "text", "text": f"u{i}"},
+                         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}])
+    assert (await loop.send("u4")).status == "completed"
+    messages = llm.calls[-1]
+    prompt = str(messages)
+    assert "u3" in prompt and "u2" not in prompt and "u1" not in prompt
+    assert "[image]" in prompt and "base64" not in prompt
+    calls = [c["id"] for m in messages for c in m.get("tool_calls", [])]
+    results = [m["tool_call_id"] for m in messages if m.get("role") == "tool"]
+    assert calls == results == ["history-3", "current-tool"]
+    assert "__pl_stats" not in prompt and "__pl_projection_fold" not in prompt
+

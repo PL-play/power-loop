@@ -25,6 +25,10 @@ OWNER_PREFIX = STATE_KEY + "/"
 PAGE_SIZE = 256
 
 
+class _ProjectionSnapshotConflict(Exception):
+    """Only an explicit zero-row conditional statistics write permits the cold retry."""
+
+
 @dataclass(frozen=True)
 class ProjectionFoldSnapshot:
     prior: ProjectMessageRow | None
@@ -129,7 +133,7 @@ def _matches(store, sid, state, policy, cutoff):
     return _state_ok(store, sid, state, policy) and state.get("cutoff") == cutoff
 
 
-async def _changed_rows(store, tx, sid, state, policy, maximum, owners):
+async def _changed_rows(store, tx, sid, state, policy, maximum, owners, window=None):
     """Only rows becoming cold, or the previous visible owner of a new dedup key, can change."""
     from .store import _row_to_project_message
 
@@ -137,13 +141,25 @@ async def _changed_rows(store, tx, sid, state, policy, maximum, owners):
     cutoff = state["cutoff"] if state["cutoff"] is not None else -1
     lower = max(cutoff, state["maximum"] - policy.hot_window)
     upper = min(state["maximum"], maximum - policy.hot_window)
-    if policy.hot_window and lower < upper:
+    indices = {send for send in owners.values() if cutoff < send <= state["maximum"]}
+    window_lo = window.window_lo if window is not None else maximum
+    covered_owners = {send for send in indices if window_lo <= send < maximum}
+    if window is not None and (covered_owners or policy.hot_window and upper >= window_lo and lower < upper):
+        # One pass, retaining references only to affected rows. The CAS that follows
+        # validates this entire statement snapshot; rendering annotations are reset by _cost.
+        for row in window.rows:
+            if window_lo <= row.send_index < maximum and (
+                    policy.hot_window and lower < row.send_index <= upper and row.kind in ("user", "project")
+                    or row.kind == "project" and row.send_index in covered_owners):
+                found[row.send_index, row.kind] = row
+    outside_upper = min(upper, window_lo - 1)
+    if policy.hot_window and lower < outside_upper:
         rows = await tx.fetchall(
             f"SELECT * FROM {store.t.project_messages} WHERE session_id=? AND send_index>? "
-            "AND send_index<=? AND kind IN ('user','project')", (sid, lower, upper),
+            "AND send_index<=? AND kind IN ('user','project')", (sid, lower, outside_upper),
         )
         found.update({(r["send_index"], r["kind"]): _row_to_project_message(r) for r in rows})
-    indices = sorted({send for send in owners.values() if cutoff < send <= state["maximum"]})
+    indices = sorted(indices - covered_owners)
     for offset in range(0, len(indices), PAGE_SIZE):
         page = indices[offset:offset + PAGE_SIZE]
         rows = await tx.fetchall(
@@ -154,10 +170,10 @@ async def _changed_rows(store, tx, sid, state, policy, maximum, owners):
     return list(found.values())
 
 
-async def _advance(store, tx, sid, state, projector, policy, new_rows, send_index):
+async def _advance(store, tx, sid, state, projector, policy, new_rows, send_index, window=None):
     new_keys = _keys(new_rows, policy)
     owners = await _owners(store, tx, sid, state["generation"], new_keys)
-    changed = await _changed_rows(store, tx, sid, state, policy, send_index, owners)
+    changed = await _changed_rows(store, tx, sid, state, policy, send_index, owners, window=window)
     old_keys = _keys(changed, policy)
     owners.update(await _owners(store, tx, sid, state["generation"], old_keys - owners.keys()))
     if any(key not in owners or owners[key] < row.send_index
@@ -178,7 +194,7 @@ async def _advance(store, tx, sid, state, projector, policy, new_rows, send_inde
 
 
 async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi, projector_version,
-                  projector=None, policy=None, ownership=None):
+                  projector=None, policy=None, ownership=None, window=None):
     """Atomically append projections and advance/invalidate statistics under a short session lock.
 
     ``ownership`` (design 215 §8.2): when the writer holds a session owner fence, the
@@ -193,60 +209,109 @@ async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi,
         token_estimate=None, created_at=0, completed_through_send_index=send_index,
     ) for kind, content, text in rows]
     now = time.time_ns() // 1_000_000
-    async with store._db.transaction() as tx:
-        # Lock the state row first; the owner fields come from that locked row, while the
-        # mutable statistics are read in a fresh statement after the lock. A joined snapshot
-        # taken while waiting does not become fresh when the lock is granted on PostgreSQL.
-        locked = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
-        store.fence_owner_row(locked, sid, ownership)
-        # After the lock, one statement returns the statistics and the cold-path facts. This is
-        # fresh (no pre-wait join snapshot): the compact subquery uses the (session_id,kind)
-        # coverage index, and any_send stops at the first row of the session index. Hot saves
-        # pay these bounded probes but issue no extra statement.
-        compact_cte = ("WITH compact AS (" if store._db.dialect.name == "mysql"
-                       else "WITH compact AS MATERIALIZED (")
-        facts = await tx.fetchone(
-            f"{compact_cte}SELECT * FROM {store.t.project_messages} "
-            "WHERE session_id=? AND kind='compact') "
-            f"SELECT (SELECT value_json FROM {store.t.session_runtime_state} "
-            "WHERE session_id=? AND state_key=?) AS stats_json, "
-            "(SELECT compact_to_send FROM compact ORDER BY send_index DESC LIMIT 1) "
-            "AS compact_to_send, "
-            f"(SELECT send_index FROM {store.t.project_messages} WHERE session_id=? LIMIT 1) AS any_send",
-            (sid, sid, STATE_KEY, sid),
-        )
-        state = parse_state(facts["stats_json"] if facts is not None else None)
-        # A valid statistics row is written under this same session lock and any fold/rewrite
-        # invalidates it, so its cutoff is current; the compact/any_send probes are ignored on
-        # this healthy path and only retained for the cold/rebuild decision below.
-        if policy is not None and _state_ok(store, sid, state, policy):
-            cutoff = state.get("cutoff")
-        else:
-            cutoff = facts["compact_to_send"] if facts is not None else None
-            if policy is not None and state is None and facts is not None and facts["any_send"] is None:
-                state = _base_state(store, sid, policy, cutoff)
-        updated = None
-        if (policy is not None and new_rows and all(r.kind in ("user", "project") for r in new_rows)
-                and _matches(store, sid, state, policy, cutoff)
-                and send_index > state["maximum"]):
-            try:
-                updated = await _advance(store, tx, sid, state, projector, policy, new_rows, send_index)
-            except (KeyError, TypeError, ValueError):
-                logger.warning("projection fold statistics require rebuilding for %s", sid, exc_info=True)
-        if new_rows:
-            await store._upsert_project_messages_tx(tx, [(
-                sid, int(send_index), row.kind,
-                _dumps(row.content if row.content is not None else {}),
-                _nul_safe(row.rendered_text),
-                source_seq_lo, source_seq_hi, None, None,
-                int(projector_version), None, int(send_index), now,
-            ) for row in new_rows])
-        if updated is None:
-            updated = _invalid(state)
-        else:
-            updated["revision"] = secrets.token_hex(16)
-        await _put(store, tx, sid, STATE_KEY, updated)
-    return updated
+    header = window.stats if window is not None else None
+    snapshot = parse_state(header.value_json) if header is not None else None
+    incremental = (policy is not None and new_rows
+                   and all(row.kind in ("user", "project") for row in new_rows))
+    healthy = (incremental and header is not None and header.row_exists
+               and _matches(store, sid, snapshot, policy, header.compact_to_send)
+               and send_index > snapshot["maximum"])
+    first = incremental and header is not None and not header.row_exists and send_index == 1
+
+    async def save(use_header):
+        async with store._db.transaction() as tx:
+            # Ownership always comes from the real locked row, never the run snapshot.
+            locked = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            store.fence_owner_row(locked, sid, ownership)
+            if use_header:
+                state = snapshot if healthy else _base_state(store, sid, policy, None)
+                cutoff = header.compact_to_send
+            else:
+                # After the lock, one statement returns the statistics and the cold-path facts. This is
+                # fresh (no pre-wait join snapshot): the compact subquery uses the (session_id,kind)
+                # coverage index, and any_send stops at the first row of the session index. Hot saves
+                # pay these bounded probes but issue no extra statement.
+                compact_cte = ("WITH compact AS (" if store._db.dialect.name == "mysql"
+                               else "WITH compact AS MATERIALIZED (")
+                facts = await tx.fetchone(
+                    f"{compact_cte}SELECT * FROM {store.t.project_messages} "
+                    "WHERE session_id=? AND kind='compact') "
+                    f"SELECT (SELECT value_json FROM {store.t.session_runtime_state} "
+                    "WHERE session_id=? AND state_key=?) AS stats_json, "
+                    "(SELECT compact_to_send FROM compact ORDER BY send_index DESC LIMIT 1) "
+                    "AS compact_to_send, "
+                    f"(SELECT send_index FROM {store.t.project_messages} WHERE session_id=? LIMIT 1) AS any_send",
+                    (sid, sid, STATE_KEY, sid),
+                )
+                state = parse_state(facts["stats_json"] if facts is not None else None)
+                # A valid statistics row is written under this same session lock and any fold/rewrite
+                # invalidates it, so its cutoff is current; the compact/any_send probes are ignored on
+                # this healthy path and only retained for the cold/rebuild decision below.
+                if policy is not None and _state_ok(store, sid, state, policy):
+                    cutoff = state.get("cutoff")
+                else:
+                    cutoff = facts["compact_to_send"] if facts is not None else None
+                    if policy is not None and state is None and facts is not None and facts["any_send"] is None:
+                        state = _base_state(store, sid, policy, cutoff)
+            updated = None
+            if (policy is not None and new_rows and all(r.kind in ("user", "project") for r in new_rows)
+                    and _matches(store, sid, state, policy, cutoff)
+                    and send_index > state["maximum"]):
+                try:
+                    updated = await _advance(store, tx, sid, state, projector, policy, new_rows, send_index,
+                                             window=window if use_header and healthy else None)
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("projection fold statistics require rebuilding for %s", sid, exc_info=True)
+            if updated is None:
+                updated = _invalid(state)
+            else:
+                updated["revision"] = secrets.token_hex(16)
+            if use_header:
+                # Keep the DB's original string as the expected value. In particular,
+                # MySQL's text collation must not erase trailing spaces or Unicode differences.
+                value = json.dumps(updated, ensure_ascii=False)
+                if healthy:
+                    equality = ("CAST(value_json AS BINARY) = CAST(? AS BINARY)" if store._db.dialect.name == "mysql"
+                                else "value_json=?")
+                    affected = await tx.execute(
+                        f"UPDATE {store.t.session_runtime_state} SET value_json=?,updated_at=? "
+                        f"WHERE session_id=? AND state_key=? AND {equality}",
+                        (value, now, sid, STATE_KEY, header.value_json),
+                    )
+                else:
+                    # First send is not evidence of an empty projection table. Both
+                    # absence predicates are evaluated BEFORE inserting the new projections.
+                    affected = await tx.execute(
+                        f"INSERT INTO {store.t.session_runtime_state} "
+                        "(session_id,state_key,value_json,updated_at) SELECT ?,?,?,? "
+                        f"WHERE NOT EXISTS (SELECT 1 FROM {store.t.session_runtime_state} "
+                        "WHERE session_id=? AND state_key=?) "
+                        f"AND NOT EXISTS (SELECT 1 FROM {store.t.project_messages} WHERE session_id=?)",
+                        (sid, STATE_KEY, value, now, sid, STATE_KEY, sid),
+                    )
+                if affected == 0:
+                    raise _ProjectionSnapshotConflict()
+            if new_rows:
+                await store._upsert_project_messages_tx(tx, [(
+                    sid, int(send_index), row.kind,
+                    _dumps(row.content if row.content is not None else {}),
+                    _nul_safe(row.rendered_text),
+                    source_seq_lo, source_seq_hi, None, None,
+                    int(projector_version), None, int(send_index), now,
+                ) for row in new_rows])
+            if not use_header:
+                await _put(store, tx, sid, STATE_KEY, updated)
+        return updated
+
+    if healthy or first:
+        try:
+            return await save(True)
+        except _ProjectionSnapshotConflict:
+            # The transaction manager has rolled back key owners and statistics.
+            # Legal mutators share the state lock: the existing locked facts path is
+            # sufficient now. Never retry an unknown commit or replay external work.
+            pass
+    return await save(False)
 
 
 async def read_snapshot(store, sid, *, revision=None):
@@ -356,11 +421,12 @@ async def _rebuild(store, sid, projector, policy, snapshot, obsolete):
 
 
 async def prepare(store, sid, *, projector, keep_last_sends, threshold, row_threshold=None,
-                  ownership=None, **projection):
+                  ownership=None, window=None, **projection):
     """Persist this send; read historical bodies only after a positive gate or during repair."""
     provider = getattr(projector, "fold_statistics_policy", None)
     policy = provider() if provider is not None else None
-    state = await persist(store, sid, projector=projector, policy=policy, ownership=ownership, **projection)
+    state = await persist(store, sid, projector=projector, policy=policy, ownership=ownership,
+                          window=window, **projection)
     if provider is not None and provider() != policy:
         async with store._db.transaction() as tx:
             await store._db.dialect.lock_state(tx, store.t.session_state, sid)
