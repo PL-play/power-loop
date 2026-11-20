@@ -132,17 +132,20 @@ async def test_each_send_gets_its_own_usage(registry_store, runtime_agent):
 
 async def _wedge_session(store, sid: str) -> None:
     """Simulate a run killed mid tool-call: pending tool_calls in the store."""
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import TargetRef, TrustedActor
+    port = RuntimeInputStore(store)
+    session = await store.get_session(sid)
+    actor = TrustedActor(session.tenant_id, session.principal_id, None)
+    target = TargetRef(store.store_id, sid)
+    await port.accept(target, "interrupted", message_id="interrupted", actor=actor)
+    batch = await port.claim(target, node_id="old", boot_id="old")
     await store.append_message(
-        sid, role="assistant", content="",
+        sid, role="assistant", content="", send_index=batch.send_index, pending_tool_calls=True,
         tool_calls=[{"id": "dead1", "type": "function",
                      "function": {"name": "echo", "arguments": "{}"}}],
     )
-    await store.set_pending(sid, {
-        "assistant_seq": 1, "round_index": 0,
-        "tool_call_ids": ["dead1"],
-        "tool_calls": [{"id": "dead1", "type": "function",
-                        "function": {"name": "echo", "arguments": "{}"}}],
-    })
+    await port.final(batch, status="interrupted", error="crash")
 
 
 @pytest.mark.asyncio

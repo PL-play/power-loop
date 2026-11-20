@@ -25,10 +25,31 @@ class Cluster:
         self.offset = 0
         self.paused = set()
         self.controller = "b"
+        self.commands = []
+        self.command_sequence = 0
+        self.command_dropped = 0
+        self.test_name = ""
+
+    def note(self, event, **values):
+        if len(self.commands) >= 4096:
+            self.command_dropped += 1
+            return
+        self.commands.append({"event": event, "seq": len(self.commands) + 1,
+                              "utc": time.time(), "monotonic": time.monotonic(), **values})
+
+    def save(self, label, payload):
+        path = self.output / f"raw/{self.test_name}-{label}.json"
+        path.write_text(json.dumps(payload, indent=2))
 
     async def call(self, node, op, **data):
+        self.command_sequence += 1
+        command_id = self.command_sequence
+        identity = {key: data[key] for key in ("session", "message_id", "key") if key in data}
+        self.note("command_send", command_id=command_id, node=node, op=op, **identity)
         response = await self.http.post(f"http://127.0.0.1:{48101 + 'abc'.index(node)}/command",
                                         json={"op": op, **data})
+        self.note("command_response", command_id=command_id, node=node, op=op,
+                  status=response.status_code, **identity)
         assert response.status_code == 200, (node, op, response.status_code, response.text)
         return response.json()
 
@@ -75,10 +96,12 @@ class Cluster:
         return (await self.call(self.controller, "messages", session=sid, limit=100))["items"]
 
     async def docker(self, *args):
+        self.note("docker_send", args=args)
         command = ["sudo", "-n", "--preserve-env=P8_ENV_FILE", "docker", "compose", "-f", str(COMPOSE), "-p", "p8-215", *args]
         process = await asyncio.create_subprocess_exec(*command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env={**os.environ, "P8_ENV_FILE": str(self.output / "cluster.env")})
         output, _ = await process.communicate()
+        self.note("docker_response", args=args, status=process.returncode)
         assert process.returncode == 0, output.decode()
         if args[0] == "pause":
             self.paused.update(args[1:])
@@ -100,9 +123,10 @@ async def cluster(request):
     if not os.environ.get("P8_OUTPUT"):
         pytest.skip("P8 real-container environment not configured (run prepare/up first)")
     c = Cluster()
+    c.test_name = request.node.name
     await c.ready()
     await c.configure("abc", enabled=False, roles=["main", "child", "workflow_driver", "background"],
-                      drop_notifications=False, fault=None)
+                      drop_notifications=False, fault=None, delay_second_spawn=False)
     c.offset = await c.redis.llen(c.manifest["namespace"] + ":events")
     started = time.monotonic()
     try:
@@ -112,9 +136,24 @@ async def cluster(request):
         for node in tuple(c.paused):
             await c.docker("unpause", node)
         events = await c.events()
+        stem = request.node.name
         with (c.output / "raw/three-node-observations.jsonl").open("a") as stream:
-            stream.write(json.dumps({"test": request.node.name, "elapsed_s": time.monotonic() - started,
+            stream.write(json.dumps({"test": stem, "elapsed_s": time.monotonic() - started,
                                      "events": events}) + "\n")
+        for node in "abc":
+            try:
+                trace = await c.call(node, "trace")
+                health = await c.health(node)
+                (c.output / f"raw/{stem}-{node}-trace.json").write_text(json.dumps({
+                    "trace": trace, "health": health,
+                }, indent=2))
+            except Exception as exc:
+                (c.output / f"raw/{stem}-{node}-trace-error.json").write_text(json.dumps({
+                    "error": type(exc).__name__, "detail": str(exc),
+                }, indent=2))
+        (c.output / f"raw/{stem}-commands.json").write_text(json.dumps({
+            "events": c.commands, "dropped": c.command_dropped, "complete": not c.command_dropped,
+        }, indent=2))
         await c.docker("restart", "a", "b", "c")
         await c.http.aclose()
         await c.redis.aclose()

@@ -113,6 +113,17 @@ def main():
         return subprocess.call([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider",
                                 "tests/system215/test_three_node.py", *extra], env=env)
     finally:
+        with (output / "containers-stderr.log").open("w") as stream:
+            saved = subprocess.run([*compose, "logs", "--no-color", "a", "b", "c"], env=env,
+                                   stdout=stream, stderr=subprocess.STDOUT, check=False)
+            stream.write(f"\nlog_export_exit={saved.returncode}\n")
+        with (output / "containers-state.txt").open("w") as stream:
+            for node in "abc":
+                saved = subprocess.run(
+                    ["sudo", "-n", "docker", "inspect", "--format", "{{json .State}}", f"p8-215-{node}-1"],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+                )
+                stream.write(f"{node} exit={saved.returncode} {saved.stdout}")
         subprocess.run([*compose, "down", "-v"], env=env, check=True)
         subprocess.run([*prepare, "--clean"], env=env, check=True)
         (output / "cluster.env").unlink(missing_ok=True)

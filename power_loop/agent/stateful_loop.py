@@ -10,8 +10,7 @@ Failure model
 -------------
 * If a session has unresolved tool_calls from a previous run, :meth:`send`
   records interrupted/unknown results and continues with the new input.
-  :meth:`resume` explicitly continues pending work; :meth:`abort_pending`
-  explicitly discards it.
+  :meth:`abort_pending` records aborted results for the remaining calls.
 * :meth:`close_session` physically deletes the session and its data.
 """
 
@@ -21,9 +20,7 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import threading
-import uuid
 import weakref
 from collections import OrderedDict
 from collections.abc import Coroutine, Mapping, Sequence
@@ -59,9 +56,7 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.pass_turn import ensure_pass_turn
 from power_loop.core.pipeline import (
     AgentPipeline,
-    _tool_call_args,
     _tool_call_name,
-    _truncate_result,
 )
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_tokens
@@ -265,7 +260,7 @@ def _discard_session_sync(sid: str) -> None:
 
 
 class _ExecutionLoop:
-    """The only public entry point for running an agent loop.
+    """Private executor constructed by RuntimeWorker after a session claim.
 
     A single instance can drive any number of sessions concurrently on one event
     loop: the store is async, and its SQLite backend runs every statement in a worker
@@ -292,7 +287,6 @@ class _ExecutionLoop:
         max_spawn_depth: int | None = None,
         session_cache_size: int = 256,
         timer_backend: Any = None,
-        session_coordinator: Any = None,
     ) -> None:
         """Bind the loop to a store. Pass EITHER a pre-opened ``store=`` (e.g. shared across
         loops) OR a store config to lazily open one: ``dsn=`` (a DSN or sqlite path; ``db_path``
@@ -320,8 +314,6 @@ class _ExecutionLoop:
         if timer_backend is not None and not isinstance(timer_backend, TimerBackend):
             raise ValueError('timer_backend must implement create/list/cancel')
         self.timer_backend = timer_backend
-        from power_loop.runtime.session_ownership import DEFAULT_SESSION_COORDINATOR
-        self.session_coordinator = session_coordinator or DEFAULT_SESSION_COORDINATOR
         self._dsn = dsn if dsn is not None else (db_path if db_path is not None else DEFAULT_DB_PATH)
         self._table_prefix = table_prefix if table_prefix is not None else DEFAULT_TABLE_PREFIX
         self._schema = schema
@@ -354,10 +346,6 @@ class _ExecutionLoop:
         # aclose() drains only its own and teardown can release its claims.
         self._sync_sids: set[str] = set()
         self._closing = False
-        # Identity passed to the coordinator. Unique per process and loop instance,
-        # and must NOT survive a restart: a crashed process's lease has to look foreign to its
-        # replacement so the replacement can take it over once it expires.
-        self._owner_id = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
         # ── per-session active-window cache (rebuildable accelerator; see _SessionCache) ──
         self._session_cache_size = int(session_cache_size)
         self._session_cache: OrderedDict[str, _SessionCache] = OrderedDict()
@@ -658,8 +646,7 @@ class _ExecutionLoop:
 
         Pure optimization for the cold-start/resume case (a freshly-created loop pointed at an
         existing session): sending without ``prewarm`` is behaviorally identical — it just pays
-        one reload on the first send. (To *finish pending tool-calls* on resume, use
-        :meth:`resume`, not this.)"""
+        one reload on the first send. Pending tools are aligned as unknown results before new work."""
         store = await self._ensure_store()
         if await store.get_session(session_id) is None:
             return False
@@ -721,28 +708,6 @@ class _ExecutionLoop:
 
 
 
-    async def _interrupt_pending(self, sid: str) -> int:
-        """Reuse the send-entry snapshot; only stale pending causes writes."""
-        from power_loop.runtime.session_ownership import _CURRENT
-        period = _CURRENT.get()
-        pending = getattr(None if period is None else period.lease, "pending_json", None)
-        # An ordinary turn already read pending_json while taking the session.
-        # Empty means there is no tool call to close and no task row to scan.
-        if period is not None and hasattr(period.lease, "pending_json") and not pending:
-            return 0
-        store = await self._ensure_store()
-        state = await store.state_snapshot(sid)
-        cached = self._session_cache.get(sid)
-        cache_valid = (cached is not None and state is not None and
-                       cached.next_seq == state.next_seq and cached.last_compact_seq == state.last_compact_seq)
-        if cached is not None and not cache_valid:
-            self._cache_invalidate(sid)
-        from power_loop.runtime.session_ownership import recover_acquired_session
-        await recover_acquired_session(self, sid, cache_valid=cache_valid)
-        if state is None or not state.pending:
-            return 0
-        return await self.abort_pending(sid, reason="执行中断，结果未知")
-
     async def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
         """Synthesize ``<aborted: reason>`` tool messages for every unresolved
         tool_call, restoring message-protocol validity. Returns the number of
@@ -753,23 +718,17 @@ class _ExecutionLoop:
         state = await store.get_state(session_id)
         if state is None or not state.pending:
             return 0
-        pending = state.pending
-        round_index = int(pending.get("round_index") or 0)
-        tool_calls = pending.get("tool_calls") or [
-            {"id": cid} for cid in pending.get("tool_call_ids", [])
-        ]
+        from .pending_tools import read_pending_tools
+        source, tool_calls = await read_pending_tools(
+            store, store._db, session_id, state.pending, state.next_seq,
+        )
+        if not tool_calls:
+            await store.set_pending(session_id, None)
+            return 0
+        round_index, send_index = source["round_index"], source["send_index"]
         sink = SQLiteSink(store, session_id)
         sink._unresolved = {str(tc.get("id") or "") for tc in tool_calls}
-        sink._assistant_seq = pending.get("assistant_seq")
-        # Prime _tool_calls so a crash mid-abort (after some but not all <aborted> rows land)
-        # persists a CONSISTENT intermediate pending — on_message_appended rebuilds the still-pending
-        # tool_calls from self._tool_calls (sink.py:171-174); left empty it would write
-        # {tool_call_ids:[…], tool_calls:[]}, a self-inconsistent pending.
-        sink._tool_calls = list(tool_calls)
-        # Stamp the pending send's index (runtime_state still holds it — abort runs before the
-        # next _persist_user_input bumps it) so projection keeps these <aborted> rows paired with
-        # their assistant tool_call instead of orphaning them in the legacy prefix. See H1.
-        send_index = await self._current_send_index(store, session_id)
+        sink._assistant_seq = source["seq"]
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc) if "function" in tc or "name" in tc else None
@@ -830,6 +789,7 @@ class _ExecutionLoop:
         return [_row_to_loop_message(r) for r in rows]
 
     async def get_pending(self, session_id: str) -> dict[str, Any] | None:
+        """Return only the durable assistant-seq marker; do not hydrate call arrays."""
         store = await self._ensure_store()
         state = await store.get_state(session_id)
         return state.pending if state else None
@@ -908,12 +868,6 @@ class _ExecutionLoop:
             lifecycle=lifecycle,
             metadata=metadata,
         )
-
-    @contextlib.asynccontextmanager
-    async def _session_lease(self, sid: str):
-        from power_loop.runtime.session_ownership import hold_session_ownership
-        async with hold_session_ownership(self, sid) as lease:
-            yield lease
 
     @staticmethod
     def _session_busy(sid: str) -> bool:
@@ -1032,77 +986,6 @@ class _ExecutionLoop:
             new_next_seq=seq + 1,
         )
         return send_index
-
-    async def _execute_pending(self, sid: str, sink: SQLiteSink) -> None:
-        """Replay leftover tool_calls. Idempotent if there is no pending."""
-        store = await self._ensure_store()
-        state = await store.get_state(sid)
-        if state is None or not state.pending:
-            return
-        pending = state.pending
-        round_index = int(pending.get("round_index") or 0)
-        # Fall back to tool_call_ids (as abort_pending / _prime_sink_from_pending do): a pending that
-        # carries only ids (e.g. a crash mid-abort left {tool_call_ids:[…], tool_calls:[]}) must
-        # still be resolved here, else resume() returns "completed" while the pending stays set and
-        # the session is permanently stranded.
-        tool_calls = pending.get("tool_calls") or [
-            {"id": cid} for cid in (pending.get("tool_call_ids") or [])
-        ]
-        if not tool_calls:
-            return
-        # Initialize sink's in-memory unresolved set so auto-resolve works.
-        await self._prime_sink_from_pending(sid, sink)
-        # The in-flight send's index (inherited, not re-bumped on resume): stamp it on every
-        # replayed tool row so projection mode pairs the result with its assistant tool_call
-        # instead of orphaning it in the NULL-send_index legacy prefix. See H1.
-        send_index = await self._current_send_index(store, sid)
-        for tc in tool_calls:
-            cid = str(tc.get("id") or "")
-            name = _tool_call_name(tc)
-            if name is None:
-                # Reconstructed from ids only — no name/args to replay. Resolve the protocol with an
-                # aborted marker (clears unresolved → pending cleared) instead of stranding.
-                await sink.on_message_appended(
-                    {
-                        "role": "tool",
-                        "tool_call_id": cid,
-                        "name": None,
-                        "content": "<aborted: unrecoverable tool_call on resume>",
-                        "send_index": send_index,
-                    },
-                    round_index=round_index,
-                )
-                continue
-            args = _tool_call_args(tc)
-            if self.tool_registry is None:
-                output, failed = (
-                    f"Error: tool '{name}' has no registry on resume",
-                    True,
-                )
-            else:
-                try:
-                    from power_loop.runtime.invocation import invocation_context
-                    with invocation_context(sid, pending.get("assistant_seq"), cid, name):
-                        raw = await self.tool_registry.invoke_async(name, args)
-                    if not isinstance(raw, str):
-                        raw = json.dumps(raw, ensure_ascii=False)
-                    output, failed = str(raw), False
-                except Exception as exc:
-                    output, failed = f"Error on resume: {exc}", True
-            await sink.on_message_appended(
-                {
-                    "role": "tool",
-                    "tool_call_id": cid,
-                    "name": name,
-                    "content": _truncate_result(output, self.config.tool_result_max_chars),
-                    "send_index": send_index,
-                },
-                round_index=round_index,
-            )
-            if failed:
-                # Still resolved from the protocol's POV — the tool message
-                # exists. Surface failure via content text.
-                pass
 
     def _resolve_registry(
         self, tools: Sequence[str] | ToolRegistry | None
@@ -1474,9 +1357,7 @@ class _ExecutionLoop:
             )
             calls = self._fold_calls(sid, stop_event)
             ctx = self._fold_context(sid, projector, calls)
-            fr = await self._run_fold_with_timeout(fold_strategy, to_compact, ctx)
-            if calls is not None:
-                calls.raise_if_cancelled()
+            fr = await self._run_fold_with_timeout(fold_strategy, to_compact, ctx, calls=calls)
             if fr is None:
                 return None, ()
             if fr.folded_to_send not in fold_sends:
@@ -1504,20 +1385,29 @@ class _ExecutionLoop:
                            memory=self.config.memory, tool_registry=self.tool_registry,
                            max_tokens=self.config.max_tokens)
 
-    async def _run_fold_with_timeout(self, fold_strategy: Any, rows: Any, ctx: Any) -> Any | None:
-        """Await ``fold_strategy.fold`` bounded by ``config.fold_timeout_s`` (None disables). A
-        timeout soft-fails to None (no fold this send; rows already committed)."""
+    async def _run_fold_with_timeout(self, fold_strategy: Any, rows: Any, ctx: Any, *, calls: Any) -> Any | None:
+        """Discard a timed-out fold while preserving cancellation of the send."""
         timeout = self.config.fold_timeout_s
+        deadline = asyncio.timeout(timeout if timeout is not None and timeout > 0 else None)
         try:
-            if timeout is not None and timeout > 0:
-                return await asyncio.wait_for(fold_strategy.fold(rows, context=ctx), timeout)
-            return await fold_strategy.fold(rows, context=ctx)
-        except (TimeoutError, asyncio.TimeoutError):
+            async with deadline:
+                result = await fold_strategy.fold(rows, context=ctx)
+                # Fold strategies may absorb model errors. Re-raise cancellation
+                # inside the deadline so asyncio can consume its own request.
+                calls.raise_if_cancelled()
+        except TimeoutError:
+            timed_out = True
+        else:
+            timed_out = deadline.expired()
+        if calls.cancel_token is not None:
+            calls.cancel_token.raise_if_cancelled()
+        if timed_out:
             logger.warning(
                 "projection fold timed out after %ss for %s (skipping fold this send)",
                 timeout, ctx.session_id,
             )
             return None
+        return result
 
     async def _apply_fold_notes(self, store: SessionStore, sid: str, note_ops: tuple[Any, ...]) -> None:
         """Apply an agentic fold's captured NoteOps (best-effort, additive memory — NOT
@@ -1530,20 +1420,6 @@ class _ExecutionLoop:
                     await store.update_note(sid, op.note_id, content=op.content, pinned=op.pinned)
             except Exception:
                 logger.exception("session %s: applying fold note op failed (continuing)", sid)
-
-    async def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:
-        store = await self._ensure_store()
-        state = await store.get_state(sid)
-        if state is None or not state.pending:
-            return
-        pending = state.pending
-        tool_calls = list(pending.get("tool_calls") or [])
-        ids = {str(tc.get("id") or "") for tc in tool_calls if tc.get("id")}
-        ids.update(str(cid) for cid in pending.get("tool_call_ids", []) if cid)
-        sink._unresolved = ids
-        sink._assistant_seq = pending.get("assistant_seq")
-        sink._tool_calls = tool_calls
-
 
 # ── helpers ──────────────────────────────────────────────────────────────
 

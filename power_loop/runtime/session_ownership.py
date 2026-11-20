@@ -8,17 +8,14 @@ new owner's lease.
 """
 from __future__ import annotations
 
-import asyncio
-import logging
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from contextlib import asynccontextmanager
-from contextvars import Context, ContextVar
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from power_loop.contracts.errors import SessionBusy, SessionLeaseLost
+from power_loop.contracts.errors import SessionLeaseLost
 
 
 @dataclass(eq=False)
@@ -117,189 +114,21 @@ class MemorySessionOwnershipCoordinator(SessionOwnershipCoordinator):
         lease.released = True
 
 
-DEFAULT_SESSION_COORDINATOR = MemorySessionOwnershipCoordinator()
-
-# Only live session periods are retained. Independent children acquire their own.
-_CURRENT: ContextVar[_OwnershipPeriod | None] = ContextVar("session_ownership", default=None)
-_PERIODS: dict[tuple, _OwnershipPeriod] = {}
-
-
-class _OwnershipPeriod:
-    def __init__(self, loop, coordinator, store, session_id, ttl_s):
-        self.loop = loop
-        self.coordinator, self.store, self.session_id = coordinator, store, session_id
-        self.key = (store.store_id, session_id)
-        self.registry_key = id(coordinator), self.key
-        self.ttl_s = ttl_s
-        self.lease = None
-        self.tasks = {}
-        self.idle = asyncio.Event()
-        self.writer = None
-        self.checked = False
-
-    def lost(self):
-        self.loop._cache_invalidate(self.session_id)
-        if _PERIODS.get(self.registry_key) is self:
-            del _PERIODS[self.registry_key]
-        for task in tuple(self.tasks):
-            task.cancel("session ownership lost")
-
-    def enter(self, task):
-        self.lease.require_owned()
-        self.idle.clear()
-        self.tasks[task] = self.tasks.get(task, 0) + 1
-
-    def leave(self, task):
-        count = self.tasks[task] - 1
-        if count:
-            self.tasks[task] = count
-        else:
-            del self.tasks[task]
-        if not self.tasks:
-            self.idle.set()
-
-    async def maintain(self):
-        try:
-            while self.tasks:
-                try:
-                    await asyncio.wait_for(self.idle.wait(), timeout=self.ttl_s / 3)
-                except TimeoutError:
-                    try:
-                        async with asyncio.timeout(max(0, self.lease.expires_at - time.monotonic())):
-                            renewed = await self.coordinator.renew(self.lease, ttl_s=self.ttl_s)
-                    except Exception:
-                        self.lease.lose()
-                        logging.getLogger(__name__).exception("session renewal failed: %s", self.key)
-                        break
-                    if not renewed:
-                        self.lease.lose()
-                        break
-                    self.lease.require_owned()
-        finally:
-            if _PERIODS.get(self.registry_key) is self:
-                del _PERIODS[self.registry_key]
-            try:
-                if not self.lease.installs_fence:
-                    await self.store.release_session_owner(self.session_id, self.lease)
-            finally:
-                await self.coordinator.release(self.lease)
+# A worker binds the actual handle obtained from its Runtime claim.
+_CURRENT: ContextVar[SessionOwnership | None] = ContextVar("session_ownership", default=None)
 
 
 def current_ownership(store=None, session_id=None):
-    period = _CURRENT.get()
-    if period is None or (store is not None and period.store.store_id != store.store_id):
+    lease = _CURRENT.get()
+    if lease is None or (store is not None and lease.key[0] != store.store_id):
         return None
-    if session_id is not None and period.session_id != session_id:
+    if session_id is not None and lease.key[1] != session_id:
         return None
-    return period.lease
-
-
-def detached_context():
-    """Retain ownership for metadata writes without inheriting transactions."""
-    context = Context()
-    context.run(_CURRENT.set, _CURRENT.get())
-    return context
-
-
-def ownership_lost(lease):
-    return lease is not None and (lease.lost or lease.released or time.monotonic() >= lease.expires_at)
+    # A matching retired handle must reach require_owned(), never become None.
+    return lease
 
 
 def require_current_ownership(store=None):
-    period = _CURRENT.get()
-    if period is not None and (store is None or period.store is store or
-                              store.store_id is not None and period.store.store_id == store.store_id):
-        period.lease.require_owned()
-
-
-def track_owned_task(task):
-    """Retain this session only for an explicitly attached metadata writer."""
-    period = _CURRENT.get()
-    if period is not None:
-        period.enter(task)
-        task.add_done_callback(period.leave)
-
-
-@asynccontextmanager
-async def _hold_session_ownership(loop, session_id):
-    store = loop.store
-    period = _CURRENT.get()
-    if (period is not None and period.store.store_id == store.store_id
-            and period.session_id == session_id and period.loop._owner_id == loop._owner_id):
-        period.lease.require_owned()
-        acquired = False
-    else:
-        acquired = True
-        period = _OwnershipPeriod(loop, loop.session_coordinator, store, session_id,
-                                  loop.config.session_lease_ttl_s)
-        # The expected epoch belongs to this acquire request, never its reply.
-        while True:
-            node_id = boot_id = loop._owner_id
-            coordinator = loop.session_coordinator
-            if getattr(coordinator, "installs_session_fence", False):
-                lease = await coordinator.acquire(
-                    period.key, owner_id=loop._owner_id, ttl_s=period.ttl_s, on_lost=period.lost,
-                    node_id=node_id, boot_id=boot_id)
-                if lease is None:
-                    raise SessionBusy(f"session {session_id} is held by another owner")
-                period.lease = lease
-                break
-            expected = await store.session_owner_epoch(session_id)
-            lease = await coordinator.acquire(
-                period.key, owner_id=loop._owner_id, ttl_s=period.ttl_s, on_lost=period.lost)
-            if lease is None:
-                raise SessionBusy(f"session {session_id} is held by another owner")
-            period.lease = lease
-            lease.node_id, lease.boot_id = node_id, boot_id
-            try:
-                installed = await store.install_session_owner(session_id, lease, expected)
-            except BaseException:
-                await coordinator.release(lease)
-                raise
-            if installed:
-                break
-            await coordinator.release(lease)
-        _PERIODS[period.registry_key] = period
-    task = asyncio.current_task()
-    period.enter(task)
-    token = _CURRENT.set(period)
-    if acquired:
-        period.writer = asyncio.create_task(period.maintain(), name="session-lease-" + session_id)
-        # Mutable store hints are discarded; the window and control caches
-        # use their existing next_seq/compaction and control-version checks.
-        store._forget_appended(session_id)
-    try:
-        async with store.send_read_scope(session_id, ownership=period.lease):
-            yield period.lease
-    except asyncio.CancelledError:
-        if period.lease.lost:
-            raise SessionLeaseLost(session_id) from None
-        raise
-    finally:
-        _CURRENT.reset(token)
-        period.leave(task)
-        if not period.tasks:
-            await period.writer
-
-
-@asynccontextmanager
-async def hold_session_ownership(loop, session_id):
-    from contextlib import ExitStack
-
-    from power_loop.core.execution_context import (
-        ExecutionContext,
-        _bind_execution_context,
-        get_execution_context,
-        independent_execution_scope,
-    )
-    previous = _CURRENT.get()
-    with ExitStack() as scopes:
-        if previous is not None and previous.key != (loop.store.store_id, session_id):
-            scopes.enter_context(independent_execution_scope())
-        async with _hold_session_ownership(loop, session_id) as lease:
-            if get_execution_context(required=False) is None:
-                def snapshot():
-                    return ExecutionContext(loop.store.store_id, session_id, lease.node_id, lease.boot_id,
-                        owner_epoch=lease.epoch, owner_token=lease.token)
-                scopes.enter_context(_bind_execution_context(snapshot))
-            yield lease
+    lease = current_ownership(store)
+    if lease is not None:
+        lease.require_owned()

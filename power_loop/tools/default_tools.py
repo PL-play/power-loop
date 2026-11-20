@@ -22,6 +22,7 @@ from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.process_control import bind_shell_control, stop_shell_target
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
+from power_loop.runtime.store.types import MessageRow
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 from power_loop.tools.background_contract import BackgroundTool
 from power_loop.tools.command_policy import command_policy_reason
@@ -1580,21 +1581,17 @@ async def run_recall_send(send_index: int | None = None, seq: int | None = None,
         from power_loop.runtime.tool_archive import recall_group
         return await recall_group(store, sid, target, group_id, offset, limit, item, char_offset, char_limit)
 
-    rows = [r for r in await store.load_all_messages(sid) if r.send_index == target]
-    if not rows:
-        return f"No messages found for send #{target} in this session."
-
-    if seq is None and (len(rows) > limit or sum(len(str(r.content or "")) for r in rows) > char_limit):
-        from power_loop.runtime.recall import recall
-        return await recall(store, sid, send_index=target, limit=limit, char_limit=char_limit)
     if seq is not None:
         try:
             want = int(seq)
         except (TypeError, ValueError):
             return f"Invalid seq: {seq!r} (expected an integer)."
-        hit = next((r for r in rows if r.seq == want), None)
-        if hit is None:
-            lo, hi = min(r.seq for r in rows), max(r.seq for r in rows)
+        hit = await store.get_message(sid, want)
+        if hit is None or hit.send_index != target:
+            bounds = await store.history_bounds(sid, send_index=target)
+            if bounds is None:
+                return f"No messages found for send #{target} in this session."
+            lo, hi = bounds
             return (f"No row seq {want} in send #{target} (its rows span seq {lo}–{hi}). "
                     "Use the exact «sS» coordinate from the summary line, or omit seq to list the whole send.")
         from power_loop.runtime.tool_context import active_engine
@@ -1602,7 +1599,18 @@ async def run_recall_send(send_index: int | None = None, seq: int | None = None,
         if char_offset or engine is not None:
             from power_loop.runtime.tool_archive import recall_original
             return await recall_original(store, sid, target, hit, char_offset, char_limit)
-        return _render_recall_row(hit, rows, cap=min(char_limit, RECALL_SEND_ROW_CHARS), head=f"send #{target} · seq {want}")
+        from power_loop.runtime.tool_archive import original_call
+        source_call = await original_call(store, sid, target, hit)
+        return _render_recall_row(hit, source_call, cap=min(char_limit, RECALL_SEND_ROW_CHARS), head=f"send #{target} · seq {want}")
+
+    rows = [MessageRow(**row) for row in await store.history_records(
+        sid, send_index=target, limit=limit + 1,
+    )]
+    if not rows:
+        return f"No messages found for send #{target} in this session."
+    if len(rows) > limit or sum(len(str(r.content or "")) for r in rows) > char_limit:
+        from power_loop.runtime.recall import recall
+        return await recall(store, sid, send_index=target, limit=limit, char_limit=char_limit)
 
     def _tc_name(tc: dict[str, Any]) -> str:
         # ``function`` is normally a dict, but a malformed/imported tool_call can carry a
@@ -1675,21 +1683,21 @@ def _recall_row_body(row: Any) -> tuple[str, list[str]]:
     return text, images
 
 
-def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str:
+def _render_recall_row(hit: Any, source_call: tuple[int, dict] | None, *, cap: int, head: str) -> str:
     """One original row in full (capped at ``cap`` chars, remainder counted), preceded by the
     assistant call that produced it when the row is a tool result."""
     blocks: list[str] = []
-    if hit.role == "tool" and hit.tool_call_id:
-        for a in rows:
-            for tc in (a.tool_calls or []) if a.role == "assistant" else []:
-                if str(tc.get("id") or "") == str(hit.tool_call_id):
-                    fn = tc.get("function")
-                    fn = fn if isinstance(fn, dict) else {}
-                    blocks.append(
-                        f"[seq {a.seq} · assistant call · {fn.get('name') or tc.get('name') or '?'}]\n"
-                        f"{fn.get('arguments') or ''}"
-                    )
-                    break
+    if hit.role == "tool":
+        if source_call is None:
+            blocks.append("Original call arguments unavailable.")
+        else:
+            assistant_seq, tc = source_call
+            fn = tc.get("function")
+            fn = fn if isinstance(fn, dict) else {}
+            blocks.append(
+                f"[seq {assistant_seq} · assistant call · {fn.get('name') or tc.get('name') or '?'}]\n"
+                f"{fn.get('arguments') or ''}"
+            )
     body, row_images = _recall_row_body(hit)
     total = len(body)
     if total > cap:

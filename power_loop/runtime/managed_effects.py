@@ -12,11 +12,13 @@ from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_types import (
     InputRef,
     RuntimeRequestError,
+    StoreError,
     TargetRef,
     canonical,
     plain,
     sha256_canonical,
 )
+from power_loop.contracts.errors import CancellationRequested, SessionLeaseLost
 
 from .tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract, resolve
 
@@ -329,14 +331,36 @@ def _context(store, actor, frozen, send_index):
     )
 
 
-async def _write_state(store, session_id, key, value):
-    async with store._db.transaction() as tx:
-        sql = store._db.dialect.upsert(
-            store.t.session_runtime_state,
-            ("session_id", "state_key"),
-            ("value_json", "updated_at"),
-        )
-        await tx.execute(sql, (session_id, key, canonical(value), now_ms()))
+async def _write_state(tx, port, session_id, key, value, timestamp):
+    sql = port.db.dialect.upsert(
+        port.store.t.session_runtime_state, ("session_id", "state_key"),
+        ("value_json", "updated_at"),
+    )
+    await tx.execute(sql, (session_id, key, canonical(value), timestamp))
+
+
+async def _write_owned_state(port, batch, key, value):
+    sid = batch.target.session_id
+    try:
+        async with port.db.transaction() as tx:
+            state = await port.db.dialect.lock_state(tx, port.state, sid)
+            if (state["execution_state"], state["active_send_index"],
+                state["owner_epoch"], state["owner_token"]) != (
+                    "running", batch.send_index, batch.owner_epoch, batch.owner_token):
+                raise SessionLeaseLost(sid)
+            if value["phase"] == "dispatched" and state["cancel_send_index"] == batch.send_index:
+                raise CancellationRequested(state["cancel_reason"] or "cancelled")
+            await _write_state(tx, port, sid, key, value, now_ms())
+    except (SessionLeaseLost, CancellationRequested):
+        raise
+    except Exception as exc:
+        raise StoreError(batch.input_refs[0]) from exc
+
+
+def _checked_result(adapter, result):
+    if type(result) is not ManagedToolResult or len(result.display) > adapter.contract.max_result_chars:
+        raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
+    return result
 
 
 async def run_session(worker, ctx, env, config):
@@ -354,129 +378,276 @@ async def run_session(worker, ctx, env, config):
         )
     adapter = handler.adapter
     key = _state_key(frozen)
+    batch = ctx.batch
+    if not any(ref.message_id == batch.start_input_message_id for ref in batch.input_refs):
+        return SessionToolResult(
+            "failed", error="managed effect requires the original start input",
+            error_code="managed_effect_original_send_required",
+        )
     existing = await worker.runtime.store.get_runtime_state(ctx.session_id, key)
     if existing and existing.get("result") is not None:
         result = ManagedToolResult.from_dict(existing["result"])
         return SessionToolResult(
             "completed", result.display, usage={}, structured_output=result.to_dict(),
         )
-    actor = ctx.actor
-    context = _context(worker.runtime.store, actor, frozen, ctx.send_index)
+    if existing or batch.send_index != 1:
+        return _unknown_outcome()
+
+    context = _context(worker.runtime.store, ctx.actor, frozen, batch.send_index)
+    prepared = None
     try:
         prepared = await adapter.prepare(context, _document(frozen["arguments"], 131072))
         if type(prepared) is not ManagedToolPreparation:
             raise RuntimeRequestError("invalid_options", "managed_effect_preparation_invalid")
-        await _write_state(worker.runtime.store, ctx.session_id, key, {
-            "phase": "dispatched",
-            "preparation": prepared.to_dict(),
-            "contract": frozen["contract"],
-            "result": None,
-        })
+        result = prepared.local_result
+        if result is not None:
+            _checked_result(adapter, result)
     except Exception as exc:
+        prepared = None
         result = ManagedToolResult(
             "The managed effect was not dispatched because preparation did not complete.",
             {"decision": "not_dispatched", "error": str(exc)[:500]},
             "not_dispatched",
         )
-        await _write_state(worker.runtime.store, ctx.session_id, key, {
-            "phase": "completed", "preparation": None, "contract": frozen["contract"],
-            "result": result.to_dict(),
+
+    state = {"preparation": prepared.to_dict() if prepared is not None else None,
+             "contract": frozen["contract"]}
+    if result is None:
+        # An exception from this storage boundary is not an adapter failure. In
+        # particular, a lost commit acknowledgement must not start the external action.
+        await _write_owned_state(worker.inputs, batch, key, {
+            **state, "phase": "dispatched", "result": None,
         })
-        return SessionToolResult(
-            "completed", result.display, usage={}, structured_output=result.to_dict(),
-        )
-    if prepared.local_result is not None:
-        result = prepared.local_result
-        await _write_state(worker.runtime.store, ctx.session_id, key, {
-            "phase": "completed", "preparation": prepared.to_dict(),
-            "contract": frozen["contract"], "result": result.to_dict(),
-        })
-        return SessionToolResult(
-            "completed", result.display, usage={}, structured_output=result.to_dict(),
-        )
-    try:
-        result = await adapter.execute(context, _document(prepared.reference))
-        if type(result) is not ManagedToolResult or len(result.display) > adapter.contract.max_result_chars:
-            raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
-    except Exception as exc:
-        await _write_state(worker.runtime.store, ctx.session_id, key, {
-            "phase": "unknown", "preparation": prepared.to_dict(),
-            "contract": frozen["contract"], "result": None,
-            "error": f"{type(exc).__name__}: {exc}"[:500],
-        })
-        return SessionToolResult(
-            "interrupted",
-            "Managed effect outcome is unknown; query the original adapter to recover it.",
-            error="managed effect outcome is unknown",
-            error_code="interrupted",
-            structured_output={"managed_effect_pending": True},
-        )
-    await _write_state(worker.runtime.store, ctx.session_id, key, {
-        "phase": "completed", "preparation": prepared.to_dict(),
-        "contract": frozen["contract"], "result": result.to_dict(),
+        try:
+            result = _checked_result(adapter, await adapter.execute(context, _document(prepared.reference)))
+        except Exception as exc:
+            await _write_owned_state(worker.inputs, batch, key, {
+                **state, "phase": "unknown", "result": None,
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            })
+            return _unknown_outcome()
+    await _write_owned_state(worker.inputs, batch, key, {
+        **state, "phase": "completed", "result": result.to_dict(),
     })
+    return SessionToolResult("completed", result.display, usage={}, structured_output=result.to_dict())
+
+
+def _unknown_outcome():
+    from .background_execution import SessionToolResult
+
     return SessionToolResult(
-        "completed", result.display, usage={}, structured_output=result.to_dict(),
+        "interrupted", "Managed effect outcome is unknown; query the original adapter to recover it.",
+        error="managed effect outcome is unknown", error_code="interrupted",
+        structured_output={"managed_effect_pending": True},
     )
 
 
-async def reconcile(store, actor, start: InputRef, adapter: ManagedTool, *, client=None):
-    """Query the original adapter and route a late result as a new ordinary send."""
-    port = RuntimeInputStore(store)
-    target = TargetRef(start.store_id, start.session_id)
-    session = await port.authorize(port.db, target, actor)
-    frozen = json.loads(session["descriptor_json"])["config"].get(FIELD)
-    if frozen is None or canonical(frozen["contract"]) != canonical(adapter.contract.to_dict()):
+_OBSERVATION = "managed_recovery_observation"
+
+
+async def _read_original(port, reader, start, *, key=None, recovery=None):
+    """Read only by the frozen start, original action key and deterministic result ID."""
+    extra_columns = "st.active_send_index AS active_send_index"
+    extra_joins = f"JOIN {port.state} st ON st.session_id=s.session_id"
+    params = (start.message_id, start.session_id)
+    if recovery is not None:
+        # The session state has already been locked and is not read again here.
+        extra_columns = (
+            "a.value_json AS managed_value,r.item_id AS recovery_item,"
+            f"r.result_delivery_error AS recovery_error,{port._now_sql()} AS db_now"
+        )
+        extra_joins = (
+            f"LEFT JOIN {port.store.t.session_runtime_state} a ON a.session_id=s.session_id AND a.state_key=? "
+            f"LEFT JOIN {port.q} r ON r.session_id=s.session_id AND r.item_id=?"
+        )
+        params = (start.message_id, key, recovery.message_id, start.session_id)
+    row = await reader.fetchone(
+        "SELECT s.session_id,s.tenant_id,s.principal_id,s.parent_session_id,s.lifecycle,"
+        "s.descriptor_json,s.start_input_message_id,s.creation_call_ref_json,s.creation_tool_call_id,"
+        "s.result_route_json,q.item_id,q.terminal_status,q.result_send_index,q.meta_json,"
+        f"{extra_columns} FROM {port.store.t.sessions} s "
+        f"LEFT JOIN {port.q} q ON q.session_id=s.session_id AND q.item_id=? "
+        f"{extra_joins} WHERE s.session_id=?", params,
+    )
+    if row is None:
+        raise RuntimeRequestError("not_found")
+    return row
+
+
+async def _authorize_original(port, reader, start, target, actor, adapter, row):
+    await port._authorize_known(reader, target, actor, row)
+    descriptor = json.loads(row["descriptor_json"])
+    frozen = descriptor["config"].get(FIELD)
+    route = json.loads(row["result_route_json"]) if row["result_route_json"] else None
+    if (frozen is None or route is None or row["start_input_message_id"] != start.message_id
+            or InputRef(**route["input_ref"]) != start or route["result_kind"] != "managed_effect_result"
+            or canonical(frozen["contract"]) != canonical(adapter.contract.to_dict())
+            or canonical(frozen["call_ref"]) != row["creation_call_ref_json"]
+            or frozen["call_id"] != row["creation_tool_call_id"]):
         raise RuntimeRequestError("forbidden", "managed adapter or original call mismatch")
+    if row["lifecycle"] != "open":
+        raise RuntimeRequestError("session_closed")
+    if row["item_id"] is None:
+        raise RuntimeRequestError("not_found", "managed original input")
+    return frozen, route
+
+
+def _recovery_ref(start, original_send):
+    return InputRef(start.store_id, start.session_id, "inp_" + sha256_canonical([
+        "managed_recover", start.store_id, start.session_id, start.message_id, original_send,
+    ])[:56])
+
+
+def _check_equal(actual, expected):
+    if canonical(actual) != canonical(expected):
+        raise RuntimeRequestError("request_conflict", "managed recovery outcome changed")
+
+
+def _recovery_source(row, state):
+    if row["terminal_status"] != "interrupted":
+        return None
+    if state["phase"] == "completed" and state["result"] is not None:
+        return "stored" if state.get("recovered_send_index") is None else "published"
+    if state["phase"] in ("dispatched", "unknown") and state["preparation"] is not None:
+        return "probe"
+    return None
+
+
+async def _commit_recovery(port, actor, start, target, adapter, frozen, route, key,
+                           original_send, state, result_document):
+    recovery = _recovery_ref(start, original_send)
+    parent_sid = route["target"]["session_id"]
+    sid = target.session_id
+    try:
+        async with port.db.transaction() as tx:
+            try:
+                states = {s: await port.db.dialect.lock_state(tx, port.state, s)
+                          for s in sorted({sid, parent_sid})}
+            except ValueError as exc:
+                raise RuntimeRequestError("not_found") from exc
+            row = await _read_original(port, tx, start, key=key, recovery=recovery)
+            current_frozen, current_route = await _authorize_original(
+                port, tx, start, target, actor, adapter, row,
+            )
+            _check_equal(current_frozen, frozen)
+            _check_equal(current_route, route)
+            if row["terminal_status"] != "interrupted" or row["result_send_index"] != original_send:
+                raise RuntimeRequestError("request_conflict", "managed original input changed")
+            current = json.loads(row["managed_value"]) if row["managed_value"] else None
+            if current is None:
+                raise RuntimeRequestError("not_found", "managed preparation")
+            _check_equal(current["preparation"], state["preparation"])
+            _check_equal(current["contract"], frozen["contract"])
+            db_now = int(row["db_now"])
+            source = _recovery_source(row, current)
+            if source in ("published", "stored") and result_document is not None:
+                _check_equal(current["result"], result_document)
+            if source == "published":
+                if row["recovery_item"] is None:
+                    raise RuntimeRequestError("not_found", "managed recovery result")
+                if row["recovery_error"] is None:
+                    return current["result"], None, None
+                record = await port.input(tx, recovery)
+                activations = []
+                parent_ref, _ = await port._route_stored_result_tx(
+                    tx, row, route, record, db_now, activations, parent_state=states[parent_sid],
+                )
+                return current["result"], None, parent_ref if activations else None
+            if source is None or result_document is None:
+                return None, None, None
+            if row["recovery_item"] is not None:
+                raise RuntimeRequestError("request_conflict", "managed recovery input identity occupied")
+            child = states[sid]
+            busy = child["active_send_index"] is not None
+            if source == "probe":
+                meta = json.loads(row["meta_json"])
+                observation = {"action_key": key, "preparation": current["preparation"], "result": result_document}
+                if _OBSERVATION in meta:
+                    _check_equal(meta[_OBSERVATION], observation)
+                elif busy:
+                    meta[_OBSERVATION] = observation
+                    changed = await tx.execute(
+                        f"UPDATE {port.q} SET meta_json=? WHERE session_id=? AND item_id=? "
+                        "AND terminal_status='interrupted' AND result_send_index=?",
+                        (canonical(meta), sid, start.message_id, original_send),
+                    )
+                    if changed != 1:
+                        raise RuntimeRequestError("request_conflict", "managed original input changed")
+            if busy:
+                return None, None, None
+            final = await port._complete_managed_recovery_tx(
+                tx, row, child, route, states[parent_sid], recovery, result_document, db_now,
+            )
+            recovered = final.results[0]
+            await _write_state(tx, port, sid, key, {
+                **current, "phase": "completed", "result": result_document,
+                "recovered_send_index": recovered.send_index,
+            }, db_now)
+            return result_document, recovered, final.result_ref if final.result_activation else None
+    except RuntimeRequestError:
+        raise
+    except (Exception, asyncio.CancelledError) as exc:
+        # Resolve an uncertain commit through the deterministic terminal input. There
+        # is no compensation write and no repeat of the external probe here.
+        try:
+            saved = await port.get_result(recovery, actor=actor)
+        except Exception:
+            saved = None
+        if (saved is not None and saved.input_ref == recovery
+                and saved.status == "completed" and result_document is not None):
+            _check_equal(saved.structured_output, result_document)
+            return result_document, None, None
+        raise StoreError(recovery) from exc
+
+
+async def reconcile(store, actor, start: InputRef, adapter: ManagedTool, *, client=None):
+    """Publish a stored outcome or query the original action outside locks."""
+    port = RuntimeInputStore(store)
+    port.check_store(start)
+    target = TargetRef(start.store_id, start.session_id)
+    row = await _read_original(port, port.db, start)
+    frozen, route = await _authorize_original(port, port.db, start, target, actor, adapter, row)
     key = _state_key(frozen)
     state = await store.get_runtime_state(target.session_id, key)
     if state is None:
         raise RuntimeRequestError("not_found", "managed preparation")
-    if state.get("result") is not None:
-        return ManagedToolResult.from_dict(state["result"])
-    if state.get("phase") != "unknown":
+    _check_equal(state["contract"], frozen["contract"])
+    result_document = None
+    original_send = row["result_send_index"]
+    source = _recovery_source(row, state)
+    if source is None:
+        if state["phase"] == "completed" and state.get("recovered_send_index") is None:
+            return ManagedToolResult.from_dict(state["result"])
         return None
-    original = await port.get_result(start, actor=actor)
-    if original is None or original.status != "interrupted":
+    if source != "published" and row["active_send_index"] is not None:
         return None
-    context = _context(store, actor, frozen, original.send_index)
-    result = await adapter.recover(context, _document(state["preparation"]["reference"]))
-    if result is None:
-        return None
-    if type(result) is not ManagedToolResult:
-        raise RuntimeRequestError("invalid_options", "managed_effect_result_invalid")
-    message_id = "inp_" + sha256_canonical([
-        "managed_recover", target.store_id, target.session_id, start.message_id,
-        original.send_index,
-    ])[:56]
-    receipt = await port.accept(
-        target,
-        {FIELD: "recovered", "result": result.to_dict()},
-        message_id=message_id,
-        actor=actor,
+    if source == "stored":
+        result_document = ManagedToolResult.from_dict(state["result"]).to_dict()
+    elif source == "probe":
+        meta = json.loads(row["meta_json"])
+        if observation := meta.get(_OBSERVATION):
+            _check_equal(observation["action_key"], key)
+            _check_equal(observation["preparation"], state["preparation"])
+            found = ManagedToolResult.from_dict(observation["result"])
+        else:
+            context = _context(store, actor, frozen, original_send)
+            found = await adapter.recover(context, _document(state["preparation"]["reference"]))
+            if found is None:
+                return None
+        result_document = _checked_result(adapter, found).to_dict()
+
+    result, recovered, parent_ref = await _commit_recovery(
+        port, actor, start, target, adapter, frozen, route, key, original_send, state, result_document,
     )
-    batch = await port.claim(target, node_id="managed-recovery", boot_id="managed-recovery")
-    final_batch = None
-    if batch is not None:
-        final_batch = await port.final(
-            batch,
-            final_text=result.display,
-            structured_output=result.to_dict(),
+    if client is not None and recovered is not None:
+        await client._notify(
+            target, recovered.input_ref.message_id, recovered.input_ref, ["output"],
+            {"kind": "completed", "session_id": target.session_id, "send_index": recovered.send_index},
         )
-    if client is not None and final_batch is not None and final_batch.result_activation is not None:
-        parent = final_batch.result_activation
-        result_ref = final_batch.result_ref
-        await client._notify(parent, result_ref.message_id, result_ref, ["work", "activation"])
-    recovered = await port.get_result(receipt.input_ref, actor=actor)
-    if recovered is None or recovered.status != "completed":
-        return None
-    await _write_state(store, target.session_id, key, {
-        **state,
-        "phase": "completed",
-        "result": result.to_dict(),
-        "recovered_send_index": recovered.send_index,
-    })
-    return result
+    if client is not None and parent_ref is not None:
+        parent = TargetRef(parent_ref.store_id, parent_ref.session_id)
+        await client._notify(parent, parent_ref.message_id, parent_ref, ["work", "activation"])
+    return ManagedToolResult.from_dict(result) if result is not None else None
 
 
 __all__ = [

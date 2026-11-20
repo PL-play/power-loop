@@ -10,7 +10,13 @@ Skipped automatically when no POWER_LOOP_* / OPENAI_COMPAT_* provider env is set
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import pytest
+
+from power_loop.agent.runtime_types import plain
 
 from ._workflow_runtime import run_workflow
 
@@ -68,6 +74,21 @@ async def test_real_workflow_sequence_foreach_structured(runtime_agent):
     assert result.usage.get("total_tokens", 0) > 0
 
 
+def _assert_persisted_workflow_result(handle, result, persisted):
+    assert handle.run_id == handle.input_ref.message_id
+    assert (handle.input_ref.store_id, handle.input_ref.session_id) == (handle.target.store_id, handle.target.session_id)
+    assert persisted.input_ref == handle.input_ref and persisted.target == handle.target
+    assert persisted.status == 'completed'
+    assert persisted.result_seq is not None and persisted.result_seq > 0
+    assert persisted.send_index is not None and persisted.send_index > 0
+    expected = result.to_dict()
+    assert plain(persisted.structured_output) == expected
+    assert expected['final'] is not None
+    assert persisted.final_text == expected['final']['text']
+    assert plain(persisted.usage) == expected['usage']
+    assert persisted.error is None and persisted.error_code is None
+
+
 async def test_real_detached_workflow_has_durable_result_without_timer(runtime_agent):
     from power_loop import RuntimeClient, create_llm_service_from_env
     from power_loop.agent.runtime_store import now_ms
@@ -75,14 +96,26 @@ async def test_real_detached_workflow_has_durable_result_without_timer(runtime_a
     spec = {'name':'one','root':{'type':'agent','id':'a',
         'spec':{'name':'a','system_prompt':'Reply with the single word: ok.'}}}
     handle = await agent.runtime.client.workflow(agent.target, spec, message_id='detached', actor=agent.actor)
+    result = await handle.wait(deadline_ms=now_ms()+120000)
+    assert result.status == 'completed'
+    await agent.drain()
     reader = RuntimeClient(store=agent.runtime.store, transport=agent.runtime.transport,
                            namespace=agent.runtime.namespace)
+    observed = {'run_id': handle.run_id, 'input_ref': plain(handle.input_ref),
+                'target': plain(handle.target), 'handle_result': result.to_dict()}
     try:
-        result = await handle.wait(deadline_ms=now_ms()+120000)
-        assert result.status == 'completed'
         persisted = await reader.wait(handle.input_ref, actor=agent.actor, deadline_ms=now_ms()+1000)
-        assert persisted.status == 'completed' and persisted.structured_output['run_id'] == handle.run_id
+        observed['persisted_result'] = plain(persisted)
+        _assert_persisted_workflow_result(handle, result, persisted)
         assert not await agent.runtime.store.list_timers(agent.target.session_id)
+        assert not await agent.runtime.store.list_timers(handle.target.session_id)
+        observed['caller_and_driver_timers_empty'] = True
     finally:
-        await reader.aclose()
-   # in-process wake, no durable timer
+        try:
+            await reader.aclose()
+        finally:
+            if output := os.environ.get('R10_EVIDENCE_DIR'):
+                path = Path(output)
+                path.mkdir(parents=True, exist_ok=True)
+                (path / 'real-detached-workflow.json').write_text(json.dumps(observed, ensure_ascii=False, indent=2) + '\n')
+    # Fresh client reads the same durable input after in-process worker teardown.

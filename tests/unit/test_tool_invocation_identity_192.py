@@ -98,8 +98,13 @@ async def test_unknown_original_call_is_not_replayed_and_keeps_identity(tmp_path
     loop = await runtime_agent(model=model, store=store, registry=registry, config=AgentLoopConfig(max_rounds=2))
     sid = loop.target.session_id
     calls = [{"id": "original-call", "type": "function", "function": {"name": "inspect", "arguments": '{"number":1}'}}]
-    seq = await store.append_message(sid, role="assistant", tool_calls=calls)
-    await store.set_pending(sid, {"assistant_seq": seq, "round_index": 0, "tool_call_ids": ["original-call"], "tool_calls": calls})
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    port = RuntimeInputStore(store)
+    await port.accept(loop.target, "interrupted", message_id="interrupted", actor=loop.actor)
+    batch = await port.claim(loop.target, node_id="old", boot_id="old")
+    seq = await store.append_message(sid, role="assistant", tool_calls=calls,
+                                     send_index=batch.send_index, pending_tool_calls=True)
+    await port.final(batch, status="interrupted", error="crash")
     try:
         result = await loop.send("continue with unknown result")
         assert result.status == "completed" and observed == []

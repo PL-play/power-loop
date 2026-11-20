@@ -1,8 +1,18 @@
 """Bounded retention over schema 17 sessions, terminal inputs and derived history."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 DAY_MS = 86400000
 DEFAULT_DAYS = {'sessions': 30, 'messages': 30, 'inbox': 7, 'runtime': 30, 'projections': 30}
+
+
+@dataclass(frozen=True)
+class RetentionPage:
+    deleted: dict[str, int]
+    scanned: int
+    fetched: int
+    next_after: str | None
 
 
 def batch_limit(limit):
@@ -24,7 +34,8 @@ async def delete_batch(tx, table, keys, where, params, limit, *, order=None):
                             (*values, *params))
 
 
-async def purge_expired(store, now, *, limit, retention_days, session_id=None, categories=None):
+async def purge_expired(store, now, *, limit, retention_days, session_id=None, categories=None,
+                        candidate_limit=None, after_session_id=None):
     from .closing import busy
 
     remaining = batch_limit(limit)
@@ -35,22 +46,41 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
     if not wanted <= DEFAULT_DAYS.keys():
         raise ValueError('unknown retention category')
     cutoff = {key: int(now-value*DAY_MS) for key, value in days.items()}
+    eligibility_cutoff = max(cutoff.values())
+    if candidate_limit is None:
+        # Preserve directed and count-only callers' candidate order.
+        scope, params = (' AND s.session_id=?', (session_id,)) if session_id else ('', ())
+        candidates = await store._db.fetchall(
+            f'SELECT s.session_id FROM {store.t.sessions} s JOIN {store.t.session_state} st '
+            "ON st.session_id=s.session_id WHERE st.execution_state='idle' AND s.updated_at<?"
+            + scope + ' ORDER BY s.updated_at,s.session_id LIMIT ?',
+            (eligibility_cutoff, *params, remaining),
+        )
+    else:
+        scope, params = (' WHERE session_id>?', (after_session_id,)) if after_session_id is not None else ('', ())
+        candidates = await store._db.fetchall(
+            f'SELECT session_id,updated_at FROM {store.t.sessions}{scope} ORDER BY session_id LIMIT ?',
+            (*params, candidate_limit),
+        )
     counts = {}
-    scope, params = (' AND s.session_id=?', (session_id,)) if session_id else ('', ())
-    candidates = await store._db.fetchall(
-        f'SELECT s.session_id FROM {store.t.sessions} s JOIN {store.t.session_state} st '
-        "ON st.session_id=s.session_id WHERE st.execution_state='idle' AND s.updated_at<?"
-        + scope + ' ORDER BY s.updated_at,s.session_id LIMIT ?',
-        (max(cutoff.values()), *params, remaining),
-    )
+    scanned, last = 0, None
     for candidate in candidates:
         if not remaining:
             break
-        sid = candidate['session_id']
+        sid = last = candidate['session_id']
+        scanned += 1
+        # Skip recent rows from the page snapshot. Deletion eligibility is
+        # always checked again under the state lock.
+        if candidate_limit is not None and candidate['updated_at'] >= eligibility_cutoff:
+            continue
         async with store._db.transaction() as tx:
-            state = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            try:
+                state = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            except ValueError:
+                # A peer can delete this candidate before we lock it.
+                continue
             row = await tx.fetchone(f'SELECT lifecycle,updated_at FROM {store.t.sessions} WHERE session_id=?', (sid,))
-            if row is None or await busy(store, tx, sid, state):
+            if row is None or row['updated_at'] >= eligibility_cutoff or await busy(store, tx, sid, state):
                 continue
             if await tx.fetchone(
                 f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? LIMIT 1', (sid,),
@@ -92,5 +122,8 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
             counts['sessions'] = counts.get('sessions', 0) + count
             remaining -= count
             store._forget_appended(sid)
-            getattr(store, '_cached_sessions', {}).pop(sid, None)
-    return counts
+    fetched = len(candidates)
+    # A full page needs one more seek to confirm the tail. Resume at the last
+    # checked candidate when deletion used the allowance before the page ended.
+    next_after = last if fetched == candidate_limit or scanned < fetched else None
+    return RetentionPage(counts, scanned, fetched, next_after)

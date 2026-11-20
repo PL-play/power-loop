@@ -53,7 +53,6 @@ async def mark_closing(store, tx, row):
         "WHERE session_id=? AND lifecycle='open'",
         (time.time_ns() // 1_000_000, row['session_id']),
     )
-    getattr(store, '_cached_sessions', {}).pop(row['session_id'], None)
     return changed
 
 
@@ -125,7 +124,6 @@ async def delete_sessions(store, session_id, *, cascade=True, limit=1000, resour
                     f'UPDATE {store.t.sessions} SET parent_session_id=NULL WHERE session_id=?',
                     (child['session_id'],),
                 )
-                getattr(store, '_cached_sessions', {}).pop(child['session_id'], None)
             if remaining < 2:
                 return deleted
             remaining -= await tx.execute(f'DELETE FROM {store.t.session_state} WHERE session_id=?', (sid,))
@@ -134,5 +132,4 @@ async def delete_sessions(store, session_id, *, cascade=True, limit=1000, resour
             if count:
                 deleted.append(sid)
                 store._forget_appended(sid)
-                getattr(store, '_cached_sessions', {}).pop(sid, None)
     return deleted

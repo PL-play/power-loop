@@ -176,7 +176,7 @@ async def test_projection_written_and_fed_to_next_send(store: SessionStore, runt
 
 
 # ── H1 (BUG_REVIEW_3.4): out-of-band tool rows must carry the in-flight send_index ──
-# submit_input / resume(_execute_pending) / abort_pending append tool rows out-of-band of the
+# Recovery and abort_pending append tool rows out-of-band of the
 # pipeline. In projection mode the reader partitions active rows by send_index; a NULL-send_index
 # tool row falls into the legacy prefix and renders BEFORE its own assistant tool_call, so
 # align_tool_calls drops it as an orphan — silently losing the answer. These three tests assert the
@@ -207,7 +207,7 @@ async def test_unknown_pending_tool_is_not_replayed_and_keeps_its_send_index(sto
     await store.append_message(sid, role='user', content='old input', send_index=1)
     call = {'id':'unknown-tool','type':'function','function':{'name':'echo','arguments':'{"text":"original"}'}}
     seq = await store.append_message(sid, role='assistant', send_index=1, round_index=0, tool_calls=[call])
-    await store.set_pending(sid, {'assistant_seq':seq,'round_index':0,'tool_call_ids':['unknown-tool'],'tool_calls':[call]})
+    await store.set_pending(sid, {'assistant_seq':seq})
     result = await loop.send('continue with new work')
     assert result.status == 'completed' and not calls
     rows = [r for r in await store.load_all_messages(sid) if r.tool_call_id == 'unknown-tool']

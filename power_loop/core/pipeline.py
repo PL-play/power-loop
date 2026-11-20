@@ -16,9 +16,9 @@ import logging
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Never
 
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
@@ -26,6 +26,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMService,
     LLMTokenUsage,
 )
+from power_loop.agent.runtime_types import plain
 from power_loop.agent.sink import MessageSink, NullSink
 from power_loop.agent.system_prompt import resolve_runtime_system_prompt
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
@@ -88,6 +89,7 @@ from power_loop.core.agent_context import (
     reset_current_cancel_token,
     set_current_cancel_token,
 )
+from power_loop.core.control import ControlledLoopStop
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
@@ -305,8 +307,15 @@ def _round_usage_payload(*, round_index: int, max_rounds: int, usage: dict[str, 
     )
 
 
-# ── AgentPipeline ──
+@dataclass
+class _ToolOutcome:
+    output: str
+    failed: bool
+    returned: bool = False
+    stop_note: str = ""
 
+
+# ── AgentPipeline ──
 class AgentPipeline:
     """Agent loop as a pipeline of hookable phases.
 
@@ -603,20 +612,26 @@ class AgentPipeline:
         definition = getattr(rt, "definition", None) if rt is not None else None
         return str(getattr(definition, "interrupt", "finish") or "finish")
 
-    async def _race(self, work: asyncio.Future, *, policy_deadline: bool = False) -> tuple[Any, str]:
+    async def _race(
+        self, work: asyncio.Future, *, policy_deadline: bool = False,
+        tool_stop: asyncio.Future[ControlledLoopStop] | None = None,
+    ) -> tuple[Any, str]:
         """Await ``work`` unless a stop (or the policy deadline) arrives first.
         ``(result, "done")`` when it finished (its exception propagates); ``(None, "stop")`` /
-        ``(None, "policy_deadline")`` otherwise — ``work`` is left RUNNING, the caller decides."""
+        ``(None, "policy_deadline")`` otherwise. A sibling's controlled stop raises the
+        original exception. On either kind of stop, the caller settles unfinished work."""
         waiters: dict[str, asyncio.Future] = {}
         if not self.cancel_token.is_never:
             waiters["stop"] = asyncio.ensure_future(self.cancel_token.wait())
         if policy_deadline:
             waiters["policy_deadline"] = asyncio.ensure_future(self._model_policy_due.wait())
-        if not waiters:
+        if not waiters and tool_stop is None:
             return await work, "done"
+        waiting = {work, *waiters.values()}
+        if tool_stop is not None:
+            waiting.add(tool_stop)
         try:
-            done, _ = await asyncio.wait({work, *waiters.values()},
-                                         return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             # We are being cancelled (a stop, shutdown): take the work down WITH us and let
             # it finish its own cleanup first — a model call records its (estimated) usage
@@ -630,6 +645,8 @@ class AgentPipeline:
         for w in waiters.values():
             if w not in done:
                 w.cancel()
+        if tool_stop is not None and tool_stop in done:
+            raise tool_stop.result()
         if work in done:
             return work.result(), "done"
         if "stop" in waiters and waiters["stop"] in done:
@@ -638,7 +655,8 @@ class AgentPipeline:
 
     def _start_tool(
         self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore | None = None,
-        *, tool_call_id: str | None = None,
+        *, tool_call_id: str | None = None, count: bool = True,
+        tool_stop: asyncio.Future[ControlledLoopStop] | None = None,
     ) -> asyncio.Future:
         """Run one tool call as its own task with its OWN stop token (a child of the run's —
         design/124 §8.2), exposed to the handler as the current cancel token. Stopping the run
@@ -646,45 +664,143 @@ class AgentPipeline:
         tok = self.cancel_token.child()
         assistant_seq = getattr(self.sink, "persisted_assistant_seq", None)
 
-        async def _run() -> tuple[str, bool]:
-            if sem is None:
-                return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
-                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
-            async with sem:
-                return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
-                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
+        async def invoke() -> tuple[str, bool] | None:
+            if tool_stop is not None and tool_stop.done():
+                return None
+            task = asyncio.current_task()
+            assert task is not None
+            self._tool_tokens[task] = tok
+            try:
+                return await self.execute_tool(
+                    tool_name, tool_args, count=count, cancel_token=tok,
+                    tool_call_id=tool_call_id, assistant_seq=assistant_seq,
+                )
+            except ControlledLoopStop as stop:
+                # Latch before releasing the semaphore so its waiters cannot start.
+                if tool_stop is not None and not tool_stop.done():
+                    tool_stop.set_result(stop)
+                raise
+            finally:
+                self._tool_tokens.pop(task, None)
 
-        fut = asyncio.ensure_future(_run())
-        self._tool_tokens[fut] = tok
-        fut.add_done_callback(lambda f: self._tool_tokens.pop(f, None))
-        return fut
+        async def _run() -> tuple[str, bool] | None:
+            if sem is None:
+                return await invoke()
+            async with sem:
+                return await invoke()
+
+        return asyncio.ensure_future(_run())
 
     async def _settle_stopped_tool(
-        self, work: asyncio.Future, mode: str,
-    ) -> tuple[str, bool]:
+        self, work: asyncio.Future, mode: str, *, controlled: ControlledLoopStop | None = None,
+    ) -> _ToolOutcome:
         """The run was stopped while this tool ran (design/124 §8.4). Mechanical, bounded:
         ``abort`` → cancel now; a sub-task (``background``: its child token is already flipped,
         it winds itself down) → up to ``subtask_s``; ``finish`` → up to ``finish_tool_s`` for its
         real result. Past the limit the call is cancelled and the model is told so."""
         pol = self.config.stop_policy
-        reason = self.cancel_token.reason
+        label = (f"执行停止（{controlled.reason}）" if controlled is not None
+                 else f"用户要求停止（{self.cancel_token.reason}）")
         if mode == "abort":
             work.cancel()
             await asyncio.wait({work}, timeout=pol.abort_tool_s)
-            return (f"[stopped: 用户要求停止（{reason}），这个调用已中止，结果没有产生。]", False)
+            return _ToolOutcome(f"[stopped: {label}，这个调用已中止，结果没有产生。]", False)
         grace = pol.subtask_s if mode == "background" else pol.finish_tool_s
         done, _ = await asyncio.wait({work}, timeout=grace)
         if work in done and not work.cancelled():
+            stop_note = f"[stopped: {label}；这个调用在停止前收了尾，下面是它交回的结果]\n"
             try:
                 out, failed = work.result()
             except Exception as exc:  # noqa: BLE001
-                out, failed = f"Error: {exc}", True
-            return (f"[stopped: 用户要求停止（{reason}）；这个调用在停止前收了尾，下面是它交回的结果]\n"
-                    f"{out}", failed)
+                return _ToolOutcome(f"Error: {exc}", True, stop_note=stop_note)
+            return _ToolOutcome(out, failed, returned=not failed, stop_note=stop_note)
         work.cancel()
         await asyncio.wait({work}, timeout=pol.abort_tool_s)
-        return (f"[stopped: 用户要求停止（{reason}）；这个调用 {grace:.0f} 秒内没有结束，已强制中止，"
-                "结果不完整或没有。]", False)
+        return _ToolOutcome(f"[stopped: {label}；这个调用 {grace:.0f} 秒内没有结束，已强制中止，"
+                            "结果不完整或没有。]", False)
+
+    async def _after_tool(
+        self, call: dict[str, Any], before: ToolBeforeCtx, output: str, failed: bool, round_idx: int,
+    ) -> ToolAfterCtx:
+        ctx = ToolAfterCtx(
+            round_index=round_idx, tool_call=call, tool_name=before.tool_name, tool_args=before.tool_args,
+            output=output, failed=failed,
+        )
+        await self.hooks.run_typed_async(HookPoint.TOOL_AFTER, ctx)
+        return ctx
+
+    async def _record_tool_result(
+        self, tool_call_id: str, ctx: ToolBeforeCtx, output: str, failed: bool, round_idx: int,
+    ) -> None:
+        from power_loop.runtime.tool_contracts import format_result
+
+        if failed:
+            self._emit(AgentEventType.TOOL_CALL_FAILED,
+                       ToolCallFailedPayload(name=ctx.tool_name, output=output, tool_input=ctx.tool_args,
+                                             tool_call_id=tool_call_id), round_index=round_idx)
+        self._emit(AgentEventType.TOOL_CALL_COMPLETED,
+                   ToolCallCompletedPayload(name=ctx.tool_name, output=output, tool_input=ctx.tool_args,
+                                            tool_call_id=tool_call_id, failed=failed),
+                   round_index=round_idx)
+        stored_output = _truncate_result(output, self.config.tool_result_max_chars)
+        stored_output = format_result(self.tool_registry.get(ctx.tool_name), str(output),
+            self.config.tool_result_max_chars or 20000) or stored_output
+        await self._append_message(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": ctx.tool_name, "content": stored_output},
+            round_index=round_idx,
+        )
+
+    async def _stop_tool_batch(
+        self, calls: Sequence[dict[str, Any]], start: int,
+        pending: dict[int, tuple[asyncio.Future | None, ToolBeforeCtx]],
+        stop: ControlledLoopStop, round_idx: int,
+        *, signal: asyncio.Future[ControlledLoopStop] | None = None,
+    ) -> Never:
+        if signal is not None:
+            if not signal.done():
+                signal.set_result(stop)
+            stop = signal.result()
+
+        async def settle(work: asyncio.Future | None, ctx: ToolBeforeCtx) -> _ToolOutcome | None:
+            try:
+                if work is None:
+                    raise stop  # The serial call raised directly in the loop.
+                if work.done():
+                    result = None if work.cancelled() else work.result()
+                    if result is None:
+                        return None
+                    output, failed = result
+                    return _ToolOutcome(output, failed, returned=not failed)
+                token = self._tool_tokens.get(work)
+                if token is None:
+                    work.cancel()  # Still waiting for a slot.
+                    await asyncio.gather(work, return_exceptions=True)
+                    return None
+                token.cancel(stop.reason)
+                return await self._settle_stopped_tool(work, self._interrupt_mode(ctx.tool_name), controlled=stop)
+            except ControlledLoopStop as rejected:
+                return _ToolOutcome(f"[stopped: {rejected.reason}] {rejected.message}".rstrip(), True)
+            except Exception as exc:  # noqa: BLE001 — preserve a completed sibling's failure
+                return _ToolOutcome(f"Error: {exc}", True)
+
+        remaining = {i: entry for i, entry in pending.items() if i >= start}
+        results = await asyncio.gather(*(settle(*entry) for entry in remaining.values()))
+        by_index = dict(zip(remaining, results, strict=True))
+        for i, call in enumerate(calls[start:], start=start):
+            outcome = by_index.get(i)
+            if outcome is None:
+                await self._resolve_skipped_tool_calls([call], reason=stop.reason, round_idx=round_idx)
+            else:
+                before = remaining[i][1]
+                output, failed = outcome.output, outcome.failed
+                if outcome.returned:
+                    after = await self._after_tool(call, before, output, failed, round_idx)
+                    output, failed = after.output, after.failed
+                await self._record_tool_result(
+                    str(call.get("id") or ""), before, outcome.stop_note + output, failed, round_idx,
+                )
+        self._completed_rounds = round_idx + 1
+        raise stop
 
     async def _resolve_skipped_tool_calls(
         self, skipped: Sequence[Mapping[str, Any]], *, reason: str, round_idx: int
@@ -1174,7 +1290,8 @@ class AgentPipeline:
             max_tokens=max_tokens,
             temperature=temperature,
             model=self.config.model,                 # per-loop model override (None = service default)
-            response_format=self.config.response_format,  # structured output when set
+            # Execution config stays frozen; providers receive ordinary JSON containers.
+            response_format=plain(self.config.response_format),
         )
 
         # The model that actually served the call: the per-loop override if set, else the
@@ -1413,15 +1530,6 @@ class AgentPipeline:
         rt = reg.get(tool_name) if reg is not None else None
         return bool(rt is not None and async_capable_for(rt.definition, tool_args))
 
-    def _spawn_tool_task(
-        self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore,
-        *, tool_call_id: str | None = None,
-    ) -> asyncio.Future:
-        """同轮并发的一个成员：受信号量限流地跑 execute_tool（自带子停止标记，见 _start_tool）。
-        contextvars 随 task 自动拷贝（PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样
-        留在 task 里，轮到它时再由串行路径的 TOOL_ERROR 分支处理。"""
-        return self._start_tool(tool_name, tool_args, sem, tool_call_id=tool_call_id)
-
     @staticmethod
     def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future, Any]]) -> None:
         for task, _ in pre.values():
@@ -1521,7 +1629,6 @@ class AgentPipeline:
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
         from power_loop.core import pass_turn as _pass
-        from power_loop.core.control import ControlledLoopStop
 
         token = _pass.begin()          # pass_turn 的状态按 send 隔离（子 agent 内联跑也不串）
         self._pass_state = _pass.current()
@@ -2126,10 +2233,15 @@ class AgentPipeline:
             )
             if len(_eligible) < 2:
                 _eligible = []
-            _pre: dict[int, tuple[asyncio.Future, Any]] = {}   # 已起任务：index → (task, tb_ctx)
+            _tool_stop: asyncio.Future[ControlledLoopStop] | None = (
+                asyncio.get_running_loop().create_future() if _eligible else None
+            )
+            _pre: dict[int, tuple[asyncio.Future | None, ToolBeforeCtx]] = {}
             _pre_skip: dict[int, Any] = {}                       # TOOL_BEFORE 判 SKIP 的 hoisted 调用
             _pre_sem: asyncio.Semaphore | None = None
             for i, tool_call in enumerate(tool_calls):
+                if _tool_stop is not None and _tool_stop.done():
+                    await self._stop_tool_batch(tool_calls, i, _pre, _tool_stop.result(), round_idx)
                 if _is_cancelled(self.cancel_token):
                     self._cancel_pre_tasks(_pre)
                     await self._finalize("cancelled")
@@ -2179,9 +2291,14 @@ class AgentPipeline:
                         tool_name=tool_name,
                         tool_args=tool_args,
                     )
-                    await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
+                    try:
+                        await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
+                    except ControlledLoopStop as stop:
+                        await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
                     tool_name = tb_ctx.tool_name
                     tool_args = tb_ctx.tool_args
+                    if _tool_stop is not None and _tool_stop.done():
+                        await self._stop_tool_batch(tool_calls, i, _pre, _tool_stop.result(), round_idx)
 
                     if tb_ctx.directive == HookDirective.SKIP:
                         await self._append_message(
@@ -2198,8 +2315,11 @@ class AgentPipeline:
                         # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
                         # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
                         _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
-                        pre_task = self._spawn_tool_task(tool_name, tool_args, _pre_sem, tool_call_id=call_id)
+                        pre_task = self._start_tool(tool_name, tool_args, _pre_sem,
+                                                    tool_call_id=call_id, tool_stop=_tool_stop)
                         for j in _eligible:
+                            if _tool_stop is not None and _tool_stop.done():
+                                break
                             if j <= i or j in _pre or j in _pre_skip:
                                 continue
                             tc_j = tool_calls[j]
@@ -2207,7 +2327,13 @@ class AgentPipeline:
                                 round_index=round_idx, tool_call=tc_j,
                                 tool_name=_tool_call_name(tc_j), tool_args=_tool_call_args(tc_j),
                             )
-                            await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_j)
+                            try:
+                                await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_j)
+                            except ControlledLoopStop as stop:
+                                _pre[i] = (pre_task, tb_ctx)
+                                await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
+                            if _tool_stop is not None and _tool_stop.done():
+                                break
                             if tb_j.directive == HookDirective.SKIP:
                                 _pre_skip[j] = tb_j
                                 continue
@@ -2215,27 +2341,31 @@ class AgentPipeline:
                                        ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
                                                               tool_call_id=str(tc_j.get("id") or "")),
                                        round_index=round_idx)
-                            _pre[j] = (self._spawn_tool_task(tb_j.tool_name, tb_j.tool_args, _pre_sem,
-                                                          tool_call_id=str(tc_j.get("id") or "")), tb_j)
+                            _pre[j] = (self._start_tool(tb_j.tool_name, tb_j.tool_args, _pre_sem,
+                                tool_call_id=str(tc_j.get("id") or ""), tool_stop=_tool_stop), tb_j)
 
                 # ── Business logic: execute tool ──
                 failed = False
                 _stopped = False
+                _work = pre_task
                 try:
-                    if not self.cancel_token.is_never:
+                    if not self.cancel_token.is_never or _tool_stop is not None:
                         # design/124 §8.4: race the call against a stop.
-                        _work = (pre_task if pre_task is not None
-                                 else self._start_tool(tool_name, tool_args, tool_call_id=call_id))
-                        _res, _why = await self._race(_work)
+                        if _work is None:
+                            _work = self._start_tool(tool_name, tool_args,
+                                                     tool_call_id=call_id, tool_stop=_tool_stop)
+                        _res, _why = await self._race(_work, tool_stop=_tool_stop)
                         if _why == "done":
                             output, failed = _res
                         else:
-                            output, failed = await self._settle_stopped_tool(_work, self._interrupt_mode(tool_name))
+                            outcome = await self._settle_stopped_tool(_work, self._interrupt_mode(tool_name))
+                            output, failed = outcome.stop_note + outcome.output, outcome.failed
                             _stopped = True
-                    elif pre_task is not None:
-                        output, failed = await pre_task
                     else:
                         output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
+                except ControlledLoopStop as stop:
+                    _pre[i] = (_work, tb_ctx)
+                    await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx)
                 except Exception as exc:
                     # ── Hook: TOOL_ERROR ──
                     from power_loop.contracts.errors import SessionBusy, SessionLeaseLost
@@ -2257,9 +2387,25 @@ class AgentPipeline:
                         try:
                             # count=False: this is a retry of the SAME logical tool
                             # call, already counted on the first dispatch.
-                            output, failed = await self.execute_tool(
-                                tool_name, tool_args, count=False, tool_call_id=call_id
-                            )
+                            if _tool_stop is None:
+                                _work = None
+                                output, failed = await self.execute_tool(
+                                    tool_name, tool_args, count=False, tool_call_id=call_id
+                                )
+                            else:
+                                _work = self._start_tool(tool_name, tool_args, count=False,
+                                                         tool_call_id=call_id, tool_stop=_tool_stop)
+                                _res, _why = await self._race(_work, tool_stop=_tool_stop)
+                                if _why == "done":
+                                    output, failed = _res
+                                else:
+                                    outcome = await self._settle_stopped_tool(
+                                        _work, self._interrupt_mode(tool_name))
+                                    output, failed = outcome.stop_note + outcome.output, outcome.failed
+                                    _stopped = True
+                        except ControlledLoopStop as stop:
+                            _pre[i] = (_work, tb_ctx)
+                            await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx)
                         except Exception as retry_exc:
                             if isinstance(retry_exc, (SessionLeaseLost, SessionBusy, CancellationRequested)):
                                 raise
@@ -2270,15 +2416,7 @@ class AgentPipeline:
                         failed = True
 
                 # ── Hook: TOOL_AFTER ──
-                ta_ctx = ToolAfterCtx(
-                    round_index=round_idx,
-                    tool_call=tool_call,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    output=output,
-                    failed=failed,
-                )
-                await self.hooks.run_typed_async(HookPoint.TOOL_AFTER, ta_ctx)
+                ta_ctx = await self._after_tool(tool_call, tb_ctx, output, failed, round_idx)
                 output = ta_ctx.output
                 failed = ta_ctx.failed
 
@@ -2287,24 +2425,9 @@ class AgentPipeline:
                     used_todo = True
                     self.rounds_since_todo = 0
 
-                if failed:
-                    self._emit(AgentEventType.TOOL_CALL_FAILED,
-                               ToolCallFailedPayload(name=tool_name, output=output, tool_input=tool_args, tool_call_id=call_id),
-                               round_index=round_idx)
-
-                self._emit(AgentEventType.TOOL_CALL_COMPLETED,
-                           ToolCallCompletedPayload(name=tool_name, output=output, tool_input=tool_args,
-                                                    tool_call_id=call_id, failed=failed),
-                           round_index=round_idx)
-
-                stored_output = _truncate_result(output, self.config.tool_result_max_chars)
-                from power_loop.runtime.tool_contracts import format_result
-                stored_output = format_result(self.tool_registry.get(tool_name), str(output),
-                    self.config.tool_result_max_chars or 20000) or stored_output
-                await self._append_message(
-                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": stored_output},
-                    round_index=round_idx,
-                )
+                await self._record_tool_result(call_id, tb_ctx, output, failed, round_idx)
+                if _tool_stop is not None and _tool_stop.done():
+                    await self._stop_tool_batch(tool_calls, i + 1, _pre, _tool_stop.result(), round_idx)
 
                 if _stopped:
                     # design/124 §8.4: the run was stopped mid-tool — this call is settled; the

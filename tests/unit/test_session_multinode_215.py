@@ -321,9 +321,18 @@ async def test_build_uses_claimed_execution_context(registry_store):
     await port.accept(root, "go", message_id="m1", actor=ACTOR)
     model = CountingModel()
     contexts = []
+    leases = []
     factory = RegistryRuntimeFactory()
 
     async def build(descriptor, context):
+        from power_loop.runtime.session_ownership import current_ownership
+
+        lease = current_ownership(store, context.session_id)
+        assert lease is runtime.worker._active[context.session_id].ownership
+        lease.require_owned()
+        assert lease.key == (context.store_id, context.session_id)
+        assert (lease.epoch, lease.token) == (context.owner_epoch, context.owner_token)
+        leases.append(lease)
         contexts.append((context.input_ref, context.send_index,
                          context.owner_epoch, context.owner_token))
         return ExecutionEnvironment(
@@ -344,6 +353,9 @@ async def test_build_uses_claimed_execution_context(registry_store):
         assert (built_ref, send_index, owner_epoch) == (ref, 1, 1)
         assert owner_token
         assert model.calls == 1
+        while runtime.worker._tasks:
+            await asyncio.wait(tuple(runtime.worker._tasks))
+        assert leases[0].released and not leases[0].lost
     finally:
         await runtime.worker.shutdown(timeout_s=2)
         await runtime.client.aclose()
@@ -393,9 +405,15 @@ async def test_claim_release_after_build_failure(registry_store):
     await port.accept(root, "go", message_id="m1", actor=ACTOR)
     model = CountingModel()
     contexts = []
+    leases = []
     factory = RegistryRuntimeFactory()
 
     async def build(descriptor, context):
+        from power_loop.runtime.session_ownership import current_ownership
+        lease = current_ownership(store, context.session_id)
+        assert lease is node_a.worker._active[context.session_id].ownership
+        lease.require_owned()
+        leases.append(lease)
         contexts.append((context.input_ref, context.send_index, context.owner_epoch))
         raise RuntimeRequestError("resource_unavailable", "only available on another node")
 
@@ -409,6 +427,7 @@ async def test_claim_release_after_build_failure(registry_store):
         while node_a.worker._tasks:
             await asyncio.wait(tuple(node_a.worker._tasks))
         assert contexts == [(ref, 1, 1)]
+        assert len(leases) == 1 and leases[0].released and not leases[0].lost
         status = await port.inspect(ref, actor=ACTOR)
         assert status.input_state == "pending" and status.terminal_status is None
         state = await store._db.fetchone(

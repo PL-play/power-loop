@@ -30,6 +30,8 @@ async def fixture(overrides=None, n=3, dsn=None, keep=False):
         args = {'command': 'x' * 1500, 'description': f'目的{i}', 'context_policy': 'keep' if keep else 'retire'}
         call = {'id': str(i), 'type': 'function', 'function': {'name': 'bash', 'arguments': json.dumps(args)}}
         for row in ({'role': 'assistant', 'tool_calls': [call]}, {'role': 'tool', 'tool_call_id': str(i), 'content': 'r' * 1500}):
+            if row['role'] == 'tool':
+                row['meta'] = {'_assistant_seq': seqs[-1]}
             seqs.append(await store.append_message(sid, send_index=1, **row))
             history.append(row)
     config = ToolContextConfig(trigger_tokens=1000, target_tokens=500, hot_tail=0,
@@ -135,9 +137,10 @@ async def test_archive_between_sends_preserves_raw_message():
     try:
         sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         call = {'id': 'echo-call', 'type': 'function', 'function': {'name': 'echo', 'arguments': '{}'}}
-        await store.append_message(sid, send_index=1, role='assistant', tool_calls=[call])
+        source = await store.append_message(sid, send_index=1, role='assistant', tool_calls=[call])
         result_seq = await store.append_message(
             sid, send_index=1, role='tool', tool_call_id='echo-call', content='UNIQUE-RESULT' * 5000,
+            meta={'_assistant_seq': source},
         )
         rows = await store.load_all_messages(sid)
         registry = create_default_tool_registry(bind=False)
@@ -270,8 +273,9 @@ async def _send_rows(store, sid, names, send_index=1):
             continue
         args = {'command': 'c' * 400, 'description': f'{name}{i}'}
         call = {'id': f'c{i}', 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}
-        await store.append_message(sid, send_index=send_index, role='assistant', content='说明文字', tool_calls=[call])
-        await store.append_message(sid, send_index=send_index, role='tool', tool_call_id=f'c{i}', content='r' * 400)
+        source = await store.append_message(sid, send_index=send_index, role='assistant', content='说明文字', tool_calls=[call])
+        await store.append_message(sid, send_index=send_index, role='tool', tool_call_id=f'c{i}',
+                                   content='r' * 400, meta={'_assistant_seq': source})
     return await store.load_all_messages(sid)
 
 
@@ -315,9 +319,10 @@ async def test_between_sends_parallel_same_tool_is_consecutive_and_merge_can_be_
         sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
         calls = [{'id': f'p{i}', 'type': 'function', 'function': {'name': 'read', 'arguments': json.dumps({'path': f'f{i}'})}}
                  for i in range(3)]
-        await store.append_message(sid, send_index=1, role='assistant', tool_calls=calls)
+        source = await store.append_message(sid, send_index=1, role='assistant', tool_calls=calls)
         for i in range(3):
-            await store.append_message(sid, send_index=1, role='tool', tool_call_id=f'p{i}', content='z' * 300)
+            await store.append_message(sid, send_index=1, role='tool', tool_call_id=f'p{i}',
+                                       content='z' * 300, meta={'_assistant_seq': source})
         rows = await store.load_all_messages(sid)
         def entries():
             return [{'name': 'read', 'seq': r.seq, 's': f'read s{r.seq}'} for r in rows if r.role == 'tool']
@@ -436,3 +441,58 @@ async def test_bash_keep_is_unchanged_in_send_at_both_levels_and_distilled_betwe
         assert '目的0' in projected.rows[0].content['tools'][0]['s']
     finally:
         await store.close()
+
+
+async def test_group_item_retains_compacted_original_call(registry_store):
+    store = registry_store[0]
+    sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
+    calls = [{'id': f'c{i}', 'function': {'name': 'bash', 'arguments': json.dumps({'command': f'original {i}'})}}
+             for i in range(2)]
+    source = await store.append_message(sid, role='assistant', send_index=1, tool_calls=calls)
+    for i in range(2):
+        await store.append_message(sid, role='tool', send_index=1, tool_call_id=f'c{i}',
+                                   content=f'result {i}', meta={'_assistant_seq': source})
+    rows = await store.load_all_messages(sid)
+    engine = ToolContextEngine(config=ToolContextConfig(overrides=ARCHIVE), store=store,
+                               owner_session_id=sid, owner_send_index=1, llm=None, model='test',
+                               registry=create_default_tool_registry(bind=False))
+    await engine.start()
+    projected = SimpleNamespace(rows=[SimpleNamespace(kind='project', content={'tools': host_entries(rows)}, rendered_text=None)])
+    await prepare_projection(engine, projected, rows, 1)
+    gid = next(iter(engine.state['archive']['groups']))
+    await store.append_message(sid, role='assistant', send_index=1, tool_calls=[{
+        'id': 'c0', 'function': {'name': 'bash', 'arguments': 'WRONG RECENT CALL'}}])
+    await store.record_compaction(sid, from_seq=source, to_seq=rows[-1].seq,
+                                 note_content='summary', before_tokens=50, after_tokens=5, round_index=1)
+    assert (await store.get_message(sid, source)).state.value == 'compacted_out'
+    for i in range(2):
+        value = json.loads(await recall_group(store, sid, 1, gid, item=i))
+        assert json.loads(value['arguments']) == {'command': f'original {i}'}
+        assert value['result'] == f'result {i}'
+
+
+async def test_original_keeps_background_payload_and_container_arguments(registry_store):
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import TargetRef
+    from power_loop.runtime.background import encode_results
+    from power_loop.runtime.tool_archive import recall_original
+
+    store = registry_store[0]
+    sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
+    descriptor = replace(DESCRIPTOR, kind='background', config={
+        'background': {'tool': 'echo', 'arguments': {'text': 'background original'}}})
+    child = await store.create_session(descriptor, actor=ACTOR, parent_session_id=sid,
+                                       created_by_session_id=sid, start_input_message_id='bg-start')
+    port = RuntimeInputStore(store)
+    target = TargetRef(store.store_id, child)
+    await port.accept(target, 'run', message_id='bg-start', actor=ACTOR)
+    batch = await port.claim(target, node_id='bg', boot_id='bg')
+    await port.final(batch, final_text='full background result')
+    call = {'id': 'container', 'function': {'name': 'background_run', 'arguments': '{"action":"read"}'}}
+    source = await store.append_message(sid, role='assistant', send_index=1, tool_calls=[call])
+    seq = await store.append_message(sid, role='tool', send_index=1, tool_call_id='container',
+                                     content=encode_results([{'task_id': child}]), meta={'_assistant_seq': source})
+    value = json.loads(await recall_original(store, sid, 1, await store.get_message(sid, seq)))
+    assert value['arguments'] == '{"action":"read"}'
+    assert value['background_originals'][0]['args'] == {'text': 'background original'}
+    assert value['background_originals'][0]['result'] == 'full background result'

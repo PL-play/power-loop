@@ -58,6 +58,7 @@ class _FakeCompletions:
         self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
+        json.dumps(kwargs, ensure_ascii=False)  # Exercise the real JSON wire boundary.
         self.calls.append(kwargs)
         events = self._streams.pop(0)
 
@@ -281,3 +282,98 @@ async def test_declared_json_schema_is_sent_natively() -> None:
 async def test_explicit_json_object_passes_through_undeclared() -> None:
     sent = await _send_structured({"type": "json_object"})
     assert sent["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize("entry", ["config", "session_options", "child", "workflow"])
+@pytest.mark.parametrize("native", [True, False, None])
+async def test_runtime_frozen_schema_reaches_provider_as_json(runtime_agent, monkeypatch, entry, native) -> None:
+    from copy import deepcopy
+    from types import MappingProxyType
+
+    from power_loop import AgentLoopConfig, RequestOptions, ToolRegistry
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.agent.runtime_types import InputRef, TargetRef, plain, result_message_id
+    from power_loop.runtime.spec import output_response_format
+    from power_loop.tools.spawn_agent import register_spawn_agent
+
+    response_format = deepcopy(_CARD_RF)
+    response_format["json_schema"]["schema"] = {
+        "type": "object", "description": "nested item collection", "required": ["items"],
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object", "required": ["name"],
+            "properties": {"name": {"type": "string", "description": "item name"}},
+        }}},
+    }
+    original = deepcopy(response_format)
+    declaration = {k: response_format["json_schema"][k] for k in ("name", "schema", "strict")}
+    payload = {"items": [{"name": "tea"}]}
+    reply = [_content_event(json.dumps(payload)), _usage_event(1, 1, 2)]
+    streams = [reply] * 6
+    registry = ToolRegistry()
+    if entry == "child":
+        register_spawn_agent(registry)
+        streams.insert(0, [
+            _tool_event(0, call_id="spawn", name="spawn_agent", type_="function",
+                        args=json.dumps({"task": "classify", "tools": [], "output_schema": declaration})),
+            _usage_event(1, 1, 2),
+        ])
+    capabilities = {} if native is None else {"supports_json_schema": native}
+    service, client = _service(streams, capabilities=capabilities)
+    # Parent execution closes its model; capture client acquisition on later child runs too.
+    monkeypatch.setattr(service, "_ensure_client", lambda: client)
+    config = AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9,
+                             response_format=response_format if entry == "config" else None)
+    agent = await runtime_agent(model=service, registry=registry, config=config)
+    store = agent.runtime.store
+    expected = response_format
+    if entry == "session_options":
+        await agent.new_session(options=RequestOptions(response_format=response_format))
+    if entry == "workflow":
+        handle = await agent.runtime.client.workflow(agent.target, {
+            "name": "nested", "root": {"type": "agent", "id": "leaf",
+                "spec": {"name": "leaf", "system_prompt": "classify"},
+                "output_schema": declaration},
+        }, message_id="workflow", actor=agent.actor)
+        result = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert result.status == "completed" and result.results["leaf"].payload == payload
+        await agent.drain()
+        leaf, = await store.list_children(handle.target.session_id)
+        descriptor = leaf.descriptor
+        expected = output_response_format(declaration)
+    else:
+        result = await agent.send("classify")
+        assert result.status == "completed"
+        target = agent.target
+        if entry == "child":
+            messages = await store.load_all_messages(agent.target.session_id)
+            receipt = json.loads(next(m.content for m in messages if m.tool_call_id == "spawn"))
+            start, target = InputRef(**receipt["input_ref"]), TargetRef(**receipt["target_ref"])
+            result = await agent.runtime.client.wait(start, actor=agent.actor, deadline_ms=now_ms() + 10000)
+            assert result.status == "completed" and plain(result.structured_output) == payload
+            parent_result = InputRef(store.store_id, agent.target.session_id,
+                result_message_id(target, start, result.send_index, "agent_result"))
+            await agent.drain(after_input=parent_result)
+            expected = output_response_format(declaration)
+        descriptor = (await store.get_session(target.session_id)).descriptor
+    frozen = descriptor.config.get("child_options", descriptor.config)["response_format"]
+    assert isinstance(frozen, MappingProxyType) and plain(frozen) == expected
+    assert isinstance(frozen["json_schema"]["schema"]["required"], tuple)
+    with pytest.raises(TypeError):
+        frozen["json_schema"]["schema"]["properties"]["items"]["items"]["type"] = "string"
+
+    # Only the structured leaf/root call carries this schema; parent acknowledgements do not.
+    sent, = [call for call in client.chat.completions.calls if (
+        "response_format" in call or any(m["role"] == "system" and "nested item collection" in m["content"]
+                                         for m in call["messages"])
+    )]
+    wire = json.loads(json.dumps(sent, ensure_ascii=False))
+    if native is True:
+        assert wire["response_format"] == expected
+        sent["response_format"]["json_schema"]["schema"]["required"].append("wire-only")
+    else:
+        assert "response_format" not in wire
+        system = next(m["content"] for m in wire["messages"] if m["role"] == "system")
+        schema_line = next(line.removeprefix("Schema: ") for line in system.splitlines()
+                           if line.startswith("Schema: "))
+        assert json.loads(schema_line) == expected["json_schema"]["schema"]
+    assert plain(frozen) == expected and response_format == original

@@ -23,6 +23,11 @@ The demo uses a fixed model; a real deployment resolves models, tools, hooks and
 resources in its registered `RuntimeFactory`.
 
 `StatefulAgentLoop` accepts `runtime=`. Direct LLM/DSN construction is retired.
+Runtime claim/recover is the only ownership installation path. The worker binds
+that same `SessionOwnership` handle before hooks and the factory build, for agent,
+workflow driver and background executions. It retires the handle and resets its
+binding before post-final business cleanup; inherited tasks keep the retired
+handle and cannot start more work. Memory and Store coordinators remain supported.
 An acceptance receipt is not completion: wait for its original `InputRef`.
 Normal authorization, accounting, context and cleanup remain required. Failures
 may leave interrupted/unknown results; unknown external actions are not replayed.

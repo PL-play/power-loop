@@ -22,6 +22,8 @@ from power_loop.runtime.blackboard import Blackboard, BlackboardError, render_en
 from power_loop.runtime.env import get_runtime_env
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.runtime_state import get_tool_runtime_context
+from power_loop.runtime.store import send_reads
+from power_loop.runtime.task_runtime import current_session_send
 
 __all__ = ["register_blackboard_tools"]
 
@@ -42,8 +44,12 @@ async def _author() -> str | None:
     ctx = get_tool_runtime_context()
     if ctx.store is not None and ctx.session_id:
         try:
-            row = await ctx.store.get_session(ctx.session_id)
-            config = row.descriptor.config if row is not None else {}
+            send = current_session_send(ctx.store, ctx.session_id)
+            if send is not None and send_reads.current(ctx.store, ctx.session_id) is not None:
+                config = send.batch.descriptor.config
+            else:
+                row = await ctx.store.get_session(ctx.session_id)
+                config = row.descriptor.config if row is not None else {}
             return config.get("child_spec", {}).get("name") or config.get("name") or ctx.session_id
         except Exception:  # noqa: BLE001 — author is best-effort
             return ctx.session_id

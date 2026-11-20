@@ -18,7 +18,7 @@ from dataclasses import replace
 from power_loop.contracts.events import AgentEventType
 from power_loop.core.events import AgentEventBus
 from power_loop.runtime.cancellation import CancellationToken
-from power_loop.runtime.session_ownership import SessionOwnership
+from power_loop.runtime.session_ownership import _CURRENT, SessionOwnership
 
 from .runtime_store import RuntimeInputStore, now_ms
 from .runtime_transport import PROTOCOL_VERSION as TRANSPORT_PROTOCOL
@@ -29,6 +29,7 @@ from .runtime_types import (
     RuntimeDescriptor,
     RuntimeRequestError,
     ShutdownResult,
+    StoreError,
     TargetRef,
     TrustedActor,
     plain,
@@ -294,6 +295,7 @@ class RuntimeWorker:
         output_task = None
         renewal = None
         ownership = None
+        ownership_token = None
         external_ownership = None
         batch = None
         normal_final = None
@@ -355,19 +357,20 @@ class RuntimeWorker:
 
             # The claim installed the fence; build the local handle from it. Per-ownership
             # process caches are cleared so no seq/index survives a change of owner.
-            ownership = SessionOwnership(
-                (store.store_id, sid), r.node_id + "/" + r.boot_id,
-                time.monotonic() + r.session_lease_ttl_s, lambda: None,
-                token=batch.owner_token, epoch=batch.owner_epoch,
-                node_id=r.node_id, boot_id=r.boot_id, installs_fence=True,
-            )
-            if external_ownership is not None:
+            if external_ownership is None:
+                ownership = SessionOwnership(
+                    (store.store_id, sid), r.node_id + "/" + r.boot_id,
+                    time.monotonic() + r.session_lease_ttl_s, lambda: None,
+                    token=batch.owner_token, epoch=batch.owner_epoch,
+                    node_id=r.node_id, boot_id=r.boot_id, installs_fence=True,
+                )
+            else:
                 ownership = external_ownership
                 ownership.epoch = batch.owner_epoch
                 ownership.node_id, ownership.boot_id = r.node_id, r.boot_id
                 ownership.installs_fence = True
             store._forget_appended(sid)
-            for cache in ("_next_seqs", "_cached_sessions", "_send_indexes", "_change_versions"):
+            for cache in ("_send_indexes", "_change_versions"):
                 getattr(store, cache, {}).pop(sid, None)
 
             ctx = _SessionExecution(
@@ -377,6 +380,7 @@ class RuntimeWorker:
             ctx.ownership = ownership
             self._active[sid] = ctx
             ownership.on_lost = lambda: ctx.stop.cancel("session ownership lost")
+            ownership_token = _CURRENT.set(ownership)
             renewal = asyncio.create_task(self._renew(sid, batch, ownership, ctx), context=contextvars.Context())
 
             with _bind_execution_context(ctx.snapshot, r.host_context_fields):
@@ -409,13 +413,32 @@ class RuntimeWorker:
                         self._activate(sid)
                     return
                 if descriptor.kind == "background":
-                    if "managed_effect" in descriptor.config:
+                    managed = "managed_effect" in descriptor.config
+                    final_input_batch, consumed = batch, None
+                    if managed:
                         from power_loop.runtime.managed_effects import run_session
+
+                        original = tuple(ref for ref in batch.input_refs
+                                         if ref.message_id == batch.start_input_message_id)
+                        if not original:
+                            # Unrelated sends have their own failure, not a notification
+                            # about the one frozen external action.
+                            final_input_batch = replace(batch, result_route=None)
+                        elif len(batch.input_refs) > 1:
+                            consumed = original
                     else:
                         from power_loop.runtime.background_execution import run_session
-                    result = await run_session(self, ctx, env, config)
+                    try:
+                        result = await run_session(self, ctx, env, config)
+                    except StoreError:
+                        if not managed:
+                            raise
+                        # The checkpoint may have committed. Let the existing lease
+                        # recovery settle this input without publishing a false final.
+                        log.exception("managed effect checkpoint unconfirmed for %s", sid)
+                        return
                     final_batch = await self.inputs.final(
-                        batch, status=result.status, final_text=result.final_text,
+                        final_input_batch, consumed=consumed, status=result.status, final_text=result.final_text,
                         usage=dict(result.usage or {}), structured_output=result.structured_output,
                         error=result.error, error_code=result.error_code, result_seq=None,
                     )
@@ -443,12 +466,11 @@ class RuntimeWorker:
                 loop = _ExecutionLoop(
                     llm=env.llm, store=store, config=config, tool_registry=env.tool_registry,
                     hooks=env.hooks, event_bus=bus,
-                    session_coordinator=r.coordinator, session_cache_size=0,
+                    session_cache_size=0,
                     timer_backend=r.timer_backend,
                 )
                 loop._runtime_worker = self
                 loop._runtime_worker_context = ctx
-                loop._owner_id = r.node_id + "/" + r.boot_id
                 ctx.loop = loop
 
                 if env.command is not None:
@@ -501,13 +523,22 @@ class RuntimeWorker:
             if batch is not None:
                 await self._final_failed(batch, "internal_error", "session send raised")
         finally:
+            try:
+                if renewal is not None:
+                    renewal.cancel()
+                    await asyncio.gather(renewal, return_exceptions=True)
+                if external_ownership is not None:
+                    await r.coordinator.release(external_ownership)
+            finally:
+                retiring = ownership if ownership is not None else external_ownership
+                if retiring is not None:
+                    retiring.released = True
+                if ownership_token is not None:
+                    _CURRENT.reset(ownership_token)
+            # Execution permission ends before post-final business maintenance.
+            # Detached tasks retain the same retired handle in their own Context.
             if env_ctx is not None:
                 env_ctx.__exit__(None, None, None)
-            if renewal is not None:
-                renewal.cancel()
-                await asyncio.gather(renewal, return_exceptions=True)
-            if external_ownership is not None:
-                await r.coordinator.release(external_ownership)
             if output_task is not None:
                 await ctx.output.put(None)
                 await asyncio.gather(output_task, return_exceptions=True)

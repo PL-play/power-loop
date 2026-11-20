@@ -110,7 +110,6 @@ class SQLiteSink:
         self.session_id = session_id
         self._unresolved: set[str] = set()
         self._assistant_seq: int | None = None
-        self._tool_calls: list[dict[str, Any]] = []
         # The send this sink is persisting for — stamped by StatefulAgentLoop._run_loop right
         # where pipeline.send_index is stamped, so per-round usage rows carry the real send
         # (usage_rounds' key is (session_id, send_index, round_index) since store schema v6).
@@ -220,12 +219,16 @@ class SQLiteSink:
             tool_call_id = str(message.get("tool_call_id") or "")
             text, structured = _encode_content(message.get("content"))
             resolves = bool(tool_call_id) and tool_call_id in self._unresolved
+            meta = dict(message.get("meta") or {})
+            meta.pop("_assistant_seq", None)
+            if resolves and self._assistant_seq is not None:
+                meta["_assistant_seq"] = self._assistant_seq
+            # Keep the caller's message untouched and capture the same source we persist,
+            # before the last result clears this sink's pending assistant.
+            message = {**message, "meta": meta}
             options = dict(usage_options)
-            remaining_pending = None
-            if resolves:
-                remaining = self._unresolved - {tool_call_id}
-                remaining_pending = await self._remaining_pending(remaining, round_index) if remaining else None
-                options["pending"] = remaining_pending
+            if resolves and len(self._unresolved) == 1:
+                options["pending"] = None
             seq = await self.store.append_message(
                 self.session_id,
                 role="tool",
@@ -246,7 +249,6 @@ class SQLiteSink:
                 self._unresolved.discard(tool_call_id)
                 if not self._unresolved:
                     self._assistant_seq = None
-                    self._tool_calls = []
             return
         if role == "assistant":
             tool_calls = message.get("tool_calls")
@@ -313,15 +315,6 @@ class SQLiteSink:
 
     # ── pending state machine ──────────────────────────────────
 
-    async def _remaining_pending(self, remaining: set[str], round_index: int | None) -> dict[str, Any]:
-        pending: dict[str, Any] = {
-            "assistant_seq": self._assistant_seq,
-            "round_index": round_index,
-            "tool_call_ids": sorted(remaining),
-            "tool_calls": [tc for tc in self._tool_calls if str(tc.get("id") or "") in remaining],
-        }
-        return pending
-
     async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None:
@@ -334,14 +327,12 @@ class SQLiteSink:
         # to the passed value only if no row seq was captured.
         seq = self._assistant_seq if self._assistant_seq is not None else assistant_seq
         self._assistant_seq = seq
-        self._tool_calls = list(tool_calls)
         from power_loop.runtime.task_runtime import atomic_pending_required
         if atomic_pending_required(self.store, self.session_id) and seq == self._assistant_seq:
             # The assistant append already persisted pending atomically with the row
             # (design 215 §8.3); a second set_pending would be a redundant control write.
             return
-        pending = {"assistant_seq": seq, "round_index": round_index, "tool_call_ids": ids,
-                   "tool_calls": list(tool_calls)}
+        pending = {"assistant_seq": seq}
         known = getattr(self.store, "known_pending", None)
         if known is not None and known(self.session_id) == (True, pending):
             return  # The assistant append already committed exactly this state.

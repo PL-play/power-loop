@@ -12,6 +12,13 @@
 
 # 13.0.0 — Design 216 projection-only history
 
+- Breaking (unpublished 13.0.0): remove the standalone ownership installation
+  chain, including `SessionStore.session_owner_epoch`, `install_session_owner`
+  and `release_session_owner`, and `hold_session_ownership`. There are no aliases.
+  Use the runtime-only `StatefulAgentLoop(runtime=...)` facade; Runtime claim/recover
+  installs ownership, and its worker binds the same handle through factory,
+  execution and final, then retires/reset it before business cleanup. Public
+  ownership handles and Memory/Store coordinators remain; schema/protocol stay 17/43.
 - Finished sends reach the model only through their stored `pl_project_messages` projection.
   The SDK default `representation` is `ProjectedRepresentation`; `VerbatimRepresentation`, the
   in-place compactor runtime path, and the deprecated `history_projector` / `compactor` config

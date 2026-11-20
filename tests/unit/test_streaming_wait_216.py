@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -15,6 +16,7 @@ from power_loop.agent.runtime_client import RuntimeClient
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.runtime_transport import (
     PROTOCOL_VERSION,
+    DatabasePollingTransport,
     MemoryMessageTransport,
     SubscriptionSpec,
     TransportPacket,
@@ -275,6 +277,218 @@ async def test_session_observation_does_not_end_with_one_send(registry_store):
 async def _terminal_input(port, session, item_id):
     await port.accept(session, "run", message_id=item_id, actor=ACTOR)
     await _finish(port, session)
+
+
+class _ObservedDiscovery:
+    def __init__(self, store):
+        self.source = RuntimeInputStore(store)
+        self.pages = []
+        self.first_page = asyncio.Event()
+        self.scan_allowed = asyncio.Event()
+        self.scan_allowed.set()
+
+    async def poll_notifications(self, binding, *, cursor, limit):
+        await self.scan_allowed.wait()
+        packets, next_cursor = await self.source.poll_notifications(
+            binding, cursor=cursor, limit=limit,
+        )
+        self.pages.append((binding, [p.input_ref for p in packets]))
+        self.first_page.set()
+        return packets, next_cursor
+
+
+@asynccontextmanager
+async def _observed_polling(store, *, page_size=100):
+    discovery = _ObservedDiscovery(store)
+    transport = DatabasePollingTransport(discovery, interval_s=0.02, page_size=page_size)
+    client = RuntimeClient(store=store, transport=transport)
+    try:
+        async with asyncio.timeout(10):
+            yield client, transport, discovery
+    finally:
+        await client.aclose()
+        await transport.aclose()
+
+
+def _assert_polling_released(client, transport, poller):
+    assert poller.done() and not transport._subscriptions
+    assert client._slots == 0 and not client._waiters and not client._outputs
+
+
+@pytest.mark.parametrize("history", [0, 301])
+async def test_database_wait_discovers_only_current_input(registry_store, monkeypatch, history):
+    store, connect = registry_store
+    writer = RuntimeInputStore(store)
+    target = await _session(writer, "point-wait")
+    for index in range(history):
+        await _terminal_input(writer, target, f"old-{index}")
+    ref = await _accept(writer, target, "current")
+    reader = await connect()
+    remote = DatabasePollingTransport(writer)
+    try:
+        async with _observed_polling(reader) as (client, transport, discovery):
+            reads = await _count_reads(monkeypatch, client.inputs)
+            output = await client.subscribe_output(ref, actor=ACTOR)
+            assert output._initial_read.record.row["status"] == "pending"
+            assert output._initial_read.result is None and reads["n"] == 1
+            await discovery.first_page.wait()
+            assert not discovery.pages[0][1]
+
+            final = await _finish(writer, target, final_text="current result")
+            await remote.publish(_completed(ref))
+            result = await output.wait()
+            assert result == final.results[0]
+            assert result.input_ref == ref and result.final_text == "current result"
+            assert [item for _, page in discovery.pages for item in page] == [ref]
+            assert discovery.pages[-1][1] == [ref]
+            assert reads["n"] == 2
+            _assert_polling_released(client, transport, output.subscription.poller)
+    finally:
+        await remote.aclose()
+
+
+@pytest.mark.parametrize("retry", [False, True])
+async def test_database_combined_can_finish_before_first_scan(registry_store, monkeypatch, retry):
+    store, connect = registry_store
+    writer = RuntimeInputStore(store)
+    target = await _session(writer, "point-combined")
+    if retry:
+        await _accept(writer, target, "current")
+    reader = await connect()
+    async with _observed_polling(reader) as (client, transport, discovery):
+        reads = await _count_reads(monkeypatch, client.inputs)
+        discovery.scan_allowed.clear()
+        output = await client.send_and_subscribe(target, "run", message_id="current", actor=ACTOR)
+        assert reads["n"] == int(retry)
+        final = await _finish(writer, target, final_text="quick result")
+        assert not discovery.pages
+        discovery.scan_allowed.set()
+        poller = output.subscription.poller
+        await poller
+        assert [(b.message_id, b.discovery_message_id, page) for b, page in discovery.pages] == [
+            (None, "current", [output.ref]),
+        ]
+        assert output.subscription in transport._subscriptions and not output.closed
+        assert await output.wait() == final.results[0]
+        assert reads["n"] == 1 + int(retry)
+        _assert_polling_released(client, transport, poller)
+
+        again = await client.send_and_subscribe(target, "run", message_id="current", actor=ACTOR)
+        assert await again.wait() == final.results[0]
+        assert reads["n"] == 2 + int(retry)
+        _assert_polling_released(client, transport, again.subscription.poller)
+
+
+async def test_database_before_send_preserves_live_gap_error_and_delta(registry_store, monkeypatch):
+    store, connect = registry_store
+    writer = RuntimeInputStore(store)
+    another = await _session(writer, "another-session")
+    await _terminal_input(writer, another, "same-name")
+    target = await _session(writer, "point-before-send")
+    ref = InputRef(store.store_id, target.session_id, "same-name")
+    reader = await connect()
+    async with _observed_polling(reader) as (client, transport, discovery):
+        reads = await _count_reads(monkeypatch, client.inputs)
+        output = await client.subscribe_output(ref, actor=ACTOR, before_send=True)
+        assert output._initial_read.record is None and reads["n"] == 1
+        await discovery.first_page.wait()
+        assert not discovery.pages[0][1]
+        assert (await anext(output)).kind == "gap"
+        assert await _accept(writer, target, ref.message_id) == ref
+        await transport.publish(_delta(ref, "local"))
+        assert (await anext(output)).payload["text"] == "local"
+        assert reads["n"] == 1
+        for kind in ("gap", "error"):
+            await transport.publish(TransportPacket(
+                PROTOCOL_VERSION, NS, "session-notice", target, "output", None, {"kind": kind},
+            ))
+            assert (await anext(output)).kind == kind
+        assert reads["n"] == 3
+        final = await _finish(writer, target, final_text="this session")
+        assert await output.wait() == final.results[0]
+        assert [item for _, page in discovery.pages for item in page] == [ref]
+        assert reads["n"] == 4  # Initial, two session notices, and durable completion.
+        _assert_polling_released(client, transport, output.subscription.poller)
+
+
+@pytest.mark.parametrize("close_client", [False, True])
+async def test_database_wait_cancel_or_close_stops_pending_scan(registry_store, close_client):
+    store, _ = registry_store
+    async with _observed_polling(store) as (client, transport, discovery):
+        target = await _session(client.inputs, "point-cancel-wait")
+        ref = await _accept(client.inputs, target, "pending")
+        task = asyncio.create_task(client.wait(ref, actor=ACTOR))
+        await discovery.first_page.wait()
+        [raw] = transport._subscriptions
+        assert raw.binding.discovery_message_id == ref.message_id
+        assert not discovery.pages[0][1] and not task.done()
+        if close_client:
+            await client.aclose()
+        else:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _assert_polling_released(client, transport, raw.poller)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_database_wait_workflow_continuation_addresses_both_inputs(registry_store, monkeypatch, cancel):
+    from .test_workflow_sessions_215 import _crash_before_aggregate, _expire
+
+    store, connect = registry_store
+    runner, handle, model = await _crash_before_aggregate(store, monkeypatch)
+    try:
+        monkeypatch.undo()
+        await _expire(store, handle.target.session_id)
+        recovered = await runner.runtime.worker.inputs.recover(
+            handle.target, node_id="recovery", boot_id="recovery", ttl_s=30,
+        )
+        assert recovered.execution_state == "queued"
+        row = await store._db.fetchone(
+            f"SELECT item_id FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_continue' AND continuation_of=?",
+            (handle.target.session_id, handle.input_ref.message_id),
+        )
+        refs = (handle.input_ref, InputRef(store.store_id, handle.target.session_id, row["item_id"]))
+        reader = await connect()
+        async with _observed_polling(reader) as (client, transport, discovery):
+            reads = await _count_reads(monkeypatch, client.inputs)
+            outputs = [await client.subscribe_output(ref, actor=runner.actor) for ref in refs]
+            assert all(output._initial_read.result is None for output in outputs)
+            if cancel:
+                assert (await handle.cancel("stop before continuation")).state == "voided"
+            else:
+                await runner.runtime.worker.recover()
+            results = await asyncio.gather(*(output.wait() for output in outputs))
+            assert tuple(result.input_ref for result in results) == refs
+            assert [result.status for result in results] == ["cancelled" if cancel else "completed"] * 2
+            if cancel:
+                assert all(result.error == "stop before continuation" for result in results)
+            else:
+                assert all(result.final_text == "journaled result" for result in results)
+                assert results[0].result_seq == results[1].result_seq
+            assert model.calls == 1 and reads["n"] == 4
+            deliveries = {binding.discovery_message_id: page for binding, page in discovery.pages if page}
+            assert deliveries == {ref.message_id: [ref] for ref in refs}
+            for output in outputs:
+                _assert_polling_released(client, transport, output.subscription.poller)
+    finally:
+        await runner.aclose()
+
+
+async def test_raw_database_late_subscription_keeps_session_paging(registry_store):
+    store, _ = registry_store
+    async with _observed_polling(store, page_size=1) as (client, transport, discovery):
+        target = await _session(client.inputs, "raw-late")
+        await _terminal_input(client.inputs, target, "old")
+        await _terminal_input(client.inputs, target, "new")
+        binding = SubscriptionSpec(NS, store.store_id, "output", "client", target.session_id)
+        sub = await transport.subscribe(binding)
+        assert [(await anext(sub)).packet.message_id for _ in range(2)] == ["old", "new"]
+        assert all(b.discovery_message_id is None for b, _ in discovery.pages)
+        assert not sub.poller.done()
+        await sub.aclose()
+        _assert_polling_released(client, transport, sub.poller)
 
 
 async def test_poll_notifications_filters_session_before_limit(registry_store):

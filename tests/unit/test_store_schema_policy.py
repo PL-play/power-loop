@@ -3,6 +3,8 @@ the next_seq monotonicity invariant the window cache relies on, and the delta lo
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import pytest
 
 from power_loop.runtime.store.backends.sqlite import SqliteDatabase
@@ -162,3 +164,95 @@ async def test_session_indexes(registry_store):
     await store._db.execute(statement)
     with pytest.raises(StoreSchemaError, match="idx_session_recovery"):
         await connect(schema="verify")
+
+
+async def test_projection_session_id_offline_migration(registry_store, monkeypatch):
+    from power_loop.runtime.store import task_schema
+    from power_loop.runtime.store.migrate_projection_session_id import add_projection_session_id_index
+
+    store, connect = registry_store
+    sid = (await new_session(store, "projection-migration")).session_id
+    await store.append_message(sid, role="user", content="original", send_index=1)
+    await store.upsert_project_message(sid, send_index=1, kind="user", content={"original": True})
+    await store.upsert_project_message(
+        sid, send_index=1, kind="compact", content={"summary": "kept"},
+        compact_from_send=1, compact_to_send=1,
+    )
+    await store.set_runtime_state(sid, "migration-probe", {"unchanged": True})
+    tables = (store.t.messages, store.t.project_messages, store.t.session_runtime_state)
+    before = {table: [dict(row) for row in await store._db.fetchall(f"SELECT * FROM {table}")]
+              for table in tables}
+    name = store.table_prefix + "idx_projection_session_id"
+    statement = f"DROP INDEX {name}"
+    if store._db.dialect.name == "mysql":
+        statement += f" ON {store.t.project_messages}"
+    await store._db.execute(statement)
+
+    reduced = {key: value for key, value in task_schema.INDEXES.items()
+               if key != "idx_projection_session_id"}
+    with monkeypatch.context() as patch:
+        patch.setattr(task_schema, "INDEXES", reduced)
+        legacy = await connect(schema="verify")
+        await legacy.close()
+    with pytest.raises(StoreSchemaError, match="idx_projection_session_id"):
+        await connect(schema="verify")
+
+    assert await add_projection_session_id_index(store._db, store.table_prefix) == {
+        "index": name, "changed": True,
+    }
+    assert await add_projection_session_id_index(store._db, store.table_prefix) == {
+        "index": name, "changed": False,
+    }
+    reopened = await connect(schema="verify")
+    for table in tables:
+        assert [dict(row) for row in await reopened._db.fetchall(f"SELECT * FROM {table}")] == before[table]
+    compact = await reopened.latest_project_compact(sid)
+    assert compact is not None and compact.compact_to_send == 1
+    migration = await reopened._db.fetchone(
+        f"SELECT version,protocol_version FROM {store.table_prefix}schema_migrations WHERE id=1"
+    )
+    assert dict(migration) == {"version": 17, "protocol_version": 43}
+
+
+async def test_projection_session_id_migration_rejects_incompatible_index(registry_store):
+    from power_loop.runtime.store.migrate_projection_session_id import add_projection_session_id_index
+
+    store, _ = registry_store
+    name = store.table_prefix + "idx_projection_session_id"
+    statement = f"DROP INDEX {name}"
+    if store._db.dialect.name == "mysql":
+        statement += f" ON {store.t.project_messages}"
+    await store._db.execute(statement)
+    await store._db.execute(
+        f"CREATE INDEX {name} ON {store.t.project_messages}(session_id,send_index)"
+    )
+    with pytest.raises(StoreSchemaError, match="idx_projection_session_id"):
+        await add_projection_session_id_index(store._db, store.table_prefix)
+
+
+async def test_projection_session_id_migration_reports_ddl_failure(monkeypatch):
+    from power_loop.runtime.store.migrate_projection_session_id import add_projection_session_id_index
+
+    store = await SessionStore.open(":memory:")
+    name = store.table_prefix + "idx_projection_session_id"
+    await store._db.execute(f"DROP INDEX {name}")
+    original = type(store._db).transaction
+
+    @asynccontextmanager
+    async def transaction(db):
+        async with original(db) as tx:
+            class FailDDL:
+                def __getattr__(self, attr):
+                    return getattr(tx, attr)
+
+                async def execute(self, sql, params=()):
+                    if sql.startswith("CREATE INDEX"):
+                        raise RuntimeError("DDL denied by test")
+                    return await tx.execute(sql, params)
+
+            yield FailDDL()
+
+    monkeypatch.setattr(type(store._db), "transaction", transaction)
+    with pytest.raises(RuntimeError, match="DDL denied by test"):
+        await add_projection_session_id_index(store._db, store.table_prefix)
+    await store.close()

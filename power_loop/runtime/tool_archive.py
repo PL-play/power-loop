@@ -473,12 +473,22 @@ async def recall_group(store, sid, send_index, group_id, offset=0, limit=10, ite
     return await recall_original(store, sid, send_index, row, char_offset, char_limit)
 
 
+async def original_call(store, sid, send_index, row):
+    """Resolve the actual producer recorded with this tool result; never scan or guess."""
+    assistant_seq = (row.meta or {}).get('_assistant_seq')
+    if row.role != 'tool' or not row.tool_call_id or assistant_seq is None:
+        return None
+    calls = await store.get_assistant_tool_calls(sid, assistant_seq, send_index=send_index)
+    call = next((c for c in calls or []
+                 if str(c.get('id') or '') == str(row.tool_call_id)), None)
+    return (assistant_seq, call) if call is not None else None
+
+
 async def recall_original(store, sid, send_index, row, char_offset=0, char_limit=20000):
     if char_offset < 0 or not 1 <= char_limit <= 100000:
         return 'Invalid original pagination: char_offset >= 0, 1 <= char_limit <= 100000.'
-    rows = await store.load_all_messages(sid)
-    call = next((c for r in rows if r.send_index == send_index and r.role == 'assistant'
-        for c in r.tool_calls or [] if c.get('id') == row.tool_call_id), None)
+    source = await original_call(store, sid, send_index, row)
+    call = source[1] if source is not None else None
     payload = {'representation': 'original', 'source': {'send_index': send_index, 'seq': row.seq},
         'arguments': (call or {}).get('function', {}).get('arguments'), 'result': row.content}
     # Background receipts can contain previews; attach the immutable canonical task result.

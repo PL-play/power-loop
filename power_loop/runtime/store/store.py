@@ -30,6 +30,7 @@ from power_loop.runtime.message_ref import integer_id
 from power_loop.runtime.store import change_signals, message_usage, send_reads
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row, Transaction
+from power_loop.runtime.store.retention import RetentionPage
 from power_loop.runtime.store.schema import (
     CURRENT_SCHEMA_VERSION,
     SchemaPolicy,
@@ -96,6 +97,8 @@ MUTATE_SKIP = _NoWrite()
 # Conversation order WITHIN one send for projection rows: the user turn before the assistant
 # (project) summary; a compact row (keyed at its own send_index) sorts last at that index.
 _PROJECT_KIND_ORDER = {"user": 0, "project": 1, "compact": 2}
+# Leave room in the 1,000-row first fetch for a lookahead, compact and statistics.
+_PROJECTION_WINDOW_PAGE_SIZE = 997
 
 
 def _coerce_max_spawn_depth(value: int) -> int:
@@ -254,7 +257,7 @@ class SessionStore:
 
     def _forget_appended(self, session_id):
         self._holding(session_id).change_snapshot = None
-        send_reads.forget(self, session_id, "session", "state")
+        send_reads.forget(self, session_id, "state")
         reads = send_reads.current(self, session_id)
         if reads is not None:
             reads.assistant_send_index, reads.assistant_ref = None, None
@@ -338,8 +341,28 @@ class SessionStore:
         counts both identity and state rows. Open sessions retain context and graphs.
         """
         from .retention import purge_expired
+        result = await purge_expired(self, now, limit=limit, retention_days=retention_days,
+                                     session_id=session_id, categories=categories)
+        return result.deleted
+
+    async def purge_expired_page(self, now: int, *, limit: int = 1000, candidate_limit: int = 1000,
+                                 after_session_id: str | None = None,
+                                 retention_days: dict[str, float] | None = None,
+                                 categories: Iterable[str] | None = None) -> RetentionPage:
+        """Scan a bounded range by session ID and prune at most `limit` rows.
+
+        Pass `next_after` back on the next call. It is absent once the range has
+        ended. `fetched` includes candidates returned but left for a later page
+        when the deletion allowance runs out. `scanned` counts examined candidates,
+        including recent sessions skipped without taking a state lock.
+        """
+        from .retention import batch_limit, purge_expired
+
+        if after_session_id is not None and (not isinstance(after_session_id, str) or not after_session_id):
+            raise ValueError('after_session_id must be a nonempty session ID')
         return await purge_expired(self, now, limit=limit, retention_days=retention_days,
-                                   session_id=session_id, categories=categories)
+                                   categories=categories, candidate_limit=batch_limit(candidate_limit),
+                                   after_session_id=after_session_id)
 
     async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
         if isinstance(self._db, Maintenance):
@@ -436,24 +459,11 @@ class SessionStore:
         return sid
 
     async def get_session(self, session_id: str) -> SessionRow | None:
-        holding = self._holding(session_id)
-        cached = getattr(self, "_cached_sessions", {}).get(session_id)
-        if cached is not None:
-            if holding.touched < cached.updated_at:
-                holding.touched = cached.updated_at
-            return cached
+        """Read current session metadata from storage in this read context."""
         row = await self._db.fetchone(
             f"SELECT * FROM {self.t.sessions} WHERE session_id=?", (session_id,)
         )
-        value = _row_to_session(row) if row else None
-        if value is not None:
-            if holding.touched < value.updated_at:
-                holding.touched = value.updated_at
-            sessions = getattr(self, "_cached_sessions", None)
-            if sessions is None:
-                self._cached_sessions = sessions = {}
-            sessions[session_id] = value
-        return value
+        return _row_to_session(row) if row else None
 
     @contextlib.asynccontextmanager
     async def send_read_scope(self, session_id, *, ownership=None):
@@ -462,33 +472,18 @@ class SessionStore:
             yield existing
             return
         snapshot = send_reads.SessionHolding(self, session_id, ownership=ownership)
-        if existing is not None and "session" in existing.rows:
-            snapshot.rows["session"] = existing.rows["session"]
-            snapshot.touched = existing.rows["session"].updated_at
         self._session_holdings[session_id] = snapshot
         token = send_reads.ACTIVE.set(snapshot)
         try:
             yield snapshot
         finally:
-            if snapshot.next_seq is not None:
-                sequences = getattr(self, "_next_seqs", None)
-                if sequences is None:
-                    self._next_seqs = sequences = {}
-                sequences[session_id] = snapshot.next_seq
             snapshot.retire()
             if self._session_holdings.get(session_id) is snapshot:
                 del self._session_holdings[session_id]
             send_reads.ACTIVE.reset(token)
 
     async def session_snapshot(self, session_id):
-        snapshot = send_reads.trusted(self, session_id)
-        if snapshot is not None and "session" in snapshot.rows:
-            return snapshot.rows["session"]
-        value = await self.get_session(session_id)
-        snapshot = send_reads.current(self, session_id)
-        if snapshot is not None:
-            snapshot.rows["session"] = value
-        return value
+        return await self.get_session(session_id)
 
     async def state_snapshot(self, session_id):
         snapshot = send_reads.trusted(self, session_id)
@@ -585,39 +580,6 @@ class SessionStore:
         holding.pending_known, holding.pending_json = True, _dumps(pending) if pending else None
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
-
-    async def session_owner_epoch(self, session_id):
-        row = await self._db.fetchone(
-            f"SELECT st.owner_epoch,s.lifecycle FROM {self.t.session_state} st "
-            f"JOIN {self.t.sessions} s ON s.session_id=st.session_id WHERE st.session_id=?",
-            (session_id,))
-        if row is None:
-            raise ValueError(f"unknown session: {session_id}")
-        if row['lifecycle'] != 'open':
-            from power_loop.agent.runtime_types import RuntimeRequestError
-            raise RuntimeRequestError('session_closed')
-        return row["owner_epoch"]
-
-    async def install_session_owner(self, session_id, lease, expected_epoch):
-        lease.require_owned()
-        async with self._db.transaction() as tx:
-            lease.require_owned()
-            changed = await tx.execute(
-                f"UPDATE {self.t.session_state} SET owner_epoch=owner_epoch+1,owner_token=?,"
-                "owner_node_id=?,owner_boot_id=? WHERE session_id=? AND owner_epoch=? "
-                f"AND EXISTS (SELECT 1 FROM {self.t.sessions} s "
-                f"WHERE s.session_id={self.t.session_state}.session_id AND s.lifecycle='open')",
-                (lease.token, lease.node_id, lease.boot_id, session_id, expected_epoch))
-            lease.require_owned()
-        if changed:
-            lease.epoch = expected_epoch + 1
-        return bool(changed)
-
-    async def release_session_owner(self, session_id, lease):
-        await self._db.execute(
-            f"UPDATE {self.t.session_state} SET owner_token=NULL,owner_node_id=NULL,"
-            "owner_boot_id=NULL,owner_lease_until_ms=NULL WHERE session_id=? AND owner_epoch=? AND owner_token=?",
-            (session_id, lease.epoch, lease.token))
 
     # ── messages ──────────────────────────────────────────────────────────────
     def _lease_write_guard(self, session_id):
@@ -761,10 +723,7 @@ class SessionStore:
         expected = holding.next_seq
 
         def atomic_pending(seq):
-            return _dumps({"assistant_seq": seq, "round_index": round_index,
-                           "tool_call_ids": [str(call.get("id") or "") for call in tool_calls
-                                             if isinstance(call, Mapping) and call.get("id")],
-                           "tool_calls": tool_calls})
+            return _dumps({"assistant_seq": seq})
         committed, lease_lost, claim_changed = False, False, False
         prior = send_reads.take_state(self, session_id)
         signal_columns = ','.join(change_signals.COLUMNS)
@@ -962,75 +921,93 @@ class SessionStore:
     async def load_projection_window(
         self, session_id: str, *, current_send_index: int, send_limit: int | None = None,
     ) -> ProjectionWindow:
-        """The compact row plus the live projection sends after its cursor, in ONE bounded read.
+        """Read one model history window; the SQL page size is independent of the send cap.
 
-        Replaces the former ``latest_project_compact`` + full ``load_project_messages`` pair on the
-        normal history entry (~two statements) and no longer reads NULL-``send_index`` rows: the
-        unique projection contract does not load pre-send-index legacy history.
-
-        ``send_limit`` bounds the read by whole SENDS (not rows), so the caller's row cap can never
-        split a send. The absolute recent lower bound is ``current_send_index - send_limit``: it
-        determines both the read and the caller's repair window even when no projection rows exist
-        at all. Without a cap the read is bounded only by the fold cursor, which is the honest
-        limit of an uncompacted history (reported by S07 measurements).
+        The first statement returns at most one compact, one raw statistics header
+        and one data page with a lookahead row. Continuations reuse the claim's
+        upper bound and the first statement's lower bound. The caller renders
+        whole sends and applies the model message cap after reassembly.
         """
-        table = self.t.project_messages
-        if int(current_send_index) <= 1:
-            # No finished send can exist before send 1, so there is nothing to read.
+        current = int(current_send_index)
+        if current <= 1:
             return ProjectionWindow(None, [], 1, ProjectionWindowStats(False, None, None))
-        # Split the tiny compact set from the recent send range so the range predicate is an
-        # actual index search, not a residual filter over every row of the session. SQLite must
-        # materialize the compact CTE; otherwise the optimizer expands it and falls back to the
-        # session-prefix scan (verified by the R1 window-work probe). MySQL has no AS MATERIALIZED
-        # and uses an ordinary CTE + UNION ALL; PG supports the same shape.
-        cte = ("WITH compact AS (" if self._db.dialect.name == "mysql"
-               else "WITH compact AS MATERIALIZED (")
-        send_limit = None if send_limit is None else max(1, int(send_limit))
-        lo = (max(1, int(current_send_index) - send_limit)
-              if send_limit is not None else None)
-        params: list[Any] = [session_id, session_id]
-        range_filter = ""
-        if lo is not None:
-            range_filter = " AND send_index>=?"
-            params.append(lo)
+
         from .projection_fold import STATE_KEY
 
-        # The constant session row guarantees exactly one header even for an empty window.
-        # Keep the statistics off the data rows: its raw JSON is returned only once.
-        projection_columns = (
+        lower = max(1, current - max(1, int(send_limit))) if send_limit is not None else 1
+        page_size = _PROJECTION_WINDOW_PAGE_SIZE
+        table, dialect = self.t.project_messages, self._db.dialect.name
+        compact_index, page_index = "idx_project_compact_order", "uq_project_send_kind"
+        if dialect == "sqlite":
+            compact_table = f"{table} INDEXED BY {self.table_prefix}{compact_index}"
+            page_table = f"{table} INDEXED BY {self.table_prefix}{page_index}"
+        else:
+            compact_table = self._access_path(table, compact_index)
+            page_table = self._access_path(table, page_index)
+        columns = (
             "id", "session_id", "send_index", "kind", "content_json", "rendered_text",
             "source_seq_lo", "source_seq_hi", "completed_through_send_index",
             "compact_from_send", "compact_to_send", "projector_version", "token_estimate", "created_at",
         )
-        columns = ",".join(projection_columns)
+        projection = ",".join(columns)
         header_kind = "__pl_stats__"
         header_values = {
             "kind": f"'{header_kind}'", "content_json": "stats.value_json", "rendered_text": "stats.state_key",
         }
-        header_columns = ",".join(header_values.get(column, "NULL") for column in projection_columns)
+        header = ",".join(header_values.get(column, "NULL") for column in columns)
+        # The compact index seeks the session/kind prefix in send order and can
+        # check the coverage end from the index. For PG, express the data bounds
+        # on the composite key so they restrict the scan as index conditions.
+        materialize = "" if dialect == "mysql" else " MATERIALIZED"
+        greatest = "MAX" if dialect == "sqlite" else "GREATEST"
+        floor = f"{greatest}(?,COALESCE((SELECT compact_to_send FROM compact),0)+1)"
+        seek = (f"AND (session_id,send_index)>=(?,{floor}) AND (session_id,send_index)<(?,?) "
+                if dialect == "postgres" else "")
+        seek_args = (session_id, lower, session_id, current) if seek else ()
         rows = await self._db.fetchall(
-            f"{cte}"
-            f"SELECT {columns} FROM {table} WHERE session_id=? AND kind='compact') "
-            f"SELECT {columns} FROM compact UNION ALL "
-            f"SELECT {columns} FROM {table} WHERE session_id=?{range_filter} "
-            "AND send_index > COALESCE((SELECT MAX(send_index) FROM compact), -1) "
-            f"UNION ALL SELECT {header_columns} FROM (SELECT ? AS session_id) AS session "
+            f"WITH compact AS{materialize} (SELECT {projection} FROM {compact_table} "
+            "WHERE session_id=? AND kind='compact' AND send_index<? "
+            "AND compact_to_send>=1 AND compact_to_send<? ORDER BY send_index DESC LIMIT 1), "
+            f"page AS (SELECT {projection} FROM {page_table} "
+            f"WHERE session_id=? AND send_index>={floor} AND send_index<? "
+            f"{seek}AND kind<>'compact' ORDER BY send_index,kind LIMIT ?) "
+            f"SELECT {projection} FROM page UNION ALL SELECT {projection} FROM compact "
+            f"UNION ALL SELECT {header} FROM (SELECT ? AS session_id) AS session "
             f"LEFT JOIN {self.t.session_runtime_state} AS stats "
-            "ON stats.session_id=session.session_id AND stats.state_key=?",
-            (*params, session_id, STATE_KEY),
+            "ON stats.session_id=session.session_id AND stats.state_key=? ORDER BY send_index,kind",
+            (session_id, current, current, session_id, lower, current, *seek_args,
+             page_size + 1, session_id, STATE_KEY),
         )
-        header = next(r for r in rows if r["id"] is None and r["kind"] == header_kind)
-        out = [_row_to_project_message(r) for r in rows if r["id"] is not None or r["kind"] != header_kind]
-        out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
-        compact = max((r for r in out if r.kind == "compact"), key=lambda r: r.send_index, default=None)
+        stats = next(row for row in rows if row["id"] is None)
+        compact_row = next((row for row in rows if row["kind"] == "compact"), None)
+        compact = _row_to_project_message(compact_row) if compact_row is not None else None
         cutoff = compact.compact_to_send if compact is not None else None
-        window_lo = (cutoff or 0) + 1
-        if lo is not None:
-            window_lo = max(window_lo, lo)
-        live = [r for r in out if r.kind != "compact" and int(r.send_index) < int(current_send_index)]
+        window_lo = max(lower, (cutoff or 0) + 1)
+        page = [row for row in rows if row["id"] is not None and row["kind"] != "compact"]
+        live = []
+        while True:
+            live.extend(_row_to_project_message(row) for row in page[:page_size])
+            if len(page) <= page_size:
+                break
+            last_send, last_kind = page[page_size - 1]["send_index"], page[page_size - 1]["kind"]
+            # Also include a scalar bound for MySQL, which does not reliably seek
+            # on a suffix tuple. Within the cursor's send, kind makes the seek strict.
+            if dialect == "postgres":
+                after = "(session_id,send_index,kind)>(?,?,?) AND (session_id,send_index)<(?,?)"
+                args = (session_id, last_send, last_kind, session_id, current)
+            else:
+                after = "(send_index>? OR kind>?)"
+                args = (last_send, last_kind)
+            page = await self._db.fetchall(
+                f"SELECT {projection} FROM {page_table} WHERE session_id=? "
+                f"AND send_index>=? AND send_index<? AND {after} AND kind<>'compact' "
+                "ORDER BY send_index,kind LIMIT ?",
+                (session_id, last_send, current, *args, page_size + 1),
+            )
+        live.sort(key=lambda row: (row.send_index, _PROJECT_KIND_ORDER.get(row.kind, 9)))
         return ProjectionWindow(compact, live, window_lo, ProjectionWindowStats(
-            row_exists=header["rendered_text"] is not None,
-            value_json=header["content_json"], compact_to_send=cutoff,
+            row_exists=stats["rendered_text"] is not None,
+            value_json=stats["content_json"], compact_to_send=cutoff,
         ))
 
     async def load_all_messages(self, session_id: str) -> list[MessageRow]:
@@ -1038,6 +1015,17 @@ class SessionStore:
             f"SELECT * FROM {self.t.messages} WHERE session_id=? ORDER BY seq ASC", (session_id,)
         )
         return [_row_to_message(r) for r in rows]
+
+    def _access_path(self, table: str, index: str | None) -> str:
+        """MySQL only: pin an approved composite index on the FROM clause.
+
+        MySQL may otherwise range-scan the PRIMARY key (or the session/seq unique key)
+        and filter ``session_id``/``send_index`` after reading unrelated history.  The
+        other backends need no hint.
+        """
+        if index is None or self._db.dialect.name != "mysql":
+            return table
+        return f"{table} FORCE INDEX ({self.table_prefix}{index})"
 
     async def history_records(
         self, session_id: str, *, source: str = "messages", lo: int = 0,
@@ -1052,11 +1040,28 @@ class SessionStore:
 
         table = self.t.messages if source == "messages" else self.t.project_messages
         coord = "seq" if source == "messages" else "id"
+        index = None
+        if record_ids is None:
+            if source == "messages" and send_index is not None:
+                index = "idx_messages_send"
+            elif source == "projection" and send_index is None and not (
+                    hi is not None and lo == hi):
+                index = "idx_projection_session_id"
+        table = self._access_path(table, index)
         where = f"session_id=? AND {coord}>=? AND {coord}>?"
         params: list[Any] = [session_id, lo, after]
         if hi is not None:
             where += f" AND {coord}<=?"
             params.append(hi)
+        order = f"{coord} ASC"
+        if (self._db.dialect.name == "postgres" and source == "projection"
+                and send_index is None and hi is not None and lo != hi
+                and record_ids is None):
+            # Both ends have the same session: the composite interval excludes all
+            # other sessions and lets PostgreSQL seek the (session_id,id) index.
+            where = "(session_id,id)>=(?,?) AND (session_id,id)>(?,?) AND (session_id,id)<=(?,?)"
+            params = [session_id, lo, session_id, after, session_id, hi]
+            order = "session_id ASC,id ASC"
         if send_index is not None:
             where += " AND send_index=?"
             params.append(send_index)
@@ -1068,7 +1073,7 @@ class SessionStore:
         if source == "projection" and exclude_compact:
             where += " AND kind IN ('user','project')"
         rows = await (_fetchall or self._db.fetchall)(
-            f"SELECT * FROM {table} WHERE {where} ORDER BY {coord} ASC LIMIT ?",
+            f"SELECT * FROM {table} WHERE {where} ORDER BY {order} LIMIT ?",
             (*params, max(1, min(limit, 1000))),
         )
         decode = _row_to_message if source == "messages" else _row_to_project_message
@@ -1076,26 +1081,65 @@ class SessionStore:
 
     async def history_bounds(
         self, session_id: str, *, source: str = "messages", after_seq: int | None = None,
+        send_index: int | None = None, lo: int | None = None, hi: int | None = None,
         _fetchone: Any = None,
     ) -> list[int] | None:
-        """Coordinates for one execution's tail, including all its repair sends."""
+        """Coordinates for a full tail, one send, or an actual id interval endpoint."""
+        if source not in {"messages", "projection"}:
+            raise ValueError("source must be messages or projection")
+        fetchone = _fetchone or self._db.fetchone
+        table = self.t.messages if source == "messages" else self.t.project_messages
+        coord = "seq" if source == "messages" else "id"
+        if send_index is not None or lo is not None:
+            index = None
+            if source == "messages" and send_index is not None:
+                index = "idx_messages_send"
+            elif source == "projection" and send_index is None and lo is not None:
+                index = "idx_projection_session_id"
+            ranged = self._access_path(table, index)
+            where = f"session_id=? AND {coord}>=?"
+            params: list[Any] = [session_id, lo or 0]
+            if hi is not None:
+                where += f" AND {coord}<=?"
+                params.append(hi)
+            first_order, last_order = f"{coord} ASC", f"{coord} DESC"
+            if (self._db.dialect.name == "postgres" and source == "projection"
+                    and send_index is None and lo is not None and hi is not None and lo != hi):
+                where = "(session_id,id)>=(?,?) AND (session_id,id)<=(?,?)"
+                params = [session_id, lo, session_id, hi]
+                first_order, last_order = "session_id ASC,id ASC", "session_id DESC,id DESC"
+            if send_index is not None:
+                where += " AND send_index=?"
+                params.append(send_index)
+            if source == "messages":
+                where += " AND seq>?"
+                params.append(after_seq or 0)
+            elif after_seq is not None:
+                where += " AND kind IN ('user','project') AND source_seq_hi>?"
+                params.append(after_seq)
+            first = await fetchone(
+                f"SELECT {coord} AS lo FROM {ranged} WHERE {where} ORDER BY {first_order} LIMIT 1",
+                tuple(params),
+            )
+            last = await fetchone(
+                f"SELECT {coord} AS hi FROM {ranged} WHERE {where} ORDER BY {last_order} LIMIT 1",
+                tuple(params),
+            )
+            return [int(first["lo"]), int(last["hi"])] if first and last else None
         if source == "messages":
-            row = await (_fetchone or self._db.fetchone)(
-                f"SELECT min(seq) AS lo, max(seq) AS hi FROM {self.t.messages} "
+            row = await fetchone(
+                f"SELECT min(seq) AS lo, max(seq) AS hi FROM {table} "
                 "WHERE session_id=? AND seq>?", (session_id, after_seq or 0),
             )
-        elif source == "projection":
+        else:
             where = "session_id=?"
-            params: tuple[Any, ...] = (session_id,)
+            params = (session_id,)
             if after_seq is not None:
                 where += " AND kind IN ('user','project') AND source_seq_hi>?"
                 params += (after_seq,)
-            row = await (_fetchone or self._db.fetchone)(
-                f"SELECT min(id) AS lo, max(id) AS hi FROM {self.t.project_messages} "
-                f"WHERE {where}", params,
+            row = await fetchone(
+                f"SELECT min(id) AS lo, max(id) AS hi FROM {table} WHERE {where}", params,
             )
-        else:
-            raise ValueError("source must be messages or projection")
         return [int(row["lo"]), int(row["hi"])] if row and row["lo"] is not None else None
 
     async def get_message(self, session_id: str, seq: int) -> MessageRow | None:
@@ -1103,6 +1147,17 @@ class SessionStore:
             f"SELECT * FROM {self.t.messages} WHERE session_id=? AND seq=?", (session_id, seq)
         )
         return _row_to_message(row) if row else None
+
+    async def get_assistant_tool_calls(
+        self, session_id: str, seq: int, *, send_index: int,
+    ) -> list[dict[str, Any]] | None:
+        """Read one original call array without its assistant body or reasoning meta."""
+        row = await self._db.fetchone(
+            f"SELECT tool_calls_json FROM {self.t.messages} "
+            "WHERE session_id=? AND seq=? AND send_index=? AND role='assistant'",
+            (session_id, seq, send_index),
+        )
+        return _loads(row["tool_calls_json"]) if row else None
 
     # ── compaction ──────────────────────────────────────────────────────────────
     async def record_compaction(

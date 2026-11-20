@@ -2,7 +2,7 @@
 
 Each test FAILS against the pre-fix code and passes after:
   B2  — workflow wake-guard must claim atomically (no journal clobber / no double-wake).
-  B3+B5 — resume() must self-heal a crash-left ids-only pending instead of stranding the session.
+  B3+B5 — new input must align a real interrupted batch without replay.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def test_b9_projected_render_tags_sends_with_index() -> None:
 
 
 
-# ── B3 + B5: resume() self-heals a crash-left ids-only pending ─────────────────
+# ── B3 + B5: new input aligns an interrupted tool batch ─────────────────
 
 
 async def test_new_input_aligns_unknown_pending_without_replay(runtime_agent) -> None:
@@ -66,10 +66,15 @@ async def test_new_input_aligns_unknown_pending_without_replay(runtime_agent) ->
             config=AgentLoopConfig(system_prompt="S", max_rounds=3),
         )
         sid = loop.target.session_id
-        # A crash mid-abort can persist a pending carrying only tool_call_ids (tool_calls dropped).
-        await store.set_pending(
-            sid, {"round_index": 0, "assistant_seq": None, "tool_call_ids": ["b"], "tool_calls": []}
-        )
+        from power_loop.agent.runtime_store import RuntimeInputStore
+        port = RuntimeInputStore(store)
+        await port.accept(loop.target, "interrupted", message_id="interrupted", actor=loop.actor)
+        batch = await port.claim(loop.target, node_id="old", boot_id="old")
+        calls = [{"id": "b", "type": "function", "function": {"name": "echo", "arguments": "{}"}}]
+        source = await store.append_message(sid, role="assistant", send_index=batch.send_index,
+                                            tool_calls=calls, pending_tool_calls=True)
+        assert (await store.get_state(sid)).pending == {"assistant_seq": source}
+        await port.final(batch, status="interrupted", error="crash")
         result = await loop.send("continue")
         assert result.status == "completed"
         assert (await store.get_state(sid)).pending is None  # pending cleared, NOT stranded

@@ -58,7 +58,10 @@ async def test_pending_is_interrupted_then_send_works(runtime_agent) -> None:
         )
 
         sid = loop.target.session_id
-        await store.append_message(sid, role="user", content="initial prompt")
+        from power_loop.agent.runtime_store import RuntimeInputStore
+        port = RuntimeInputStore(store)
+        await port.accept(loop.target, "initial prompt", message_id="interrupted", actor=loop.actor)
+        batch = await port.claim(loop.target, node_id="old", boot_id="old")
         seq = await store.append_message(
             sid,
             role="assistant",
@@ -66,16 +69,10 @@ async def test_pending_is_interrupted_then_send_works(runtime_agent) -> None:
                 "id": "tc-stuck",
                 "function": {"name": "echo", "arguments": '{"text":"x"}'},
             }],
-            round_index=0,
+            round_index=0, send_index=batch.send_index, pending_tool_calls=True,
         )
-        await store.set_pending(sid, {
-            "assistant_seq": seq, "round_index": 0,
-            "tool_call_ids": ["tc-stuck"],
-            "tool_calls": [{
-                "id": "tc-stuck",
-                "function": {"name": "echo", "arguments": '{"text":"x"}'},
-            }],
-        })
+        assert (await store.get_state(sid)).pending == {"assistant_seq": seq}
+        await port.final(batch, status="interrupted", error="crash")
 
         q = "In one short sentence, what does HTML stand for?"
         r = await loop.send(q)

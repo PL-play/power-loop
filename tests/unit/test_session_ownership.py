@@ -120,21 +120,30 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
     recovered = await port.recover(root, node_id="new", boot_id="new")
     assert recovered.execution_state == "queued"
 
-    # Store ownership helpers read lifecycle from sessions, including a close
-    # committed between reading the epoch and the conditional owner write.
+    # A fresh claim replaces only an expired run through real recovery, never
+    # through the removed standalone installer.
     active = await port.claim(root, node_id="new", boot_id="new")
-    epoch = await store.session_owner_epoch(root.session_id)
-    assert epoch == active.owner_epoch
-    lease = SessionOwnership(
-        (store.store_id, root.session_id), "replacement", time.monotonic() + 90,
-        lambda: None, node_id="replacement", boot_id="replacement",
+    assert active.owner_epoch > old.owner_epoch
+    assert await port.claim(root, node_id="replacement", boot_id="replacement") is None
+    await store._db.execute(
+        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        (root.session_id,),
     )
-    assert await store.install_session_owner(root.session_id, lease, epoch)
-    assert lease.epoch == epoch + 1
-    assert await store.session_owner_epoch(root.session_id) == lease.epoch
-    assert not await store.install_session_owner(root.session_id, lease, epoch)
+    await port.accept(root, "three", message_id="three", actor=ACTOR)
+    recovered = await port.recover(root, node_id="replacement", boot_id="replacement")
+    assert recovered.execution_state == "queued"
+    replacement = await port.claim(root, node_id="replacement", boot_id="replacement")
+    assert replacement.owner_epoch > active.owner_epoch
+    assert replacement.owner_token != active.owner_token
     with pytest.raises(SessionLeaseLost):
         await port.final(active, final_text="stale")
+    state = await store._db.fetchone(
+        f"SELECT owner_epoch,owner_token FROM {store.t.session_state} WHERE session_id=?",
+        (root.session_id,),
+    )
+    assert state == {"owner_epoch": replacement.owner_epoch, "owner_token": replacement.owner_token}
+    await port.final(replacement, final_text="current")
+    await port.accept(root, "closed input", message_id="closed", actor=ACTOR)
 
     for lifecycle in ("closing", "closed"):
         await store._db.execute(
@@ -142,10 +151,10 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
             (lifecycle, root.session_id),
         )
         with pytest.raises(RuntimeRequestError, match="session_closed"):
-            await store.session_owner_epoch(root.session_id)
-        assert not await store.install_session_owner(root.session_id, lease, lease.epoch)
+            await port.accept(root, "late", message_id="late", actor=ACTOR)
+        assert await port.claim(root, node_id="late", boot_id="late") is None
         state = await store._db.fetchone(
             f"SELECT owner_epoch,owner_token FROM {store.t.session_state} WHERE session_id=?",
             (root.session_id,),
         )
-        assert state == {"owner_epoch": lease.epoch, "owner_token": lease.token}
+        assert state == {"owner_epoch": replacement.owner_epoch, "owner_token": None}

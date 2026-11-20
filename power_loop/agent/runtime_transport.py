@@ -50,6 +50,8 @@ class SubscriptionSpec:
     node_id: str
     session_id: str | None = None
     message_id: str | None = None
+    # Database discovery only. Live packet matching still uses message_id.
+    discovery_message_id: str | None = None
 
 
 class Delivery(Protocol):
@@ -188,7 +190,9 @@ class _PollingSubscription(_Subscription):
                 packets, self.cursor = await self.transport.source.poll_notifications(
                     self.binding, cursor=self.cursor, limit=self.transport.page_size)
                 for packet in packets:
-                    self.offer(packet)
+                    if (self.offer(packet) and self.binding.channel == "output"
+                            and self.binding.discovery_message_id is not None):
+                        return
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise

@@ -19,6 +19,8 @@ from power_loop._vendor.llm_client.interface import (
     LLMTokenUsage,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.core.agent_context import get_current_cancel_token
+from power_loop.core.control import ControlledLoopStop
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
@@ -91,6 +93,14 @@ def _registry(log: list[str], *, delay: float = 0.25) -> ToolRegistry:
 
 def _tool_rows(msgs: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return [(str(m.get("tool_call_id")), str(m.get("content"))) for m in msgs if m.get("role") == "tool"]
+
+
+async def _paired_durable_receipts(loop):
+    records = await loop.runtime.store.load_active_messages(loop.target.session_id)
+    announced = [call["id"] for row in records for call in row.tool_calls or []]
+    rows = [(row.tool_call_id, row.content) for row in records if row.role == "tool"]
+    assert announced == [call_id for call_id, _ in rows]
+    return rows
 
 
 @pytest.mark.asyncio
@@ -195,3 +205,234 @@ async def test_started_events_fire_for_every_member_up_front(tmp_path, runtime_a
     ids = [(e.payload or {}).get("tool_call_id") for e in events]
     assert ids == ["c1", "c2"]
     await loop.aclose()
+
+
+async def test_later_controlled_stop_settles_running_tools_and_skips_waiters(runtime_agent):
+    log = []
+    finishing = asyncio.Event()
+    aborting = asyncio.Event()
+
+    async def finish():
+        log.append("finish started")
+        finishing.set()
+        await get_current_cancel_token().wait()
+        log.append("finish receipt retained")
+        return "supplier receipt"
+
+    async def reject():
+        await finishing.wait()
+        await aborting.wait()
+        log.append("rejected")
+        raise ControlledLoopStop("test_limit", message="No remaining budget.")
+
+    async def abort():
+        log.append("abort started")
+        aborting.set()
+        try:
+            await asyncio.Future()
+        finally:
+            log.append("abort settled")
+
+    def previous():
+        log.append("previous")
+        return "already completed"
+
+    def unexpected():
+        pytest.fail("Tool started after the controlled stop")
+
+    reg = ToolRegistry()
+    for name, handler, parallel, mode in [
+        ("previous", previous, False, "finish"),
+        ("finish", finish, True, "finish"),
+        ("reject", reject, True, "finish"),
+        ("abort", abort, True, "abort"),
+        ("waiter", unexpected, True, "finish"),
+        ("serial", unexpected, False, "finish"),
+    ]:
+        reg.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"},
+                     async_capable=parallel, interrupt=mode, pricing=Free("test_fixture")), handler)
+    ids = ["previous", "finish", "serial", "reject", "abort", "waiter"]
+    llm = _Scripted(responses=[_batch(*[(i, i, {}) for i in ids]), _resp("next send")])
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(tool_batch_concurrency=3), registry=reg)
+    processed = []
+    loop.hooks.register(HookPoint.TOOL_AFTER, lambda ctx: processed.append(ctx.tool_name))
+
+    res = await asyncio.wait_for(loop.send("go"), timeout=5)
+    assert res.status == "failed" and res.error_code == "budget_exceeded"
+    assert res.error == "No remaining budget."
+    assert len(llm.seen) == 1
+    assert log[:1] == ["previous"]
+    assert set(log[1:3]) == {"finish started", "abort started"}
+    assert log[3] == "rejected"
+    assert sorted(log[4:]) == ["abort settled", "finish receipt retained"]
+    rows = await _paired_durable_receipts(loop)
+    assert [i for i, _ in rows] == ids
+    assert dict(rows)["previous"] == "already completed"
+    assert dict(rows)["finish"].endswith("supplier receipt")
+    assert dict(rows)["reject"] == "[stopped: test_limit] No remaining budget."
+    assert dict(rows)["serial"] == dict(rows)["waiter"] == "[skipped: test_limit]"
+    assert "已中止" in dict(rows)["abort"]
+    assert processed == ["previous", "finish"]
+    assert (await loop.send("next")).status == "completed"
+    projected = "\n".join(str(row.get("content")) for row in llm.seen[1])
+    assert "supplier receipt" in projected and "<missing>" not in projected
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_retry_can_stop_the_send_without_starting_later_tools(runtime_agent, parallel):
+    attempts = []
+    errors = []
+    sibling_finished = asyncio.Event()
+
+    async def retried():
+        attempts.append("retried")
+        if len(attempts) == 1:
+            raise RuntimeError("retry once")
+        raise ControlledLoopStop("test_limit", message="No remaining budget.")
+
+    def unexpected():
+        pytest.fail("Serial tool ran after the controlled stop")
+
+    async def sibling():
+        sibling_finished.set()
+        return "sibling already completed"
+
+    reg = ToolRegistry()
+    for name, handler, eligible in [
+        ("retry", retried, parallel),
+        ("sibling", sibling, parallel),
+        ("serial", unexpected, False),
+    ]:
+        reg.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"},
+                     async_capable=eligible, pricing=Free("test_fixture")), handler)
+    calls = [("retry", "retry", {}), ("sibling", "sibling", {}), ("serial", "serial", {})]
+    llm = _Scripted(responses=[_batch(*calls), _resp("next send")])
+    loop = await runtime_agent(model=llm, config=AgentLoopConfig(), registry=reg)
+
+    async def on_error(ctx):
+        errors.append(str(ctx.error))
+        if parallel:
+            await sibling_finished.wait()
+        return HookDirective.SHORT_CIRCUIT
+
+    loop.hooks.register(HookPoint.TOOL_ERROR, on_error, name="test_retry")
+    stopped = await loop.send("go")
+    assert stopped.status == "failed" and stopped.error_code == "budget_exceeded"
+    assert stopped.error == "No remaining budget."
+    assert len(llm.seen) == 1
+    assert attempts == ["retried", "retried"] and errors == ["retry once"]
+    assert await _paired_durable_receipts(loop) == [
+        ("retry", "[stopped: test_limit] No remaining budget."),
+        ("sibling", "sibling already completed" if parallel else "[skipped: test_limit]"),
+        ("serial", "[skipped: test_limit]"),
+    ]
+    assert (await loop.send("next")).status == "completed"
+
+
+async def test_controlled_stop_during_parallel_admission_does_not_start_queued_tools(runtime_agent):
+    log = []
+    llm = _Scripted(responses=[_batch(
+        ("first", "gen_image", {"tag": "first"}),
+        ("denied", "gen_image", {"tag": "denied"}),
+    )])
+    loop = await runtime_agent(model=llm, registry=_registry(log))
+
+    def before(ctx):
+        if ctx.tool_args["tag"] == "denied":
+            raise ControlledLoopStop("test_limit", message="No remaining budget.")
+
+    loop.hooks.register(HookPoint.TOOL_BEFORE, before, name="test_limit")
+    result = await loop.send("go")
+    assert (result.status, result.error_code) == ("failed", "budget_exceeded")
+    assert len(llm.seen) == 1 and not log
+    assert await _paired_durable_receipts(loop) == [
+        ("first", "[skipped: test_limit]"),
+        ("denied", "[skipped: test_limit]"),
+    ]
+
+
+@pytest.mark.parametrize("timing", ["allowed", "returned_before_denial", "returned_during_finish"])
+async def test_tool_after_processes_real_returns_once_and_in_call_order(runtime_agent, timing):
+    raw = "draft supplier result"
+    approved = "approved public result"
+    arguments = {"key": "fixture"}
+    denied = timing != "allowed"
+    ready = asyncio.Event()
+    timeline, processed, emitted = [], [], []
+
+    async def decide():
+        await ready.wait()
+        timeline.append("decision")
+        if denied:
+            raise ControlledLoopStop("quota_exhausted", message="No remaining budget.")
+        return "allowed"
+
+    async def lookup(key):
+        assert key == arguments["key"]
+        ready.set()
+        if timing == "returned_during_finish":
+            await get_current_cancel_token().wait()
+        timeline.append("returned")
+        return raw
+
+    def marker():
+        timeline.append("marker")
+        return "ran"
+
+    def process_result(ctx):
+        processed.append((ctx.tool_call["id"], ctx.tool_name, dict(ctx.tool_args), ctx.output, ctx.failed))
+        if ctx.tool_name == "lookup":
+            ctx.output = approved
+            ctx.failed = True
+            if denied:
+                return HookDirective.BREAK
+        return None
+
+    registry = ToolRegistry()
+    for name, handler, parallel in (("decide", decide, True), ("lookup", lookup, True), ("marker", marker, False)):
+        registry.register(ToolDefinition(
+            name=name, description=name, input_schema={"type": "object", "properties": {"key": {"type": "string"}}},
+            async_capable=parallel, interrupt="finish", pricing=Free("test_fixture"),
+        ), handler)
+    bus = AgentEventBus(suppress_subscriber_errors=True)
+    bus.subscribe(AgentEventType.TOOL_CALL_FAILED, emitted.append)
+    bus.subscribe(AgentEventType.TOOL_CALL_COMPLETED, emitted.append)
+    model = _Scripted(responses=[
+        _batch(("gate", "decide", {}), ("body", "lookup", arguments), ("later", "marker", {})),
+        _resp("done"), _resp("done"),
+    ])
+    loop = await runtime_agent(
+        model=model, registry=registry, config=AgentLoopConfig(tool_batch_concurrency=2), event_bus=bus,
+    )
+    loop.hooks.register(HookPoint.TOOL_AFTER, process_result)
+
+    result = await asyncio.wait_for(loop.send("first"), timeout=5)
+    assert (result.status, result.error_code) == (("failed", "budget_exceeded") if denied else ("completed", None))
+    assert len(model.seen) == (1 if denied else 2)
+    assert timeline[:2] == (["decision", "returned"] if timing == "returned_during_finish"
+                            else ["returned", "decision"])
+    assert timeline[2:] == ([] if denied else ["marker"])
+    lookup_hook = ("body", "lookup", arguments, raw, False)
+    assert processed == ([lookup_hook] if denied else [
+        ("gate", "decide", {}, "allowed", False), lookup_hook, ("later", "marker", {}, "ran", False),
+    ])
+
+    rows = await _paired_durable_receipts(loop)
+    assert [call_id for call_id, _ in rows] == ["gate", "body", "later"]
+    contents = dict(rows)
+    assert contents["gate"] == ("[stopped: quota_exhausted] No remaining budget." if denied else "allowed")
+    assert contents["later"] == ("[skipped: quota_exhausted]" if denied else "ran")
+    if timing == "returned_during_finish":
+        assert contents["body"].startswith("[stopped: 执行停止（quota_exhausted）")
+        assert contents["body"].endswith("\n" + approved)
+    else:
+        assert contents["body"] == approved
+
+    body_events = [event for event in emitted if event.payload["tool_call_id"] == "body"]
+    assert [event.type for event in body_events] == [
+        AgentEventType.TOOL_CALL_FAILED, AgentEventType.TOOL_CALL_COMPLETED,
+    ]
+    assert all(event.payload["output"] == contents["body"] for event in body_events)
+    assert body_events[-1].payload["failed"] is True
+    assert (await loop.send("next")).status == "completed"
+    assert approved in str(model.seen[-1]) and raw not in str(model.seen[-1])

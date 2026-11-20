@@ -110,8 +110,13 @@ async def recall(
                     raise ValueError
             except (ValueError, TypeError, KeyError, UnicodeError):
                 raise RecallInputError("invalid cursor for this session/selection") from None
-        else:
-            bounds = await store.history_bounds(sid, source=source)
+        elif single is None:
+            if send_index is not None:
+                bounds = await store.history_bounds(sid, source=source, send_index=send_index)
+            elif ids is not None:
+                bounds = await store.history_bounds(sid, source=source, lo=lo, hi=hi)
+            else:
+                bounds = await store.history_bounds(sid, source=source)
             if bounds is None:
                 return dumps({"status": "unavailable", "reason": "records_not_found"})
             hi = min(hi, bounds[1]) if hi is not None else bounds[1]

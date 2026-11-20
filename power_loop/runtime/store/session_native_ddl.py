@@ -34,6 +34,10 @@ INDEXES = {
         ("session_id", "kind", "projector_version", "source_seq_hi",
          "completed_through_send_index"),
     ),
+    "idx_project_compact_order": (
+        "project_messages", ("session_id", "kind", "send_index", "compact_to_send"),
+    ),
+    "idx_projection_session_id": ("project_messages", ("session_id", "id")),
 }
 
 

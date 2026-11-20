@@ -3,6 +3,8 @@
 ``python -m bench`` runs the full sweep; ``--smoke`` runs a tiny subset (what CI runs,
 non-blocking). Output is a single JSON document on stdout — paste the table into
 ``docs/.../scaling.md`` (SCALE-5) and record the environment it was measured on.
+history_size counts completed sends; setup_s is separate from measured latency.
+Historical raw-message results use a different workload and are not comparable.
 """
 
 from __future__ import annotations
@@ -44,13 +46,16 @@ async def run_suite(*, smoke: bool = False) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="bench", description="power-loop SCALE-1 harness")
+    parser = argparse.ArgumentParser(prog="bench", description=(
+        "power-loop SCALE-1 harness; history_size counts completed sends, setup_s is separate"))
     parser.add_argument("--smoke", action="store_true", help="run the fast smoke subset")
     args = parser.parse_args(argv)
     results = asyncio.run(run_suite(smoke=args.smoke))
     json.dump(results, sys.stdout, indent=2)
     sys.stdout.write("\n")
-    return 0
+    scenarios = results["scenarios"]
+    reports = [*scenarios["fanout"], *scenarios["big_history"], scenarios["throughput"]]
+    return 1 if any(r["failed_count"] > 0 for r in reports) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

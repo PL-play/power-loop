@@ -169,10 +169,13 @@ class RuntimeClient:
                 if initial.record is None:
                     raise RuntimeRequestError("not_found")
             return ref, initial
-        return await self._open_output(target, actor=actor, submit=submit)
+        return await self._open_output(
+            target, actor=actor, submit=submit, discovery_message_id=message_id,
+        )
 
     async def _open_output(
         self, ref, *, actor, read_initial=False, allow_missing=False, submit=None,
+        discovery_message_id=None,
     ):
         """Own one output from slot acquisition through registration or cleanup."""
         self._require_open(reading=True)
@@ -185,8 +188,12 @@ class RuntimeClient:
         output = None
         try:
             target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
+            if isinstance(ref, InputRef):
+                discovery_message_id = ref.message_id
             subscription = await self.transport.subscribe(SubscriptionSpec(
-                self.namespace, ref.store_id, "output", "client", ref.session_id))
+                self.namespace, ref.store_id, "output", "client", ref.session_id,
+                discovery_message_id=discovery_message_id,
+            ))
             # The raw subscription is owned by an existing OutputSubscription before
             # any await that can fail; internal cleanup never keeps it in a local only.
             output = OutputSubscription(self, ref, actor, subscription)

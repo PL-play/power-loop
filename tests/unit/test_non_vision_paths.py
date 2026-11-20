@@ -138,7 +138,7 @@ def _image_row(tmp_path):
 def test_recall_row_with_images_on_a_blind_model_says_so(tmp_path) -> None:
     row = _image_row(tmp_path)
     with _InLoop(_loop(None)):
-        out = _render_recall_row(row, [row], cap=4000, head="send #1")
+        out = _render_recall_row(row, None, cap=4000, head="send #1")
         assert image_recall.drain_queued_images("s1") == ([], [])
     assert "放到你眼前" not in out
     assert "当前模型看不了图片" in out and "shot.png · file_uuid=abc" in out
@@ -147,7 +147,7 @@ def test_recall_row_with_images_on_a_blind_model_says_so(tmp_path) -> None:
 def test_recall_row_with_images_on_a_vision_model_puts_them_back(tmp_path) -> None:
     row = _image_row(tmp_path)
     with _InLoop(_loop(VISION)):
-        out = _render_recall_row(row, [row], cap=4000, head="send #1")
+        out = _render_recall_row(row, None, cap=4000, head="send #1")
         durable, _ = image_recall.drain_queued_images("s1")
     assert "1 张图已放到你眼前" in out and len(durable) == 1
 

@@ -24,8 +24,7 @@ async def _assistant_with_pending(store, port, batch, tool_ids):
         "state,meta_json,send_index,created_at) VALUES (?,?, 'assistant', '', ?, 0, 'active', ?, ?, 0)",
         (batch.target.session_id, seq, json.dumps(tool_calls), "{}", batch.send_index),
     )
-    pending = {"assistant_seq": seq, "round_index": 0, "tool_call_ids": list(tool_ids),
-               "tool_calls": tool_calls}
+    pending = {"assistant_seq": seq}
     await store._db.execute(
         f"UPDATE {store.t.session_state} SET pending_json=?,next_seq=? WHERE session_id=?",
         (json.dumps(pending), seq + 1, batch.target.session_id),
@@ -39,12 +38,12 @@ async def _expire(store, session_id):
 
 
 async def test_recover_repairs_missing_tools_without_replay(registry_store):
-    store, _ = registry_store
+    store, connect = registry_store
     port = RuntimeInputStore(store)
     root = await target(port)
     await port.accept(root, "go", message_id="m1", actor=ACTOR)
     batch = await port.claim(root, node_id="a", boot_id="a")
-    await _assistant_with_pending(store, port, batch, ["t1", "t2"])
+    assistant_seq = await _assistant_with_pending(store, port, batch, ["t1", "t2"])
     await _expire(store, root.session_id)
 
     recovered = await port.recover(root, node_id="b", boot_id="b")
@@ -52,11 +51,18 @@ async def test_recover_repairs_missing_tools_without_replay(registry_store):
     assert recovered.results[0].status == "interrupted"
     # Both missing tools got a fixed unknown result stamped with the INTERRUPTED send_index.
     tools = await store._db.fetchall(
-        f"SELECT tool_call_id,content,send_index FROM {store.t.messages} "
+        f"SELECT seq,tool_call_id,content,send_index,meta_json FROM {store.t.messages} "
         "WHERE session_id=? AND role='tool' ORDER BY seq", (root.session_id,))
     assert {t["tool_call_id"] for t in tools} == {"t1", "t2"}
     assert all(t["send_index"] == batch.send_index for t in tools)
     assert all("执行中断" in t["content"] for t in tools)
+    assert all(json.loads(t["meta_json"])["_assistant_seq"] == assistant_seq for t in tools)
+    from power_loop.runtime.tool_archive import recall_original
+    reader = await connect()
+    for tool in tools:
+        row = await reader.get_message(root.session_id, tool["seq"])
+        original = json.loads(await recall_original(reader, root.session_id, batch.send_index, row))
+        assert original["arguments"] == "{}" and original["result"] == tool["content"]
     state = await store.get_state(root.session_id)
     assert state.pending is None
     # The input is terminal interrupted; a cold wait sees it (no eternal wait).
@@ -81,6 +87,7 @@ async def test_existing_tool_result_is_not_duplicated(registry_store):
         f"UPDATE {store.t.session_state} SET next_seq=? WHERE session_id=?",
         (assistant_seq + 2, root.session_id),
     )
+    before = await store.get_message(root.session_id, assistant_seq + 1)
     await _expire(store, root.session_id)
     await port.recover(root, node_id="b", boot_id="b")
     tools = await store._db.fetchall(
@@ -89,6 +96,9 @@ async def test_existing_tool_result_is_not_duplicated(registry_store):
     assert [t["tool_call_id"] for t in tools] == ["t1", "t2"]  # t1 not duplicated
     assert tools[0]["content"] == "real result"
     assert "执行中断" in tools[1]["content"]
+    assert await store.get_message(root.session_id, assistant_seq + 1) == before
+    repaired = await store.get_message(root.session_id, assistant_seq + 2)
+    assert repaired.meta["_assistant_seq"] == assistant_seq
 
 
 async def test_claim_repairs_pending_before_new_user_message(registry_store):
@@ -225,3 +235,246 @@ async def test_recovering_with_followup_terminates_old_then_claims_new(registry_
     new_batch = await port.claim(root, node_id="b", boot_id="b")
     assert new_batch.send_index == batch.send_index + 1
     assert [r.message_id for r in new_batch.input_refs] == ["new"]
+
+
+async def test_partial_result_and_abort_preserve_pending_source(registry_store):
+    from power_loop import AgentLoopConfig
+    from power_loop.agent.sink import SQLiteSink
+    from power_loop.agent.stateful_loop import _ExecutionLoop
+    from power_loop.runtime.tool_archive import recall_original
+    from tests.runtime_fixture import ScriptedModel
+
+    from .session_native_fixture import DESCRIPTOR
+
+    store = registry_store[0]
+    sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
+    calls = [{'id': cid, 'function': {'name': 'echo', 'arguments': '{"text":"original"}'}}
+             for cid in ('completed', 'aborted')]
+    sink = SQLiteSink(store, sid)
+    await sink.on_message_appended({'role': 'assistant', 'tool_calls': calls, 'send_index': 1}, round_index=0)
+    source = sink.persisted_assistant_seq
+    await sink.on_assistant_tool_calls(assistant_seq=source, tool_calls=calls, round_index=0)
+    await store.set_runtime_state(sid, 'send_index', 99)
+    model = ScriptedModel()
+    loop = _ExecutionLoop(llm=model, store=store, config=AgentLoopConfig(delegation_policy="single_level"))
+    await sink.on_message_appended({'role': 'tool', 'tool_call_id': 'completed',
+                                   'content': 'known result', 'send_index': 1}, round_index=0)
+    assert (await store.get_state(sid)).pending == {'assistant_seq': source}
+    assert len([r for r in await store.load_all_messages(sid) if r.role == 'tool']) == 1
+    assert await loop.abort_pending(sid) == 1
+    rows = await store.load_all_messages(sid)
+    tools = [r for r in rows if r.role == 'tool']
+    assert len(tools) == 2 and model._idx == 0
+    assert all(r.meta['_assistant_seq'] == source for r in tools)
+    assert (await store.get_state(sid)).pending is None
+    for row in tools:
+        value = json.loads(await recall_original(store, sid, 1, row))
+        assert value['arguments'] == '{"text":"original"}'
+        assert value['result'] == row.content
+
+
+async def test_marker_and_last_result_rollback_preserve_batch(registry_store, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from power_loop.agent.sink import SQLiteSink
+    from power_loop.runtime.tool_archive import recall_original
+
+    store = registry_store[0]
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, 'go', message_id='m1', actor=ACTOR)
+    await port.claim(root, node_id='old', boot_id='old')
+    sid = root.session_id
+    arguments = json.dumps({'text': 'CURRENT', 'large': 'x' * 65536})
+    calls = [{'id': f'c{i}', 'function': {'name': 'echo', 'arguments': arguments}}
+             for i in range(3)]
+    # A completed earlier batch in the SAME send reused these ids.
+    old = await store.append_message(sid, role='assistant', send_index=1, tool_calls=calls, pending_tool_calls=True)
+    for i in range(3):
+        options = {'pending': None} if i == 2 else {}
+        await store.append_message(sid, role='tool', tool_call_id=f'c{i}', content='earlier',
+                                   send_index=1, meta={'_assistant_seq': old}, **options)
+    baseline = await store.load_all_messages(sid)
+    transaction = store._db.transaction
+
+    @asynccontextmanager
+    async def rolled_back():
+        async with transaction() as tx:
+            yield tx
+            raise RuntimeError('rollback before commit')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store._db, 'transaction', rolled_back)
+        with pytest.raises(RuntimeError, match='rollback before commit'):
+            await store.append_message(sid, role='assistant', tool_calls=calls,
+                                       send_index=1, round_index=7, pending_tool_calls=True)
+    assert (await store.get_state(sid)).pending is None
+    assert await store.load_all_messages(sid) == baseline
+    source = await store.append_message(sid, role='assistant', tool_calls=calls,
+                                        send_index=1, round_index=7, pending_tool_calls=True)
+    marker = {'assistant_seq': source}
+    assert (await store.get_state(sid)).pending == marker
+    sink = SQLiteSink(store, sid)
+    await sink.on_assistant_tool_calls(assistant_seq=source, tool_calls=calls, round_index=7)
+    # The call remains a valid recovery source after compaction.
+    await store.record_compaction(sid, from_seq=source, to_seq=source, note_content='folded',
+                                 before_tokens=30, after_tokens=2, round_index=7)
+    for cid in ('c2', 'c0'):
+        await sink.on_message_appended({'role': 'tool', 'tool_call_id': cid,
+                                       'send_index': 1, 'content': cid}, round_index=7)
+        assert (await store.get_state(sid)).pending == marker
+    with monkeypatch.context() as patch:
+        patch.setattr(store._db, 'transaction', rolled_back)
+        with pytest.raises(RuntimeError, match='rollback before commit'):
+            await sink.on_message_appended({'role': 'tool', 'tool_call_id': 'c1',
+                                           'send_index': 1, 'content': 'rolled back'}, round_index=7)
+    assert sink._unresolved == {'c1'} and sink.persisted_assistant_seq == source
+    assert (await store.get_state(sid)).pending == marker
+    await _expire(store, sid)
+    await port.recover(root, node_id='new', boot_id='new')
+    rows = await store.load_all_messages(sid)
+    current = [r for r in rows if r.role == 'tool' and r.meta.get('_assistant_seq') == source]
+    assert [r.tool_call_id for r in current] == ['c2', 'c0', 'c1']
+    assert [r.content for r in current[:2]] == ['c2', 'c0']
+    assert '结果未知' in current[-1].content and current[-1].round_index == 7
+    for row in current:
+        assert json.loads(await recall_original(store, sid, 1, row, char_limit=100000))['arguments'] == arguments
+    assert (await store.get_state(sid)).pending is None
+
+
+async def test_tool_result_ack_loss_is_not_replayed_or_duplicated(registry_store, monkeypatch):
+    from power_loop.agent.sink import SQLiteSink
+
+    from .session_native_fixture import UnknownCommit, fail_next_commit
+
+    store = registry_store[0]
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, 'go', message_id='m1', actor=ACTOR)
+    await port.claim(root, node_id='old', boot_id='old')
+    sink = SQLiteSink(store, root.session_id)
+    calls = [{'id': cid, 'function': {'name': 'echo', 'arguments': '{}'}} for cid in ('one', 'two')]
+    await sink.on_message_appended({'role': 'assistant', 'tool_calls': calls, 'send_index': 1}, round_index=0)
+    source = sink.persisted_assistant_seq
+    await sink.on_assistant_tool_calls(assistant_seq=source, tool_calls=calls, round_index=0)
+    fail_next_commit(monkeypatch, store)
+    with pytest.raises(UnknownCommit):
+        await sink.on_message_appended({'role': 'tool', 'tool_call_id': 'one',
+                                       'content': 'committed original', 'send_index': 1}, round_index=0)
+    assert sink._unresolved == {'one', 'two'}  # Stop this executor; do not retry the tool.
+    await _expire(store, root.session_id)
+    await port.recover(root, node_id='new', boot_id='new')
+    tools = [r for r in await store.load_all_messages(root.session_id) if r.role == 'tool']
+    assert [r.tool_call_id for r in tools] == ['one', 'two']
+    assert tools[0].content == 'committed original' and '结果未知' in tools[1].content
+    assert all(r.meta['_assistant_seq'] == source for r in tools)
+
+
+@pytest.mark.parametrize('entry', ['recover', 'abort'])
+async def test_all_results_present_only_clears_marker(registry_store, entry):
+    from power_loop import AgentLoopConfig
+    from power_loop.agent.stateful_loop import _ExecutionLoop
+    from tests.runtime_fixture import ScriptedModel
+
+    store = registry_store[0]
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, 'go', message_id='m1', actor=ACTOR)
+    batch = await port.claim(root, node_id='old', boot_id='old')
+    source = await _assistant_with_pending(store, port, batch, ['t1', 't2'])
+    for cid in ('t1', 't2'):
+        await store.append_message(root.session_id, role='tool', tool_call_id=cid,
+                                   send_index=1, content=cid, meta={'_assistant_seq': source})
+    before = [r for r in await store.load_all_messages(root.session_id) if r.role == 'tool']
+    if entry == 'recover':
+        await _expire(store, root.session_id)
+        await port.recover(root, node_id='new', boot_id='new')
+    else:
+        loop = _ExecutionLoop(llm=ScriptedModel(), store=store, config=AgentLoopConfig(delegation_policy='single_level'))
+        assert await loop.get_pending(root.session_id) == {'assistant_seq': source}
+        assert await loop.abort_pending(root.session_id) == 0
+    assert (await store.get_state(root.session_id)).pending is None
+    assert [r for r in await store.load_all_messages(root.session_id) if r.role == 'tool'] == before
+
+
+@pytest.mark.parametrize('entry', ['claim', 'abort'])
+async def test_unavailable_pending_source_is_explicit_and_unchanged(registry_store, monkeypatch, entry):
+    from power_loop import AgentLoopConfig
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    from power_loop.agent.stateful_loop import _ExecutionLoop
+    from tests.runtime_fixture import ScriptedModel
+
+    store = registry_store[0]
+    port = RuntimeInputStore(store)
+    model = ScriptedModel()
+    loop = _ExecutionLoop(llm=model, store=store, config=AgentLoopConfig(delegation_policy='single_level'))
+    unknown_checks = []
+
+    async def no_unknown(*args):
+        unknown_checks.append(args)
+        raise AssertionError('domain rejection must not check an unknown commit')
+
+    monkeypatch.setattr(port, '_claim_after_unknown', no_unknown)
+    for kind in ('missing', 'not-assistant', 'invalid-json', 'empty-calls'):
+        root = await target(port, session_id=f'{entry}-{kind}')
+        await port.accept(root, 'old', message_id='m1', actor=ACTOR)
+        batch = await port.claim(root, node_id='old', boot_id='old')
+        source = await _assistant_with_pending(store, port, batch, ['t1'])
+        await port.final(batch, status='interrupted', error='crash')
+        if kind == 'missing':
+            await store._db.execute(f'DELETE FROM {store.t.messages} WHERE session_id=? AND seq=?', (root.session_id, source))
+        elif kind == 'not-assistant':
+            await store._db.execute(f"UPDATE {store.t.messages} SET role='user' WHERE session_id=? AND seq=?", (root.session_id, source))
+        else:
+            await store._db.execute(f'UPDATE {store.t.messages} SET tool_calls_json=? WHERE session_id=? AND seq=?',
+                                    ('not-json' if kind == 'invalid-json' else '[]', root.session_id, source))
+        if entry == 'claim':
+            await port.accept(root, 'new', message_id='m2', actor=ACTOR)
+        before = await store._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=? ORDER BY seq', (root.session_id,))
+        with pytest.raises(RuntimeRequestError) as error:
+            if entry == 'claim':
+                await port.claim(root, node_id='new', boot_id='new')
+            else:
+                await loop.abort_pending(root.session_id)
+        assert error.value.code == 'pending_source_unavailable'
+        assert (await store.get_state(root.session_id)).pending == {'assistant_seq': source}
+        assert await store._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=? ORDER BY seq', (root.session_id,)) == before
+    assert model._idx == 0 and not unknown_checks
+
+
+async def test_replaced_runtime_owner_rejects_old_sink(registry_store):
+    import asyncio
+    import contextvars
+    import time
+
+    from power_loop.agent.sink import SQLiteSink
+    from power_loop.runtime.session_ownership import SessionOwnership
+
+    store = registry_store[0]
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    await port.accept(root, 'go', message_id='m1', actor=ACTOR)
+    batch = await port.claim(root, node_id='old', boot_id='old')
+    lease = SessionOwnership((store.store_id, root.session_id), 'old', time.monotonic() + 60,
+                             lambda: None, token=batch.owner_token, epoch=batch.owner_epoch,
+                             node_id='old', boot_id='old', installs_fence=True)
+    async with store.send_read_scope(root.session_id, ownership=lease):
+        await store.get_state(root.session_id)
+        sink = SQLiteSink(store, root.session_id)
+        calls = [{'id': 'c', 'function': {'name': 'echo', 'arguments': '{}'}}]
+        await sink.on_message_appended({'role': 'assistant', 'tool_calls': calls, 'send_index': 1}, round_index=0)
+        await sink.on_assistant_tool_calls(assistant_seq=sink.persisted_assistant_seq,
+                                           tool_calls=calls, round_index=0)
+
+        async def replacement():
+            await _expire(store, root.session_id)
+            await RuntimeInputStore(store).recover(root, node_id='new', boot_id='new')
+
+        await asyncio.create_task(replacement(), context=contextvars.Context())
+        with pytest.raises(SessionLeaseLost):
+            await sink.on_message_appended({'role': 'tool', 'tool_call_id': 'c',
+                                           'content': 'stale', 'send_index': 1}, round_index=0)
+        assert sink._unresolved == {'c'}
+    rows = await store.load_all_messages(root.session_id)
+    assert all(row.content != 'stale' for row in rows)
+    assert len([r for r in rows if r.role == 'tool' and r.tool_call_id == 'c']) == 1

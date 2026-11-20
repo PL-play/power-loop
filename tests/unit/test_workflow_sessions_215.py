@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
@@ -14,7 +15,7 @@ from power_loop import (
     RuntimeClient,
 )
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
-from power_loop.agent.runtime_types import InputRef, RuntimeRequestError, TargetRef
+from power_loop.agent.runtime_types import InputRef, RuntimeRequestError, TargetRef, plain
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import register_workflow_tool
 from tests.runtime_fixture import RunningAgent
@@ -50,6 +51,20 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
     registry = ToolRegistry()
     register_workflow_tool(registry)
     runner = await RunningAgent(store, Parent(), registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
+    built = []
+    original_build = runner.runtime.factory.build
+
+    async def build(descriptor, execution):
+        from power_loop.runtime.session_ownership import current_ownership
+        lease = current_ownership(store, execution.session_id)
+        assert lease is runner.runtime.worker._active[execution.session_id].ownership
+        lease.require_owned()
+        assert (lease.key, lease.epoch, lease.token) == (
+            (execution.store_id, execution.session_id), execution.owner_epoch, execution.owner_token)
+        built.append((descriptor.kind, lease))
+        return await original_build(descriptor, execution)
+
+    runner.runtime.factory.build = build
     try:
         parent = await asyncio.wait_for(runner.send("run"), 10)
         assert parent.status == "completed"
@@ -86,6 +101,8 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
         driver = TargetRef(**receipt["target_ref"])
         children = await runner.runtime.client.list_children(driver, actor=runner.actor)
         assert len(children.items) == 1
+        assert {kind for kind, _ in built} == {"agent", "workflow_driver"}
+        assert all(lease.released and not lease.lost for _, lease in built)
     finally:
         await runner.aclose()
 
@@ -390,9 +407,14 @@ async def test_original_cancel_running_continuation_cancels_current_send(registr
         await runner.aclose()
 
 
-async def test_halt_late_result_is_journaled_without_advancing_finished_graph(registry_store):
+async def test_halt_late_result_is_journaled_without_advancing_finished_graph(registry_store, monkeypatch):
     store, _ = registry_store
+    await _exercise_halt_late_result(store, store._db, monkeypatch)
+
+
+async def _exercise_halt_late_result(store, raw_db, monkeypatch, *, measure=nullcontext):
     from power_loop.workflow import journal
+    from power_loop.workflow import runner as workflow_runner
 
     started, release = asyncio.Event(), asyncio.Event()
 
@@ -420,26 +442,94 @@ async def test_halt_late_result_is_journaled_without_advancing_finished_graph(re
         try:
             result = await handle.wait(deadline_ms=now_ms() + 10000)
         except TimeoutError:
-            states = await store._db.fetchall(
+            states = await raw_db.fetchall(
                 f"SELECT session_id,execution_state,active_send_index,cancel_send_index FROM {store.t.session_state}",
             )
             raise AssertionError(states)
-        assert result.status == "failed"
-        release.set()
-        async with asyncio.timeout(10):
-            while True:
-                saved = await journal.read(store, runner.target.session_id, handle.run_id)
-                b = next(entry for entry in saved["nodes"] if entry["path"] == "B")
-                if b["late_results"]:
-                    break
-                await runner.runtime.worker.recover()
-                await asyncio.sleep(0.02)
-        assert b["result"] is None and b["late_results"][0]["status"] == "cancelled"
-        aggregate = await store._db.fetchone(
-            f"SELECT COUNT(*) AS n FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_result'",
-            (runner.target.session_id,),
+        assert result.name == "late halt" and result.status == "failed"
+        await runner.finish(handle.input_ref)
+        driver_sid = handle.target.session_id
+        saved_before = await journal.get(store, raw_db, driver_sid, journal.run_key(handle.run_id))
+        assert saved_before["status"] == "failed" and saved_before["aggregate_delivered"]
+
+        async def read_nodes():
+            return await journal.nodes(store, raw_db, driver_sid)
+
+        async def read_aggregates():
+            return await raw_db.fetchall(
+                f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+                "WHERE session_id=? AND kind='workflow_result'",
+                (runner.target.session_id,),
+            )
+
+        nodes_before = await read_nodes()
+        [a] = [node for node in nodes_before if node["path"] == "A"]
+        [before_b] = [node for node in nodes_before if node["path"] == "B"]
+        b_ref = InputRef(**before_b["input_ref"])
+        assert before_b["result"] is None and before_b["late_results"] == []
+        [first_aggregate] = await read_aggregates()
+        aggregate_ref = InputRef(store.store_id, runner.target.session_id, first_aggregate["item_id"])
+        # Finish the failed graph's original parent delivery before resetting the write meter.
+        parent = await runner.runtime.client.wait(
+            aggregate_ref, actor=runner.actor, deadline_ms=now_ms() + 10000,
         )
-        assert aggregate["n"] == 1
+        assert parent.status == "completed" and parent.input_ref == aggregate_ref
+        await runner.finish(aggregate_ref)
+        await runner.finish(InputRef(**a["input_ref"]))
+        committed = asyncio.Event()
+        commits = []
+        finish_late = workflow_runner._finish_late
+
+        async def observe_finish(worker, context, refs):
+            final = await finish_late(worker, context, refs)
+            if worker is runner.runtime.worker and context.session_id == driver_sid:
+                commits.append(tuple(refs))
+                committed.set()
+            return final
+
+        with monkeypatch.context() as patch:
+            patch.setattr(workflow_runner, "_finish_late", observe_finish)
+            async with measure():
+                release.set()
+                async with asyncio.timeout(10):
+                    await committed.wait()
+                    await runner.drain()
+
+        [(late_ref,)] = commits
+        late_row = await raw_db.fetchone(
+            f"SELECT kind,terminal_status,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (driver_sid, late_ref.message_id),
+        )
+        assert late_ref.session_id == driver_sid
+        assert late_row["kind"] == "workflow_node_result" and late_row["terminal_status"] == "completed"
+        routed = json.loads(late_row["content_json"])
+        assert routed["status"] == "cancelled" and routed["input_ref"] == plain(b_ref)
+        [b] = [entry for entry in await read_nodes() if entry["path"] == "B"]
+        [late] = b["late_results"]
+        assert b["input_ref"] == late["input_ref"] == plain(b_ref)
+        assert b["result"] is None and late["status"] == "cancelled"
+        inputs = runner.runtime.client.inputs
+        b_result = await inputs.get_result(b_ref, actor=runner.actor)
+        assert b_result.input_ref == b_ref and b_result.status == "cancelled"
+        persisted = await inputs.get_result(handle.input_ref, actor=runner.actor)
+        assert persisted.input_ref == handle.input_ref and persisted.target == handle.target
+        assert persisted.status == result.status and persisted.result_seq == saved_before["result_seq"]
+        assert plain(persisted.structured_output) == saved_before["result"]
+        aggregates = await read_aggregates()
+        [aggregate] = aggregates
+        assert aggregate == first_aggregate
+        body = json.loads(aggregate["content_json"])
+        assert body["input_ref"] == plain(handle.input_ref) and body["status"] == "failed"
+        return {
+            "b_input_ref_before_release": plain(b_ref), "b_late_before_release": len(before_b["late_results"]),
+            "b_result": b["result"], "b_late_results": b["late_results"],
+            "b_persisted_status": b_result.status, "driver_late_input_ref": plain(late_ref),
+            "driver_late_terminal_status": late_row["terminal_status"],
+            "driver_original_input_ref": plain(persisted.input_ref), "driver_original_status": persisted.status,
+            "driver_original_result_seq": persisted.result_seq, "parent_aggregate_count": len(aggregates),
+            "parent_aggregate_input_ref": plain(aggregate_ref),
+        }
     finally:
         release.set()
         await runner.aclose()

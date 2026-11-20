@@ -71,6 +71,20 @@ async def test_execute_freezes_original_tool_and_routes_result(registry_store, t
     runner = await RunningAgent(
         store, BackgroundParent(), registry, AgentLoopConfig(context_budget_tokens=10**9),
     ).start()
+    built = []
+    original_build = runner.runtime.factory.build
+
+    async def build(descriptor, execution):
+        from power_loop.runtime.session_ownership import current_ownership
+        lease = current_ownership(store, execution.session_id)
+        assert lease is runner.runtime.worker._active[execution.session_id].ownership
+        lease.require_owned()
+        assert (lease.key, lease.epoch, lease.token) == (
+            (execution.store_id, execution.session_id), execution.owner_epoch, execution.owner_token)
+        built.append((descriptor.kind, lease))
+        return await original_build(descriptor, execution)
+
+    runner.runtime.factory.build = build
     try:
         assert (await runner.send("start background")).status == "completed"
         receipt = _receipt(await store.load_all_messages(runner.target.session_id))
@@ -92,6 +106,8 @@ async def test_execute_freezes_original_tool_and_routes_result(registry_store, t
         )
         assert parent_rows[0]["kind"] == "background_result"
         assert "background result" in parent_rows[0]["content_json"]
+        assert {kind for kind, _ in built} == {"agent", "background"}
+        assert all(lease.released and not lease.lost for _, lease in built)
     finally:
         await runner.aclose()
 

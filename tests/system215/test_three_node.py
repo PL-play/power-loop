@@ -97,31 +97,111 @@ async def test_container_kill_repairs_unknown_without_replay(cluster, mode):
     assert (await c.result(sid, "continue"))["status"] == "completed"
 
 
+async def _workflow_leaves(c, driver):
+    facts = await c.call("b", "facts", events=["claim_return"])
+    rows = [row for row in facts if row.get("claimed") and row["kind"] == "agent"
+            and row.get("parent") == driver and row["send"] == 1]
+    leaves = {row["session"]: row["inputs"][0] for row in rows}
+    return leaves if len(leaves) == 2 else None
+
+
+async def _leaf_gates(c, leaves):
+    rows = await c.events("gate", node="b", phase="enter")
+    keys = {row["key"] for row in rows}
+    return rows if all(f"{leaf}:child" in keys for leaf in leaves) else None
+
+
+async def _pending_leaf_reads(c, driver, leaves):
+    reads = await c.call("b", "facts", events=["result_read_return"])
+    pending = {(row["session"], row["input"]) for row in reads
+               if row["actor"] == driver and not row["terminal"]}
+    return reads if all((leaf, input_id) in pending for leaf, input_id in leaves.items()) else None
+
+
+async def _results_delivered(c, expected, *, send=1):
+    facts = await c.call("b", "result_facts")
+    for target, input_id in expected.items():
+        if not any(
+            fact["session"] == target and fact["result_ref"]
+            and any(result["input"] == input_id and (send is None or result["send"] == send)
+                    and result["status"] == "completed" and result["delivery_error"] is None
+                    for result in fact["results"])
+            for fact in facts
+        ):
+            return None
+    return facts
+
+
+def _assert_workflow_result(result, driver, input_id, leaves):
+    assert result["input_ref"]["session_id"] == driver
+    assert result["input_ref"]["message_id"] == input_id
+    assert result["status"] == "completed"
+    nodes = result["structured_output"]["results"]
+    assert set(nodes) == {"N0", "N1"}
+    assert {node["session_id"] for node in nodes.values()} == set(leaves)
+    assert all(node["status"] == "completed" for node in nodes.values())
+
+
 @pytest.mark.parametrize("mode,kind", [("spawn", "agent"), ("workflow", "workflow_driver"),
                                        ("background", "background")])
 async def test_real_child_workflow_background_result_routes(cluster, mode, kind):
     c = cluster
-    await c.configure("abc", drop_notifications=True)
+    await c.configure("abc", drop_notifications=mode != "workflow")
     await c.configure("a", enabled=True, roles=["main"])
-    await c.configure("b", enabled=True, roles=["child", "workflow_driver", "background"])
+    await c.configure("b", enabled=True, roles=["child", "workflow_driver", "background"],
+                      delay_second_spawn=mode == "spawn")
     sid = await c.create(mode=mode, gates=[2])
     await c.send(sid)
-    await c.event("model", session=sid, node="a", call=2)
-    builds = [r for r in await c.events("build") if r["session"] != sid]
-    await c.until(lambda: c.events("build", node="b", kind=kind))
-    # Workflow leaves start asynchronously after the driver's first build.
+    [parent_call] = await c.event("model", session=sid, node="a", call=2)
+    tool_name = {"spawn": "spawn_agent", "workflow": "workflow", "background": "background_run"}[mode]
+    receipts = [json.loads(row["content"]) for row in parent_call["messages"]
+                if row["role"] == "tool" and row["name"] == tool_name]
+    expected = {row["target_ref"]["session_id"]: row["input_ref"]["message_id"] for row in receipts}
+    assert len(expected) == (2 if mode == "spawn" else 1)
+    if mode == "spawn":
+        await c.event("build", node="b", kind=kind)
+        legacy_builds = [r for r in await c.events("build") if r["session"] in expected]
+        delayed = set(expected) - {r["session"] for r in legacy_builds}
+        c.note("legacy_snapshot", expected=sorted(expected),
+               builds=[r["session"] for r in legacy_builds], omitted=sorted(delayed))
+        assert len(delayed) == 1
+        for target in delayed:
+            await c.release(target, "build")
+
+    async def expected_builds():
+        rows = [r for r in await c.events("build", node="b", kind=kind) if r["session"] in expected]
+        return rows if {r["session"] for r in rows} == set(expected) else None
+
+    builds = await c.until(expected_builds)
+    leaves = set()
     if mode == "workflow":
-        async def leaves_started():
-            return len([r for r in await c.events("model", node="b") if r["session"] != sid]) == 2
-        await c.until(leaves_started)
-    builds = [r for r in await c.events("build") if r["session"] != sid]
-    for child in {r["session"] for r in builds}:
+        driver, = expected
+        leaves = await c.until(lambda: _workflow_leaves(c, driver))
+        await c.until(lambda: _leaf_gates(c, leaves))
+        await c.until(lambda: _pending_leaf_reads(c, driver, leaves))
+    else:
+        suffix = "tool" if mode == "background" else "child"
+
+        async def target_gates():
+            rows = await c.events("gate", node="b", phase="enter")
+            keys = {r["key"] for r in rows}
+            return rows if all(f"{target}:{suffix}" in keys for target in expected) else None
+        await c.until(target_gates)
+    for child in set(expected) | set(leaves):
         await c.release(child, "child")
         await c.release(child, "tool")
-    async def all_finished():
-        statuses = [await c.call("b", "inspect", session=r["session"]) for r in builds]
-        return all(s["execution_state"] == "idle" for s in statuses)
-    await c.until(all_finished)
+
+    await c.until(lambda: _results_delivered(c, expected))
+    for target, input_id in expected.items():
+        result = await c.result(target, input_id)
+        assert result["status"] == "completed"
+        if mode == "workflow":
+            assert result["send_index"] == 1
+            _assert_workflow_result(result, target, input_id, leaves)
+            assert len(await c.events("build", session=target)) == 1
+    c.note("parent_release", session=sid, expected=expected, leaves=sorted(leaves), builds=[{
+        "session": row["session"], "send": row["send"], "epoch": row["epoch"], "kind": row["kind"],
+    } for row in builds])
     await c.release(sid, "model:2")
     assert (await c.result(sid))["status"] == "completed"
     async def parent_consumed():
@@ -132,6 +212,112 @@ async def test_real_child_workflow_background_result_routes(cluster, mode, kind)
     assert len(merged) == 1
     if mode == "spawn":
         assert merged[0]["content"].count('"kind":"agent_result"') == 2
+
+
+async def test_workflow_notification_loss_explicit_recovery(cluster):
+    c = cluster
+    await c.configure("abc", drop_notifications=True)
+    await c.configure("a", enabled=True, roles=["main"])
+    await c.configure("b", enabled=True, roles=["child", "workflow_driver", "background"])
+    sid = await c.create(mode="workflow", gates=[2])
+    await c.send(sid)
+    [parent_call] = await c.event("model", session=sid, node="a", call=2)
+    [receipt] = [json.loads(row["content"]) for row in parent_call["messages"]
+                 if row["role"] == "tool" and row["name"] == "workflow"]
+    driver = receipt["target_ref"]["session_id"]
+    driver_input = receipt["input_ref"]["message_id"]
+    await c.event("build", session=driver, node="b", kind="workflow_driver")
+    leaves = await c.until(lambda: _workflow_leaves(c, driver))
+    await c.until(lambda: _leaf_gates(c, leaves))
+    await c.until(lambda: _pending_leaf_reads(c, driver, leaves))
+    for leaf in leaves:
+        await c.release(leaf, "child")
+        await c.release(leaf, "tool")
+    await c.until(lambda: _results_delivered(c, leaves))
+
+    def driver_reads(rows):
+        return [row for row in rows if row["actor"] == driver
+                and (row["session"], row["input"]) in leaves.items()]
+
+    async def read_facts():
+        return await c.call("b", "facts", events=["result_read_return"])
+
+    initial_reads = driver_reads(await read_facts())
+    assert len(initial_reads) == 2 and all(not row["terminal"] for row in initial_reads)
+
+    async def successful_renews():
+        rows = await c.call("b", "facts", events=["renew_return"])
+        return len([row for row in rows if row["session"] == driver
+                    and row["epoch"] == 1 and row["renewed"]])
+
+    renews_before = await successful_renews()
+
+    async def two_more_renews():
+        return await successful_renews() >= renews_before + 2
+
+    await c.until(two_more_renews)
+    renews_after = await successful_renews()
+    assert driver_reads(await read_facts()) == initial_reads
+    assert not [row for row in await c.call("b", "result_facts") if row["session"] == driver]
+    status = await c.call("b", "inspect", session=driver, message_id=driver_input)
+    assert status["execution_state"] == "running" and status["terminal_status"] is None
+    assert not await c.events("gate", node="a", phase="exit", key=f"{sid}:model:2")
+
+    a_before = await c.health("a")
+    b_before = await c.health("b")
+    before_trace = await c.call("b", "trace")
+    c.note("before_explicit_recovery", parent=sid, driver=driver, driver_input=driver_input,
+           leaves=leaves, parent_boot=a_before["boot_id"], driver_boot=b_before["boot_id"],
+           successful_renews=renews_after)
+    c.save("before-explicit-recovery", {
+        "parent": sid, "driver": driver, "driver_input": driver_input, "leaves": leaves,
+        "parent_boot": a_before["boot_id"], "driver_boot": b_before["boot_id"],
+        "initial_driver_reads": initial_reads, "successful_renews": renews_after,
+        "driver_status": status, "trace": before_trace, "commands": c.commands,
+    })
+    c.note("explicit_recovery_now", action="restart_b", parent=sid, driver=driver,
+           parent_boot=a_before["boot_id"], old_driver_boot=b_before["boot_id"])
+    await c.docker("restart", "b")
+    await c.ready()
+    assert (await c.health("a"))["boot_id"] == a_before["boot_id"]
+    b_after = await c.health("b")
+    assert b_after["boot_id"] != b_before["boot_id"]
+    await c.configure("b", enabled=True, roles=["child", "workflow_driver", "background"],
+                      drop_notifications=True, delay_second_spawn=False)
+    c.note("explicit_recovery_configured", driver=driver, new_driver_boot=b_after["boot_id"])
+
+    await c.until(lambda: _results_delivered(c, {driver: driver_input}, send=None))
+    result = await c.result(driver, driver_input)
+    assert result["send_index"] > 1
+    _assert_workflow_result(result, driver, driver_input, leaves)
+    for leaf, input_id in leaves.items():
+        leaf_result = await c.result(leaf, input_id)
+        assert leaf_result["input_ref"]["message_id"] == input_id
+        assert leaf_result["status"] == "completed" and leaf_result["send_index"] == 1
+        models = await c.events("model", session=leaf)
+        builds = await c.events("build", session=leaf)
+        assert len(models) == 1 and models[0]["boot"] == b_before["boot_id"]
+        assert len(builds) == 1 and builds[0]["boot"] == b_before["boot_id"]
+        assert not await c.events("tool", session=leaf)
+
+    c.note("parent_release_after_explicit_recovery", parent=sid, driver=driver,
+           driver_input=driver_input, leaves=leaves)
+    await c.release(sid, "model:2")
+    parent_result = await c.result(sid)
+    assert parent_result["status"] == "completed"
+
+    async def parent_consumed():
+        rows = await c.messages(sid)
+        return [row for row in rows if row["role"] == "user" and "workflow_result" in row["content"]]
+
+    merged = await c.until(parent_consumed)
+    assert len(merged) == 1
+    c.save("after-explicit-recovery", {
+        "parent": sid, "driver": driver, "driver_input": driver_input, "leaves": leaves,
+        "parent_boot": (await c.health("a"))["boot_id"], "driver_boot": b_after["boot_id"],
+        "driver_result": result, "parent_result": parent_result, "merged_count": len(merged),
+        "trace": await c.call("b", "trace"), "commands": c.commands,
+    })
 
 
 @pytest.mark.parametrize("stage", ["accept", "claim", "final"])

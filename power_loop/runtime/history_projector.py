@@ -8,6 +8,9 @@ modified; the projection is derived and rebuildable.
 This module retains the original standalone ``DefaultDeterministicProjector`` helper. It is a
 custom ``Representation`` implementation (pass it as ``AgentLoopConfig.representation``); it is
 not the library default, which is :class:`power_loop.runtime.representation.ProjectedRepresentation`.
+The current loop uses a representation's project/render operations and obtains folding
+policy only from ``AgentLoopConfig.fold_strategy``. This helper's retained keep/trigger
+fields are not loop policy; its standalone ``compact()`` is not called by that path.
 
 * :class:`DefaultDeterministicProjector` — a generic, no-LLM structured summary: each tool
   call is summarized via its optional ``ToolDefinition.project`` hook (else a truncating
@@ -82,13 +85,12 @@ class ProjectedCompact:
 
 @runtime_checkable
 class HistoryProjector(Protocol):
-    """Strategy for the send-context projection layer. ``version`` is stamped on every row
-    so a later projector change leaves prior rows intact (and is auditable). ``keep_last_sends``
-    is how many most-recent finished sends stay individually projected before older ones are
-    folded into a ``compact`` row (0 = never compact). ``trigger_ratio`` is the fraction of the
-    loop's ``max_tokens`` the rendered projected prefix must reach before older sends fold
-    (the token-driven fold trigger; the loop reads it via ``getattr(..., 0.75)`` so a custom
-    projector that omits it still works, but declaring it keeps the contract explicit)."""
+    """Independent projection-helper protocol; ``version`` stamps derived rows.
+
+    The current loop uses project/render as its representation and reads keep/trigger
+    only from the configured FoldStrategy. The retained helper fields below do not
+    supply that policy or gate a direct call to this helper's compact().
+    """
 
     version: int
     keep_last_sends: int
@@ -105,7 +107,7 @@ class HistoryProjector(Protocol):
         ...
 
     def compact(self, rows: list[ProjectMessageRow]) -> ProjectedCompact | None:
-        """Fold a span of projection rows into one ``compact`` row (or None = don't)."""
+        """Standalone helper over supplied rows; the current loop uses FoldStrategy."""
         ...
 
 
@@ -133,11 +135,12 @@ def _parse_args(raw: Any) -> Any:
 def _validate_projector_params(
     *, version: int, keep_last_sends: int, trigger_ratio: float
 ) -> None:
-    """Fail-fast on the params shared by the shipped projectors, at construction (not deep in a
-    later run). ``version`` >= 1 because it is the projection-compatibility key the reader uses
-    to decide whether a stored row is faithfully renderable by the current projector (else it
-    falls back to verbatim). A NaN ``trigger_ratio`` fails both comparisons → rejected, so it can
-    never reach ``int(max_tokens * nan)`` (which would crash the fold)."""
+    """Validate this helper's parameters at construction, separately from FoldStrategy.
+
+    Version is the projection compatibility key; incompatible projections do not
+    authorize a verbatim fallback. The ratio comparison also rejects NaN here.
+    These checks do not make the helper's keep/trigger fields current loop policy.
+    """
     if version < 1:
         raise ValueError(
             f"projector version must be >= 1 (the projection-compatibility key); got {version!r}"
@@ -161,16 +164,15 @@ class DefaultDeterministicProjector:
 
     version: int = 1
     max_chars: int = 300  # per-field truncation budget; <= 0 = no truncation (unlimited)
-    keep_last_sends: int = 4  # most-recent sends ALWAYS kept individually (never folded)
-    #: Fold older sends into a compact row once the rendered projected prefix reaches
-    #: ``loop max_tokens × trigger_ratio`` (mirrors DefaultCompactor's policy) — token-driven,
-    #: not send-count-driven. The most-recent ``keep_last_sends`` are always preserved.
+    keep_last_sends: int = 4  # retained helper parameter, not the current loop's fold keep
+    #: Retained and validated helper parameter. The configured FoldStrategy owns
+    #: the current loop's trigger; this helper's compact() does not consult it.
     trigger_ratio: float = 0.75
     #: Hard cap (chars) on a rolled-forward ``compact`` row's rendered summary. This projector
     #: CONCATENATES (no LLM to summarize-to-shrink), so without a cap the compact — and thus the
-    #: rendered context — would grow without bound over a long session, defeating the token fold.
+    #: standalone summary — would grow without bound when repeatedly rolled forward.
     #: When the summary exceeds this, the OLDEST folded lines are dropped (their full detail stays
-    #: in pl_messages, recoverable via recall_send). 0 disables the cap (unbounded — old behavior).
+    #: in pl_messages, recoverable via recall_send). 0 disables the cap.
     max_compact_chars: int = 4000
 
     def __post_init__(self) -> None:
@@ -295,7 +297,8 @@ class DefaultDeterministicProjector:
         """Fold user/project rows (and an optional prior ``compact`` row, rolled forward so
         nothing is lost) into one summary. Deterministic concat, no LLM. ``from_send``/
         ``to_send`` are derived from the user/project send range; a leading prior-compact row's
-        own range is preserved by the caller via ``compact_from_send``."""
+        own range is preserved by the caller via ``compact_from_send``. This is a standalone
+        operation over the supplied rows, not the loop's automatic folding path."""
         lines: list[str] = []
         folded_sends: list[int] = []
         for r in rows:

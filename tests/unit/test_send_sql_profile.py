@@ -75,7 +75,7 @@ _LEGACY_RUNTIME_STORE_CALLS = (
     "agent.runtime_store:execution_input", "agent.runtime_store:result_input",
     "agent.runtime_store:discard_cancelled_result", "agent.runtime_store:fail_start",
     "agent.runtime_store:commit_result_and_parent_ref", "agent.runtime_store:_lock_result_sessions",
-    "agent.runtime_store:_commit_result", "agent.runtime_store:poll_notifications",
+    "agent.runtime_store:_commit_result",
 )
 
 
@@ -99,6 +99,18 @@ def _category(chain, sql=""):
         return "legacy_job_control"
     if any(c.startswith(_LEGACY_MODULES) or c in _LEGACY_RUNTIME_STORE_CALLS for c in chain):
         return "legacy_job_control"
+    if "runtime.store.process_guard:acquire" in chain and normalized in {
+        "select pg_try_advisory_lock($1)", "select get_lock(%s,0)",
+    }:
+        return "session_control"
+    if "runtime.store.process_guard:check" in chain and normalized == "select 1":
+        return "periodic" if "agent.runtime_worker:_watch_guard" in chain else "session_control"
+    if "agent.runtime_store:poll_notifications" in chain and re.match(r"\s*select\b", normalized):
+        if re.search(r"\bfrom\s+(?:[a-z0-9_]+_)?follow_up_queue\b", normalized):
+            return "periodic"
+        if ("agent.runtime_store:discover_unfinished" in chain
+                and re.search(r"\bfrom\s+(?:[a-z0-9_]+_)?session_state\b", normalized)):
+            return "periodic"
     # append_message touches activity at most once per second. Metadata's initial
     # write also touches activity, so cold/warm sends can differ by this timed write.
     if ("runtime.store.store:append_message" in chain
@@ -149,8 +161,13 @@ def _counts(records, tx_sites, tx_categories=None):
     counts.update({name + "_tx": 0 for name in _CATEGORIES})
     for record in records:
         counts[_category(record["chain"], record["sql"])] += 1
-    for category in tx_categories or [_category(chain) for chain in tx_sites]:
-        counts[category + "_tx"] += 1
+    if tx_categories is None:
+        tx_categories = [_category(chain) for chain in tx_sites]
+    for category in tx_categories:
+        if category is None:
+            counts["unfinished_transactions"] = counts.get("unfinished_transactions", 0) + 1
+        else:
+            counts[category + "_tx"] += 1
     counts.update(
         ordinary=counts["message"],
         control=counts["session_control"] + counts["legacy_job_control"],
@@ -197,12 +214,27 @@ class Profiled:
                 return category
         return _category(site)
 
+    def _reserve_transaction(self, site):
+        self.transactions += 1
+        index = len(self.tx_sites)
+        self.tx_sites.append(site)
+        # The index follows entry order even when exits overlap. A legacy window
+        # reset may clear only tx_sites, so discard categories from that old window.
+        self.tx_categories[index:] = [None]
+        return index
+
+    def _finish_transaction(self, index, site, measured):
+        # Reset can reuse the index and even the same call chain in a new window.
+        if index < len(self.tx_sites) and index < len(self.tx_categories) and self.tx_sites[index] is site:
+            self.tx_categories[index] = self._transaction_category(
+                measured.records if measured is not None else (), site,
+            )
+
     @asynccontextmanager
     async def transaction(self):
-        self.transactions += 1
         site = _sites()
-        self.tx_sites.append(site)
-        start = len(self.records)
+        index = self._reserve_transaction(site)
+        measured = None
         try:
             async with self.db.transaction() as tx:
                 measured = _Tx(self, tx)
@@ -212,19 +244,19 @@ class Profiled:
                     self.meter.max_tx_rows = max(self.meter.max_tx_rows, after[0] - measured.before[0])
                     self.meter.max_tx_bytes = max(self.meter.max_tx_bytes, after[1] - measured.before[1])
         finally:
-            self.tx_categories.append(self._transaction_category(self.records[start:], site))
+            self._finish_transaction(index, site, measured)
 
     @asynccontextmanager
     async def read_snapshot(self):
-        self.transactions += 1
         site = _sites()
-        self.tx_sites.append(site)
-        start = len(self.records)
+        index = self._reserve_transaction(site)
+        measured = None
         try:
             async with self.db.read_snapshot() as reader:
-                yield _Tx(self, reader)
+                measured = _Tx(self, reader)
+                yield measured
         finally:
-            self.tx_categories.append(self._transaction_category(self.records[start:], site))
+            self._finish_transaction(index, site, measured)
 
     async def fetchone(self, sql, params=()):
         result = await self.db.fetchone(sql, params)
@@ -246,6 +278,7 @@ class _Tx:
     def __init__(self, owner, tx):
         self.owner, self.tx = owner, tx
         self.before = None
+        self.records = []
 
     async def begin_meter(self, sql):
         # A PostgreSQL snapshot must set isolation before its first query.
@@ -256,26 +289,30 @@ class _Tx:
     def __getattr__(self, name):
         return getattr(self.tx, name)
 
+    def note(self, sql, rows=None):
+        self.owner.note(sql, rows)
+        self.records.append(self.owner.records[-1])
+
     async def execute(self, sql, params=()):
         await self.begin_meter(sql)
-        self.owner.note(sql)
+        self.note(sql)
         return await self.tx.execute(sql, params)
 
     async def execute_flag(self, sql, params=()):
         await self.begin_meter(sql)
-        self.owner.note(sql)
+        self.note(sql)
         return await self.tx.execute_flag(sql, params)
 
     async def fetchone(self, sql, params=()):
         await self.begin_meter(sql)
         result = await self.tx.fetchone(sql, params)
-        self.owner.note(sql, 0 if result is None else 1)
+        self.note(sql, 0 if result is None else 1)
         return result
 
     async def fetchall(self, sql, params=()):
         await self.begin_meter(sql)
         result = await self.tx.fetchall(sql, params)
-        self.owner.note(sql, len(result))
+        self.note(sql, len(result))
         return result
 
 def _executor_heartbeat(chain):
