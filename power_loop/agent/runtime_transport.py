@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -245,3 +246,132 @@ class DatabasePollingTransport(MemoryMessageTransport):
         if packet.channel == "output":
             return await super().publish(packet)
         return PublishReceipt(True)
+
+
+WakeCallback = Callable[[str, str], Awaitable[None]]
+CancelCallback = Callable[[str, str], Awaitable[None]]
+
+
+class WakeTransport(ABC):
+    """Session-Core wake/cancel transport interface (Design 217 §4.5 / P1-6).
+
+    Host integrations (e.g. Kafka/Redis) implement this interface; the SDK ships
+    two zero-middleware defaults: ``InMemoryWakeTransport`` (0 SQL, single-process)
+    and ``DatabasePollingWakeTransport`` (bounded indexed DB scan, multi-process).
+    """
+
+    @abstractmethod
+    async def publish_wake(self, session_id: str, *, reason: str = "accept") -> None:
+        """Notify workers that ``session_id`` has wakeable pending work."""
+
+    @abstractmethod
+    async def publish_cancel(self, session_id: str, *, cancel_by: str = "user") -> None:
+        """Hint active workers that ``session_id`` received a cancel/deactivate."""
+
+    @abstractmethod
+    async def subscribe(
+        self,
+        *,
+        on_wake: WakeCallback,
+        on_cancel: CancelCallback | None = None,
+    ) -> None:
+        """Register local worker callbacks."""
+
+    async def poll_once(self, *, limit: int = 32) -> list[str]:
+        """Pull-based discovery hook (no-op for push transports; bounded scan for DB polling)."""
+        return []
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Release resources cleanly."""
+
+
+class InMemoryWakeTransport(WakeTransport):
+    """Default 0-SQL single-process wake transport for embedded SDK mode."""
+
+    def __init__(self) -> None:
+        self._wake_handlers: list[WakeCallback] = []
+        self._cancel_handlers: list[CancelCallback] = []
+        self.published_wakes: list[tuple[str, str]] = []
+        self.published_cancels: list[tuple[str, str]] = []
+        self._closed = False
+
+    async def publish_wake(self, session_id: str, *, reason: str = "accept") -> None:
+        if self._closed:
+            return
+        self.published_wakes.append((session_id, reason))
+        for handler in list(self._wake_handlers):
+            await handler(session_id, reason)
+
+    async def publish_cancel(self, session_id: str, *, cancel_by: str = "user") -> None:
+        if self._closed:
+            return
+        self.published_cancels.append((session_id, cancel_by))
+        for handler in list(self._cancel_handlers):
+            await handler(session_id, cancel_by)
+
+    async def subscribe(
+        self,
+        *,
+        on_wake: WakeCallback,
+        on_cancel: CancelCallback | None = None,
+    ) -> None:
+        self._wake_handlers.append(on_wake)
+        if on_cancel is not None:
+            self._cancel_handlers.append(on_cancel)
+
+    async def aclose(self) -> None:
+        self._closed = True
+        self._wake_handlers.clear()
+        self._cancel_handlers.clear()
+
+
+class DatabasePollingWakeTransport(WakeTransport):
+    """Zero-middleware multi-process wake transport backed by bounded indexed DB scans.
+
+    ``poll_once(limit=32)`` issues 1 bounded index scan on ``sessions`` via
+    ``idx_session_recovery`` (``WHERE execution_state='queued' AND lifecycle='open'
+    AND wake_pending_count>0 ORDER BY session_id ASC LIMIT ?``).
+    """
+
+    def __init__(self, source, *, poll_interval_s: float = 1.0) -> None:
+        if poll_interval_s <= 0:
+            raise ValueError("poll_interval_s must be positive")
+        if not hasattr(source, "discover_queued"):
+            from .runtime_store import RuntimeInputStore
+            source = RuntimeInputStore(source)
+        self.source = source
+        self.poll_interval_s = poll_interval_s
+        self._wake_handlers: list[WakeCallback] = []
+        self._cancel_handlers: list[CancelCallback] = []
+        self._closed = False
+
+    async def publish_wake(self, session_id: str, *, reason: str = "accept") -> None:
+        return None
+
+    async def publish_cancel(self, session_id: str, *, cancel_by: str = "user") -> None:
+        return None
+
+    async def subscribe(
+        self,
+        *,
+        on_wake: WakeCallback,
+        on_cancel: CancelCallback | None = None,
+    ) -> None:
+        self._wake_handlers.append(on_wake)
+        if on_cancel is not None:
+            self._cancel_handlers.append(on_cancel)
+
+    async def poll_once(self, *, limit: int = 32) -> list[str]:
+        if self._closed:
+            return []
+        sids = await self.source.discover_queued(limit=limit)
+        for sid in sids:
+            for handler in list(self._wake_handlers):
+                await handler(sid, "db_poll")
+        return sids
+
+    async def aclose(self) -> None:
+        self._closed = True
+        self._wake_handlers.clear()
+        self._cancel_handlers.clear()

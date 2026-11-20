@@ -50,7 +50,7 @@ class WaitingModel(LLMService):
 async def running(store, coordinator, *, hooks=None, ttl_s=.3):
     model, factory = WaitingModel(), RegistryRuntimeFactory()
     async def build(descriptor, context):
-        assert context.owner_epoch > 0 and context.owner_token
+        assert context.owner_epoch > 0
         return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
     factory.register('test.agent@215', build)
     runtime = Runtime(store=store, factory=factory, node_id='test', coordinator=coordinator,
@@ -132,7 +132,7 @@ async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_sto
         # A real expired lease is taken by another store connection. The old tool
         # then observes its stale write permission; its hook must not retry it.
         await other._db.execute(
-            f"UPDATE {other.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+            f"UPDATE {other.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
             (execution.session_id,),
         )
         await RuntimeInputStore(other).recover(

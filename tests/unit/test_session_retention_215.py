@@ -26,10 +26,10 @@ async def test_active_inputs_pending_tools_and_remote_owner_are_protected(regist
     assert not await store.purge_expired(2**62, retention_days={'inbox': 0})
     await port.final(batch, final_text='done')
     # Pending tool evidence protects even an otherwise idle session.
-    await peer._db.execute(f'UPDATE {peer.t.session_state} SET pending_json=? WHERE session_id=?',
-                           ('{"tool_calls":[{"id":"unfinished"}]}', root.session_id))
+    await peer._db.execute(f'UPDATE {peer.t.sessions} SET pending_tool_seq=? WHERE session_id=?',
+                           (2, root.session_id))
     assert await store.close_if_idle(root.session_id) == 'busy'
-    await peer._db.execute(f'UPDATE {peer.t.session_state} SET pending_json=NULL WHERE session_id=?', (root.session_id,))
+    await peer._db.execute(f'UPDATE {peer.t.sessions} SET pending_tool_seq=NULL WHERE session_id=?', (root.session_id,))
     assert (await port.get_result(receipt.input_ref, actor=ACTOR)).final_text == 'done'
     assert await store.close_if_idle(root.session_id) == 'closed'
     assert (await store.get_session(root.session_id)).lifecycle == 'closing'
@@ -101,7 +101,7 @@ async def test_terminal_inputs_graph_projection_cleanup_and_row_limit(registry_s
             totals[k] = totals.get(k, 0) + v
         if await store.get_session(root.session_id) is None:
             break
-    assert totals == {'inbox': 1, 'projections': 1, 'runtime': 2, 'messages': 2, 'sessions': 2}
+    assert totals == {'inbox': 1, 'projections': 1, 'runtime': 2, 'messages': 2, 'sessions': 1}
     assert await store.get_session(root.session_id) is None
 
 

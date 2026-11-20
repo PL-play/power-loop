@@ -18,20 +18,53 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 @asynccontextmanager
 async def _waiter_probe(store, *, started, locked):
-    """Signal the waiter's transaction start and its state-lock acquisition.
+    """Signal the waiter's transaction start and its sessions row-lock acquisition.
 
     ``started`` is set before the backend opens its transaction (SQLite's write lock is
-    taken inside it); ``locked`` only after the state row lock is actually held. A waiter
-    that is blocked on the database therefore has ``started`` set and ``locked`` unset.
+    taken inside it); ``locked`` only after the first statement touching ``sessions``
+    completes (or ``lock_state`` completes). A waiter blocked on the database therefore
+    has ``started`` set and ``locked`` unset.
     """
     db = store._db
     original_transaction, original_lock = db.transaction, db.dialect.lock_state
+    sessions_table = store.t.sessions
+
+    class _ProbedTx:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def execute(self, sql, params=()):
+            res = await self._inner.execute(sql, params)
+            if sessions_table in sql:
+                locked.set()
+            return res
+
+        async def fetchone(self, sql, params=()):
+            res = await self._inner.fetchone(sql, params)
+            if sessions_table in sql:
+                locked.set()
+            return res
+
+        async def fetchall(self, sql, params=()):
+            res = await self._inner.fetchall(sql, params)
+            if sessions_table in sql:
+                locked.set()
+            return res
+
+        async def execute_packed(self, sql, params=()):
+            res = await self._inner.execute_packed(sql, params)
+            if sessions_table in sql:
+                locked.set()
+            return res
 
     @asynccontextmanager
     async def transaction():
         started.set()
         async with original_transaction() as tx:
-            yield tx
+            yield _ProbedTx(tx)
 
     async def lock(tx, state_table, session_id):
         row = await original_lock(tx, state_table, session_id)
@@ -45,6 +78,31 @@ async def _waiter_probe(store, *, started, locked):
     finally:
         db.transaction = original_transaction
         db.dialect.lock_state = original_lock
+
+
+@asynccontextmanager
+async def _hold_next_transaction(store, *, held, release):
+    """Pause the next transaction right before commit while holding its DB locks."""
+    db = store._db
+    original_transaction = db.transaction
+    armed = True
+
+    @asynccontextmanager
+    async def transaction():
+        nonlocal armed
+        async with original_transaction() as tx:
+            yield tx
+            if armed:
+                armed = False
+                held.set()
+                await release.wait()
+
+    db.transaction = transaction
+    try:
+        yield
+    finally:
+        release.set()
+        db.transaction = original_transaction
 
 
 async def _await_database_lock_wait(store):
@@ -62,7 +120,7 @@ async def _await_database_lock_wait(store):
         )
     else:
         return
-    param = f"%{store.table_prefix}session_state%"
+    param = f"%{store.table_prefix}sessions%"
     async with asyncio.timeout(5):
         while True:
             row = await store._db.fetchone(sql, (param,))
@@ -85,7 +143,7 @@ async def test_accept_is_idempotent_without_touching_idle_or_version(registry_st
         await port.accept(root, "new", message_id="expired", actor=ACTOR, deadline_ms=1)
     assert deadline_error.value.code == "deadline_expired"
     state = await store._db.fetchone(
-        f"SELECT execution_state,inbox_version FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT execution_state,inbox_version FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,),
     )
     assert state == {"execution_state": "queued", "inbox_version": 1}
@@ -94,7 +152,7 @@ async def test_accept_is_idempotent_without_touching_idle_or_version(registry_st
     assert idle_duplicate.state == "accepted"
     assert not idle_duplicate.newly_accepted and idle_duplicate.notification == "not_needed"
     state = await store._db.fetchone(
-        f"SELECT execution_state,inbox_version FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT execution_state,inbox_version FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,),
     )
     assert state == {"execution_state": "idle", "inbox_version": 1}
@@ -159,7 +217,7 @@ async def test_concurrent_accept_at_capacity_boundary_accepts_exactly_one(
     )
     assert len(rows) == 1
     state = await store._db.fetchone(
-        f"SELECT execution_state,inbox_version FROM {store.t.session_state} "
+        f"SELECT execution_state,inbox_version FROM {store.t.sessions} "
         "WHERE session_id=?", (root.session_id,),
     )
     assert state == {"execution_state": "queued", "inbox_version": 1}
@@ -171,18 +229,9 @@ async def test_accept_lock_wait_reads_the_committed_pending_count(registry_store
     port, waiter = RuntimeInputStore(store, inbox_item_limit=1), RuntimeInputStore(
         other, inbox_item_limit=1)
     root = await target(port)
-    original = store._db.dialect.lock_state
     locked, release = asyncio.Event(), asyncio.Event()
-
-    async def gated(tx, state_table, session_id):
-        row = await original(tx, state_table, session_id)
-        locked.set()
-        await release.wait()
-        return row
-
     started, reached = asyncio.Event(), asyncio.Event()
-    store._db.dialect.lock_state = gated
-    try:
+    async with _hold_next_transaction(store, held=locked, release=release):
         async with _waiter_probe(other, started=started, locked=reached):
             first = asyncio.create_task(
                 port.accept(root, "first", message_id="a", actor=ACTOR))
@@ -196,8 +245,6 @@ async def test_accept_lock_wait_reads_the_committed_pending_count(registry_store
             assert (await first).newly_accepted
             with pytest.raises(CapacityError):
                 await second
-    finally:
-        store._db.dialect.lock_state = original
     rows = await store._db.fetchall(
         f"SELECT item_id FROM {store.t.follow_up_queue} ORDER BY item_id")
     assert [row["item_id"] for row in rows] == ["a"]
@@ -211,18 +258,9 @@ async def test_close_and_accept_serialize_on_the_state_lock(registry_store, orde
         (store, other) if order == "close-first" else (other, store))
     holder, waiter = RuntimeInputStore(holder_store), RuntimeInputStore(waiter_store)
     root = await target(holder)
-    original = holder_store._db.dialect.lock_state
     held, release = asyncio.Event(), asyncio.Event()
-
-    async def gated(tx, state_table, session_id):
-        row = await original(tx, state_table, session_id)
-        held.set()
-        await release.wait()
-        return row
-
     started, reached = asyncio.Event(), asyncio.Event()
-    holder_store._db.dialect.lock_state = gated
-    try:
+    async with _hold_next_transaction(holder_store, held=held, release=release):
         async with _waiter_probe(waiter_store, started=started, locked=reached):
             if order == "close-first":
                 first = asyncio.create_task(holder.close(root, actor=ACTOR))
@@ -247,9 +285,6 @@ async def test_close_and_accept_serialize_on_the_state_lock(registry_store, orde
             else:
                 with pytest.raises(SessionBusy):
                     await asyncio.wait_for(second, 5)
-    finally:
-        release.set()
-        holder_store._db.dialect.lock_state = original
 
     session = await store._db.fetchone(
         f"SELECT lifecycle FROM {store.t.sessions} WHERE session_id=?",
@@ -260,7 +295,7 @@ async def test_close_and_accept_serialize_on_the_state_lock(registry_store, orde
         (root.session_id,),
     )
     state = await store._db.fetchone(
-        f"SELECT inbox_version FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT inbox_version FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,),
     )
     if order == "close-first":
@@ -372,19 +407,15 @@ async def test_capability_is_decided_before_owner_in_a_concurrent_claim(registry
     port, capable_port = RuntimeInputStore(store), RuntimeInputStore(other)
     root = await target(port)
     await port.accept(root, "go", message_id="m1", actor=ACTOR)
-    original = store._db.dialect.lock_state
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def gated(tx, state_table, session_id):
-        row = await original(tx, state_table, session_id)
+    def gated_can_execute(descriptor):
         entered.set()
-        await release.wait()
-        return row
+        return False
 
-    store._db.dialect.lock_state = gated
-    try:
+    async with _hold_next_transaction(store, held=entered, release=release):
         incapable = asyncio.create_task(port.claim(
-            root, node_id="incapable", boot_id="i", can_execute=lambda descriptor: False))
+            root, node_id="incapable", boot_id="i", can_execute=gated_can_execute))
         await asyncio.wait_for(entered.wait(), 5)
         # The capable node starts while the incapable one holds the state lock.
         capable = asyncio.create_task(capable_port.claim(
@@ -392,16 +423,14 @@ async def test_capability_is_decided_before_owner_in_a_concurrent_claim(registry
         await asyncio.sleep(0)
         release.set()
         first, second = await asyncio.wait_for(asyncio.gather(incapable, capable), 5)
-    finally:
-        store._db.dialect.lock_state = original
     assert first is None and second is not None
     assert second.owner_node_id == "capable"
     state = await store._db.fetchone(
-        f"SELECT execution_state,active_send_index,owner_node_id,owner_token "
-        f"FROM {store.t.session_state} WHERE session_id=?", (root.session_id,))
+        f"SELECT execution_state,send_index,owner_node_id,owner_epoch "
+        f"FROM {store.t.sessions} WHERE session_id=?", (root.session_id,))
     assert state["execution_state"] == "running"
-    assert state["active_send_index"] == second.send_index
-    assert state["owner_node_id"] == "capable" and state["owner_token"] == second.owner_token
+    assert state["send_index"] == second.send_index
+    assert state["owner_node_id"] == "capable" and state["owner_epoch"] == second.owner_epoch
     messages = await port.messages(root, actor=ACTOR)
     assert len(messages.items) == 1 and messages.items[0].send_index == second.send_index
 
@@ -420,10 +449,9 @@ async def test_claim_rollback_does_not_report_a_batch(registry_store, monkeypatc
     with pytest.raises(StoreError):
         await port.claim(root, node_id="a", boot_id="a")
     state = await store._db.fetchone(
-        f"SELECT execution_state,active_send_index,owner_token FROM {store.t.session_state} "
+        f"SELECT execution_state,owner_node_id FROM {store.t.sessions} "
         "WHERE session_id=?", (root.session_id,))
-    assert state == {"execution_state": "queued", "active_send_index": None,
-                     "owner_token": None}
+    assert state == {"execution_state": "queued", "owner_node_id": None}
     pending = await store._db.fetchone(
         f"SELECT status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='m1'",
         (root.session_id,))
@@ -464,16 +492,7 @@ async def test_final_only_completes_consumed_and_never_claims_at_final_boundary(
     for message_id in ("one", "two"):
         await port.accept(root, message_id, message_id=message_id, actor=ACTOR)
     batch = await port.claim(root, node_id="a", boot_id="a")
-    original_lock = store._db.dialect.lock_state
     entered, release, accept_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
-
-    async def paused_lock(*args, **kwargs):
-        row = await original_lock(*args, **kwargs)
-        entered.set()
-        await release.wait()
-        return row
-
-    store._db.dialect.lock_state = paused_lock
     transaction = other.store._db.transaction
 
     @asynccontextmanager
@@ -483,15 +502,16 @@ async def test_final_only_completes_consumed_and_never_claims_at_final_boundary(
             yield tx
 
     other.store._db.transaction = signaled_transaction
-    finishing = asyncio.create_task(port.final(
-        batch, consumed=(batch.input_refs[0],), final_text="first result"
-    ))
-    await entered.wait()
-    accepting = asyncio.create_task(other.accept(root, "late", message_id="late", actor=ACTOR))
-    await accept_started.wait()
-    release.set()
-    final = await finishing
-    await accepting
+    async with _hold_next_transaction(store, held=entered, release=release):
+        finishing = asyncio.create_task(port.final(
+            batch, consumed=(batch.input_refs[0],), final_text="first result"
+        ))
+        await asyncio.wait_for(entered.wait(), 5)
+        accepting = asyncio.create_task(other.accept(root, "late", message_id="late", actor=ACTOR))
+        await asyncio.wait_for(accept_started.wait(), 5)
+        release.set()
+        final = await finishing
+        await accepting
     assert final.execution_state == "queued"
     consumed, unconsumed = batch.input_refs
     assert (await other.inspect(consumed, actor=ACTOR)).terminal_status == "completed"
@@ -568,34 +588,28 @@ async def test_accept_read_aggregates_pending_and_waiting_once(registry_store):
     other = await target(port, session_id="aggregate-other")
     await port.accept(root, "汉字正文", message_id="a", actor=ACTOR)
     await port.accept(root, "second body", message_id="b", actor=ACTOR)
-    await store._db.execute(
-        f"UPDATE {store.t.follow_up_queue} SET status='waiting_continuation',"
-        "delivered_at=1,delivered_seq=1,delivered_send_index=1 "
-        "WHERE session_id=? AND item_id='b'", (root.session_id,),
-    )
-    # A terminated row is not part of the pending capacity aggregate.
-    await port.accept(root, "finished", message_id="c", actor=ACTOR)
-    await store._db.execute(
-        f"UPDATE {store.t.follow_up_queue} SET status='void',terminal_status='cancelled',"
-        "completed_at=1 WHERE session_id=? AND item_id='c'", (root.session_id,),
-    )
-    # Another session's pending input must not leak into this session's aggregate.
+    # A cancelled row is removed from the pending capacity counters.
+    c_receipt = await port.accept(root, "finished", message_id="c", actor=ACTOR)
+    await port.cancel(c_receipt.input_ref, actor=ACTOR)
+    # Another session's pending input must not leak into this session's counters.
     await port.accept(other, "other session", message_id="other", actor=ACTOR)
     rows = await store._db.fetchall(
         f"SELECT content_json,meta_json FROM {store.t.follow_up_queue} "
-        "WHERE session_id=? AND status IN ('pending','waiting_continuation')",
+        "WHERE session_id=? AND status='pending'",
         (root.session_id,),
     )
     expected_count = len(rows)
     expected_bytes = sum(_stored_bytes(r["content_json"]) + _stored_bytes(r["meta_json"])
                          for r in rows)
-    async with store._db.transaction() as tx:
-        current = await port._accept_read(tx, root.session_id, "absent")
-    assert current["id"] is None
+    current = await store._db.fetchone(
+        f"SELECT pending_count,pending_bytes FROM {store.t.sessions} WHERE session_id=?",
+        (root.session_id,),
+    )
     assert int(current["pending_count"]) == expected_count == 2
     assert int(current["pending_bytes"]) == expected_bytes
     assert expected_bytes > len("汉字正文".encode())  # multibyte body counted in UTF-8 bytes
     with pytest.raises(RuntimeRequestError) as missing:
-        async with store._db.transaction() as tx:
-            await port._accept_read(tx, "missing-session", "absent")
+        await port.accept(
+            type(root)(store.store_id, "missing-session"), "body", message_id="absent", actor=ACTOR,
+        )
     assert missing.value.code == "not_found"

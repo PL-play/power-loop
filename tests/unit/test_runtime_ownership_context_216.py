@@ -76,7 +76,7 @@ async def test_worker_retires_actual_external_handle_before_cleanup(registry_sto
         lease = current_ownership()
         lease.require_owned()
         execution = context.values["execution"]
-        assert (lease.epoch, lease.token) == (execution.owner_epoch, execution.owner_token)
+        assert lease.epoch == execution.owner_epoch
 
     async def on_finished(context):
         assert current_ownership() is None
@@ -100,7 +100,7 @@ async def test_worker_retires_actual_external_handle_before_cleanup(registry_sto
         assert lease is acquired[-1] is runtime.worker._active[execution.session_id].ownership
         lease.require_owned()
         assert lease.key == (execution.store_id, execution.session_id)
-        assert (lease.epoch, lease.token) == (execution.owner_epoch, execution.owner_token)
+        assert lease.epoch == execution.owner_epoch
         seen.append(lease)
         with independent_execution_scope():
             assert current_ownership() is None
@@ -166,7 +166,7 @@ async def test_worker_retires_actual_external_handle_before_cleanup(registry_sto
         assert resources.closed == (exit_kind not in {"build_failure", "release_failure", "empty_claim"})
         if exit_kind in {"build_failure", "empty_claim"}:
             state = await store._db.fetchone(
-                f"SELECT execution_state FROM {store.t.session_state} WHERE session_id=?",
+                f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?",
                 (root.session_id,),
             )
             assert state["execution_state"] == "queued"

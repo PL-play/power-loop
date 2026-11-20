@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def test_cancelled_lock_wait_does_not_replace_cancellation_with_rollback_disconnect(registry_store):
     store, _ = registry_store
-    db, table = store._db, store.t.session_state
+    db, table = store._db, store.t.sessions
     sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     assert await db.execute(f'UPDATE {table} SET inbox_version=? WHERE session_id=?', (1, sid)) == 1
     if db.dialect.name == 'sqlite':

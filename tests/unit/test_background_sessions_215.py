@@ -79,8 +79,8 @@ async def test_execute_freezes_original_tool_and_routes_result(registry_store, t
         lease = current_ownership(store, execution.session_id)
         assert lease is runner.runtime.worker._active[execution.session_id].ownership
         lease.require_owned()
-        assert (lease.key, lease.epoch, lease.token) == (
-            (execution.store_id, execution.session_id), execution.owner_epoch, execution.owner_token)
+        assert (lease.key, lease.epoch) == (
+            (execution.store_id, execution.session_id), execution.owner_epoch)
         built.append((descriptor.kind, lease))
         return await original_build(descriptor, execution)
 
@@ -190,7 +190,7 @@ async def test_crash_after_execute_is_interrupted_and_not_replayed(registry_stor
             await asyncio.sleep(0.01)
         assert crashed and calls == 1
         await store._db.execute(
-            f"UPDATE {store.t.session_state} SET owner_lease_until_ms=0 WHERE session_id=?",
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?",
             (start.session_id,),
         )
         recovered = await runner.runtime.worker.inputs.recover(

@@ -74,7 +74,7 @@ async def test_200_rounds_read_history_once_at_entry(registry_store):
         # past history to load, and there is NO per-round reload of messages.
         history_selects = [r for r in profiled.records
                            if r["sql"].upper().startswith("SELECT") and messages_table in r["sql"]
-                           and not any("get_result" in c for c in r["chain"])]
+                           and not any("get_result" in c or "read_result_state" in c for c in r["chain"])]
         assert history_selects == [], [r["sql"] for r in history_selects]
         # The projection save is the only writer; on a cold session its statistics path needs
         # at most the combined compact/existence read (the window read is skipped for send 1).
@@ -108,7 +108,6 @@ async def test_projection_coverage_and_owner_fence(registry_store):
 
     class Lease:
         epoch = batch.owner_epoch
-        token = batch.owner_token
 
     projector = ProjectedRepresentation()
     rows = await store.load_active_messages(root.session_id, send_index=batch.send_index)
@@ -146,7 +145,7 @@ async def test_next_seq_fence_and_gaps(registry_store):
     first = await port.claim(root, node_id="a", boot_id="a")
     await port.final(first, final_text="before result")
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET next_seq=next_seq+3 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET next_seq=next_seq+3 WHERE session_id=?",
         (root.session_id,),
     )
     await port.accept(root, "after", message_id="after", actor=ACTOR)

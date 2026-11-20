@@ -19,11 +19,16 @@ class SessionHolding:
         self.assistant_ref = None
         self.ownership = ownership
         self.next_seq = None
-        self.pending_known, self.pending_json = False, None
+        self.pending_known, self.pending_tool_seq = False, None
         self.deferred_round = None
         self.touched = 0
         self.change_snapshot = None
         self.appended_call = None
+        # Piggyback boundary state for tool rounds (Design 217 §4.3):
+        self.wake_inbox_seq: int | None = None
+        self.cancel_seq: int | None = None
+        self.piggyback_boundary: dict | None = None
+        self.piggyback_verified: bool = False
 
     def retire(self):
         self.active = False
@@ -31,8 +36,11 @@ class SessionHolding:
         self.runtime.clear()
         self.assistant_send_index = self.assistant_ref = None
         self.next_seq = self.deferred_round = None
-        self.pending_known, self.pending_json = False, None
+        self.pending_known, self.pending_tool_seq = False, None
         self.touched, self.change_snapshot, self.appended_call = 0, None, None
+        self.wake_inbox_seq = self.cancel_seq = None
+        self.piggyback_boundary = None
+        self.piggyback_verified = False
 
 
 def current(store, sid):

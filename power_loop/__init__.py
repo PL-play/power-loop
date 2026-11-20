@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "13.0.0"
+__version__ = "14.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -48,12 +48,15 @@ from power_loop.agent.runtime import (
 from power_loop.agent.runtime_client import OutputSubscription, RuntimeClient
 from power_loop.agent.runtime_transport import (
     DatabasePollingTransport,
+    DatabasePollingWakeTransport,
+    InMemoryWakeTransport,
     MemoryMessageTransport,
     MessageTransport,
     PublishReceipt,
     SubscriptionSpec,
     TransportCapabilities,
     TransportPacket,
+    WakeTransport,
 )
 from power_loop.agent.runtime_types import (
     CancelPropagation as CancelPropagation,
@@ -352,7 +355,7 @@ _logging.getLogger("power_loop").addHandler(_logging.NullHandler())
 # The authoritative STABLE tier (single source of truth — tests assert the module
 # docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed
 # without a major bump). Add freely; never remove/rename within a major version.
-STABLE_API = ('AgentEventBus', 'AgentHooks', 'AgentLoopConfig', 'AgentLoopResult', 'CancellationRequested', 'CancellationToken', 'CapacityError', 'CancelPropagation', 'CostExtractor', 'DatabasePollingTransport', 'DefaultCostExtractor', 'DefaultTokenUsageExtractor', 'ExecutionContext', 'ExecutionEnvironment', 'ExecutionState', 'FieldCostExtractor', 'FieldTokenUsageExtractor', 'HookDirective', 'HookPoint', 'InputRef', 'InputState', 'Lifecycle', 'LLMProviderConfig', 'LLMRequest', 'LLMResponse', 'LLMRetryExhausted', 'LLMRetryPolicy', 'LLMService', 'LLMStreamChunk', 'LLMTimeout', 'MemoryMessageTransport', 'MemorySessionOwnershipCoordinator', 'MessagePage', 'MessageRow', 'MessageState', 'MessageTransport', 'ModelCapabilities', 'ModelCapabilityError', 'OutputSubscription', 'PowerLoopError', 'Priority', 'ProviderCost', 'PublishReceipt', 'Receipt', 'RegistryRuntimeFactory', 'RequestOptions', 'ResponseExtractionError', 'ResponseMetrics', 'Result', 'ResultKind', 'Runtime', 'RuntimeClient', 'RuntimeDescriptor', 'RuntimeFactory', 'RuntimeRequestError', 'RuntimeWorker', 'SessionBusy', 'SessionKind', 'SessionLeaseLost', 'SessionNotFoundError', 'SessionOwnership', 'SessionOwnershipCoordinator', 'SessionPage', 'SessionStore', 'ShutdownResult', 'StatefulAgentLoop', 'Status', 'StoreBlackboard', 'StoreError', 'StoreSessionOwnershipCoordinator', 'StoreTimerBackend', 'SubscriptionSpec', 'TargetRef', 'TerminalStatus', 'TimerBackend', 'TimerContext', 'TimerDriver', 'TimerDriverStatus', 'TimerRunner', 'TokenUsageExtractor', 'ToolDefinition', 'ToolRegistry', 'TransportCapabilities', 'TransportPacket', 'TrustedActor', 'WaitTimeout', 'create_llm_service_from_config', 'create_llm_service_from_env', 'result_message_id', 'timer_context')
+STABLE_API = ('AgentEventBus', 'AgentHooks', 'AgentLoopConfig', 'AgentLoopResult', 'CancellationRequested', 'CancellationToken', 'CapacityError', 'CancelPropagation', 'CostExtractor', 'DatabasePollingTransport', 'DatabasePollingWakeTransport', 'DefaultCostExtractor', 'DefaultTokenUsageExtractor', 'ExecutionContext', 'ExecutionEnvironment', 'ExecutionState', 'FieldCostExtractor', 'FieldTokenUsageExtractor', 'HookDirective', 'HookPoint', 'InMemoryWakeTransport', 'InputRef', 'InputState', 'Lifecycle', 'LLMProviderConfig', 'LLMRequest', 'LLMResponse', 'LLMRetryExhausted', 'LLMRetryPolicy', 'LLMService', 'LLMStreamChunk', 'LLMTimeout', 'MemoryMessageTransport', 'MemorySessionOwnershipCoordinator', 'MessagePage', 'MessageRow', 'MessageState', 'MessageTransport', 'ModelCapabilities', 'ModelCapabilityError', 'OutputSubscription', 'PowerLoopError', 'Priority', 'ProviderCost', 'PublishReceipt', 'Receipt', 'RegistryRuntimeFactory', 'RequestOptions', 'ResponseExtractionError', 'ResponseMetrics', 'Result', 'ResultKind', 'Runtime', 'RuntimeClient', 'RuntimeDescriptor', 'RuntimeFactory', 'RuntimeRequestError', 'RuntimeWorker', 'SessionBusy', 'SessionKind', 'SessionLeaseLost', 'SessionNotFoundError', 'SessionOwnership', 'SessionOwnershipCoordinator', 'SessionPage', 'SessionStore', 'ShutdownResult', 'StatefulAgentLoop', 'Status', 'StoreBlackboard', 'StoreError', 'StoreSessionOwnershipCoordinator', 'StoreTimerBackend', 'SubscriptionSpec', 'TargetRef', 'TerminalStatus', 'TimerBackend', 'TimerContext', 'TimerDriver', 'TimerDriverStatus', 'TimerRunner', 'TokenUsageExtractor', 'ToolDefinition', 'ToolRegistry', 'TransportCapabilities', 'TransportPacket', 'TrustedActor', 'WaitTimeout', 'WakeTransport', 'create_llm_service_from_config', 'create_llm_service_from_env', 'result_message_id', 'timer_context')
 
 __all__ = [
     "SessionOwnership",
@@ -395,6 +398,7 @@ __all__ = [
 	"TimerRow",
 	"TimerRunner",
 	"TimerBackend", "TimerContext", "timer_context", "TimerDriver", "TimerDriverStatus", "StoreTimerBackend",
+	"WakeTransport", "InMemoryWakeTransport", "DatabasePollingWakeTransport",
 	"TimerFireCtx",
 	"TimerFiredPayload",
 	"SessionStatus",

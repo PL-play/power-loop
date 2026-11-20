@@ -48,7 +48,7 @@ _MESSAGE_TABLES = (
     "notes", "hook_events", "context_cache", "context_attempts",
 )
 _SESSION_TABLES = (
-    "sessions", "session_state", "follow_up_queue", "session_runtime_state", "shared_state",
+    "sessions", "follow_up_queue", "session_runtime_state", "shared_state",
     "background_tasks", "timers",
 )
 _LEGACY_MODULES = (
@@ -109,7 +109,7 @@ def _category(chain, sql=""):
         if re.search(r"\bfrom\s+(?:[a-z0-9_]+_)?follow_up_queue\b", normalized):
             return "periodic"
         if ("agent.runtime_store:discover_unfinished" in chain
-                and re.search(r"\bfrom\s+(?:[a-z0-9_]+_)?session_state\b", normalized)):
+                and re.search(r"\bfrom\s+(?:[a-z0-9_]+_)?sessions\b", normalized)):
             return "periodic"
     # append_message touches activity at most once per second. Metadata's initial
     # write also touches activity, so cold/warm sends can differ by this timed write.
@@ -303,6 +303,11 @@ class _Tx:
         self.note(sql)
         return await self.tx.execute_flag(sql, params)
 
+    async def execute_packed(self, sql, params=()):
+        await self.begin_meter(sql)
+        self.note(sql)
+        return await self.tx.execute_packed(sql, params)
+
     async def fetchone(self, sql, params=()):
         await self.begin_meter(sql)
         result = await self.tx.fetchone(sql, params)
@@ -342,7 +347,7 @@ class _ProfileModel(LLMService):
 
 
 async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
-                   lose_notifications=False):
+                   lose_notifications=False, fused=True):
     from tests.write_meter import WriteMeter
 
     original = store._db
@@ -356,8 +361,10 @@ async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
     registry.register(ToolDefinition("echo", "Return input", input_schema={
         "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("fixture")), echo)
     model = _ProfileModel(models, tools_per_round)
+    use_fused = bool(fused) and backlog == 1 and not lose_notifications
     agent = await RunningAgent(store, model, registry,
-                               AgentLoopConfig(max_rounds=models + 1, max_tokens=20, context_budget_tokens=10**9)).start()
+                               AgentLoopConfig(max_rounds=models + 1, max_tokens=20, context_budget_tokens=10**9),
+                               fuse_local_send=use_fused).start()
     try:
         if lose_notifications:
             async def lost(packet):
@@ -367,8 +374,8 @@ async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
             model.calls = 0
             assert (await agent.send(f"history {index}")).status == "completed"
             await agent.drain()
-        # Hold notifications so the measured send is claimed exactly once (one batch),
-        # then drive the worker task directly — no client wait polling in the profile.
+        # Hold notifications on standard 3-tx/backlog runs so the measured send is
+        # claimed in one deterministic batch without client wait polling.
         async def held(packet):
             return PublishReceipt(False)
         agent.runtime.transport.publish = held
@@ -387,7 +394,8 @@ async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
             mid = f"b{i}" if backlog > 1 else "run"
             receipt = await agent.runtime.client.send(agent.target, body, message_id=mid, actor=agent.actor)
             refs.append(receipt.input_ref)
-        await agent.runtime.worker.recover()
+        if not use_fused:
+            await agent.runtime.worker.recover()
         await agent.drain(after_input=refs[0])
         measured_ref = refs[0]
         result = await agent.runtime.client.inputs.get_result(measured_ref, actor=agent.actor)
@@ -403,6 +411,7 @@ async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
                 f.write(json.dumps({
                     "db": original.dialect.name, "models": models, "tools_per_round": tools_per_round,
                     "history": history, "backlog": backlog, "lose_notifications": lose_notifications,
+                    "fused": use_fused,
                     "total_sql": len(records), "counts": _counts(records, tx_sites, tx_categories),
                     "transactions": transactions, "writes": writes, "elapsed_s": elapsed_s,
                 }) + "\n")
@@ -423,11 +432,12 @@ def _per_round_ceiling(db, tools_per_round):
 async def test_frozen_fixed_send_budget(registry_store):
     """P0-R2's fixed allowance includes the complete ordinary send, not only growth."""
     store, _ = registry_store
-    records, _, sites, _, _ = await _measure(store, 1)
+    records, _, sites, _, _ = await _measure(store, 1, fused=False)
     fixed = sum(_category(record["chain"], record["sql"]) != "periodic" for record in records)
     maximum = 24 if store._db.dialect.name == "mysql" else 22
     control_transactions = sum(any(site in {
-        "agent.runtime_store:accept", "agent.runtime_store:claim", "agent.runtime_store:final",
+        "agent.runtime_store:accept", "agent.runtime_store:accept_and_claim",
+        "agent.runtime_store:claim", "agent.runtime_store:final",
     } for site in chain) for chain in sites)
     assert control_transactions <= 3, control_transactions
     assert fixed <= maximum, {"fixed_sql": fixed, "frozen_maximum": maximum}
@@ -443,14 +453,8 @@ async def test_send_sql_profile(registry_store, models, tools_per_round):
     counts = _counts(records, tx_sites, tx_categories)
     assert counts["legacy_job_control"] == 0, counts
     assert counts["billing"] == 0, counts
-    # Per-round growth (model + tool round incl. the boundary inbox_version read) stays
-    # within the frozen session-native budget; control SQL never references job tables.
     if models >= 2:
         one, *_ = await _measure(store, 1, tools_per_round=tools_per_round)
-        # Marginal cost per additional round. The time-based session activity touch
-        # (UPDATE sessions SET updated_at, <=1/sec of send duration) is periodic, not a
-        # per-round control cost. Timer polling is independently scheduled too; both
-        # remain counted in raw total SQL / periodic, outside the per-round marginal.
         def non_periodic(recs):
             return [r for r in recs if _category(r["chain"], r["sql"]) != "periodic"
                         and not re.search(r"UPDATE \S*sessions SET updated_at", r["sql"])]
@@ -465,8 +469,6 @@ async def test_send_sql_independent_of_history(registry_store):
     cold_counts = _counts(cold, [], None)
     warm_counts = _counts(warm, [], None)
     assert cold_counts["legacy_job_control"] == 0 and warm_counts["legacy_job_control"] == 0
-    # Control SQL is independent of how many prior sends the session has. The entry history
-    # read stays ONE query; only the number of rows it returns grows with history.
     assert warm_counts["session_control"] == cold_counts["session_control"], (cold_counts, warm_counts)
 
     def entry_rows(records):
@@ -481,11 +483,10 @@ async def test_send_sql_independent_of_history(registry_store):
 @pytest.mark.parametrize("backlog", [1, 20])
 async def test_batch_input_sql_profile(registry_store, backlog):
     store, _ = registry_store
-    records, transactions, tx_sites, _, tx_categories = await _measure(store, 1, backlog=backlog)
+    records, transactions, tx_sites, _, tx_categories = await _measure(
+        store, 1, backlog=backlog, fused=False)
     counts = _counts(records, tx_sites, tx_categories)
     assert counts["legacy_job_control"] == 0
-    # A 20-input backlog is ONE claim batch / one model run (asserted in _measure via
-    # model.calls==1). Each input is accepted in its own transaction, then one claim/final.
     claim_tx = sum(1 for chain in tx_sites if any("runtime_store:claim" in c for c in chain))
     assert claim_tx == 1, counts
     assert counts["session_control_tx"] <= backlog + 3, counts
@@ -494,7 +495,92 @@ async def test_batch_input_sql_profile(registry_store, backlog):
 async def test_notification_loss_sql_profile(registry_store):
     store, _ = registry_store
     records, transactions, tx_sites, _, tx_categories = await _measure(
-        store, 2, lose_notifications=True)
+        store, 2, lose_notifications=True, fused=False)
     counts = _counts(records, tx_sites, tx_categories)
     assert counts["legacy_job_control"] == 0
     assert counts["billing"] == 0
+
+
+def _split_m1a_core_vs_m1b(records):
+    """Separate M1a core control SQL from M1b projection_fold and test harness reads."""
+    core_ctrl, m1b_ctrl, harness_ctrl, business = [], [], [], []
+    for rec in records:
+        cat = _category(rec["chain"], rec["sql"])
+        chain_str = " ".join(rec["chain"])
+        if cat == "message":
+            business.append(rec)
+        elif cat == "session_control":
+            if "projection_fold:" in chain_str:
+                m1b_ctrl.append(rec)
+            elif "get_result" in chain_str or "read_result_state" in chain_str or "discover_unfinished" in chain_str:
+                harness_ctrl.append(rec)
+            else:
+                core_ctrl.append(rec)
+    return core_ctrl, m1b_ctrl, harness_ctrl, business
+
+
+async def test_m1a_fused_2tx_sql_profile(registry_store):
+    """Design 217 M1a fused 2-tx: core control SQL == 3/3/4 (SQLite/PG/MySQL), 2 control txs."""
+    store, _ = registry_store
+    db = store._db.dialect.name
+    records, _, tx_sites, _, tx_categories = await _measure(store, 1, fused=True)
+    counts = _counts(records, tx_sites, tx_categories)
+    core_ctrl, m1b_ctrl, _, business = _split_m1a_core_vs_m1b(records)
+    core_txs = [
+        chain for chain in tx_sites
+        if any(s in {"agent.runtime_store:accept_and_claim", "agent.runtime_store:final"} for s in chain)
+    ]
+    assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+    assert len(core_txs) == 2, tx_sites
+    expected_core = 4 if db == "mysql" else 3
+    assert len(core_ctrl) == expected_core, {"core_ctrl": core_ctrl, "m1b_ctrl": m1b_ctrl, "business": business}
+
+
+async def test_m1a_standard_3tx_sql_profile(registry_store):
+    """Design 217 M1a standard 3-tx: core control SQL == 5/5/6 (SQLite/PG/MySQL), 3 control txs."""
+    store, _ = registry_store
+    db = store._db.dialect.name
+    records, _, tx_sites, _, tx_categories = await _measure(store, 1, fused=False)
+    counts = _counts(records, tx_sites, tx_categories)
+    core_ctrl, m1b_ctrl, _, business = _split_m1a_core_vs_m1b(records)
+    core_txs = [
+        chain for chain in tx_sites
+        if any(s in {"agent.runtime_store:accept", "agent.runtime_store:claim", "agent.runtime_store:final"} for s in chain)
+    ]
+    assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+    assert len(core_txs) == 3, tx_sites
+    expected_core = 6 if db == "mysql" else 5
+    assert len(core_ctrl) == expected_core, {"core_ctrl": core_ctrl, "m1b_ctrl": m1b_ctrl, "business": business}
+
+
+@pytest.mark.parametrize("tools_per_round", [1, 4])
+async def test_m1a_tool_round_zero_control_sql(registry_store, tools_per_round):
+    """Design 217 M1a tool rounds add +0 control SQL per round across all 3 DBs."""
+    store, _ = registry_store
+    r1, _, tx1, _, tc1 = await _measure(store, 1, tools_per_round=tools_per_round, fused=True)
+    r4, _, tx4, _, tc4 = await _measure(store, 4, tools_per_round=tools_per_round, fused=True)
+    c1 = _counts(r1, tx1, tc1)
+    c4 = _counts(r4, tx4, tc4)
+    assert c4["session_control"] - c1["session_control"] == 0, (c1, c4)
+    assert (c4["message"] - c1["message"]) == 3 * (1 + tools_per_round), (c1, c4)
+
+
+async def test_m1a_periodic_node_sql_profile(registry_store):
+    """Design 217 M1a node periodic tick: batch_renew + discover_queued(32) + sweep_expired_leases(32) == 3/3/4."""
+    store, _ = registry_store
+    db = store._db.dialect.name
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+    model = _ProfileModel(1, 0)
+    agent = await RunningAgent(store, model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9)).start()
+    try:
+        profiled.records.clear()
+        profiled.tx_sites.clear()
+        profiled.transactions = 0
+        await agent.runtime.worker.periodic_tick(limit=32)
+        expected = 4 if db == "mysql" else 3
+        assert len(profiled.records) == expected, [r["sql"] for r in profiled.records]
+    finally:
+        await agent.aclose()
+        store._db = original

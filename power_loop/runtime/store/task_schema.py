@@ -1,4 +1,4 @@
-"""Schema 17 / protocol 43 verification. Older stores are never migrated."""
+"""Schema 18 / protocol 43 verification. Older stores are never migrated."""
 from __future__ import annotations
 
 import re
@@ -15,7 +15,7 @@ from .schema import (
 )
 from .session_native_ddl import INDEXES, session_native_ddl
 
-TASK_SCHEMA_VERSION = 17
+TASK_SCHEMA_VERSION = 18
 TASK_PROTOCOL_VERSION = 43
 TASK_TABLES: tuple[str, ...] = ()
 

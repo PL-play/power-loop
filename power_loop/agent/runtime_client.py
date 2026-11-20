@@ -29,11 +29,14 @@ log = logging.getLogger(__name__)
 
 
 class RuntimeClient:
-    def __init__(self, *, store, transport, namespace="power-loop", hooks=None, hook_timeout_s=1.0):
+    def __init__(self, *, store, transport, namespace="power-loop", hooks=None, hook_timeout_s=1.0,
+                 wake_transport=None):
         if not namespace:
             raise ValueError("namespace must be nonempty")
         self.store, self.transport, self.namespace = store, transport, namespace
         self.hooks, self.hook_timeout_s = hooks, hook_timeout_s
+        self.wake_transport = wake_transport
+        self._local_worker = None
         self.inputs = RuntimeInputStore(store)
         self._waiters, self._outputs = set(), set()
         self._closed = False
@@ -63,27 +66,70 @@ class RuntimeClient:
             cancel_propagation=cancel_propagation, options=options,
         )
 
-    async def send(self, target, body, *, message_id, actor, priority="normal",
-                   deadline_ms=None) -> Receipt:
+    async def configure_session(self, target, *, actor, descriptor=None, cancel_propagation=None):
+        self._require_open()
+        return await self.inputs.configure_session(
+            target, actor=actor, descriptor=descriptor, cancel_propagation=cancel_propagation,
+        )
+
+    async def inspect_input(self, input_ref, *, actor):
+        self._require_open(reading=True)
+        return await self.inputs.inspect_input(input_ref, actor=actor)
+
+    async def send(
+        self, target, body, *, message_id, actor, priority="normal",
+        deadline_ms=None, wake=True, kind="user", reply_route=None,
+    ) -> Receipt:
         """Accept an input: idle starts a new round, busy joins the next loop boundary.
 
-        The durable accept is the authority; the activation notification is a best-effort
-        latency optimization. A lost notification never loses the input (the worker's
-        periodic unfinished scan and the running loop's boundary read both pick it up).
+        When a local started worker has capacity and can execute the session, takes the
+        Session-Core fused accept_and_claim fast path (2-tx); otherwise transparently falls
+        back to durable accept + wake notification (3-tx).
         """
         self._require_open()
-        receipt, activate = await self.inputs.accept(
-            target, body, message_id=message_id, actor=actor, priority=priority,
-            deadline_ms=deadline_ms, _with_activation=True,
+        worker = self._local_worker
+        can_fuse = (
+            worker is not None
+            and worker._started
+            and bool(wake)
+            and getattr(worker.runtime, "fuse_local_send", True)
+            and getattr(worker.runtime.coordinator, "installs_session_fence", False)
+            and worker.can_fuse_locally(target.session_id)
         )
+        batch = None
+        if can_fuse:
+            receipt, batch, activate = await self.inputs.accept_and_claim(
+                target, body, message_id=message_id, actor=actor,
+                node_id=worker.runtime.node_id, boot_id=worker.runtime.boot_id,
+                ttl_s=worker.runtime.session_lease_ttl_s,
+                priority=priority, deadline_ms=deadline_ms, wake=wake,
+                kind=kind, reply_route=reply_route, can_execute=worker._capable,
+            )
+        else:
+            receipt, activate = await self.inputs.accept(
+                target, body, message_id=message_id, actor=actor, priority=priority,
+                deadline_ms=deadline_ms, wake=wake, kind=kind, reply_route=reply_route,
+                _with_activation=True,
+            )
         if receipt.newly_accepted:
             from power_loop.contracts.hooks import HookPoint
             from power_loop.core.execution_notifications import notify
             await notify(self.hooks, HookPoint.MESSAGE_ACCEPTED, {"receipt": receipt}, timeout_s=self.hook_timeout_s)
+        if batch is not None:
+            worker.dispatch_claimed(batch)
+            from dataclasses import replace
+            return replace(receipt, notification="published", reason=None)
+        if worker is not None and priority == "urgent" and receipt.state == "accepted":
+            worker.notify_urgent(target.session_id)
         if receipt.state != "accepted" or not activate:
             return receipt
         published = await self._notify(receipt.target, receipt.message_id, receipt.input_ref,
                                        ["work", "activation"])
+        if self.wake_transport is not None:
+            try:
+                await self.wake_transport.publish_wake(receipt.target.session_id)
+            except Exception:
+                log.warning("wake_transport publish_wake failed for %s", receipt.target.session_id, exc_info=True)
         from dataclasses import replace
         return replace(receipt, notification="published" if published else "failed",
                        reason=None if published else "wake_pending")
@@ -94,10 +140,22 @@ class RuntimeClient:
             ref, actor=actor, scope=scope, reason=reason, _with_activation=True,
         )
         target = receipt.target
+        if self._local_worker is not None:
+            self._local_worker._activate(
+                target.session_id, receipt.input_ref,
+                cancelled=True, cancel_reason=reason, cancel_verified=True,
+            )
+        if self.wake_transport is not None:
+            try:
+                await self.wake_transport.publish_cancel(
+                    target.session_id, cancel_by=("agent" if actor.session_id is not None else "user"),
+                )
+            except Exception:
+                log.warning("wake_transport publish_cancel failed for %s", target.session_id, exc_info=True)
         # Wake the owner so it can observe the cancel marker at its next checkpoint; the
         # marker itself is durable and is also read at every loop boundary.
         await self._notify(target, receipt.message_id or "cancel", receipt.input_ref,
-                           ["activation", "work"], {"cancelled": True, "reason": reason})
+                           ["activation", "work"], {"cancelled": True, "reason": reason, "verified": True})
         for parent in dict.fromkeys(activations):
             result_ref = InputRef(parent.store_id, parent.session_id, "cancel-result")
             await self._notify(parent, result_ref.message_id, result_ref, ["work", "activation"])
@@ -147,7 +205,7 @@ class RuntimeClient:
 
     async def send_and_subscribe(
         self, target, body, *, message_id, actor, priority="normal",
-        deadline_ms=None, on_submit_start=None,
+        deadline_ms=None, wake=True, kind="user", reply_route=None, on_submit_start=None,
     ) -> OutputSubscription:
         """Accept once and observe that input without a post-accept initial read.
 
@@ -161,6 +219,7 @@ class RuntimeClient:
             receipt = await self.send(
                 target, body, message_id=message_id, actor=actor,
                 priority=priority, deadline_ms=deadline_ms,
+                wake=wake, kind=kind, reply_route=reply_route,
             )
             ref = receipt.input_ref
             initial = None

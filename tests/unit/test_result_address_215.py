@@ -133,13 +133,12 @@ async def test_release_claim_matching_cancel_routes_result_once(registry_store, 
         "error_detail": "stop build", "result_delivery_error": expected_error,
     }
     state = await store._db.fetchone(
-        f"SELECT execution_state,active_send_index,cancel_send_index,owner_token "
-        f"FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT execution_state,owner_node_id,cancel_by "
+        f"FROM {store.t.sessions} WHERE session_id=?",
         (child.session_id,),
     )
     assert state == {
-        "execution_state": "idle", "active_send_index": None,
-        "cancel_send_index": None, "owner_token": None,
+        "execution_state": "idle", "owner_node_id": None, "cancel_by": "user",
     }
 
     result_id = result_message_id(child, start, 1, "agent_result")

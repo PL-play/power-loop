@@ -30,7 +30,7 @@ def test_stable_api_symbols_are_exported_and_real() -> None:
     assert not missing_all, f"STABLE_API names not in __all__: {missing_all}"
 
 
-_FROZEN_STABLE_V12 = frozenset({
+_FROZEN_STABLE_V14 = frozenset({
     'AgentEventBus',
     'AgentHooks',
     'AgentLoopConfig',
@@ -41,6 +41,7 @@ _FROZEN_STABLE_V12 = frozenset({
     'CancelPropagation',
     'CostExtractor',
     'DatabasePollingTransport',
+    'DatabasePollingWakeTransport',
     'DefaultCostExtractor',
     'DefaultTokenUsageExtractor',
     'ExecutionContext',
@@ -50,6 +51,7 @@ _FROZEN_STABLE_V12 = frozenset({
     'FieldTokenUsageExtractor',
     'HookDirective',
     'HookPoint',
+    'InMemoryWakeTransport',
     'InputRef',
     'InputState',
     'Lifecycle',
@@ -117,6 +119,7 @@ _FROZEN_STABLE_V12 = frozenset({
     'TransportPacket',
     'TrustedActor',
     'WaitTimeout',
+    'WakeTransport',
     'create_llm_service_from_config',
     'create_llm_service_from_env',
     'result_message_id',
@@ -124,11 +127,11 @@ _FROZEN_STABLE_V12 = frozenset({
 })
 
 
-def test_frozen_v13():
+def test_frozen_v14():
     import importlib.metadata
 
-    assert set(power_loop.STABLE_API) == _FROZEN_STABLE_V12
-    assert power_loop.__version__ == importlib.metadata.version('power-loop') == '13.0.0'
+    assert set(power_loop.STABLE_API) == _FROZEN_STABLE_V14
+    assert power_loop.__version__ == importlib.metadata.version('power-loop') == '14.0.0'
     assert not {'JobRef', 'JobPage', 'Command', 'SubagentLifecycle'} & set(power_loop.__all__)
 
 

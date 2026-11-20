@@ -13,7 +13,7 @@ from power_loop.runtime.message_ref import MessageRef
 PROTOCOL_VERSION = 43
 Priority = Literal["normal", "urgent"]
 SessionKind = Literal["agent", "workflow_driver", "background"]
-ExecutionState = Literal["idle", "queued", "running", "recovering"]
+ExecutionState = Literal["idle", "queued", "running"]
 InputState = Literal["pending", "delivered", "void", "waiting_continuation"]
 TerminalStatus = Literal["completed", "failed", "cancelled", "interrupted"]
 ResultKind = Literal[
@@ -21,7 +21,8 @@ ResultKind = Literal[
     "background_result", "managed_effect_result",
 ]
 CancelPropagation = Literal["linked", "independent"]
-Lifecycle = Literal["open", "closing", "closed"]
+Lifecycle = Literal["open", "suspended", "closing", "closed"]
+RESERVED_INPUT_PREFIXES = ("res_", "wfc_", "sys_")
 
 
 class RuntimeRequestError(ValueError):

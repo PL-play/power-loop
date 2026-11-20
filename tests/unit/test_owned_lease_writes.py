@@ -33,7 +33,7 @@ class ClaimedTurns:
         assert batch is not None
         lease = SessionOwnership(
             (self.store.store_id, sid), self.node, time.monotonic() + 90, lambda: None,
-            epoch=batch.owner_epoch, token=batch.owner_token,
+            epoch=batch.owner_epoch,
             node_id=self.node, boot_id=self.node, installs_fence=True,
         )
         token = _CURRENT.set(lease)
@@ -96,7 +96,6 @@ async def test_old_child_cannot_reuse_the_same_loops_next_lease_or_consume_its_r
             with pytest.raises(SessionLeaseLost):
                 await child
             await store.append_message(sid, role="assistant", content="current")
-            assert (await store.get_state(sid)).round_index == 7
             assert await assistant_contents(store, sid) == ["done", "current"]
             assert len([row for row in await store.load_all_messages(sid) if row.role == "user"]) == 2
     finally:
@@ -140,7 +139,6 @@ async def test_writer_waiting_for_a_transaction_cannot_restore_an_expired_turns_
             release.set()
             with pytest.raises(SessionLeaseLost):
                 await child
-            assert (await store.get_state(sid)).round_index == 7
             assert await assistant_contents(store, sid) == ["done", "current"]
             assert len([row for row in await store.load_all_messages(sid) if row.role == "user"]) == 2
     finally:
@@ -151,7 +149,7 @@ async def test_writer_waiting_for_a_transaction_cannot_restore_an_expired_turns_
 
 
 
-@pytest.mark.parametrize("operation", ["append", "pending", "round"])
+@pytest.mark.parametrize("operation", ["append", "pending"])
 async def test_owner_epoch_rejects_a_writer_after_replacement_committed(registry_store, monkeypatch, operation):
     store, connect = registry_store
     sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
@@ -171,7 +169,7 @@ async def test_owner_epoch_rejects_a_writer_after_replacement_committed(registry
                 # Only time is injected. Recovery and the next owner installation
                 # use the real state transitions on another connection/context.
                 await other._db.execute(
-                    f"UPDATE {other.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+                    f"UPDATE {other.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
                     (sid,),
                 )
                 recovered = await RuntimeInputStore(other).recover(
@@ -197,7 +195,6 @@ async def test_owner_epoch_rejects_a_writer_after_replacement_committed(registry
             assert old_lease.expires_at > time.monotonic()
         assert await assistant_contents(other, sid) == ["replacement", "done"]
         assert len([row for row in await other.load_all_messages(sid) if row.role == "user"]) == 2
-        assert (await other.get_state(sid)).round_index == 7
         assert (await other.get_state(sid)).pending is None
     finally:
         assert _CURRENT.get() is None

@@ -53,6 +53,10 @@ class Transaction(Protocol):
         """Conditional UPDATE's flag, or None on no match, in one statement."""
         ...
 
+    async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
+        """Conditional UPDATE returning (rowcount, lastrowid) for MySQL LAST_INSERT_ID bitpacking."""
+        ...
+
 
 @runtime_checkable
 class Database(Protocol):
@@ -82,4 +86,21 @@ class Database(Protocol):
     async def close(self) -> None: ...
 
 
-__all__ = ["Database", "Transaction", "Row", "Params"]
+def is_duplicate_key_error(exc: BaseException) -> bool:
+    """Detect UNIQUE / PRIMARY KEY violations across SQLite, PostgreSQL, and MySQL."""
+    if getattr(exc, "sqlstate", None) == "23505":
+        return True
+    name = type(exc).__name__
+    if name == "UniqueViolationError":
+        return True
+    if name == "IntegrityError":
+        args = getattr(exc, "args", ())
+        if args and args[0] == 1062:
+            return True
+        msg = str(exc).lower()
+        if "unique" in msg or "primary key" in msg or "duplicate entry" in msg:
+            return True
+    return False
+
+
+__all__ = ["Database", "Transaction", "Row", "Params", "is_duplicate_key_error"]

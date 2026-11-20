@@ -67,7 +67,7 @@ async def test_deterministic_child_retry_and_creation_conflict(registry_store):
     assert first[0] == second[0] and first[1] == second[1]
     assert first[2].newly_accepted is True and second[2].newly_accepted is False
     state = await store._db.fetchone(
-        f"SELECT execution_state,inbox_version,next_seq FROM {store.t.session_state} "
+        f"SELECT execution_state,inbox_version,next_seq FROM {store.t.sessions} "
         "WHERE session_id=?", (first[0].session_id,),
     )
     # The first-create path initializes the known queued state directly instead of
@@ -155,7 +155,7 @@ async def test_committed_child_is_recovered_without_replaying_creation(registry_
         }],
     })
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (parent.session_id,),
     )
     recovered = await port.recover(parent, node_id="B", boot_id="B")
@@ -235,7 +235,7 @@ async def _confirm_creation_lock_wait(store, probe_store, session_id, *, waiter_
     except TimeoutError:
         pass
     row = await probe_store._db.fetchone(
-        f"SELECT * FROM {probe_store.t.session_state} WHERE session_id=? "
+        f"SELECT * FROM {probe_store.t.sessions} WHERE session_id=? "
         "FOR UPDATE SKIP LOCKED", (session_id,))
     assert row is None, "holder did not hold the parent/target state lock"
     assert not waiter_task.done(), "waiter finished before the holder released the lock"
@@ -251,7 +251,7 @@ async def _warm_state_lock(store, session_id):
     if store._db.dialect.name == "sqlite":
         return
     async with store._db.transaction() as tx:
-        await store._db.dialect.lock_state(tx, store.t.session_state, session_id)
+        await store._db.dialect.lock_state(tx, store.t.sessions, session_id)
 
 
 @pytest.mark.parametrize("entry", ("child", "workflow_node"))
@@ -365,7 +365,7 @@ async def test_linked_create_committed_while_close_waits_keeps_parent_busy(
     )
     assert child_row == {"lifecycle": "open"}
     state = await store._db.fetchone(
-        f"SELECT execution_state,inbox_version FROM {store.t.session_state} "
+        f"SELECT execution_state,inbox_version FROM {store.t.sessions} "
         "WHERE session_id=?", (target.session_id,),
     )
     assert state == {"execution_state": "queued", "inbox_version": 1}
@@ -402,7 +402,7 @@ async def test_closed_parent_rejects_retry_but_keeps_existing_independent_child(
     )
     assert lifecycle == {"lifecycle": "open"}
     state = await store._db.fetchone(
-        f"SELECT execution_state FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?",
         (child.session_id,),
     )
     assert state == {"execution_state": "queued"}
@@ -467,7 +467,7 @@ async def test_closed_parent_rejects_workflow_retry_but_keeps_existing_target(
     )
     assert lifecycle == {"lifecycle": "open"}
     state = await store._db.fetchone(
-        f"SELECT execution_state,inbox_version FROM {store.t.session_state} "
+        f"SELECT execution_state,inbox_version FROM {store.t.sessions} "
         "WHERE session_id=?", (node.session_id,),
     )
     assert state == {"execution_state": "queued", "inbox_version": 1}
@@ -618,7 +618,7 @@ async def test_same_request_concurrent_creation_is_idempotent(registry_store, en
     sessions = await store._db.fetchone(
         f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE session_id=?", (target_id,))
     states = await store._db.fetchone(
-        f"SELECT COUNT(*) AS n FROM {store.t.session_state} WHERE session_id=?", (target_id,))
+        f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE session_id=?", (target_id,))
     inputs = await store._db.fetchone(
         f"SELECT COUNT(*) AS n FROM {store.t.follow_up_queue} WHERE session_id=?", (target_id,))
     assert (int(sessions["n"]), int(states["n"]), int(inputs["n"])) == (1, 1, 1)
@@ -679,7 +679,7 @@ async def test_concurrent_creation_with_different_request_conflicts(
     sessions = await store._db.fetchone(
         f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE session_id=?", (target_id,))
     states = await store._db.fetchone(
-        f"SELECT COUNT(*) AS n FROM {store.t.session_state} WHERE session_id=?", (target_id,))
+        f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE session_id=?", (target_id,))
     inputs = await store._db.fetchone(
         f"SELECT COUNT(*) AS n FROM {store.t.follow_up_queue} WHERE session_id=?", (target_id,))
     assert (int(sessions["n"]), int(states["n"]), int(inputs["n"])) == (1, 1, 1)
@@ -863,7 +863,7 @@ async def test_reentry_after_concurrent_creation_rejects_parent_closed_meanwhile
             )
             assert lifecycle == {"lifecycle": "open"}
             state = await store._db.fetchone(
-                f"SELECT execution_state,inbox_version FROM {store.t.session_state} "
+                f"SELECT execution_state,inbox_version FROM {store.t.sessions} "
                 "WHERE session_id=?", (child,),
             )
             assert state == {"execution_state": "queued", "inbox_version": 1}
@@ -927,18 +927,17 @@ async def test_cleaned_target_before_reentry_lock_returns_creation_conflict(
                 time.time_ns() // 1_000_000, limit=20,
                 retention_days=ZERO_RETENTION, session_id=target_id,
             )
-            assert purged.get("sessions") == 2, purged
+            assert purged.get("sessions") == 1, purged
             assert purged.get("inbox") == 1, purged
             counts = {}
             for name, table in (
                 ("session", store.t.sessions),
-                ("state", store.t.session_state),
                 ("input", store.t.follow_up_queue),
             ):
                 row = await cleaner._db.fetchone(
                     f"SELECT COUNT(*) AS n FROM {table} WHERE session_id=?", (target_id,))
                 counts[name] = int(row["n"])
-            assert counts == {"session": 0, "state": 0, "input": 0}
+            assert counts == {"session": 0, "input": 0}
             gate_state["allow_reentry"].set()
             loser_task = next(task for task in tasks if task is not winner_task)
             with pytest.raises(RuntimeRequestError) as rejected:

@@ -191,7 +191,10 @@ async def test_busy_followup_is_read_at_next_boundary_not_one_round_late(registr
 async def test_twenty_backlog_inputs_merge_into_one_send(registry_store):
     store, _ = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
+    agent = await RunningAgent(
+        store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9),
+        fuse_local_send=False,
+    ).start()
     try:
         # Hold notifications so the worker cannot claim until all 20 are accepted; then
         # one discovery scan claims the whole backlog as a single batch (one run).
@@ -232,7 +235,10 @@ async def test_notification_loss_is_recovered_by_explicit_read(registry_store):
     """
     store, _ = registry_store
     model = EchoModel()
-    agent = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9)).start()
+    agent = await RunningAgent(
+        store, model, config=AgentLoopConfig(max_rounds=4, context_budget_tokens=10**9),
+        fuse_local_send=False,
+    ).start()
     try:
         # Drop every notification by failing the transport publish.
         async def lost_publish(packet):
@@ -378,10 +384,14 @@ async def test_expired_activity_time_still_writes(registry_store):
                                                       context_budget_tokens=10**9)).start()
     sid = agent.target.session_id
     try:
-        await _set_session_updated_at(store, sid, now_ms() - 2000)
+        old_ts = now_ms() - 2000
+        await _set_session_updated_at(store, sid, old_ts)
         result, touches = await _touch_updates(store, lambda: agent.send("expired"))
         assert result.status == "completed"
-        assert touches == 1
+        row = await store._db.fetchone(
+            f"SELECT updated_at FROM {store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        assert int(row["updated_at"]) > old_ts and touches == 0
     finally:
         await agent.aclose()
 
@@ -400,10 +410,14 @@ async def test_model_runtime_crossing_the_interval_still_writes(registry_store):
                                                       context_budget_tokens=10**9)).start()
     sid = agent.target.session_id
     try:
-        await _set_session_updated_at(store, sid, now_ms())
+        start_ts = now_ms()
+        await _set_session_updated_at(store, sid, start_ts)
         result, touches = await _touch_updates(store, lambda: agent.send("slow"))
         assert result.status == "completed"
-        assert touches == 1
+        row = await store._db.fetchone(
+            f"SELECT updated_at FROM {store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        assert int(row["updated_at"]) >= start_ts + 900 and touches == 0
     finally:
         await agent.aclose()
 

@@ -1,4 +1,4 @@
-"""Bounded retention over schema 17 sessions, terminal inputs and derived history."""
+"""Bounded retention over schema 18 sessions, settled inputs and derived history."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -48,12 +48,11 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
     cutoff = {key: int(now-value*DAY_MS) for key, value in days.items()}
     eligibility_cutoff = max(cutoff.values())
     if candidate_limit is None:
-        # Preserve directed and count-only callers' candidate order.
-        scope, params = (' AND s.session_id=?', (session_id,)) if session_id else ('', ())
+        scope, params = (' AND session_id=?', (session_id,)) if session_id else ('', ())
         candidates = await store._db.fetchall(
-            f'SELECT s.session_id FROM {store.t.sessions} s JOIN {store.t.session_state} st '
-            "ON st.session_id=s.session_id WHERE st.execution_state='idle' AND s.updated_at<?"
-            + scope + ' ORDER BY s.updated_at,s.session_id LIMIT ?',
+            f"SELECT session_id FROM {store.t.sessions} "
+            "WHERE execution_state='idle' AND updated_at<?"
+            + scope + ' ORDER BY updated_at,session_id LIMIT ?',
             (eligibility_cutoff, *params, remaining),
         )
     else:
@@ -69,32 +68,32 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
             break
         sid = last = candidate['session_id']
         scanned += 1
-        # Skip recent rows from the page snapshot. Deletion eligibility is
-        # always checked again under the state lock.
         if candidate_limit is not None and candidate['updated_at'] >= eligibility_cutoff:
             continue
         async with store._db.transaction() as tx:
             try:
-                state = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+                state = await store._db.dialect.lock_state(tx, store.t.sessions, sid)
             except ValueError:
-                # A peer can delete this candidate before we lock it.
                 continue
-            row = await tx.fetchone(f'SELECT lifecycle,updated_at FROM {store.t.sessions} WHERE session_id=?', (sid,))
-            if row is None or row['updated_at'] >= eligibility_cutoff or await busy(store, tx, sid, state):
+            if state['updated_at'] >= eligibility_cutoff or await busy(store, tx, sid, state):
                 continue
             if await tx.fetchone(
                 f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? LIMIT 1', (sid,),
             ):
                 continue
             if 'inbox' in wanted:
-                count = await delete_batch(tx, store.t.follow_up_queue, ('id',),
-                    'session_id=? AND terminal_status IS NOT NULL AND completed_at<?',
-                    (sid, cutoff['inbox']), remaining)
+                cur_si = int(state['send_index'])
+                count = await delete_batch(
+                    tx, store.t.follow_up_queue, ('id',),
+                    "session_id=? AND ("
+                    "(terminal_status IS NOT NULL AND completed_at<?) "
+                    "OR (status='delivered' AND terminal_status IS NULL "
+                    "AND delivered_at<? AND delivered_send_index<=?))",
+                    (sid, cutoff['inbox'], cutoff['inbox'], cur_si), remaining,
+                )
                 counts['inbox'] = counts.get('inbox', 0) + count
                 remaining -= count
-            # Open sessions retain their context/journal. Closed sessions can be
-            # drained in bounded batches, but results remain while inputs reference them.
-            if row['lifecycle'] == 'open' or await tx.fetchone(
+            if state['lifecycle'] in ('open', 'suspended') or await tx.fetchone(
                 f'SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? LIMIT 1', (sid,),
             ):
                 continue
@@ -108,7 +107,7 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                         f'session_id=? AND {age_column}<?', (sid, cutoff[category]), remaining)
                     counts[category] = counts.get(category, 0) + count
                     remaining -= count
-            if 'sessions' not in wanted or remaining < 2 or row['updated_at'] >= cutoff['sessions']:
+            if 'sessions' not in wanted or remaining < 1 or state['updated_at'] >= cutoff['sessions']:
                 continue
             retained = False
             for table in (store.t.project_messages, store.t.session_runtime_state, store.t.messages):
@@ -117,13 +116,10 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                     break
             if retained:
                 continue
-            count = await tx.execute(f'DELETE FROM {store.t.session_state} WHERE session_id=?', (sid,))
-            count += await tx.execute(f'DELETE FROM {store.t.sessions} WHERE session_id=?', (sid,))
+            count = await tx.execute(f'DELETE FROM {store.t.sessions} WHERE session_id=?', (sid,))
             counts['sessions'] = counts.get('sessions', 0) + count
             remaining -= count
             store._forget_appended(sid)
     fetched = len(candidates)
-    # A full page needs one more seek to confirm the tail. Resume at the last
-    # checked candidate when deletion used the allowance before the page ended.
     next_after = last if fetched == candidate_limit or scanned < fetched else None
     return RetentionPage(counts, scanned, fetched, next_after)

@@ -55,7 +55,7 @@ async def read_state(store, reader, sid):
 
 async def _put(store, writer, sid, key, value):
     # This is private DERIVED state (fold statistics and their key owners). No runtime
-    # projector polls these keys, so bumping session_state.runtime_version here would wake
+    # projector polls these keys, so bumping sessions.runtime_version here would wake
     # every runtime-state reader (e.g. Todo) for a value that did not change. Readers of the
     # derived state query it directly under the session lock.
     sql = store._db.dialect.upsert(
@@ -221,7 +221,7 @@ async def persist(store, sid, *, send_index, rows, source_seq_lo, source_seq_hi,
     async def save(use_header):
         async with store._db.transaction() as tx:
             # Ownership always comes from the real locked row, never the run snapshot.
-            locked = await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            locked = await store._db.dialect.lock_state(tx, store.t.sessions, sid)
             store.fence_owner_row(locked, sid, ownership)
             if use_header:
                 state = snapshot if healthy else _base_state(store, sid, policy, None)
@@ -404,7 +404,7 @@ async def _rebuild(store, sid, projector, policy, snapshot, obsolete):
                 for key, send in entries[offset:offset + PAGE_SIZE]:
                     await _put(store, tx, sid, _owner_key(state["generation"], key), send)
         async with store._db.transaction() as tx:
-            await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            await store._db.dialect.lock_state(tx, store.t.sessions, sid)
             current = await read_state(store, tx, sid)
             provider = getattr(projector, "fold_statistics_policy", None)
             if current and current["revision"] == snapshot.revision and provider() == policy:
@@ -429,7 +429,7 @@ async def prepare(store, sid, *, projector, keep_last_sends, threshold, row_thre
                           window=window, **projection)
     if provider is not None and provider() != policy:
         async with store._db.transaction() as tx:
-            await store._db.dialect.lock_state(tx, store.t.session_state, sid)
+            await store._db.dialect.lock_state(tx, store.t.sessions, sid)
             current = await read_state(store, tx, sid)
             if current and current["revision"] == state["revision"]:
                 await invalidate(store, tx, sid)

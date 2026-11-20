@@ -50,7 +50,7 @@ class ScriptedModel(LLMService):
 
 
 class RunningAgent:
-    def __init__(self, store, model, registry=None, config=None, *, hooks=None, runtime_env=None, process_control=None, capacity=1, command=None, event_bus=None, allowed_models=None, coordinator=None, transport=None, options=None):
+    def __init__(self, store, model, registry=None, config=None, *, hooks=None, runtime_env=None, process_control=None, capacity=1, command=None, event_bus=None, allowed_models=None, coordinator=None, transport=None, options=None, fuse_local_send=True):
         self.owns_transport = transport is None
         self.config = config or AgentLoopConfig(context_budget_tokens=10**9)
         self.hooks = hooks or AgentHooks()
@@ -68,7 +68,8 @@ class RunningAgent:
                 command=command if "child_spec" not in descriptor.config else None)
         factory.register('fixture.agent@215', build)
         self.runtime = Runtime(store=store, factory=factory, node_id='fixture', boot_id='boot',
-                               capacity=capacity, recovery_interval_s=None, coordinator=coordinator, transport=transport)
+                               capacity=capacity, recovery_interval_s=None, coordinator=coordinator,
+                               transport=transport, fuse_local_send=fuse_local_send)
         self.loop = StatefulAgentLoop(runtime=self.runtime)
         self.actor = TrustedActor('test', 'host', None)
         descriptor_config = {f.name: getattr(self.config, f.name) for f in fields(RequestOptions)

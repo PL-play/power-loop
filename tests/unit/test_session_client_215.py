@@ -283,7 +283,7 @@ async def test_message_rows_pagination_scope_export(registry_store):
     assert error.value.code == "forbidden"
 
     exported = await store.export_session(root.session_id)
-    assert exported["schema_version"] == 17
+    assert exported["schema_version"] == 18
     assert json.loads(json.dumps(exported, ensure_ascii=False))["session_id"] == root.session_id
     assert [row["content"] for row in exported["tables"]["messages"]] == [
         first.items[0].content, "ORIGINAL-42"
@@ -385,7 +385,7 @@ async def test_result_read_keeps_authorization_and_counts_special_paths(registry
         ancestor = await port.get_result(
             receipt.input_ref, actor=TrustedActor("tenant", "host", parent.session_id),
         )
-    assert (len(measured.records), measured.transactions) == (2, 1)
+    assert (len(measured.records), measured.transactions) == (1, 1)
     assert ancestor.final_text == "child result"
 
     for actor in (
@@ -426,11 +426,16 @@ async def test_result_read_follows_continuation_and_reports_extra_reads(registry
         (session.session_id, "start"),
     )
     await store._db.execute(
-        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,kind,priority,status,"
-        "content_json,meta_json,request_hash,created_at,continuation_of,continuation_index) "
-        "VALUES (?,?,'workflow_continue','normal','pending',?,?,?,?,?,?)",
+        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,inbox_version,kind,priority,wake,status,"
+        "content_json,content_bytes,meta_json,request_hash,created_at,continuation_of,continuation_index) "
+        "VALUES (?,?,2,'workflow_continue','normal',1,'pending',?,24,?,?,?,?,?)",
         (session.session_id, "wfc-1", canonical({"workflow_continue": {}}), canonical({}),
          "0" * 64, 1, "start", 1),
+    )
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET wake_pending_count=wake_pending_count+1,"
+        "pending_count=pending_count+1 WHERE session_id=?",
+        (session.session_id,),
     )
     await port.final(batch)
     continuation = await port.claim(session, node_id="b", boot_id="b")
@@ -438,7 +443,7 @@ async def test_result_read_follows_continuation_and_reports_extra_reads(registry
 
     async with _profiled(store) as measured:
         state = await port.read_result_state(receipt.input_ref, actor=ACTOR)
-    assert (len(measured.records), measured.transactions) == (4, 1)
+    assert (len(measured.records), measured.transactions) == (5, 1)
     assert state.record.ref == receipt.input_ref
     assert "content_json" not in state.record.row and "meta_json" not in state.record.row
     assert state.resolved.ref.message_id == "wfc-1"
@@ -448,7 +453,7 @@ async def test_result_read_follows_continuation_and_reports_extra_reads(registry
 
     async with _profiled(store) as measured:
         result = await port.get_result(receipt.input_ref, actor=ACTOR)
-    assert (len(measured.records), measured.transactions) == (4, 1)
+    assert (len(measured.records), measured.transactions) == (5, 1)
     assert result.final_text == "continued"
 
 
@@ -465,19 +470,24 @@ async def test_result_read_follows_multihop_continuation(registry_store):
         (session.session_id,),
     )
     await store._db.execute(
-        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,kind,priority,status,"
-        "content_json,meta_json,request_hash,created_at,delivered_at,delivered_seq,"
+        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,inbox_version,kind,priority,wake,status,"
+        "content_json,content_bytes,meta_json,request_hash,created_at,delivered_at,delivered_seq,"
         "delivered_send_index,continuation_of,continuation_index) "
-        "VALUES (?,?,'workflow_continue','normal','waiting_continuation',?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,2,'workflow_continue','normal',1,'waiting_continuation',?,24,?,?,?,?,?,?,?,?)",
         (session.session_id, "wfc-1", canonical({"workflow_continue": {}}), canonical({}),
          "0" * 64, 1, 1, 1, 2, "start", 1),
     )
     await store._db.execute(
-        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,kind,priority,status,"
-        "content_json,meta_json,request_hash,created_at,continuation_of,continuation_index) "
-        "VALUES (?,?,'workflow_continue','normal','pending',?,?,?,?,?,?)",
+        f"INSERT INTO {store.t.follow_up_queue} (session_id,item_id,inbox_version,kind,priority,wake,status,"
+        "content_json,content_bytes,meta_json,request_hash,created_at,continuation_of,continuation_index) "
+        "VALUES (?,?,3,'workflow_continue','normal',1,'pending',?,24,?,?,?,?,?)",
         (session.session_id, "wfc-2", canonical({"workflow_continue": {}}), canonical({}),
          "0" * 64, 1, "wfc-1", 2),
+    )
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET wake_pending_count=wake_pending_count+1,"
+        "pending_count=pending_count+1 WHERE session_id=?",
+        (session.session_id,),
     )
     await port.final(batch)
     continuation = await port.claim(session, node_id="b", boot_id="b")
@@ -485,7 +495,7 @@ async def test_result_read_follows_multihop_continuation(registry_store):
 
     async with _profiled(store) as measured:
         state = await port.read_result_state(receipt.input_ref, actor=ACTOR)
-    assert (len(measured.records), measured.transactions) == (5, 1)
+    assert (len(measured.records), measured.transactions) == (6, 1)
     assert state.record.ref == receipt.input_ref
     assert state.resolved.ref.message_id == "wfc-2"
     assert state.result.status == "completed" and state.result.final_text == "multihop done"

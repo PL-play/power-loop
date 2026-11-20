@@ -11,7 +11,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 async def test_host_fields_are_whitelisted_frozen_and_reset_across_tasks():
-    context = ExecutionContext('store', 'session', 'node', 'boot', owner_epoch=7, owner_token='secret')
+    context = ExecutionContext('store', 'session', 'node', 'boot', owner_epoch=7)
     assert get_execution_context(required=False) is None
     with _bind_execution_context(lambda: context, {'app': {'trace', 'values'}}):
         with pytest.raises(ValueError):
@@ -21,7 +21,7 @@ async def test_host_fields_are_whitelisted_frozen_and_reset_across_tasks():
             with bind_host_context('app', {'job_ref': 'forged'}):
                 pass
         with pytest.raises(FrozenInstanceError):
-            get_execution_context().owner_token = 'forged'
+            get_execution_context().owner_epoch = 999
         source = {'values': [1]}
         with bind_host_context('app', source):
             source['values'].append(2)

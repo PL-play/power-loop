@@ -46,6 +46,10 @@ class _PgTransaction:
         row = await self.fetchone(sql, params)
         return bool(row["cancelled"]) if row is not None else None
 
+    async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
+        rc = await self.execute(sql, params)
+        return rc, 0
+
 
 class PostgresDatabase:
     def __init__(self, pool: Any, *, lock_connection_factory=None) -> None:

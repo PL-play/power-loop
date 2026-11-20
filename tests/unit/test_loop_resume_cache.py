@@ -256,7 +256,7 @@ async def test_unknown_pending_tool_alignment_survives_worker_rebuild(runtime_ag
                                tool_calls=[{
         "id":"old-call", "type":"function", "function":{"name":"echo", "arguments":"{}"}}])
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET send_index=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET send_index=1 WHERE session_id=?",
         (target.session_id,),
     )
     await first.aclose()

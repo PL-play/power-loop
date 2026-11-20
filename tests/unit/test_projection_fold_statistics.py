@@ -317,7 +317,7 @@ async def test_fold_reads_all_candidates_despite_history_cap_and_pages(fold_stor
         await append(fold_store, sid, n)
         await fold_store.append_message(sid, role="user", content=f"original {n}", send_index=n)
     await fold_store._db.execute(
-        f"UPDATE {fold_store.t.session_state} SET send_index=? WHERE session_id=?", (321, sid))
+        f"UPDATE {fold_store.t.sessions} SET send_index=? WHERE session_id=?", (321, sid))
 
     probe = ProjectionReads(fold_store, monkeypatch)
     try:
@@ -396,7 +396,7 @@ async def test_fold_cannot_advance_over_unprocessed_sends(fold_store, runtime_ag
     for n in range(1, 4):
         await append(fold_store, sid, n)
     await fold_store._db.execute(
-        f"UPDATE {fold_store.t.session_state} SET send_index=? WHERE session_id=?", (3, sid))
+        f"UPDATE {fold_store.t.sessions} SET send_index=? WHERE session_id=?", (3, sid))
 
     try:
         assert (await loop.send("next")).status == "completed"

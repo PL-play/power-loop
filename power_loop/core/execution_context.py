@@ -25,13 +25,12 @@ class ExecutionContext:
     boot_id: str
     input_ref: object = None
     owner_epoch: int = 0
-    owner_token: str | None = None
     actor: object = None
     options: object = None
     resources: object = None
     cancel_token: object = None
     host_context: Mapping = field(default_factory=lambda: MappingProxyType({}))
-    #: design 215 session-native identity: the claimed send index and direct parent
+    #: design 215/217 session-core identity: the claimed send index and direct parent
     #: session.
     send_index: int | None = None
     parent_session_id: str | None = None

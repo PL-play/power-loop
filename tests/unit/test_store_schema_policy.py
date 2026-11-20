@@ -122,7 +122,7 @@ def test_table_prefix_length_is_capped() -> None:
         validate_table_prefix("a" * (_MAX_TABLE_PREFIX_LEN + 1))
 
 
-async def test_schema17_has_no_legacy_tables_and_enforces_owner_state(registry_store):
+async def test_schema18_has_no_legacy_tables_and_enforces_owner_state(registry_store):
     from power_loop.runtime.store.session_native_ddl import FORBIDDEN_TABLES
 
     store, _ = registry_store
@@ -140,12 +140,13 @@ async def test_schema17_has_no_legacy_tables_and_enforces_owner_state(registry_s
     assert not {store.table_prefix + table for table in FORBIDDEN_TABLES} & names
     with pytest.raises(Exception):
         await store._db.execute(
-            f"INSERT INTO {store.t.session_state}(session_id,execution_state,active_send_index) "
-            "VALUES ('bad','running',1)"
+            f"INSERT INTO {store.t.sessions}(session_id,root_session_id,depth,tenant_id,principal_id,"
+            "descriptor_json,descriptor_hash,execution_state,created_at,updated_at) "
+            "VALUES ('bad','bad',0,'t','p','{}','h','running',1,1)"
         )
 
 
-@pytest.mark.parametrize("column,value", (("version", 16), ("protocol_version", 42)))
+@pytest.mark.parametrize("column,value", (("version", 17), ("version", 16), ("protocol_version", 42)))
 async def test_old_schema_or_protocol_is_rejected(registry_store, column, value):
     store, connect = registry_store
     await store._db.execute(
@@ -160,7 +161,7 @@ async def test_session_indexes(registry_store):
     index = store.table_prefix + "idx_session_recovery"
     statement = f"DROP INDEX {index}"
     if store._db.dialect.name == "mysql":
-        statement += f" ON {store.t.session_state}"
+        statement += f" ON {store.t.sessions}"
     await store._db.execute(statement)
     with pytest.raises(StoreSchemaError, match="idx_session_recovery"):
         await connect(schema="verify")
@@ -211,7 +212,7 @@ async def test_projection_session_id_offline_migration(registry_store, monkeypat
     migration = await reopened._db.fetchone(
         f"SELECT version,protocol_version FROM {store.table_prefix}schema_migrations WHERE id=1"
     )
-    assert dict(migration) == {"version": 17, "protocol_version": 43}
+    assert dict(migration) == {"version": 18, "protocol_version": 43}
 
 
 async def test_projection_session_id_migration_rejects_incompatible_index(registry_store):

@@ -1,7 +1,8 @@
-"""Shared owner fence stored on session_state.
+"""Shared owner fence stored on sessions (Design 217 schema 18).
 
 Claim/recover install ownership in their own transactions. This coordinator only
-renews or takes over an already active send; it never creates a send or a claim token.
+renews or takes over an already active send using owner_epoch (no owner_token,
+no 'recovering' execution_state).
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
 
     def __init__(self, store):
         self.store = store
-        self.table = store.t.session_state
+        self.table = store.t.sessions
 
     async def claim(self, inputs, target, **options):
         """Install the fence in the same transaction as the input batch."""
@@ -38,23 +39,20 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
             now = await RuntimeInputStore(self.store)._db_now(tx)
             deadline = now + int(ttl_s * 1000)
             changed = await tx.execute(
-                f"UPDATE {self.table} SET execution_state=CASE "
-                "WHEN execution_state='running' THEN 'recovering' ELSE execution_state END,"
-                "owner_epoch=owner_epoch+1,owner_token=?,"
-                "owner_node_id=?,owner_boot_id=?,owner_lease_until_ms=? "
-                "WHERE session_id=? AND execution_state IN ('running','recovering') "
-                "AND (owner_token IS NULL OR owner_lease_until_ms<=?) "
-                "AND EXISTS (SELECT 1 FROM " + self.store.t.sessions + " s "
-                "WHERE s.session_id=" + self.table + ".session_id AND s.lifecycle='open')",
-                (lease.token, node_id, boot_id, deadline, key[1], now),
+                f"UPDATE {self.table} SET owner_epoch=owner_epoch+1,"
+                "owner_node_id=?,owner_boot_id=?,owner_lease_until_ms=?,updated_at=? "
+                "WHERE session_id=? AND execution_state='running' "
+                "AND (owner_node_id IS NULL OR owner_lease_until_ms<=?) "
+                "AND lifecycle IN ('open','suspended')",
+                (node_id, boot_id, deadline, now, key[1], now),
             )
             if not changed:
                 return None
             row = await tx.fetchone(
-                f"SELECT owner_epoch,pending_json FROM {self.table} WHERE session_id=?", (key[1],)
+                f"SELECT owner_epoch,pending_tool_seq FROM {self.table} WHERE session_id=?", (key[1],)
             )
         lease.epoch = int(row["owner_epoch"])
-        lease.pending_json = row["pending_json"]
+        lease.pending_tool_seq = row["pending_tool_seq"]
         return lease
 
     async def renew(self, lease, *, ttl_s):
@@ -67,12 +65,11 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
         from power_loop.agent.runtime_store import RuntimeInputStore
         now = await RuntimeInputStore(self.store)._db_now(self.store._db)
         changed = await self.store._db.execute(
-            f"UPDATE {self.table} SET owner_lease_until_ms=? "
-            "WHERE session_id=? AND owner_epoch=? AND owner_token=? "
-            "AND execution_state IN ('running','recovering') AND owner_lease_until_ms>? "
-            "AND EXISTS (SELECT 1 FROM " + self.store.t.sessions + " s "
-            "WHERE s.session_id=" + self.table + ".session_id AND s.lifecycle='open')",
-            (now + int(ttl_s * 1000), lease.key[1], lease.epoch, lease.token, now),
+            f"UPDATE {self.table} SET owner_lease_until_ms=?,updated_at=? "
+            "WHERE session_id=? AND owner_epoch=? "
+            "AND execution_state='running' AND owner_lease_until_ms>? "
+            "AND lifecycle IN ('open','suspended')",
+            (now + int(ttl_s * 1000), now, lease.key[1], lease.epoch, now),
         )
         if not changed or lease.lost or lease.released:
             lease.lose()
@@ -84,16 +81,10 @@ class StoreSessionOwnershipCoordinator(SessionOwnershipCoordinator):
         from power_loop.agent.runtime_types import RuntimeRequestError
 
         row = await self.store._db.fetchone(
-            f"SELECT execution_state,owner_epoch,owner_token FROM {self.table} WHERE session_id=?",
+            f"SELECT execution_state,owner_epoch FROM {self.table} WHERE session_id=?",
             (lease.key[1],),
         )
-        if row and row["owner_token"] == lease.token and row["owner_epoch"] == lease.epoch:
-            if row["execution_state"] in {"running", "recovering"}:
+        if row and int(row["owner_epoch"]) == int(lease.epoch):
+            if row["execution_state"] == "running":
                 raise RuntimeRequestError("invalid_options", "final or recover before release")
-        await self.store._db.execute(
-            f"UPDATE {self.table} SET owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,"
-            "owner_lease_until_ms=NULL WHERE session_id=? AND owner_epoch=? AND owner_token=? "
-            "AND execution_state IN ('idle','queued')",
-            (lease.key[1], lease.epoch, lease.token),
-        )
         lease.released = True

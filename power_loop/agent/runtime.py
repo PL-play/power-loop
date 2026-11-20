@@ -101,6 +101,7 @@ class RegistryRuntimeFactory:
 
 class Runtime:
     def __init__(self, *, store, factory, node_id, boot_id=None, coordinator=None, transport=None,
+                 wake_transport=None, fuse_local_send=True,
                  namespace="power-loop", capacity=8, session_lease_ttl_s=90.0,
                  recovery_interval_s=30.0, claim_limit=100, shared_execution=False, host_context_fields=None, hooks=None, hook_timeout_s=1.0,
                  timer_backend=None, timer_driver=None, timers_enabled=True, required_profiles=()):
@@ -118,6 +119,8 @@ class Runtime:
             raise ValueError("recovery_interval_s must be positive or None")
         self.store, self.factory = store, factory
         self.shared_execution = shared_execution
+        self.fuse_local_send = bool(fuse_local_send)
+        self.wake_transport = wake_transport
         self.required_profiles = frozenset(required_profiles)
         self.hooks, self.hook_timeout_s = hooks, hook_timeout_s
         self.node_id, self.boot_id, self.namespace = node_id, boot_id, namespace
@@ -135,7 +138,10 @@ class Runtime:
         self.host_context_fields = {k: frozenset(v) for k, v in (host_context_fields or {}).items()}
         self.capacity, self.claim_limit = capacity, claim_limit
         self.session_lease_ttl_s, self.recovery_interval_s = session_lease_ttl_s, recovery_interval_s
-        self.client = RuntimeClient(store=store, transport=self.transport, namespace=namespace, hooks=hooks, hook_timeout_s=hook_timeout_s)
+        self.client = RuntimeClient(
+            store=store, transport=self.transport, namespace=namespace,
+            hooks=hooks, hook_timeout_s=hook_timeout_s, wake_transport=wake_transport,
+        )
         self.client._accepting = False
         from power_loop.runtime.timer_backend import StoreTimerBackend
         from power_loop.runtime.timers import TimerRunner
@@ -152,6 +158,7 @@ class Runtime:
         self.process_guard = (ProcessStoreGuard(store, self.coordinator, self.transport)
             if not shared_execution and self.transport.capabilities.scope != "shared" else None)
         self.worker = RuntimeWorker(self)
+        self.client._local_worker = self.worker
         self._closed = False
 
     def status(self):
@@ -173,12 +180,15 @@ class Runtime:
             raise RuntimeRequestError("forbidden", "host identity required to open a root session")
         return await self.client.create_session(descriptor, actor=actor)
 
-    async def aclose(self, *, timeout_s=30.0, cancel_running=False):
+    async def aclose(self, *, timeout_s=30.0, drain_timeout=None, cancel_running=False):
         if self._closed:
             return self.worker.shutdown_result
-        result = await self.worker.shutdown(timeout_s=timeout_s, cancel_running=cancel_running)
+        effective_timeout = timeout_s if drain_timeout is None else drain_timeout
+        result = await self.worker.shutdown(timeout_s=effective_timeout, cancel_running=cancel_running)
         await self.client.aclose()
         await self.transport.aclose()
+        if self.wake_transport is not None:
+            await self.wake_transport.aclose()
         await self.store.close()
         self._closed = True
         return result

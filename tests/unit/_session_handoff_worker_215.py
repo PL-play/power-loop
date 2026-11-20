@@ -21,15 +21,22 @@ async def command():
 
 
 def pause_after_lock(store, event):
-    original = store._db.dialect.lock_state
+    from contextlib import asynccontextmanager
 
-    async def gated(tx, state_table, session_id):
-        row = await original(tx, state_table, session_id)
-        emit(event=event)
-        await command()
-        return row
+    original = store._db.transaction
+    armed = True
 
-    store._db.dialect.lock_state = gated
+    @asynccontextmanager
+    async def gated():
+        nonlocal armed
+        async with original() as tx:
+            yield tx
+            if armed:
+                armed = False
+                emit(event=event)
+                await command()
+
+    store._db.transaction = gated
 
 
 def batch_json(batch):
@@ -57,7 +64,7 @@ async def main():
                 raise AssertionError("stale owner finalized")
         elif role == "new":
             await port.accept(target, "new", message_id="new", actor=ACTOR)
-            assert (await port.inspect(target, actor=ACTOR)).execution_state == "recovering"
+            assert (await port.inspect(target, actor=ACTOR)).execution_state == "running"
             recovered = await port.recover(target, node_id="new-process", boot_id="new-boot")
             assert recovered.execution_state == "queued"
             batch = await port.claim(target, node_id="new-process", boot_id="new-boot")

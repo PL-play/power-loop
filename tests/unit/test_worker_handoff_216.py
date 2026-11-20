@@ -124,6 +124,7 @@ async def handoff_rig(store, *, stage="model", tool=False, command=False):
     agent = await RunningAgent(
         store, model, registry, AgentLoopConfig(max_rounds=5, context_budget_tokens=10**9),
         transport=traffic, command=("echo", {}) if command else None,
+        fuse_local_send=False,
     ).start()
     worker = agent.runtime.worker
     claim, recover, final, has_pending = (
@@ -466,29 +467,26 @@ async def test_discovery_states_limit_and_locked_recover(registry_store):
     port = RuntimeInputStore(store)
     assert await port.discover_unfinished() == ()
     refs = {}
-    for name in ("idle", "queued", "recovering", "expired", "healthy"):
+    for name in ("idle", "queued", "expired", "healthy"):
         refs[name] = ref = await target(port, name)
         if name == "idle":
             continue
         await port.accept(ref, name, message_id="m", actor=ACTOR)
         if name != "queued":
             await port.claim(ref, node_id="old", boot_id="old", ttl_s=300)
-        if name in {"recovering", "expired"}:
+        if name == "expired":
             await store._db.execute(
-                f"UPDATE {port.state} SET owner_lease_until_ms=1 WHERE session_id=?", (name,))
-        if name == "recovering":
-            await store._db.execute(
-                f"UPDATE {port.state} SET execution_state='recovering' WHERE session_id=?", (name,))
-    assert await port.discover_unfinished() == tuple(refs[k] for k in ("queued", "recovering", "expired"))
+                f"UPDATE {port.s} SET owner_lease_until_ms=1 WHERE session_id=?", (name,))
+    assert await port.discover_unfinished() == tuple(refs[k] for k in ("queued", "expired"))
     assert await port.discover_unfinished(limit=1) == (refs["queued"],)
-    assert len(await port.discover_unfinished(limit=1000)) == 3
+    assert len(await port.discover_unfinished(limit=1000)) == 2
     from power_loop.agent.runtime_types import RuntimeRequestError
     for limit in (0, 1001):
         with pytest.raises(RuntimeRequestError, match="limit"):
             await port.discover_unfinished(limit=limit)
     # Discovery does not authorize a takeover: recover checks the locked CURRENT expiry.
     await store._db.execute(
-        f"UPDATE {port.state} SET owner_lease_until_ms=(SELECT {port._now_sql()})+300000 "
+        f"UPDATE {port.s} SET owner_lease_until_ms=(SELECT {port._now_sql()})+300000 "
         "WHERE session_id=?", (refs["expired"].session_id,))
     assert await port.recover(refs["expired"], node_id="new", boot_id="new") is None
     assert await port.recover(refs["healthy"], node_id="new", boot_id="new") is None
@@ -499,33 +497,33 @@ async def _seed_discovery_states(store, rows):
         params = []
         batch = rows[offset:offset + 200]
         for sid, state, lease in batch:
-            active = 1 if state in {"running", "recovering"} else None
-            owner = ("token", "node", "boot") if lease is not None else (None, None, None)
-            params.extend((sid, state, active, *owner, lease))
+            owner = ("node", "boot") if lease is not None else (None, None)
+            wake_cnt = 1 if state == "queued" else 0
+            params.extend((sid, sid, 0, "agent", "t", "p", "{}", "h" * 64, "c" * 64, "linked", state, wake_cnt, *owner, lease, 1, 1))
         await store._db.execute(
-            f"INSERT INTO {store.t.session_state} (session_id,execution_state,active_send_index,"
-            "owner_token,owner_node_id,owner_boot_id,owner_lease_until_ms) VALUES "
-            + ",".join("(?,?,?,?,?,?,?)" for _ in batch), params)
+            f"INSERT INTO {store.t.sessions} (session_id,root_session_id,depth,session_kind,"
+            "tenant_id,principal_id,descriptor_json,descriptor_hash,creation_identity_hash,"
+            "cancel_propagation,execution_state,wake_pending_count,owner_node_id,owner_boot_id,"
+            "owner_lease_until_ms,created_at,updated_at) VALUES "
+            + ",".join("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" for _ in batch), params)
 
 
-@pytest.mark.parametrize("candidates", ("mixed", "queued", "recovering", "running"))
+@pytest.mark.parametrize("candidates", ("mixed", "queued", "running"))
 async def test_discovery_keeps_original_order_and_limits(registry_store, candidates):
     store, _ = registry_store
     db, port = store._db, RuntimeInputStore(store)
     assert await port.discover_unfinished() == ()
     rows = [("idle", "idle", None), ("healthy", "running", 9999999999999)]
-    for state in ("queued", "recovering", "running"):
+    for state in ("queued", "running"):
         count = 6 if candidates == "mixed" else (1105 if state == candidates else 0)
         for i in range(count):
-            # Reverse insertion order, tied leases, and legal recovering NULL/non-NULL
-            # leases expose wrong state/lease/id order and branch truncation.
-            lease = None if state == "queued" or state == "recovering" and i % 3 == 0 else 1 + i % 2
+            lease = None if state == "queued" else 1 + i % 2
             rows.append((f"{state}-{count - i:04d}", state, lease))
     await _seed_discovery_states(store, rows)
     database_now = await port._db_now(db)
     for limit in (1, 10, 1000):
         expected = await db.fetchall(
-            f"SELECT session_id FROM {port.state} WHERE execution_state IN ('queued','recovering') "
+            f"SELECT session_id FROM {port.s} WHERE execution_state='queued' "
             "OR (execution_state='running' AND owner_lease_until_ms<=?) "
             "ORDER BY execution_state,owner_lease_until_ms,session_id LIMIT ?",
             (database_now, limit))
@@ -547,15 +545,15 @@ async def test_discovery_sqlite_work_does_not_grow_with_unrelated_idle(tmp_path)
     try:
         port = RuntimeInputStore(store)
         await _seed_discovery_states(store, [
-            ("queued", "queued", None), ("recovering-null", "recovering", None),
-            ("recovering", "recovering", 1), ("expired", "running", 1),
+            ("queued", "queued", None),
+            ("expired", "running", 1),
             ("healthy", "running", 9999999999999),
         ])
         counts = []
         for low, high in ((0, 2000), (2000, 20000)):
             await _seed_discovery_states(store, [(f"idle-{i:05d}", "idle", None)
                                                   for i in range(low, high)])
-            await store._db.execute(f"ANALYZE {port.state}")
+            await store._db.execute(f"ANALYZE {port.s}")
             steps = [0]
             store._db._conn.set_progress_handler(
                 lambda: steps.__setitem__(0, steps[0] + 1) or 0, 1)
@@ -563,8 +561,7 @@ async def test_discovery_sqlite_work_does_not_grow_with_unrelated_idle(tmp_path)
                 result = await port.discover_unfinished(limit=10)
             finally:
                 store._db._conn.set_progress_handler(None, 0)
-            assert {ref.session_id for ref in result} == {
-                "queued", "recovering-null", "recovering", "expired"}
+            assert {ref.session_id for ref in result} == {"queued", "expired"}
             counts.append(steps[0])
         assert counts[0] > 0 and counts[1] <= 2 * counts[0], counts
     finally:

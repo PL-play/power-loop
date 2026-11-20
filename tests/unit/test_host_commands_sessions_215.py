@@ -59,10 +59,15 @@ async def test_inline_child_create_send_and_consume_without_parent_assistant(reg
         stored = await runner.runtime.worker.inputs.get_result(start, actor=runner.actor)
         assert stored.status == "completed" and stored.final_text == "inline child result"
         rows = await store._db.fetchall(
-            f"SELECT kind,status,terminal_status FROM {store.t.follow_up_queue} "
+            f"SELECT kind,status,item_id FROM {store.t.follow_up_queue} "
             "WHERE session_id=? AND kind='agent_result'",
             (runner.target.session_id,),
         )
-        assert rows == [{"kind": "agent_result", "status": "delivered", "terminal_status": "completed"}]
+        assert len(rows) == 1 and rows[0]["kind"] == "agent_result" and rows[0]["status"] == "delivered"
+        inspected = await runner.runtime.client.inspect(
+            InputRef(store.store_id, runner.target.session_id, rows[0]["item_id"]),
+            actor=runner.actor,
+        )
+        assert inspected.terminal_status == "completed"
     finally:
         await runner.aclose()

@@ -259,12 +259,15 @@ async def _exercise_managed_notice(store, raw_db, *, pending, measure=nullcontex
         for notice, row in zip(model.notices, routed, strict=True):
             assert notice["projected_origin"] == (_CALL_ID, start.session_id, start.message_id)
             assert notice["payload"] == row["content"]
-            assert row["status"] == "delivered" and row["terminal_status"] == "completed"
+            assert row["status"] == "delivered"
+            inspected = await client.inputs.inspect(
+                InputRef(store.store_id, runner.target.session_id, row["item_id"]), actor=runner.actor,
+            )
+            assert inspected.terminal_status == "completed"
             assert row["delivered_send_index"] == notice["send_index"]
         actual = model.notices[-1]["payload"]
         assert actual["child_target"] == plain(target) and actual["status"] == "completed"
         assert actual["structured_output"]["reference"] == state.actions[0]
-        assert routed[-1]["result_seq"] == parent_result.result_seq
         assert parent_result.send_index == model.notices[-1]["send_index"]
         if pending:
             assert child_result == original and child.terminal_status == "interrupted"
@@ -519,7 +522,7 @@ async def test_recovery_does_not_consume_unrelated_child_or_lose_observation(reg
                     # Hold the real lifecycle lock and close the parent. The public close
                     # also enforces linked-child policy; inject only the lifecycle fact.
                     async with independent._db.transaction() as tx:
-                        await independent._db.dialect.lock_state(tx, port.state, runner.target.session_id)
+                        await independent._db.dialect.lock_state(tx, port.s, runner.target.session_id)
                         await tx.execute(f"UPDATE {store.t.sessions} SET lifecycle='closed' WHERE session_id=?",
                                          (runner.target.session_id,))
             return result
@@ -538,16 +541,19 @@ async def test_recovery_does_not_consume_unrelated_child_or_lose_observation(reg
             assert observed.meta[managed_effects._OBSERVATION]["result"] == state.external_result.to_dict()
             assert await port.input(port.db, recovery_ref) is None
             lock = await port.boundary(target)
-            assert lock["active_send_index"] == owner.send_index and lock["owner_token"] == owner.owner_token
+            assert lock["send_index"] == owner.send_index and lock["owner_epoch"] == owner.owner_epoch
             assert row.row["terminal_status"] is None and row.row["delivered_send_index"] == owner.send_index
             assert await port.get_result(start, actor=runner.actor) == original
             assert await reconcile(store, runner.actor, start, adapter) is None
             await port.final(replace(owner, result_route=None), status="failed", error="unrelated input")
             # Set the same stricter acceptance limit on the recovery port in this test.
             if parent_input is not None:
-                # Fill the actual configured cap with distinct pending items. No hints sent.
-                for index in range(99):
-                    await port.accept(runner.target, "real backlog", actor=runner.actor, message_id=f"backlog-{index}")
+                # Fill the actual configured byte cap (1 MiB) with distinct pending items so even
+                # internal River delivery (hard_pending_limit=1024) hits capacity_exceeded.
+                for index in range(10):
+                    await port.accept(
+                        runner.target, "x" * 104_800, actor=runner.actor, message_id=f"backlog-{index}",
+                    )
             result = await reconcile(store, runner.actor, start, adapter, client=runner.runtime.client)
             assert result == state.external_result
             send_index = owner.send_index + 1
@@ -563,11 +569,11 @@ async def test_recovery_does_not_consume_unrelated_child_or_lose_observation(reg
             assert await port.input(port.db, parent_ref) is None
             if parent_input:
                 # Cancel backlog through its native port without starting the parent.
-                for item in [parent_input.message_id, *(f"backlog-{i}" for i in range(99))]:
+                for item in [parent_input.message_id, *(f"backlog-{i}" for i in range(10))]:
                     await port.cancel(InputRef(start.store_id, runner.target.session_id, item), actor=runner.actor)
             else:
                 async with independent._db.transaction() as tx:
-                    await independent._db.dialect.lock_state(tx, port.state, runner.target.session_id)
+                    await independent._db.dialect.lock_state(tx, port.s, runner.target.session_id)
                     await tx.execute(f"UPDATE {store.t.sessions} SET lifecycle='open' WHERE session_id=?",
                                      (runner.target.session_id,))
             assert await reconcile(store, runner.actor, start, adapter) == state.external_result
@@ -635,13 +641,15 @@ async def test_public_forgery_and_original_rerun_cannot_execute(registry_store):
         # Explicitly replay the original through the real claim and worker under a new
         # send. The public send is idempotent, so reset only its queue state to inject this.
         async with independent._db.transaction() as tx:
-            await independent._db.dialect.lock_state(tx, port.state, start.session_id)
+            await independent._db.dialect.lock_state(tx, port.s, start.session_id)
             await tx.execute(f"UPDATE {port.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
                              "delivered_send_index=NULL,terminal_status=NULL,result_seq=NULL,"
                              "result_send_index=NULL,completed_at=NULL,error_code=NULL,error_detail=NULL "
                              "WHERE session_id=? AND item_id=?", (start.session_id, start.message_id))
-            await tx.execute(f"UPDATE {port.state} SET execution_state='queued' WHERE session_id=?",
-                             (start.session_id,))
+            await tx.execute(
+                f"UPDATE {port.s} SET execution_state='queued',wake_pending_count=1,pending_count=1 WHERE session_id=?",
+                (start.session_id,),
+            )
         await runner.runtime.worker.recover()
         await runner.drain(after_input=start)
         rerun = await port.get_result(start, actor=runner.actor)
@@ -718,7 +726,7 @@ async def test_managed_checkpoint_cannot_write_after_ownership_loss(registry_sto
             await port.cancel(start, actor=runner.actor)
         else:
             await independent._db.execute(
-                f"UPDATE {port.state} SET owner_lease_until_ms=0 WHERE session_id=?", (start.session_id,),
+                f"UPDATE {port.s} SET owner_lease_until_ms=0 WHERE session_id=?", (start.session_id,),
             )
             recovered = await port.recover(target, node_id="replacement", boot_id="new-boot")
             assert recovered is not None and recovered.results[0].status == "interrupted"
@@ -921,7 +929,7 @@ async def test_explicit_reconcile_after_native_takeover(registry_store, monkeypa
         if checkpoint == "dispatched":
             assert pending is None
         data["running_reconcile_returned"] = plain(pending)
-        await port.db.execute(f"UPDATE {port.state} SET owner_lease_until_ms=0 WHERE session_id=?",
+        await port.db.execute(f"UPDATE {port.s} SET owner_lease_until_ms=0 WHERE session_id=?",
                               (start.session_id,))
         takeover = await port.recover(target, node_id="replacement", boot_id="replacement")
         assert len(takeover.results) == 1

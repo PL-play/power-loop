@@ -82,6 +82,10 @@ class _SqliteTransaction:
         row = await self.fetchone(sql, params)
         return bool(row["cancelled"]) if row is not None else None
 
+    async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
+        rc = await self.execute(sql, params)
+        return rc, 0
+
 
 class SqliteDatabase:
     def __init__(self, conn: sqlite3.Connection, *, path: str) -> None:

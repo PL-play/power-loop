@@ -31,7 +31,7 @@ async def test_claim_claim_has_one_owner_and_one_merged_message(registry_store):
     assert (first is None) != (second is None)
     batch = first or second
     state = await store._db.fetchone(
-        f"SELECT execution_state,owner_epoch,send_index FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT execution_state,owner_epoch,send_index FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,),
     )
     assert state == {"execution_state": "running", "owner_epoch": 1, "send_index": 1}
@@ -82,20 +82,22 @@ async def test_expired_accept_blocks_stale_final_then_recovers_before_new_claim(
     await old.accept(root, "old", message_id="old", actor=ACTOR)
     batch = await old.claim(root, node_id="old", boot_id="old")
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (root.session_id,),
     )
     follow_up = await new.accept(root, "new", message_id="new", actor=ACTOR)
-    assert (await new.inspect(root, actor=ACTOR)).execution_state == "recovering"
+    assert follow_up.newly_accepted
+    assert (await new.inspect(root, actor=ACTOR)).execution_state == "running"
     assert await new.claim(root, node_id="new", boot_id="new") is None
+    recovered = await new.recover(root, node_id="new", boot_id="new")
+    assert recovered.execution_state == "queued"
+    assert recovered.results[0].status == "interrupted"
     with pytest.raises(SessionLeaseLost):
         await old.final(batch, final_text="stale")
     with pytest.raises(SessionLeaseLost):
         await old.cancel_active(batch)
-    assert not await old.release_owner(batch)
-    recovered = await new.recover(root, node_id="new", boot_id="new")
-    assert recovered.execution_state == "queued"
-    assert recovered.results[0].status == "interrupted"
+    with pytest.raises(SessionLeaseLost):
+        await old.release_claim(batch)
     next_batch = await new.claim(root, node_id="new", boot_id="new")
     assert [ref.message_id for ref in next_batch.input_refs] == ["new"]
     await new.final(next_batch, final_text="new owner")
@@ -109,7 +111,7 @@ async def test_expired_running_without_new_input_is_discovered_and_finished(regi
     await port.accept(root, "old", message_id="old", actor=ACTOR)
     batch = await port.claim(root, node_id="old", boot_id="old")
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (root.session_id,),
     )
     assert root in await port.discover_unfinished()
@@ -128,7 +130,7 @@ async def test_recover_honours_matching_active_cancellation(registry_store):
     requested = await port.cancel(receipt.input_ref, actor=ACTOR, reason="stop old send")
     assert requested.state == "cancel_requested"
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (root.session_id,),
     )
     new = RuntimeInputStore(await connect(schema="verify"))
@@ -172,7 +174,7 @@ async def test_two_real_processes_hand_off_on_shared_server_db(registry_store, t
     try:
         assert (await event(old))["event"] == "claimed"
         await store._db.execute(
-            f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
             (root.session_id,),
         )
         new = await launch("new")
@@ -184,10 +186,14 @@ async def test_two_real_processes_hand_off_on_shared_server_db(registry_store, t
         for process in processes:
             await asyncio.wait_for(process.wait(), 20)
             assert process.returncode == 0, (await process.stderr.read()).decode()[-3000:]
-        statuses = await store._db.fetchall(
-            f"SELECT item_id,terminal_status FROM {store.t.follow_up_queue} ORDER BY item_id"
-        )
-        assert statuses == [
+        from power_loop import InputRef
+        inspected = [
+            {"item_id": item_id, "terminal_status": (await port.inspect(
+                InputRef(store.store_id, root.session_id, item_id), actor=ACTOR
+            )).terminal_status}
+            for item_id in ("new", "old")
+        ]
+        assert inspected == [
             {"item_id": "new", "terminal_status": "completed"},
             {"item_id": "old", "terminal_status": "interrupted"},
         ]

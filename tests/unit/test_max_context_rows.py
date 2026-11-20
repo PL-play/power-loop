@@ -89,7 +89,7 @@ async def test_history_limit_is_explicit_beyond_previous_defaults(store: Session
                               ("project", {"final_text": f"history-answer-{send:04d}"})):
             await store.upsert_project_message(sid, send_index=send, kind=kind, content=content,
                                                projector_version=1)
-    await store._db.execute(f"UPDATE {store.t.session_state} SET send_index=? WHERE session_id=?", (211, sid))
+    await store._db.execute(f"UPDATE {store.t.sessions} SET send_index=? WHERE session_id=?", (211, sid))
     try:
         assert (await loop.send("current")).status == "completed"
         prompt = str(llm.calls[0])

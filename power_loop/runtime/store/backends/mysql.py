@@ -60,6 +60,12 @@ class _MyTransaction:
             await cur.execute(self._db.dialect.translate(sql), _args(params))
             return bool(cur.lastrowid) if cur.rowcount else None
 
+    async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
+        # LAST_INSERT_ID(expr) in the 1st SET slot returns packed bits in the OK packet.
+        async with self._conn.cursor() as cur:
+            await cur.execute(self._db.dialect.translate(sql), _args(params))
+            return cur.rowcount, int(cur.lastrowid or 0)
+
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         import aiomysql  # optional extra: power-loop[mysql]
 

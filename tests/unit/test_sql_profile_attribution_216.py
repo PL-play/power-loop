@@ -26,7 +26,7 @@ OUTPUT_POINT = (
     "SELECT id,session_id,item_id FROM r13_follow_up_queue WHERE session_id=? AND item_id=? "
     "AND terminal_status IS NOT NULL"
 )
-DISCOVERY = "SELECT session_id FROM (SELECT session_id FROM r13_session_state LIMIT ?) AS candidates"
+DISCOVERY = "SELECT session_id FROM (SELECT session_id FROM r13_sessions LIMIT ?) AS candidates"
 
 
 @pytest.mark.parametrize(("chain", "sql", "expected"), [
@@ -87,6 +87,8 @@ async def _paused_message_snapshot(profile, store, target, entered, release):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["accept_poll", "snapshot_poll", "snapshot_accept"])
 async def test_transaction_classifies_only_its_own_statements(registry_store, monkeypatch, case):
+    from contextlib import asynccontextmanager
+
     store, _ = registry_store
     raw = store._db
     port = RuntimeInputStore(store)
@@ -94,22 +96,23 @@ async def test_transaction_classifies_only_its_own_statements(registry_store, mo
     profile = Profiled(raw)
     entered, release = asyncio.Event(), asyncio.Event()
     exit_records = []
-    original_accept = port._accept_tx
+    original_tx = profile.transaction
 
     def attributed(records, site):
         exit_records.append((list(records), site))
         return Profiled._transaction_category(records, site)
 
-    async def held_accept(*args, **kwargs):
-        result = await original_accept(*args, **kwargs)
-        entered.set()
-        await release.wait()
-        return result
+    @asynccontextmanager
+    async def held_tx():
+        async with original_tx() as tx:
+            yield tx
+            entered.set()
+            await release.wait()
 
     monkeypatch.setattr(profile, "_transaction_category", attributed)
     monkeypatch.setattr(store, "_db", profile)
     if case == "accept_poll":
-        monkeypatch.setattr(port, "_accept_tx", held_accept)
+        monkeypatch.setattr(profile, "transaction", held_tx)
         outer = asyncio.create_task(port.accept(target, "first", message_id="one", actor=ACTOR))
     else:
         outer = asyncio.create_task(_paused_message_snapshot(profile, store, target, entered, release))
@@ -136,10 +139,11 @@ async def test_transaction_classifies_only_its_own_statements(registry_store, mo
         release.set()
         await asyncio.gather(outer, return_exceptions=True)
 
+    accept_sql = 3 if raw.dialect.name == "mysql" else 2
     expected = {
-        "accept_poll": (5, [[0, 1, 2, 3]], ["session_control"]),
+        "accept_poll": (accept_sql + 1, [list(range(accept_sql))], ["session_control"]),
         "snapshot_poll": (2, [[0]], ["message"]),
-        "snapshot_accept": (5, [[0], [1, 2, 3, 4]], ["message", "session_control"]),
+        "snapshot_accept": (1 + accept_sql, [[0], list(range(1, 1 + accept_sql))], ["message", "session_control"]),
     }[case]
     sql, memberships, categories = expected
     assert len(profile.records) == sql
@@ -187,29 +191,31 @@ async def _stored_inputs(raw, port, target):
 
 @pytest.mark.asyncio
 async def test_clear_inflight_accept_returns_the_committed_receipt(registry_store, monkeypatch):
+    from contextlib import asynccontextmanager
+
     store, _ = registry_store
     raw = store._db
     port = RuntimeInputStore(store)
     target = await port.create_session(DESCRIPTOR, actor=ACTOR)
     profile = Profiled(ReadWork(raw))
     entered, release = asyncio.Event(), asyncio.Event()
-    original_accept = port._accept_tx
-    receipts = []
+    original_tx = profile.transaction
 
-    async def held_accept(*args, **kwargs):
-        receipt = await original_accept(*args, **kwargs)
-        receipts.append(receipt)
-        entered.set()
-        await release.wait()
-        return receipt
+    @asynccontextmanager
+    async def held_tx():
+        async with original_tx() as tx:
+            yield tx
+            entered.set()
+            await release.wait()
 
     monkeypatch.setattr(store, "_db", profile)
-    monkeypatch.setattr(port, "_accept_tx", held_accept)
+    monkeypatch.setattr(profile, "transaction", held_tx)
+    accept_sql = 3 if raw.dialect.name == "mysql" else 2
     task = asyncio.create_task(port.accept(target, "A", message_id="A", actor=ACTOR))
     try:
         async with asyncio.timeout(10):
             await entered.wait()
-            assert len(profile.records) == 4 and profile.tx_categories == [None]
+            assert len(profile.records) == accept_sql and profile.tx_categories == [None]
             _reset(profile, StreamModel(text="test"))
             release.set()
             receipt = await task
@@ -217,7 +223,6 @@ async def test_clear_inflight_accept_returns_the_committed_receipt(registry_stor
         release.set()
         await asyncio.gather(task, return_exceptions=True)
 
-    assert receipts == [receipt]
     assert receipt.input_ref == InputRef(store.store_id, target.session_id, "A")
     assert receipt.target == target and receipt.message_id == "A" and receipt.newly_accepted
     assert await _stored_inputs(raw, port, target) == [{"item_id": "A", "status": "pending"}]
@@ -252,7 +257,7 @@ async def test_old_snapshot_does_not_write_the_new_window(registry_store, monkey
             else:
                 async with profile.read_snapshot() as reader:
                     row = await reader.fetchone(
-                        f"SELECT execution_state FROM {store.t.session_state} WHERE session_id=?",
+                        f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?",
                         (target.session_id,),
                     )
                     assert row["execution_state"] == "idle"
@@ -267,7 +272,8 @@ async def test_old_snapshot_does_not_write_the_new_window(registry_store, monkey
         release.set()
         await asyncio.gather(old, return_exceptions=True)
 
-    assert len(profile.records) == (4 if replacement == "accept" else 1)
+    accept_sql = 3 if raw.dialect.name == "mysql" else 2
+    assert len(profile.records) == (accept_sql if replacement == "accept" else 1)
     assert profile.transactions == len(profile.tx_sites) == 1
     assert profile.tx_categories == ["session_control"]
     if replacement == "accept":

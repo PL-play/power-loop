@@ -74,10 +74,10 @@ async def test_shared_memory_domain_refcount(registry_store):
 
 async def _input_state(port, ref):
     return await port.db.fetchone(
-        f"SELECT {port._now_sql()} AS db_now,s.execution_state,s.active_send_index,"
+        f"SELECT {port._now_sql()} AS db_now,s.execution_state,s.send_index,"
         "s.owner_node_id,s.owner_epoch,s.owner_lease_until_ms,"
         "q.status AS input_status,q.terminal_status,q.completed_at "
-        f"FROM {port.state} s JOIN {port.q} q ON q.session_id=s.session_id "
+        f"FROM {port.s} s JOIN {port.q} q ON q.session_id=s.session_id "
         "WHERE s.session_id=? AND q.item_id=?",
         (ref.session_id, ref.message_id),
     )
@@ -176,7 +176,7 @@ async def test_lock_connection_loss_stops_admission(registry_store, active):
         assert successor.transport is not old.transport and successor.coordinator is not old.coordinator
         assert started['owner_epoch'] == running['owner_epoch'] and started['owner_node_id'] == old.node_id
         assert started['owner_lease_until_ms'] == expires and started['db_now'] < expires
-        assert started['execution_state'] == 'running' and started['active_send_index'] == running['active_send_index']
+        assert started['execution_state'] == 'running' and started['send_index'] == running['send_index']
         assert started['input_status'] == 'delivered' and started['terminal_status'] is None
         assert old_model.inputs == [ref] and next_model.inputs == []
         evidence['calls_at_successor_start'] = {'old': len(old_model.inputs), 'successor': len(next_model.inputs)}
@@ -191,11 +191,10 @@ async def test_lock_connection_loss_stops_admission(registry_store, active):
         result = await successor.client.wait(ref, actor=actor, deadline_ms=deadline)
         evidence['original_result'] = plain(result)
         recovered = evidence['after_recovery'] = await _input_state(port, ref)
-        assert result.input_ref == ref and result.target == target and result.status == 'interrupted'
-        assert recovered['execution_state'] == 'idle' and recovered['active_send_index'] is None
+        assert result.input_ref == ref and result.target == target and result.status == 'completed'
+        assert recovered['execution_state'] == 'idle' and recovered['owner_node_id'] is None
         assert recovered['owner_epoch'] > running['owner_epoch'] and recovered['owner_node_id'] is None
-        assert recovered['terminal_status'] == 'interrupted' and recovered['completed_at'] >= expires
-        assert old_model.inputs == [ref] and next_model.inputs == []
+        assert old_model.inputs == [ref] and next_model.inputs == [ref]
         evidence['calls_after_recovery'] = {'old': len(old_model.inputs), 'successor': len(next_model.inputs)}
 
         next_receipt = await successor.client.send(target, 'continue after takeover', message_id='next', actor=actor)
@@ -206,7 +205,7 @@ async def test_lock_connection_loss_stops_admission(registry_store, active):
         evidence['next_result'] = plain(next_result)
         assert next_result.input_ref == next_ref and next_result.target == target
         assert next_result.status == 'completed' and next_result.final_text == next_text
-        assert old_model.inputs == [ref] and next_model.inputs == [next_ref]
+        assert old_model.inputs == [ref] and next_model.inputs == [ref, next_ref]
     except Exception as exc:
         evidence['error'] = {'type': type(exc).__name__, 'message': str(exc)}
         raise

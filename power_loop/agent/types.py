@@ -42,6 +42,9 @@ class AgentLoopConfig:
 
     system_prompt: str | None = None
     max_rounds: int = 24
+    #: Hard cap on COMPLETE_DECIDE continuation injections per send (design 217 Probe 3).
+    #: None disables the cap; default 3 allows bounded finalization without runaway loops.
+    max_extra_rounds: int | None = 3
     temperature: float | None = 0.0
     max_tokens: int | None = 8000
     #: Per-loop model override. When set, every LLM request of this loop carries

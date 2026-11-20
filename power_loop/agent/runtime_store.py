@@ -1,12 +1,14 @@
-"""Session-native accept/claim/final storage. No job or generation reads."""
+"""Session-Core accept / claim / final / stop / recovery storage (Design 217 schema 18)."""
 from __future__ import annotations
 
 import asyncio
 import json
-import uuid
+import secrets
 from dataclasses import dataclass, replace
+from typing import Any
 
 from power_loop.contracts.errors import SessionLeaseLost
+from power_loop.runtime.store.db import is_duplicate_key_error
 from power_loop.runtime.store.types import (
     MessageRow as StoredMessageRow,
 )
@@ -14,6 +16,7 @@ from power_loop.runtime.store.types import MessageState
 
 from .runtime_types import (
     PROTOCOL_VERSION,
+    RESERVED_INPUT_PREFIXES,
     CapacityError,
     InputRef,
     MessagePage,
@@ -32,8 +35,30 @@ from .runtime_types import (
     sha256_canonical,
 )
 
+SOFT_PENDING_LIMIT = 100
+HARD_PENDING_LIMIT = 1024
+DEFAULT_MAX_PENDING_BYTES = 1_048_576
+_VALID_INPUT_KINDS = frozenset({
+    "user",
+    "system_notice",
+    "agent_result",
+    "workflow_result",
+    "workflow_node_result",
+    "background_result",
+    "managed_effect_result",
+    "workflow_continue",
+})
+_PUBLIC_INPUT_KINDS = frozenset({"user", "system_notice"})
+_VALID_RESULT_KINDS = frozenset({
+    "agent_result",
+    "workflow_result",
+    "workflow_node_result",
+    "background_result",
+    "managed_effect_result",
+})
 
-def now_ms():
+
+def now_ms() -> int:
     import time
     return int(time.time() * 1000)
 
@@ -49,27 +74,20 @@ _RESULT_INPUT_COLUMNS = (
     "session_id", "item_id", "kind", "status", "terminal_status",
     "result_seq", "result_send_index", "error_code", "error_detail",
     "result_delivery_error", "delivered_send_index", "continuation_of",
+    "result_json", "cancel_by",
 )
 
 
 @dataclass(frozen=True)
 class ResultInput:
-    """The narrow input view needed to resolve and report a durable result."""
+    """Narrow input view needed to resolve and report a durable result."""
     ref: InputRef
     row: dict
 
 
 @dataclass(frozen=True)
 class ResultRead:
-    """One authorized read of a target input and its durable result.
-
-    ``record is None`` means the target authorized the caller but the input does not
-    exist (``before_send=True`` keeps this state; public ``get_result`` raises).
-    ``resolved`` is the newest continuation input when the requested input is a
-    continuation chain member, otherwise the same record. ``result`` is non-None only
-    for a terminal resolved input. The records are internal narrow result views, not
-    full InputRecords.
-    """
+    """One authorized read of a target input and its durable result."""
     ref: InputRef
     target: TargetRef
     session: dict
@@ -79,20 +97,28 @@ class ResultRead:
 
 
 @dataclass(frozen=True)
-class ClaimedBatch:
-    """One atomically claimed input snapshot.
+class ChildSpec:
+    """Specification for one child session in ``create_many``."""
+    session_id: str
+    message_id: str
+    body: Any
+    descriptor: RuntimeDescriptor
+    result_kind: str = "agent_result"
+    reply_to_session_id: str | None = None
+    cancel_propagation: str = "linked"
+    creation_tool_call_id: str | None = None
+    creation_call_ref: dict | None = None
+    creation_identity_hash: str | None = None
 
-    The claim transaction already knows everything the worker and loop need to start the
-    send: the frozen descriptor/identity read under the state lock, and the merged user row
-    it wrote (content, seq, send_index, meta). Returning them here keeps the healthy path
-    from re-reading its own session/state and its own just-written user message.
-    """
+
+@dataclass(frozen=True)
+class ClaimedBatch:
+    """One atomically claimed input snapshot on schema 18 (no owner_token)."""
     target: TargetRef
     send_index: int
     message_seq: int
     input_refs: tuple[InputRef, ...]
     owner_epoch: int
-    owner_token: str
     owner_node_id: str
     owner_boot_id: str
     descriptor: RuntimeDescriptor
@@ -100,16 +126,27 @@ class ClaimedBatch:
     principal_id: str
     parent_session_id: str | None
     user_row: StoredMessageRow
-    # The frozen direct-parent route read under the claim's state lock. It is creation
-    # metadata, so the claim snapshot is the authoritative value final needs; final never
-    # re-reads the session for it. ``None`` is the real "no route" case, not a default.
     result_route: dict | None
-    #: The session's ``updated_at`` from the same post-lock batch read. It is the activity
-    #: time the claim actually saw, handed to this run's existing touch throttle; it is not a
-    #: long-lived cache and does not replace the owner/touch conditional writes.
     session_updated_at: int
     inbox_version: int = 0
+    wake_inbox_seq: int = 0
+    cancel_seq: int = 0
+    cancel_by: str | None = None
     start_input_message_id: str | None = None
+    root_session_id: str = ""
+    depth: int = 0
+    reply_to_session_id: str | None = None
+    reply_result_kind: str | None = None
+    is_reclaimed: bool = False
+    reclaimed_has_assistant: bool = False
+    reclaimed_cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class CreateManyResult:
+    preclaimed: tuple[ClaimedBatch, ...]
+    queued_targets: tuple[TargetRef, ...]
+    already_created: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,65 +155,76 @@ class FinalBatch:
     results: tuple[Result, ...]
     result_ref: InputRef | None = None
     result_activation: TargetRef | None = None
+    result_delivery_error: str | None = None
 
 
 class _TargetAlreadyCreated(Exception):
-    """A concurrent request inserted the deterministic target after this call read it
-    absent. Private and narrow: it only drives one re-entry into the ordinary
-    existing-target path after the first transaction has exited and released its locks.
-    """
+    pass
+
+
+class _AcceptSlowPath(Exception):
+    def __init__(self, reason: str = "slow"):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class _ClaimRollback(Exception):
+    pass
 
 
 class RuntimeInputStore:
-    """The only schema-17 execution storage port used by P1."""
+    """Session-Core schema-18 storage port (SQLite / PostgreSQL 16 / MySQL 8.4)."""
 
-    def __init__(self, store, *, inbox_item_limit=100, inbox_byte_limit=1_048_576):
+    def __init__(
+        self,
+        store,
+        *,
+        inbox_item_limit: int = SOFT_PENDING_LIMIT,
+        hard_pending_limit: int | None = None,
+        inbox_byte_limit: int = DEFAULT_MAX_PENDING_BYTES,
+    ):
         self.store = store
+        self.s = store.t.sessions
         self.q = store.t.follow_up_queue
-        self.state = store.t.session_state
         self.inbox_item_limit = inbox_item_limit
+        if hard_pending_limit is None:
+            self.hard_pending_limit = (
+                HARD_PENDING_LIMIT if inbox_item_limit == SOFT_PENDING_LIMIT else inbox_item_limit
+            )
+        else:
+            self.hard_pending_limit = hard_pending_limit
         self.inbox_byte_limit = inbox_byte_limit
-        # One row for the target session, its addressed input and that input's result
-        # message. Aliases keep the three tables' overlapping columns apart. The message
-        # join carries both halves of the address so it cannot land on another send.
-        self._result_sql = (
-            "SELECT s.session_id AS session_id,s.tenant_id AS tenant_id,"
-            "s.principal_id AS principal_id,s.parent_session_id AS parent_session_id,"
-            "q.item_id AS input_item_id,q.kind AS input_kind,q.status AS input_status,"
-            "q.terminal_status AS input_terminal_status,"
-            "q.result_seq AS input_result_seq,"
-            "q.result_send_index AS input_result_send_index,"
-            "q.error_code AS input_error_code,q.error_detail AS input_error_detail,"
-            "q.result_delivery_error AS input_result_delivery_error,"
-            "q.delivered_send_index AS input_delivered_send_index,"
-            "q.continuation_of AS input_continuation_of,"
-            "m.id AS result_message_id,m.content AS result_content,"
-            "m.meta_json AS result_meta_json "
-            f"FROM {store.t.sessions} s "
-            f"LEFT JOIN {self.q} q ON q.session_id=s.session_id AND q.item_id=? "
-            f"LEFT JOIN {store.t.messages} m ON m.session_id=q.session_id "
-            "AND m.seq=q.result_seq AND m.send_index=q.result_send_index "
-            "WHERE s.session_id=?"
-        )
 
     @property
     def db(self):
         return self.store._db
 
-    def check_store(self, ref):
+    @property
+    def _dialect(self) -> str:
+        return self.db.dialect.name
+
+    def check_store(self, ref) -> None:
         if ref.store_id != self.store.store_id:
             raise RuntimeRequestError("wrong_store")
 
-    def _now_sql(self):
-        name = self.db.dialect.name
+    def _now_sql(self) -> str:
+        name = self._dialect
         if name == "sqlite":
-            return "CAST(strftime('%s','now') AS INTEGER)*1000"
+            return "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
         if name == "postgres":
-            return "floor(extract(epoch from clock_timestamp())*1000)::bigint"
-        return "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS SIGNED)"
+            return "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)"
+        return "FLOOR(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000)"
 
-    async def _db_now(self, reader):
+    def _p_text(self) -> str:
+        return "CAST(? AS TEXT)" if self._dialect == "postgres" else "?"
+
+    def _p_int(self) -> str:
+        return "CAST(? AS BIGINT)" if self._dialect == "postgres" else "?"
+
+    async def _db_now(self, reader) -> int:
         return int((await reader.fetchone(f"SELECT {self._now_sql()} AS now"))["now"])
+
+    # ── Session creation & configuration ─────────────────────────────────────
 
     async def create_session(
         self, descriptor: RuntimeDescriptor, *, actor, parent=None, result_route=None,
@@ -196,7 +244,6 @@ class RuntimeInputStore:
             parent_id = parent.session_id
         session_id = opts.get("session_id")
         if session_id is None:
-            import secrets
             session_id = "sess_" + secrets.token_hex(12)
         route = self._result_route(parent, result_route, session_id)
         sid = await self.store.create_session(
@@ -215,32 +262,88 @@ class RuntimeInputStore:
         )
         return TargetRef(self.store.store_id, sid)
 
+    async def configure_session(
+        self,
+        target: TargetRef,
+        *,
+        actor,
+        descriptor: RuntimeDescriptor | None = None,
+        cancel_propagation: str | None = None,
+    ) -> dict[str, Any]:
+        """Hot-update session descriptor (immediate if not running; staged in next_descriptor_* if running).
+
+        Staged descriptors are promoted atomically across all three claim entry points:
+        fused ``accept_and_claim``, standard ``claim``, and 1-SQL pre-staged child ``claim``.
+        """
+        self.check_store(target)
+        if cancel_propagation is not None and cancel_propagation not in {"linked", "independent"}:
+            raise RuntimeRequestError("invalid_options", "cancel_propagation")
+        desc_json = canonical(descriptor) if descriptor is not None else None
+        desc_hash = sha256_canonical(descriptor) if descriptor is not None else None
+        now_sql = self._now_sql()
+        suffix = "" if self._dialect == "sqlite" else " FOR UPDATE"
+        async with self.db.transaction() as tx:
+            row = await tx.fetchone(
+                f"SELECT session_id,tenant_id,principal_id,parent_session_id,lifecycle,execution_state "
+                f"FROM {self.s} WHERE session_id=?" + suffix,
+                (target.session_id,),
+            )
+            if row is None:
+                raise RuntimeRequestError("not_found")
+            await self._authorize_known(tx, target, actor, row)
+            if row["lifecycle"] not in ("open", "suspended"):
+                raise RuntimeRequestError("session_closed")
+            sets = [f"updated_at={now_sql}"]
+            params: list[Any] = []
+            applied_immediately = row["execution_state"] != "running"
+            if desc_json is not None:
+                if applied_immediately:
+                    sets.extend([
+                        "descriptor_json=?",
+                        "descriptor_hash=?",
+                        "next_descriptor_json=NULL",
+                        "next_descriptor_hash=NULL",
+                    ])
+                    params.extend([desc_json, desc_hash])
+                else:
+                    sets.extend(["next_descriptor_json=?", "next_descriptor_hash=?"])
+                    params.extend([desc_json, desc_hash])
+            if cancel_propagation is not None:
+                sets.append("cancel_propagation=?")
+                params.append(cancel_propagation)
+            params.append(target.session_id)
+            await tx.execute(
+                f"UPDATE {self.s} SET {','.join(sets)} WHERE session_id=?",
+                tuple(params),
+            )
+        return {
+            "session_id": target.session_id,
+            "applied_immediately": applied_immediately,
+            "staged": desc_json is not None and not applied_immediately,
+        }
+
     async def _lock_creation_parent_tx(self, tx, parent, actor, *, existing_id=None):
-        """Lock the parent and an existing deterministic target in session_id order,
-        then read/authorize the parent and check lifecycle/cancel under that lock."""
+        """Lock deep-first (child before parent) consistent with Design 217 lock ordering."""
         from power_loop.contracts.errors import CancellationRequested
 
-        lock_ids = {parent.session_id}
-        if existing_id is not None:
-            lock_ids.add(existing_id)
+        lock_ids = []
+        if existing_id is not None and existing_id != parent.session_id:
+            lock_ids.append(existing_id)
+        lock_ids.append(parent.session_id)
         states = {}
-        for sid in sorted(lock_ids):
+        for sid in lock_ids:
             try:
-                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
+                states[sid] = await self.db.dialect.lock_state(tx, self.s, sid)
             except ValueError as exc:
                 if sid == parent.session_id:
                     raise RuntimeRequestError("not_found") from exc
-                # The only other id in this set is the existing deterministic target.
-                # A public cancel/close/retention cleanup can remove it between the
-                # re-entry read and this lock; report the creation conflict instead of
-                # leaking the storage layer's ValueError.
                 raise RuntimeRequestError("creation_conflict") from exc
-        parent_session = await self.authorize(tx, parent, actor)
+        parent_session = states[parent.session_id]
+        await self._authorize_known(tx, parent, actor, parent_session)
         if parent_session["lifecycle"] != "open":
             raise RuntimeRequestError("session_closed")
-        parent_state = states[parent.session_id]
-        if parent_state["cancel_send_index"] is not None:
-            raise CancellationRequested(parent_state["cancel_reason"] or "cancelled")
+        if parent_session["execution_state"] == "running" and parent_session["cancel_by"] is not None:
+            raise CancellationRequested(parent_session["cancel_reason"] or "cancelled")
         return parent_session
 
     async def create_child(
@@ -254,10 +357,7 @@ class RuntimeInputStore:
             raise RuntimeRequestError("forbidden", "child creation requires the direct parent actor")
         if cancel_propagation not in {"linked", "independent"}:
             raise RuntimeRequestError("invalid_options", "cancel_propagation")
-        if result_kind not in {
-            "agent_result", "background_result", "managed_effect_result",
-            "workflow_result", "workflow_node_result",
-        }:
+        if result_kind not in _VALID_RESULT_KINDS:
             raise RuntimeRequestError("invalid_options", "result_kind")
         session_id = "ses_" + sha256_canonical([
             "child", parent.store_id, parent.session_id, call_ref.to_dict(), tool_call_id,
@@ -276,12 +376,17 @@ class RuntimeInputStore:
             parent.store_id, parent.session_id, call_ref.to_dict(), tool_call_id,
             descriptor, start,
         ])
+        content = canonical(body)
+        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        content_bytes = len(content.encode()) + len(meta.encode())
+        if self.inbox_item_limit <= 0 or content_bytes > self.inbox_byte_limit:
+            raise CapacityError()
+        req_hash = self.request_hash(target, body, "normal")
         for attempt in range(2):
             try:
                 async with self.db.transaction() as tx:
                     existing = await tx.fetchone(
-                        f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?",
-                        (session_id,),
+                        f"SELECT * FROM {self.s} WHERE session_id=?", (session_id,),
                     )
                     parent_session = await self._lock_creation_parent_tx(
                         tx, parent, actor,
@@ -296,40 +401,53 @@ class RuntimeInputStore:
                                 "WHERE session_id=? AND seq=? AND role='assistant'",
                                 (parent.session_id, call_ref.seq),
                             )
-                            calls = (
-                                json.loads(call["tool_calls_json"] or "[]")
-                                if call is not None else []
-                            )
+                            calls = json.loads(call["tool_calls_json"] or "[]") if call is not None else []
                             if not any(item.get("id") == tool_call_id for item in calls):
                                 raise RuntimeRequestError(
                                     "forbidden", "original assistant tool call not found")
                         database_now = await self._db_now(tx)
+                        root_id = str(parent_session["root_session_id"])
+                        child_depth = int(parent_session["depth"]) + 1
+                        if child_depth > self.store.max_spawn_depth:
+                            raise RuntimeRequestError(
+                                "invalid_options",
+                                f"child depth exceeds max {self.store.max_spawn_depth}",
+                            )
                         changed = await tx.execute(
-                            f"INSERT INTO {self.store.t.sessions} ("
-                            "session_id,parent_session_id,created_by_session_id,session_kind,"
-                            "descriptor_json,descriptor_hash,creation_identity_hash,"
+                            f"INSERT INTO {self.s} ("
+                            "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
+                            "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
                             "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
                             "tenant_id,principal_id,result_route_json,cancel_propagation,"
-                            "created_at,updated_at) "
-                            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
-                            f"WHERE NOT EXISTS (SELECT 1 FROM {self.store.t.sessions} "
-                            "WHERE session_id=?)",
+                            "execution_state,inbox_version,wake_inbox_seq,wake_pending_count,"
+                            "pending_count,pending_bytes,created_at,updated_at) "
+                            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',1,1,1,1,?,?,? "
+                            f"WHERE NOT EXISTS (SELECT 1 FROM {self.s} WHERE session_id=?)",
                             (
-                                session_id, parent.session_id, actor.session_id, descriptor.kind,
-                                canonical(descriptor), sha256_canonical(descriptor), identity,
-                                canonical(call_ref.to_dict()), tool_call_id, start.message_id,
+                                session_id, parent.session_id, actor.session_id, root_id, child_depth,
+                                descriptor.kind, canonical(descriptor), sha256_canonical(descriptor),
+                                identity, canonical(call_ref.to_dict()), tool_call_id, start.message_id,
                                 parent_session["tenant_id"], parent_session["principal_id"],
-                                canonical(route), cancel_propagation, database_now, database_now,
-                                session_id,
+                                canonical(route), cancel_propagation,
+                                content_bytes, database_now, database_now, session_id,
                             ),
                         )
                         if changed != 1:
                             if attempt == 0:
                                 raise _TargetAlreadyCreated
                             raise RuntimeRequestError("creation_conflict")
-                        receipt = await self._start_new_session_tx(
-                            tx, target, body, start, database_now=database_now,
+                        await tx.execute(
+                            f"INSERT INTO {self.q} ("
+                            "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                            "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                            "meta_json,request_hash,result_kind,created_at,expires_at) "
+                            "VALUES (?,?,1,'user','normal',1,'pending',?,?,?,?,?,?,NULL,?,NULL)",
+                            (
+                                session_id, start.message_id, parent.session_id, result_kind,
+                                content, content_bytes, meta, req_hash, database_now,
+                            ),
                         )
+                        receipt = Receipt(start, target, start.message_id, True, "accepted", None, "not_needed")
                     else:
                         expected = {
                             "parent_session_id": parent.session_id,
@@ -343,35 +461,231 @@ class RuntimeInputStore:
                         }
                         if any(existing[key] != value for key, value in expected.items()):
                             raise RuntimeRequestError("creation_conflict")
-                        # A retry of a deterministic create keeps the ordinary accept path:
-                        # it verifies the existing session/input instead of assuming
-                        # first-create.
-                        receipt = await self._accept_tx(
-                            tx, target, body, start, self.request_hash(target, body, "normal"),
-                            canonical(body), actor=actor, priority="normal", deadline_ms=None,
-                            kind="user", result_kind=None,
+                        receipt = await self._accept_existing_tx(
+                            tx, target, start, req_hash, content, content_bytes,
+                            actor=actor, priority="normal", deadline_ms=None,
+                            kind="user", result_kind=None, wake=True,
+                            reply_to_session_id=parent.session_id, reply_result_kind=result_kind,
                         )
                 return target, start, receipt
             except _TargetAlreadyCreated:
                 if attempt:
                     raise
-                # The conditional INSERT hit the winner's committed row. The transaction
-                # has exited and released the parent lock; re-enter once through the
-                # ordinary existing-target verification.
                 continue
         raise RuntimeRequestError("creation_conflict")
+
+    async def create_many(
+        self,
+        *,
+        parent: TargetRef,
+        actor,
+        specs: list[ChildSpec],
+        node_id: str,
+        boot_id: str,
+        ttl_s: float = 30.0,
+        can_execute: bool = True,
+        free_slots: int = 0,
+        parent_owner_epoch: int | None = None,
+        parent_cancel_seq: int | None = None,
+    ) -> CreateManyResult:
+        """Batch-create N child sessions in 1 atomic transaction (Design 217 §4.2).
+
+        - Pre-claims the first ``k = min(N, free_slots)`` when ``can_execute=True`` (0 Claim SQL).
+        - Pre-stages the remaining ``N - k`` queued children with ``follow_up_queue(status='delivered')``,
+          initial ``messages(role='user', seq=1)``, and ``ready_item_json`` so cross-container
+          ``claim()`` completes in 1 SQL (SQLite/PG) or 2 SQL (MySQL) with 0 message inserts!
+        """
+        self.check_store(parent)
+        if not specs:
+            return CreateManyResult(preclaimed=(), queued_targets=())
+        if ttl_s <= 0:
+            raise RuntimeRequestError("invalid_options", "ttl_s")
+        k = min(len(specs), max(0, int(free_slots))) if can_execute else 0
+        ttl_ms = int(ttl_s * 1000)
+
+        spec_hashes = {}
+        for sp in specs:
+            if sp.cancel_propagation not in {"linked", "independent"}:
+                raise RuntimeRequestError("invalid_options", "cancel_propagation")
+            if sp.result_kind not in _VALID_RESULT_KINDS:
+                raise RuntimeRequestError("invalid_options", "result_kind")
+            spec_hashes[sp.session_id] = sp.creation_identity_hash or sha256_canonical([
+                parent.store_id, parent.session_id, sp.session_id,
+                sp.creation_tool_call_id, sp.message_id, sp.descriptor,
+            ])
+
+        try:
+            async with self.db.transaction() as tx:
+                parent_row = await self.db.dialect.lock_state(tx, self.s, parent.session_id)
+                await self._authorize_known(tx, parent, actor, parent_row)
+                if parent_owner_epoch is not None and (
+                    int(parent_row["owner_epoch"]) != int(parent_owner_epoch)
+                    or parent_row["execution_state"] != "running"
+                ):
+                    raise SessionLeaseLost(parent.session_id)
+                if parent_row["lifecycle"] != "open":
+                    raise RuntimeRequestError("session_closed")
+                if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
+                    raise RuntimeRequestError("cancelled", "parent_cancelled")
+
+                database_now = await self._db_now(tx)
+                root_id = str(parent_row["root_session_id"])
+                child_depth = int(parent_row["depth"]) + 1
+                if child_depth > self.store.max_spawn_depth:
+                    raise RuntimeRequestError(
+                        "invalid_options",
+                        f"child depth exceeds max {self.store.max_spawn_depth}",
+                    )
+                lease_until = database_now + ttl_ms
+
+                preclaimed: list[ClaimedBatch] = []
+                queued: list[TargetRef] = []
+
+                for idx, sp in enumerate(specs):
+                    is_preclaimed = idx < k
+                    child_target = TargetRef(parent.store_id, sp.session_id)
+                    start_ref = InputRef(parent.store_id, sp.session_id, sp.message_id)
+                    reply_to = sp.reply_to_session_id or parent.session_id
+                    route = self._result_route(
+                        parent,
+                        {"target": parent, "input_ref": start_ref, "result_kind": sp.result_kind},
+                        sp.session_id,
+                    )
+                    content = canonical(sp.body)
+                    meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+                    content_bytes = len(content.encode()) + len(meta.encode())
+                    if content_bytes > self.inbox_byte_limit:
+                        raise CapacityError()
+                    req_hash = self.request_hash(child_target, sp.body, "normal")
+                    is_driver = sp.descriptor.kind == "workflow_driver"
+                    merged = self.merge_batch([{
+                        "item_id": sp.message_id, "kind": "user", "priority": "normal",
+                        "content_json": content,
+                    }])
+                    merged_json = canonical(merged)
+                    msg_meta = {"content_encoding": "json", "input_refs": [plain(start_ref)]}
+
+                    ready_item = None if is_preclaimed else canonical({
+                        "item_id": sp.message_id,
+                        "kind": "user",
+                        "priority": "normal",
+                        "wake": 1,
+                        "content_json": content,
+                        "content_bytes": content_bytes,
+                        "meta_json": meta,
+                        "reply_to_session_id": reply_to,
+                        "reply_result_kind": sp.result_kind,
+                        "user_content": merged_json,
+                        "user_seq": None if is_driver else 1,
+                    })
+
+                    execution_state_val = "running" if is_preclaimed else "queued"
+                    send_idx_col = 1 if is_preclaimed else 0
+                    next_seq_col = 1 if is_driver else 2
+                    owner_epoch_col = 1 if is_preclaimed else 0
+                    owner_node_col = node_id if is_preclaimed else None
+                    owner_boot_col = boot_id if is_preclaimed else None
+                    lease_col = lease_until if is_preclaimed else None
+                    wake_pending_col = 0 if is_preclaimed else 1
+
+                    await tx.execute(
+                        f"INSERT INTO {self.s} ("
+                        "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
+                        "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
+                        "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
+                        "tenant_id,principal_id,result_route_json,cancel_propagation,"
+                        "next_seq,send_index,execution_state,owner_epoch,owner_node_id,"
+                        "owner_boot_id,owner_lease_until_ms,inbox_version,wake_inbox_seq,"
+                        "wake_pending_count,pending_count,pending_bytes,ready_item_json,"
+                        "created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            sp.session_id, parent.session_id, actor.session_id, root_id, child_depth,
+                            sp.descriptor.kind, canonical(sp.descriptor), sha256_canonical(sp.descriptor),
+                            spec_hashes[sp.session_id],
+                            canonical(sp.creation_call_ref) if sp.creation_call_ref else None,
+                            sp.creation_tool_call_id, sp.message_id,
+                            parent_row["tenant_id"], parent_row["principal_id"],
+                            canonical(route), sp.cancel_propagation,
+                            next_seq_col, send_idx_col, execution_state_val, owner_epoch_col,
+                            owner_node_col, owner_boot_col, lease_col,
+                            1, 1, wake_pending_col, 0, 0, ready_item,
+                            database_now, database_now,
+                        ),
+                    )
+                    deliv_seq = None if is_driver else 1
+                    await tx.execute(
+                        f"INSERT INTO {self.q} ("
+                        "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                        "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                        "meta_json,request_hash,result_kind,created_at,delivered_at,"
+                        "delivered_seq,delivered_send_index) "
+                        "VALUES (?,?,1,'user','normal',1,'delivered',?,?,?,?,?,?,NULL,?,?,?,1)",
+                        (
+                            sp.session_id, sp.message_id, reply_to, sp.result_kind,
+                            content, content_bytes, meta, req_hash, database_now,
+                            database_now, deliv_seq,
+                        ),
+                    )
+                    if not is_driver:
+                        await self._insert_message(
+                            tx, sp.session_id, 1, "user", merged_json, msg_meta, 1, database_now,
+                        )
+                    if is_preclaimed:
+                        user_row = StoredMessageRow(
+                            session_id=sp.session_id, seq=1, role="user", name=None,
+                            content=merged_json, tool_calls=None, tool_call_id=None,
+                            round_index=0, state=MessageState.ACTIVE, meta=msg_meta,
+                            created_at=database_now, send_index=1,
+                        )
+                        preclaimed.append(ClaimedBatch(
+                            target=child_target,
+                            send_index=1,
+                            message_seq=1 if not is_driver else 0,
+                            input_refs=(start_ref,),
+                            owner_epoch=1,
+                            owner_node_id=node_id,
+                            owner_boot_id=boot_id,
+                            descriptor=sp.descriptor,
+                            tenant_id=parent_row["tenant_id"],
+                            principal_id=parent_row["principal_id"],
+                            parent_session_id=parent.session_id,
+                            user_row=user_row,
+                            result_route=route,
+                            session_updated_at=database_now,
+                            inbox_version=1,
+                            wake_inbox_seq=1,
+                            cancel_seq=0,
+                            start_input_message_id=sp.message_id,
+                            root_session_id=root_id,
+                            depth=child_depth,
+                            reply_to_session_id=reply_to,
+                            reply_result_kind=sp.result_kind,
+                        ))
+                    else:
+                        queued.append(child_target)
+                return CreateManyResult(preclaimed=tuple(preclaimed), queued_targets=tuple(queued))
+        except Exception as exc:
+            if not is_duplicate_key_error(exc):
+                raise
+            # Verify idempotent retry via creation_identity_hash
+            ids = [sp.session_id for sp in specs]
+            rows = await self.db.fetchall(
+                f"SELECT session_id,creation_identity_hash FROM {self.s} "
+                f"WHERE session_id IN ({','.join('?' for _ in ids)})",
+                tuple(ids),
+            )
+            by_id = {r["session_id"]: r["creation_identity_hash"] for r in rows}
+            if len(by_id) != len(ids) or any(by_id.get(sid) != h for sid, h in spec_hashes.items()):
+                raise RuntimeRequestError("creation_conflict") from exc
+            return CreateManyResult(preclaimed=(), queued_targets=(), already_created=True)
 
     async def create_workflow_session(
         self, descriptor: RuntimeDescriptor, *, parent: TargetRef, actor,
         target: TargetRef, start: InputRef, body, result_kind: str,
         cancel_propagation="linked", run_journal=None,
     ):
-        """Atomically align/create a deterministic workflow session and its start.
-
-        Node journals are deliberately written by the caller in a second transaction.
-        A driver run journal may be included here because its worker must never discover
-        a runnable driver without its frozen run coordinates.
-        """
+        """Atomically align/create a deterministic workflow session and its start."""
         self.check_store(parent)
         if (target.store_id, start.store_id, start.session_id) != (
             self.store.store_id, self.store.store_id, target.session_id
@@ -387,14 +701,17 @@ class RuntimeInputStore:
             "workflow_session", parent.store_id, parent.session_id,
             target.session_id, descriptor, start,
         ])
+        content = canonical(body)
+        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        content_bytes = len(content.encode()) + len(meta.encode())
+        req_hash = self.request_hash(target, body, "normal")
         for attempt in range(2):
             try:
                 async with self.db.transaction() as tx:
                     existing = await tx.fetchone(
-                        f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?",
-                        (target.session_id,),
+                        f"SELECT * FROM {self.s} WHERE session_id=?", (target.session_id,),
                     )
-                    await self._lock_creation_parent_tx(
+                    parent_session = await self._lock_creation_parent_tx(
                         tx, parent, actor,
                         existing_id=(target.session_id if existing is not None else None),
                     )
@@ -402,25 +719,26 @@ class RuntimeInputStore:
                         if attempt:
                             raise RuntimeRequestError("creation_conflict")
                         database_now = await self._db_now(tx)
+                        root_id = str(parent_session["root_session_id"])
+                        child_depth = int(parent_session["depth"]) + 1
                         changed = await tx.execute(
-                            f"INSERT INTO {self.store.t.sessions} ("
-                            "session_id,parent_session_id,created_by_session_id,session_kind,"
-                            "descriptor_json,descriptor_hash,creation_identity_hash,"
+                            f"INSERT INTO {self.s} ("
+                            "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
+                            "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
                             "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
                             "tenant_id,principal_id,result_route_json,cancel_propagation,"
-                            "created_at,updated_at) "
-                            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? "
-                            f"WHERE NOT EXISTS (SELECT 1 FROM {self.store.t.sessions} "
-                            "WHERE session_id=?)",
+                            "execution_state,inbox_version,wake_inbox_seq,wake_pending_count,"
+                            "pending_count,pending_bytes,created_at,updated_at) "
+                            "SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',1,1,1,1,?,?,? "
+                            f"WHERE NOT EXISTS (SELECT 1 FROM {self.s} WHERE session_id=?)",
                             (
                                 target.session_id, parent.session_id, actor.session_id,
-                                descriptor.kind, canonical(descriptor),
+                                root_id, child_depth, descriptor.kind, canonical(descriptor),
                                 sha256_canonical(descriptor), identity,
-                                canonical(actor.call_ref.to_dict())
-                                if actor.call_ref is not None else None,
+                                canonical(actor.call_ref.to_dict()) if actor.call_ref is not None else None,
                                 actor.tool_call_id, start.message_id,
                                 actor.tenant_id, actor.principal_id, canonical(route),
-                                cancel_propagation, database_now, database_now,
+                                cancel_propagation, content_bytes, database_now, database_now,
                                 target.session_id,
                             ),
                         )
@@ -428,9 +746,18 @@ class RuntimeInputStore:
                             if attempt == 0:
                                 raise _TargetAlreadyCreated
                             raise RuntimeRequestError("creation_conflict")
-                        receipt = await self._start_new_session_tx(
-                            tx, target, body, start, database_now=database_now,
+                        await tx.execute(
+                            f"INSERT INTO {self.q} ("
+                            "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                            "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                            "meta_json,request_hash,result_kind,created_at,expires_at) "
+                            "VALUES (?,?,1,'user','normal',1,'pending',?,?,?,?,?,?,NULL,?,NULL)",
+                            (
+                                target.session_id, start.message_id, parent.session_id, result_kind,
+                                content, content_bytes, meta, req_hash, database_now,
+                            ),
                         )
+                        receipt = Receipt(start, target, start.message_id, True, "accepted", None, "not_needed")
                     else:
                         expected = {
                             "parent_session_id": parent.session_id,
@@ -442,14 +769,14 @@ class RuntimeInputStore:
                         }
                         if any(existing[key] != value for key, value in expected.items()):
                             raise RuntimeRequestError("creation_conflict")
-                        receipt = await self._accept_tx(
-                            tx, target, body, start, self.request_hash(target, body, "normal"),
-                            canonical(body), actor=actor, priority="normal", deadline_ms=None,
-                            kind="user", result_kind=None,
+                        receipt = await self._accept_existing_tx(
+                            tx, target, start, req_hash, content, content_bytes,
+                            actor=actor, priority="normal", deadline_ms=None,
+                            kind="user", result_kind=None, wake=True,
+                            reply_to_session_id=parent.session_id, reply_result_kind=result_kind,
                         )
                     if run_journal is not None and existing is None:
                         from power_loop.workflow import journal
-
                         await journal.put(
                             self.store, tx, target.session_id,
                             journal.run_key(start.message_id), run_journal,
@@ -458,9 +785,6 @@ class RuntimeInputStore:
             except _TargetAlreadyCreated:
                 if attempt:
                     raise
-                # The conditional INSERT hit the winner's committed row. The first
-                # transaction has exited and released the parent lock; re-enter once
-                # through the ordinary existing-target verification.
                 continue
         raise RuntimeRequestError("creation_conflict")
 
@@ -475,35 +799,69 @@ class RuntimeInputStore:
         start = route["input_ref"]
         if target != parent or start.store_id != self.store.store_id:
             raise RuntimeRequestError("forbidden", "result route")
-        # Validate and freeze the deterministic address before persisting it.
         result_message_id(TargetRef(self.store.store_id, child_id), start, None, route["result_kind"])
         return {
             "target": plain(target), "input_ref": plain(start),
             "result_kind": route["result_kind"],
         }
 
+    @staticmethod
+    def _parse_reply_route(reply_route) -> tuple[str | None, str | None]:
+        if reply_route is None:
+            return None, None
+        if not isinstance(reply_route, dict):
+            raise RuntimeRequestError("invalid_options", "reply_route must be a mapping")
+        target = reply_route.get("target") or reply_route.get("reply_to_session_id")
+        if isinstance(target, TargetRef):
+            reply_sid = target.session_id
+        elif isinstance(target, dict) and "session_id" in target:
+            reply_sid = str(target["session_id"])
+        elif isinstance(target, str) and target:
+            reply_sid = target
+        else:
+            raise RuntimeRequestError("invalid_options", "reply_route target required")
+        rk = reply_route.get("result_kind") or reply_route.get("reply_result_kind") or "agent_result"
+        if rk not in _VALID_RESULT_KINDS:
+            raise RuntimeRequestError("invalid_options", "reply_route result_kind")
+        return reply_sid, rk
+
+    # ── Authorization & Lookup Helpers ───────────────────────────────────────
+
     async def _session(self, reader, session_id):
         row = await reader.fetchone(
-            f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,)
+            f"SELECT * FROM {self.s} WHERE session_id=?", (session_id,)
         )
         if row is None:
             raise RuntimeRequestError("not_found")
         return row
 
+    async def _is_ancestor(self, reader, parent_session_id: str | None, actor_session_id: str) -> bool:
+        cur = parent_session_id
+        visited: set[str] = set()
+        while cur is not None and cur not in visited:
+            if cur == actor_session_id:
+                return True
+            visited.add(cur)
+            row = await reader.fetchone(
+                f"SELECT parent_session_id FROM {self.s} WHERE session_id=?", (cur,)
+            )
+            if row is None:
+                return False
+            cur = row["parent_session_id"]
+        return False
+
     async def _authorize_known(self, reader, target, actor, session):
-        """Apply the existing actor contract to an already-read target session row."""
         if (session["tenant_id"], session["principal_id"]) != (
             actor.tenant_id, actor.principal_id
         ):
             raise RuntimeRequestError("forbidden")
         if actor.session_id is not None:
-            sid, expected = target.session_id, actor.session_id
-            ancestor = session
-            while sid != expected:
-                if ancestor["parent_session_id"] is None:
-                    raise RuntimeRequestError("forbidden")
-                sid = ancestor["parent_session_id"]
-                ancestor = await self._session(reader, sid)
+            if (
+                actor.session_id != target.session_id
+                and actor.session_id != session["parent_session_id"]
+                and not await self._is_ancestor(reader, session["parent_session_id"], actor.session_id)
+            ):
+                raise RuntimeRequestError("forbidden")
 
     async def authorize(self, reader, target, actor):
         self.check_store(target)
@@ -534,8 +892,8 @@ class RuntimeInputStore:
         return Receipt(
             ref, TargetRef(self.store.store_id, ref.session_id),
             ref.message_id, new, state,
-            row["result_send_index"] or row["delivered_send_index"],
-            "not_needed", reason if reason is not None else row["error_detail"],
+            row.get("result_send_index") or row.get("delivered_send_index"),
+            "not_needed", reason if reason is not None else row.get("error_detail"),
         )
 
     @staticmethod
@@ -544,301 +902,810 @@ class RuntimeInputStore:
             PROTOCOL_VERSION, target.store_id, target.session_id, body, priority,
         ])
 
-    async def accept(
-        self, target, body, *, message_id, actor, priority="normal", deadline_ms=None,
-        kind="user", result_kind=None, _with_activation=False,
-    ) -> Receipt:
+    # ── Accept (Standard 2-SQL Fast Path + Slow Diagnostic Path) ─────────────
+
+    def _validate_accept_args(
+        self, target, body, *, message_id, priority, kind, wake, reply_route, public
+    ):
         if priority not in {"normal", "urgent"}:
             raise RuntimeRequestError("invalid_options", "priority")
+        if public and isinstance(message_id, str) and message_id.startswith(RESERVED_INPUT_PREFIXES):
+            raise RuntimeRequestError("invalid_options", "reserved message_id prefix")
+        if kind not in _VALID_INPUT_KINDS or (public and kind not in _PUBLIC_INPUT_KINDS):
+            raise RuntimeRequestError("invalid_options", "kind")
         self.check_store(target)
         ref = InputRef(target.store_id, target.session_id, message_id)
-        digest = self.request_hash(target, body, priority)
-        # Validate JSON before opening the write transaction.
+        reply_to_sid, reply_rk = self._parse_reply_route(reply_route)
         content = canonical(body)
-        activations = []
+        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        content_bytes = len(content.encode()) + len(meta.encode())
+        digest = self.request_hash(target, body, priority)
+        wake_int = 1 if wake else 0
+        return ref, digest, content, meta, content_bytes, wake_int, reply_to_sid, reply_rk
+
+    async def accept(
+        self, target, body, *, message_id, actor, priority="normal", deadline_ms=None,
+        kind="user", result_kind=None, wake: bool = True, reply_route: dict | None = None,
+        public: bool = True, _with_activation: bool = False,
+    ) -> Receipt:
+        """Accept an input into ``follow_up_queue`` (2 control SQL on the fast path).
+
+        - ``wake=False`` ONLY increments ``inbox_version``, ``pending_count``, ``pending_bytes``
+          (never increments ``wake_inbox_seq`` or ``wake_pending_count``, never flips ``queued``).
+        - Public calls reject reserved prefixes ``res_`` / ``wfc_`` / ``sys_`` with 0 SQL.
+        """
+        ref, digest, content, meta, content_bytes, wake_int, reply_to_sid, reply_rk = (
+            self._validate_accept_args(
+                target, body, message_id=message_id, priority=priority,
+                kind=kind, wake=wake, reply_route=reply_route, public=public,
+            )
+        )
+        now_sql = self._now_sql()
+        pt, pi = self._p_text(), self._p_int()
+        limit = self.inbox_item_limit if public else self.hard_pending_limit
         try:
-            async with self.db.transaction() as tx:
-                receipt = await self._accept_tx(
-                    tx, target, body, ref, digest, content, actor=actor, priority=priority,
-                    deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
-                    activations=activations,
+            try:
+                async with self.db.transaction() as tx:
+                    if self._dialect == "mysql":
+                        rc, packed = await tx.execute_packed(
+                            f"UPDATE {self.s} SET "
+                            "inbox_version=(LAST_INSERT_ID("
+                            "((inbox_version+1)<<1)|"
+                            "(CASE WHEN execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                            ")>>1),"
+                            "wake_inbox_seq=wake_inbox_seq+?,"
+                            "cancel_by=CASE WHEN execution_state='idle' AND ?=1 THEN NULL ELSE cancel_by END,"
+                            "wake_pending_count=wake_pending_count+?,"
+                            "pending_count=pending_count+1,"
+                            "pending_bytes=pending_bytes+?,"
+                            "execution_state=CASE WHEN execution_state='idle' AND ?=1 THEN 'queued' ELSE execution_state END,"
+                            f"updated_at={now_sql} "
+                            "WHERE session_id=? AND lifecycle='open' "
+                            "AND tenant_id=? AND principal_id=? "
+                            "AND (? IS NULL OR session_id=? OR parent_session_id=?) "
+                            f"AND (? IS NULL OR ?>{now_sql}) "
+                            "AND pending_count<? AND (pending_bytes+?)<=?",
+                            (
+                                wake_int, wake_int, wake_int, wake_int, content_bytes, wake_int,
+                                target.session_id, actor.tenant_id, actor.principal_id,
+                                actor.session_id, actor.session_id, actor.session_id,
+                                deadline_ms, deadline_ms,
+                                limit, content_bytes, self.inbox_byte_limit,
+                            ),
+                        )
+                        if rc == 0:
+                            raise _AcceptSlowPath("update_zero")
+                        new_inbox_ver = packed >> 1
+                        need_wake = bool(packed & 1)
+                    else:
+                        row = await tx.fetchone(
+                            f"UPDATE {self.s} SET "
+                            "inbox_version=inbox_version+1,"
+                            "wake_inbox_seq=wake_inbox_seq+?,"
+                            "cancel_by=CASE WHEN execution_state='idle' AND ?=1 THEN NULL ELSE cancel_by END,"
+                            "wake_pending_count=wake_pending_count+?,"
+                            "pending_count=pending_count+1,"
+                            "pending_bytes=pending_bytes+?,"
+                            "execution_state=CASE WHEN execution_state='idle' AND ?=1 THEN 'queued' ELSE execution_state END,"
+                            f"updated_at={now_sql} "
+                            "WHERE session_id=? AND lifecycle='open' "
+                            "AND tenant_id=? AND principal_id=? "
+                            f"AND ({pt} IS NULL OR session_id={pt} OR parent_session_id={pt}) "
+                            f"AND ({pi} IS NULL OR {pi}>{now_sql}) "
+                            "AND pending_count<? AND (pending_bytes+?)<=? "
+                            "RETURNING inbox_version,execution_state,wake_pending_count",
+                            (
+                                wake_int, wake_int, wake_int, content_bytes, wake_int,
+                                target.session_id, actor.tenant_id, actor.principal_id,
+                                actor.session_id, actor.session_id, actor.session_id,
+                                deadline_ms, deadline_ms,
+                                limit, content_bytes, self.inbox_byte_limit,
+                            ),
+                        )
+                        if row is None:
+                            raise _AcceptSlowPath("update_zero")
+                        new_inbox_ver = int(row["inbox_version"])
+                        need_wake = (
+                            wake_int == 1
+                            and row["execution_state"] == "queued"
+                            and int(row["wake_pending_count"]) == 1
+                        )
+                    try:
+                        await tx.execute(
+                            f"INSERT INTO {self.q} ("
+                            "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                            "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                            "meta_json,request_hash,result_kind,created_at,expires_at) "
+                            f"VALUES (?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,{now_sql},?)",
+                            (
+                                target.session_id, ref.message_id, new_inbox_ver, kind, priority,
+                                wake_int, reply_to_sid, reply_rk, content, content_bytes,
+                                meta, digest, result_kind, deadline_ms,
+                            ),
+                        )
+                    except Exception as exc:
+                        if is_duplicate_key_error(exc):
+                            raise _AcceptSlowPath("duplicate") from exc
+                        raise
+                receipt = Receipt(ref, target, ref.message_id, True, "accepted", None, "not_needed")
+                return (receipt, need_wake) if _with_activation else receipt
+            except _AcceptSlowPath:
+                receipt, need_wake = await self._accept_slow_path(
+                    target, ref, digest, content, meta, content_bytes,
+                    actor=actor, priority=priority, deadline_ms=deadline_ms,
+                    kind=kind, result_kind=result_kind, wake_int=wake_int,
+                    limit=limit, reply_to_sid=reply_to_sid, reply_rk=reply_rk,
                 )
-            return (receipt, bool(activations)) if _with_activation else receipt
+                return (receipt, need_wake) if _with_activation else receipt
         except RuntimeRequestError:
             raise
         except (Exception, asyncio.CancelledError) as exc:
             raise StoreError(ref) from exc
 
-    def _pending_bytes_sql(self, alias):
-        if self.db.dialect.name == "sqlite":
-            return (f"LENGTH(CAST({alias}.content_json AS BLOB))"
-                    f"+LENGTH(CAST({alias}.meta_json AS BLOB))")
-        return f"OCTET_LENGTH({alias}.content_json)+OCTET_LENGTH({alias}.meta_json)"
-
-    async def _accept_read(self, tx, session_id, item_id):
-        """Session facts, retry receipt fields, pending count/bytes and database time.
-
-        Runs after the state lock. The session row is the row source, so a missing
-        target session (no row, not_found) stays distinct from an existing session
-        with no matching input (one row with the input columns NULL).
-        """
-        pending = "q2.session_id=? AND q2.status IN ('pending','waiting_continuation')"
-        row = await tx.fetchone(
-            "SELECT s.tenant_id AS tenant_id,s.principal_id AS principal_id,"
-            "s.parent_session_id AS parent_session_id,s.lifecycle AS lifecycle,"
-            "q.id AS id,"
-            "q.request_hash AS request_hash,q.result_send_index AS result_send_index,"
-            "q.delivered_send_index AS delivered_send_index,q.error_detail AS error_detail,"
-            "p.pending_count AS pending_count,p.pending_bytes AS pending_bytes,"
-            f"{self._now_sql()} AS db_now "
-            f"FROM {self.store.t.sessions} s LEFT JOIN {self.q} q "
-            "ON q.session_id=s.session_id AND q.item_id=? "
-            "CROSS JOIN ("
-            f"SELECT COUNT(*) AS pending_count,"
-            f"COALESCE(SUM({self._pending_bytes_sql('q2')}),0) AS pending_bytes "
-            f"FROM {self.q} q2 WHERE {pending}"
-            ") p WHERE s.session_id=?",
-            (item_id, session_id, session_id),
+    async def _accept_slow_path(
+        self, target, ref, digest, content, meta, content_bytes, *,
+        actor, priority, deadline_ms, kind, result_kind, wake_int, limit,
+        reply_to_sid, reply_rk,
+    ) -> tuple[Receipt, bool]:
+        now_sql = self._now_sql()
+        diag = await self.db.fetchone(
+            "SELECT s.session_id,s.tenant_id,s.principal_id,s.parent_session_id,"
+            f"s.lifecycle,s.pending_count,s.pending_bytes,{now_sql} AS db_now,"
+            "q.id AS existing_id,q.request_hash AS existing_hash,"
+            "q.result_send_index AS result_send_index,"
+            "q.delivered_send_index AS delivered_send_index,q.error_detail AS error_detail "
+            f"FROM {self.s} s LEFT JOIN {self.q} q "
+            "ON q.session_id=s.session_id AND q.item_id=? WHERE s.session_id=?",
+            (ref.message_id, target.session_id),
         )
-        if row is None:
+        if diag is None:
             raise RuntimeRequestError("not_found")
-        return row
-
-    async def _accept_tx(
-        self, tx, target, body, ref, digest, content, *, actor, priority, deadline_ms,
-        kind, result_kind, activations=None,
-    ):
-        self.check_store(target)
-        try:
-            state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
-        except ValueError as exc:
-            raise RuntimeRequestError("not_found") from exc
-        current = await self._accept_read(tx, target.session_id, ref.message_id)
-        await self._authorize_known(tx, target, actor, current)
-        if current["lifecycle"] != "open":
+        if (diag["tenant_id"], diag["principal_id"]) != (actor.tenant_id, actor.principal_id):
+            raise RuntimeRequestError("forbidden")
+        is_deep_ancestor = False
+        if actor.session_id is not None:
+            direct = actor.session_id in (diag["session_id"], diag["parent_session_id"])
+            if not direct:
+                if not await self._is_ancestor(self.db, diag["parent_session_id"], actor.session_id):
+                    raise RuntimeRequestError("forbidden")
+                is_deep_ancestor = True
+        if diag["lifecycle"] != "open":
+            if diag["lifecycle"] == "suspended":
+                raise RuntimeRequestError("session_suspended")
             raise RuntimeRequestError("session_closed")
-        if current["id"] is not None:
-            if current["request_hash"] != digest:
+        if diag["existing_id"] is not None:
+            if diag["existing_hash"] != digest:
                 raise RuntimeRequestError("request_conflict")
-            return self._receipt(ref, current)
-        if int(current["pending_count"]) >= self.inbox_item_limit:
-            raise CapacityError()
-        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
-        if (int(current["pending_bytes"]) + len(content.encode()) + len(meta.encode())
-                > self.inbox_byte_limit):
-            raise CapacityError()
-        database_now = int(current["db_now"])
-        if deadline_ms is not None and deadline_ms <= database_now:
+            return self._receipt(ref, dict(diag)), False
+        if deadline_ms is not None and deadline_ms <= int(diag["db_now"]):
             raise RuntimeRequestError("deadline_expired")
-        execution_state = state["execution_state"]
-        if execution_state == "idle":
-            next_state = "queued"
-        elif execution_state == "running" and int(state["owner_lease_until_ms"]) <= database_now:
-            next_state = "recovering"
-        else:
-            next_state = execution_state
-        await tx.execute(
-            f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
-            "meta_json,request_hash,result_kind,created_at,expires_at) "
-            "VALUES (?,?,?,?,'pending',?,?,?,?,?,?)",
-            (
-                target.session_id, ref.message_id, kind, priority, content, meta, digest,
-                result_kind, database_now, deadline_ms,
-            ),
-        )
-        changed = await tx.execute(
-            f"UPDATE {self.state} SET execution_state=?,inbox_version=inbox_version+1 "
-            "WHERE session_id=? AND execution_state=?",
-            (next_state, target.session_id, execution_state),
-        )
-        if changed != 1:
-            raise SessionLeaseLost(target.session_id)
-        row = {
-            "session_id": target.session_id, "item_id": ref.message_id, "status": "pending",
-            "delivered_send_index": None, "result_send_index": None, "error_detail": None,
-        }
-        if activations is not None and next_state != "running":
-            activations.append(target)
-        return self.receipt(InputRecord(ref, row, {}), new=True)
+        if is_deep_ancestor:
+            pi = self._p_int()
+            async with self.db.transaction() as tx:
+                try:
+                    if self._dialect == "mysql":
+                        rc, packed = await tx.execute_packed(
+                            f"UPDATE {self.s} SET "
+                            "inbox_version=(LAST_INSERT_ID("
+                            "((inbox_version+1)<<1)|"
+                            "(CASE WHEN execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                            ")>>1),"
+                            "wake_inbox_seq=wake_inbox_seq+?,"
+                            "wake_pending_count=wake_pending_count+?,"
+                            "pending_count=pending_count+1,"
+                            "pending_bytes=pending_bytes+?,"
+                            "execution_state=CASE WHEN execution_state='idle' AND ?=1 THEN 'queued' ELSE execution_state END,"
+                            f"updated_at={now_sql} "
+                            "WHERE session_id=? AND lifecycle='open' "
+                            f"AND (? IS NULL OR ?>{now_sql}) "
+                            "AND pending_count<? AND (pending_bytes+?)<=?",
+                            (
+                                wake_int, wake_int, wake_int, content_bytes, wake_int,
+                                target.session_id, deadline_ms, deadline_ms,
+                                limit, content_bytes, self.inbox_byte_limit,
+                            ),
+                        )
+                        if rc == 0:
+                            raise CapacityError()
+                        new_ver, need_wake = packed >> 1, bool(packed & 1)
+                    else:
+                        row = await tx.fetchone(
+                            f"UPDATE {self.s} SET "
+                            "inbox_version=inbox_version+1,"
+                            "wake_inbox_seq=wake_inbox_seq+?,"
+                            "wake_pending_count=wake_pending_count+?,"
+                            "pending_count=pending_count+1,"
+                            "pending_bytes=pending_bytes+?,"
+                            "execution_state=CASE WHEN execution_state='idle' AND ?=1 THEN 'queued' ELSE execution_state END,"
+                            f"updated_at={now_sql} "
+                            "WHERE session_id=? AND lifecycle='open' "
+                            f"AND ({pi} IS NULL OR {pi}>{now_sql}) "
+                            "AND pending_count<? AND (pending_bytes+?)<=? "
+                            "RETURNING inbox_version,execution_state,wake_pending_count",
+                            (
+                                wake_int, wake_int, content_bytes, wake_int,
+                                target.session_id, deadline_ms, deadline_ms,
+                                limit, content_bytes, self.inbox_byte_limit,
+                            ),
+                        )
+                        if row is None:
+                            raise CapacityError()
+                        new_ver = int(row["inbox_version"])
+                        need_wake = (
+                            wake_int == 1
+                            and row["execution_state"] == "queued"
+                            and int(row["wake_pending_count"]) == 1
+                        )
+                    await tx.execute(
+                        f"INSERT INTO {self.q} ("
+                        "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                        "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                        "meta_json,request_hash,result_kind,created_at,expires_at) "
+                        f"VALUES (?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,{now_sql},?)",
+                        (
+                            target.session_id, ref.message_id, new_ver, kind, priority,
+                            wake_int, reply_to_sid, reply_rk, content, content_bytes,
+                            meta, digest, result_kind, deadline_ms,
+                        ),
+                    )
+                except Exception as exc:
+                    if is_duplicate_key_error(exc):
+                        ex = await self.db.fetchone(
+                            f"SELECT request_hash,result_send_index,delivered_send_index,error_detail "
+                            f"FROM {self.q} WHERE session_id=? AND item_id=?",
+                            (target.session_id, ref.message_id),
+                        )
+                        if ex is not None:
+                            if ex["request_hash"] != digest:
+                                raise RuntimeRequestError("request_conflict") from None
+                            return self._receipt(ref, dict(ex)), False
+                    raise
+            return Receipt(ref, target, ref.message_id, True, "accepted", None, "not_needed"), need_wake
+        raise CapacityError()
 
-    async def _start_new_session_tx(self, tx, target, body, ref, *, database_now):
-        """Write the state row and start input of a session created in this transaction.
-
-        Only the first-create path calls this, after it has authorized and locked the
-        parent and inserted the empty session row. There is no old input, pending count or
-        bytes to read, and the known idle->queued transition is initialized directly as
-        ``queued``/inbox_version=1 instead of being written as a second UPDATE. The
-        input's own byte size is still checked; an empty inbox does not accept any input.
-        """
-        content = canonical(body)
+    async def _accept_existing_tx(
+        self, tx, target, ref, digest, content, content_bytes, *,
+        actor, priority, deadline_ms, kind, result_kind, wake,
+        reply_to_session_id=None, reply_result_kind=None,
+    ) -> Receipt:
+        """Accept into an already-locked session within an existing transaction (used by create retries)."""
+        existing = await tx.fetchone(
+            f"SELECT request_hash,result_send_index,delivered_send_index,error_detail "
+            f"FROM {self.q} WHERE session_id=? AND item_id=?",
+            (target.session_id, ref.message_id),
+        )
+        if existing is not None:
+            if existing["request_hash"] != digest:
+                raise RuntimeRequestError("request_conflict")
+            return self._receipt(ref, dict(existing))
+        now_sql = self._now_sql()
+        wake_int = 1 if wake else 0
         meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
-        if self.inbox_item_limit <= 0:
-            raise CapacityError()
-        if len(content.encode()) + len(meta.encode()) > self.inbox_byte_limit:
-            raise CapacityError()
+        if self._dialect == "mysql":
+            rc, packed = await tx.execute_packed(
+                f"UPDATE {self.s} SET inbox_version=LAST_INSERT_ID(inbox_version+1),"
+                "wake_inbox_seq=wake_inbox_seq+?,wake_pending_count=wake_pending_count+?,"
+                "pending_count=pending_count+1,pending_bytes=pending_bytes+?,"
+                "execution_state=CASE WHEN execution_state='idle' AND ?=1 THEN 'queued' ELSE execution_state END,"
+                f"updated_at={now_sql} WHERE session_id=? AND lifecycle='open' "
+                "AND pending_count<? AND (pending_bytes+?)<=?",
+                (wake_int, wake_int, content_bytes, wake_int, target.session_id,
+                 self.hard_pending_limit, content_bytes, self.inbox_byte_limit),
+            )
+            if rc == 0:
+                raise CapacityError()
+            new_ver = packed
+        else:
+            row = await tx.fetchone(
+                f"UPDATE {self.s} SET inbox_version=inbox_version+1,"
+                "wake_inbox_seq=wake_inbox_seq+?,wake_pending_count=wake_pending_count+?,"
+                "pending_count=pending_count+1,pending_bytes=pending_bytes+?,"
+                "execution_state=CASE WHEN execution_state='idle' AND ?=1 THEN 'queued' ELSE execution_state END,"
+                f"updated_at={now_sql} WHERE session_id=? AND lifecycle='open' "
+                "AND pending_count<? AND (pending_bytes+?)<=? RETURNING inbox_version",
+                (wake_int, wake_int, content_bytes, wake_int, target.session_id,
+                 self.hard_pending_limit, content_bytes, self.inbox_byte_limit),
+            )
+            if row is None:
+                raise CapacityError()
+            new_ver = int(row["inbox_version"])
         await tx.execute(
-            f"INSERT INTO {self.state} (session_id,execution_state,inbox_version) "
-            "VALUES (?,'queued',1)",
-            (target.session_id,),
-        )
-        await tx.execute(
-            f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
+            f"INSERT INTO {self.q} ("
+            "session_id,item_id,inbox_version,kind,priority,wake,status,"
+            "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
             "meta_json,request_hash,result_kind,created_at,expires_at) "
-            "VALUES (?,?,'user','normal','pending',?,?,?,NULL,?,NULL)",
+            f"VALUES (?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,{now_sql},?)",
             (
-                target.session_id, ref.message_id, content, meta,
-                self.request_hash(target, body, "normal"), database_now,
+                target.session_id, ref.message_id, new_ver, kind, priority, wake_int,
+                reply_to_session_id, reply_result_kind, content, content_bytes,
+                meta, digest, result_kind, deadline_ms,
             ),
         )
-        row = {
-            "session_id": target.session_id, "item_id": ref.message_id, "status": "pending",
-            "delivered_send_index": None, "result_send_index": None, "error_detail": None,
-        }
-        return self.receipt(InputRecord(ref, row, {}), new=True)
+        return Receipt(ref, target, ref.message_id, True, "accepted", None, "not_needed")
 
-    async def accept_result(self, child_target, result: Result, *, result_kind):
-        """Trusted delivery using only the child's frozen direct-parent route."""
-        self.check_store(child_target)
-        async with self.db.transaction() as tx:
-            session = await self._session(tx, child_target.session_id)
-            if not session["result_route_json"]:
-                return None
-            route = json.loads(session["result_route_json"])
-            target = TargetRef(**route["target"])
-            states = {}
-            for sid in sorted({child_target.session_id, target.session_id}):
-                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
-            activations = []
-            ref, error = await self._route_result_tx(
-                tx, session, route, result, result_kind, await self._db_now(tx), activations,
-                parent_state=states[target.session_id],
+    # ── Fused Local Accept + Claim (2-Tx Fast Path, Probe 8 Entry #1) ────────
+
+    async def accept_and_claim(
+        self, target, body, *, message_id, actor, node_id: str, boot_id: str,
+        ttl_s: float = 30.0, priority: str = "normal", deadline_ms: int | None = None,
+        kind: str = "user", result_kind: str | None = None, wake: bool = True,
+        reply_route: dict | None = None, public: bool = True, can_execute=None,
+    ) -> tuple[Receipt, ClaimedBatch | None, bool]:
+        """Fused 1-tx accept + claim when idle & empty inbox; transparent fallback to ``accept()``.
+
+        Promotes ``next_descriptor_json/hash`` atomically in the same ``UPDATE sessions`` statement.
+        Returns ``(receipt, claimed_batch_or_None, need_wake)``.
+        """
+        if ttl_s <= 0:
+            raise RuntimeRequestError("invalid_options", "ttl_s")
+        ref, digest, content, meta, content_bytes, wake_int, reply_to_sid, reply_rk = (
+            self._validate_accept_args(
+                target, body, message_id=message_id, priority=priority,
+                kind=kind, wake=wake, reply_route=reply_route, public=public,
             )
-            return ref, error, activations[0] if activations else None
+        )
+        if not wake:
+            receipt, need_wake = await self.accept(
+                target, body, message_id=message_id, actor=actor, priority=priority,
+                deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
+                wake=False, reply_route=reply_route, public=public, _with_activation=True,
+            )
+            return receipt, None, need_wake
+
+        now_sql = self._now_sql()
+        pt, pi = self._p_text(), self._p_int()
+        ttl_ms = int(ttl_s * 1000)
+        try:
+            try:
+                async with self.db.transaction() as tx:
+                    if self._dialect == "mysql":
+                        rc = await tx.execute(
+                            f"UPDATE {self.s} SET "
+                            "execution_state='running',"
+                            "owner_node_id=?,owner_boot_id=?,"
+                            "owner_epoch=owner_epoch+1,"
+                            "send_index=send_index+1,"
+                            "inbox_version=inbox_version+1,"
+                            "wake_inbox_seq=wake_inbox_seq+1,"
+                            "next_seq=CASE WHEN session_kind='workflow_driver' THEN next_seq ELSE next_seq+1 END,"
+                            f"owner_lease_until_ms={now_sql}+?,"
+                            "wake_pending_count=0,pending_count=0,pending_bytes=0,"
+                            "cancel_by=NULL,cancel_reason=NULL,ready_item_json=NULL,"
+                            "descriptor_json=COALESCE(next_descriptor_json,descriptor_json),"
+                            "descriptor_hash=COALESCE(next_descriptor_hash,descriptor_hash),"
+                            "next_descriptor_json=NULL,next_descriptor_hash=NULL,"
+                            f"updated_at={now_sql} "
+                            "WHERE session_id=? AND lifecycle='open' AND execution_state='idle' "
+                            "AND wake_pending_count=0 AND pending_count=0 AND pending_tool_seq IS NULL "
+                            "AND tenant_id=? AND principal_id=? "
+                            "AND (? IS NULL OR session_id=? OR parent_session_id=?) "
+                            f"AND (? IS NULL OR ?>{now_sql}) "
+                            "AND ?<=?",
+                            (
+                                node_id, boot_id, ttl_ms,
+                                target.session_id, actor.tenant_id, actor.principal_id,
+                                actor.session_id, actor.session_id, actor.session_id,
+                                deadline_ms, deadline_ms,
+                                content_bytes, self.inbox_byte_limit,
+                            ),
+                        )
+                        if rc == 0:
+                            raise _AcceptSlowPath("not_idle_fast")
+                        srow = await tx.fetchone(
+                            "SELECT owner_epoch,send_index,inbox_version,wake_inbox_seq,next_seq,"
+                            "cancel_seq,depth,session_kind,tenant_id,principal_id,parent_session_id,"
+                            "root_session_id,result_route_json,start_input_message_id,"
+                            f"descriptor_json,updated_at FROM {self.s} WHERE session_id=?",
+                            (target.session_id,),
+                        )
+                        if srow is None:
+                            raise _AcceptSlowPath("missing")
+                    else:
+                        srow = await tx.fetchone(
+                            f"UPDATE {self.s} SET "
+                            "execution_state='running',"
+                            "owner_node_id=?,owner_boot_id=?,"
+                            "owner_epoch=owner_epoch+1,"
+                            "send_index=send_index+1,"
+                            "inbox_version=inbox_version+1,"
+                            "wake_inbox_seq=wake_inbox_seq+1,"
+                            "next_seq=CASE WHEN session_kind='workflow_driver' THEN next_seq ELSE next_seq+1 END,"
+                            f"owner_lease_until_ms={now_sql}+?,"
+                            "wake_pending_count=0,pending_count=0,pending_bytes=0,"
+                            "cancel_by=NULL,cancel_reason=NULL,ready_item_json=NULL,"
+                            "descriptor_json=COALESCE(next_descriptor_json,descriptor_json),"
+                            "descriptor_hash=COALESCE(next_descriptor_hash,descriptor_hash),"
+                            "next_descriptor_json=NULL,next_descriptor_hash=NULL,"
+                            f"updated_at={now_sql} "
+                            "WHERE session_id=? AND lifecycle='open' AND execution_state='idle' "
+                            "AND wake_pending_count=0 AND pending_count=0 AND pending_tool_seq IS NULL "
+                            "AND tenant_id=? AND principal_id=? "
+                            f"AND ({pt} IS NULL OR session_id={pt} OR parent_session_id={pt}) "
+                            f"AND ({pi} IS NULL OR {pi}>{now_sql}) "
+                            f"AND {pi}<={pi} "
+                            "RETURNING owner_epoch,send_index,inbox_version,wake_inbox_seq,next_seq,"
+                            "cancel_seq,depth,session_kind,tenant_id,principal_id,parent_session_id,"
+                            "root_session_id,result_route_json,start_input_message_id,"
+                            "descriptor_json,updated_at",
+                            (
+                                node_id, boot_id, ttl_ms,
+                                target.session_id, actor.tenant_id, actor.principal_id,
+                                actor.session_id, actor.session_id, actor.session_id,
+                                deadline_ms, deadline_ms,
+                                content_bytes, self.inbox_byte_limit,
+                            ),
+                        )
+                        if srow is None:
+                            raise _AcceptSlowPath("not_idle_fast")
+
+                    descriptor = RuntimeDescriptor(**json.loads(srow["descriptor_json"]))
+                    if can_execute is not None and not can_execute(descriptor):
+                        raise _AcceptSlowPath("incapable")
+
+                    send_idx = int(srow["send_index"])
+                    new_inbox_ver = int(srow["inbox_version"])
+                    new_wake_seq = int(srow["wake_inbox_seq"])
+                    is_driver = srow["session_kind"] == "workflow_driver"
+                    user_seq = None if is_driver else int(srow["next_seq"]) - 1
+                    db_now = int(srow["updated_at"])
+
+                    try:
+                        await tx.execute(
+                            f"INSERT INTO {self.q} ("
+                            "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                            "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                            "meta_json,request_hash,result_kind,created_at,expires_at,"
+                            "delivered_at,delivered_seq,delivered_send_index) "
+                            "VALUES (?,?,?,?,?,1,'delivered',?,?,?,?,?,?,?,"
+                            f"{now_sql},?,{now_sql},?,?)",
+                            (
+                                target.session_id, ref.message_id, new_inbox_ver, kind, priority,
+                                reply_to_sid, reply_rk, content, content_bytes,
+                                meta, digest, result_kind, deadline_ms, user_seq, send_idx,
+                            ),
+                        )
+                    except Exception as exc:
+                        if is_duplicate_key_error(exc):
+                            raise _AcceptSlowPath("duplicate") from exc
+                        raise
+
+                    merged = self.merge_batch([{
+                        "item_id": ref.message_id, "kind": kind,
+                        "priority": priority, "content_json": content,
+                    }])
+                    merged_json = canonical(merged)
+                    msg_meta = {"content_encoding": "json", "input_refs": [plain(ref)]}
+                    if not is_driver:
+                        await self._insert_message(
+                            tx, target.session_id, user_seq, "user", merged_json,
+                            msg_meta, send_idx, db_now,
+                        )
+                    user_row = StoredMessageRow(
+                        session_id=target.session_id, seq=user_seq or 0, role="user", name=None,
+                        content=merged_json, tool_calls=None, tool_call_id=None, round_index=0,
+                        state=MessageState.ACTIVE, meta=msg_meta, created_at=db_now,
+                        send_index=send_idx,
+                    )
+                    batch = ClaimedBatch(
+                        target=target,
+                        send_index=send_idx,
+                        message_seq=user_seq or 0,
+                        input_refs=(ref,),
+                        owner_epoch=int(srow["owner_epoch"]),
+                        owner_node_id=node_id,
+                        owner_boot_id=boot_id,
+                        descriptor=descriptor,
+                        tenant_id=srow["tenant_id"],
+                        principal_id=srow["principal_id"],
+                        parent_session_id=srow["parent_session_id"],
+                        user_row=user_row,
+                        result_route=(
+                            json.loads(srow["result_route_json"])
+                            if srow["result_route_json"] else None
+                        ),
+                        session_updated_at=db_now,
+                        inbox_version=new_inbox_ver,
+                        wake_inbox_seq=new_wake_seq,
+                        cancel_seq=int(srow["cancel_seq"]),
+                        start_input_message_id=srow["start_input_message_id"],
+                        root_session_id=str(srow["root_session_id"]),
+                        depth=int(srow["depth"]),
+                        reply_to_session_id=reply_to_sid,
+                        reply_result_kind=reply_rk,
+                    )
+                receipt = Receipt(ref, target, ref.message_id, True, "accepted", send_idx, "not_needed")
+                return receipt, batch, False
+            except _AcceptSlowPath:
+                receipt, need_wake = await self.accept(
+                    target, body, message_id=message_id, actor=actor, priority=priority,
+                    deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
+                    wake=wake, reply_route=reply_route, public=public, _with_activation=True,
+                )
+                return receipt, None, need_wake
+        except RuntimeRequestError:
+            raise
+        except (Exception, asyncio.CancelledError) as exc:
+            raise StoreError(ref) from exc
+
+    # ── Standard Claim & 1-SQL Pre-Staged Child Claim (Probe 8 Entries #2 & #3) ──
 
     async def claim(
-        self, target, *, node_id, boot_id, ttl_s=30.0, _owner_token=None,
+        self, target, *, node_id: str, boot_id: str, ttl_s: float = 30.0,
         can_execute=None,
     ) -> ClaimedBatch | None:
-        """Claim the queued input snapshot and install the owner fence atomically.
+        """Claim queued inputs atomically (2 control SQL on SQLite/PG; 3 on MySQL).
 
-        The state lock is the only pre-write read. The batch statement that follows it is
-        executed after the lock is held, so every fact it returns (descriptor/identity,
-        lifecycle, pending rows and database time) is a post-lock fact. ``can_execute`` is
-        a cheap synchronous predicate: it runs after that read and before the owner UPDATE,
-        so a node that cannot build the descriptor leaves the input for a capable node and
-        never becomes the owner (design 215 §9.4).
-
-        No separate MAX read: accept commits its inbox row only while holding the same
-        state lock, so the pending rows returned here are already a stable snapshot. The
-        delivered UPDATE names exactly those row ids; later input stays pending for the
-        next boundary.
+        - Pre-staged cross-container child from ``create_many`` takes 1 SQL (SQLite/PG)
+          or 2 SQL (MySQL) with 0 message inserts.
+        - Promotes ``next_descriptor_json/hash`` atomically in the same ``UPDATE sessions``.
+        - Repairs ``pending_tool_seq`` (if non-NULL) before inserting the new merged user row.
         """
         self.check_store(target)
         if ttl_s <= 0:
             raise RuntimeRequestError("invalid_options", "ttl_s")
-        context = {}
+        now_sql = self._now_sql()
+        ttl_ms = int(ttl_s * 1000)
+        context: dict[str, Any] = {}
         try:
             async with self.db.transaction() as tx:
-                state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
-                if state["execution_state"] != "queued":
-                    return None
-                rows = await tx.fetchall(
-                    "SELECT q.id AS id,q.item_id AS item_id,q.kind AS kind,"
-                    "q.priority AS priority,q.content_json AS content_json,"
-                    "q.meta_json AS meta_json,s.lifecycle AS lifecycle,"
-                    "s.descriptor_json AS descriptor_json,s.tenant_id AS tenant_id,"
-                    "s.principal_id AS principal_id,s.parent_session_id AS parent_session_id,"
-                    "s.result_route_json AS result_route_json,"
-                    "s.start_input_message_id AS start_input_message_id,"
-                    "s.updated_at AS session_updated_at,"
-                    f"{self._now_sql()} AS db_now "
-                    f"FROM {self.q} q JOIN {self.store.t.sessions} s "
-                    "ON s.session_id=q.session_id "
-                    "WHERE q.session_id=? AND q.status='pending' "
-                    "ORDER BY CASE q.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.id",
-                    (target.session_id,),
-                )
-                if not rows:
-                    return None
-                first = rows[0]
-                if first["lifecycle"] != "open":
-                    return None
-                descriptor = RuntimeDescriptor(**json.loads(first["descriptor_json"]))
-                if can_execute is not None and not can_execute(descriptor):
-                    return None
-                # Capability is settled above; only a node that can execute repairs the
-                # interrupted run's unresolved tool calls. Repair stays ahead of the new
-                # merged user message and keeps that run's send_index.
-                repaired = await self._repair_pending_tx(
-                    tx, target.session_id, int(state["send_index"]), state)
-                # The batch read's time is the normal-path clock. If repair appended rows,
-                # re-read after it so the lease deadline is not shortened by repair work.
-                database_now = int(first["db_now"]) if not repaired else await self._db_now(tx)
+                if self._dialect == "mysql":
+                    # MySQL evaluates SET left-to-right: read pending_count & ready_item_json
+                    # BEFORE zeroing pending_count, and promote descriptor BEFORE clearing next_descriptor!
+                    rc = await tx.execute(
+                        f"UPDATE {self.s} SET "
+                        "execution_state='running',"
+                        "owner_node_id=?,owner_boot_id=?,"
+                        "owner_epoch=owner_epoch+1,"
+                        "send_index=send_index+1,"
+                        "next_seq=CASE "
+                        "WHEN session_kind='workflow_driver' THEN next_seq "
+                        "WHEN pending_count=0 AND ready_item_json IS NOT NULL THEN next_seq "
+                        "ELSE next_seq+1 END,"
+                        "cancel_by=CASE "
+                        "WHEN pending_count=0 AND ready_item_json IS NOT NULL THEN cancel_by "
+                        "ELSE NULL END,"
+                        "cancel_reason=CASE "
+                        "WHEN pending_count=0 AND ready_item_json IS NOT NULL THEN cancel_reason "
+                        "ELSE NULL END,"
+                        "ready_item_json=CASE "
+                        "WHEN pending_count=0 THEN ready_item_json "
+                        "WHEN ready_item_json IS NOT NULL THEN '' "
+                        "ELSE NULL END,"
+                        "descriptor_json=COALESCE(next_descriptor_json,descriptor_json),"
+                        "descriptor_hash=COALESCE(next_descriptor_hash,descriptor_hash),"
+                        "next_descriptor_json=NULL,next_descriptor_hash=NULL,"
+                        f"owner_lease_until_ms={now_sql}+?,"
+                        "wake_pending_count=0,pending_count=0,pending_bytes=0,"
+                        f"updated_at={now_sql} "
+                        "WHERE session_id=? AND lifecycle='open' "
+                        "AND execution_state='queued' AND wake_pending_count>0",
+                        (node_id, boot_id, ttl_ms, target.session_id),
+                    )
+                    if rc == 0:
+                        return None
+                    joined = await tx.fetchall(
+                        "SELECT s.owner_epoch,s.send_index,s.inbox_version,s.wake_inbox_seq,"
+                        "s.next_seq,s.cancel_seq,s.cancel_by,s.pending_tool_seq,s.depth,"
+                        "s.session_kind,s.tenant_id,s.principal_id,s.parent_session_id,"
+                        "s.root_session_id,s.result_route_json,s.start_input_message_id,"
+                        "s.ready_item_json,s.descriptor_json,s.updated_at,"
+                        "q.id AS q_id,q.item_id AS q_item_id,q.kind AS q_kind,"
+                        "q.priority AS q_priority,q.content_json AS q_content_json,"
+                        "q.meta_json AS q_meta_json,q.cancel_by AS q_cancel_by,"
+                        "q.reply_to_session_id AS q_reply_to_session_id,"
+                        "q.reply_result_kind AS q_reply_result_kind "
+                        f"FROM {self.s} s LEFT JOIN {self.q} q "
+                        "ON q.session_id=s.session_id AND q.status='pending' "
+                        "WHERE s.session_id=? "
+                        "ORDER BY CASE q.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.id",
+                        (target.session_id,),
+                    )
+                    if not joined:
+                        raise _ClaimRollback()
+                    srow = joined[0]
+                    descriptor = RuntimeDescriptor(**json.loads(srow["descriptor_json"]))
+                    if can_execute is not None and not can_execute(descriptor):
+                        raise _ClaimRollback()
+                    # 1-SQL (2 SQL on MySQL) pre-staged cross-container child claim!
+                    if srow["ready_item_json"] and srow["q_id"] is None and srow["pending_tool_seq"] is None:
+                        return self._build_prestaged_batch(
+                            target, srow, descriptor, node_id, boot_id,
+                        )
+                    rows = [
+                        {
+                            "id": r["q_id"], "item_id": r["q_item_id"], "kind": r["q_kind"],
+                            "priority": r["q_priority"], "content_json": r["q_content_json"],
+                            "meta_json": r["q_meta_json"], "cancel_by": r["q_cancel_by"],
+                            "reply_to_session_id": r["q_reply_to_session_id"],
+                            "reply_result_kind": r["q_reply_result_kind"],
+                        }
+                        for r in joined if r["q_id"] is not None
+                    ]
+                    if not rows:
+                        raise _ClaimRollback()
+                    pending_already_delivered = False
+                else:
+                    srow = await tx.fetchone(
+                        f"UPDATE {self.s} SET "
+                        "execution_state='running',"
+                        "owner_node_id=?,owner_boot_id=?,"
+                        "owner_epoch=owner_epoch+1,"
+                        "send_index=send_index+1,"
+                        "next_seq=CASE "
+                        "WHEN session_kind='workflow_driver' THEN next_seq "
+                        "WHEN pending_count=0 AND ready_item_json IS NOT NULL THEN next_seq "
+                        "ELSE next_seq+1 END,"
+                        "cancel_by=CASE "
+                        "WHEN pending_count=0 AND ready_item_json IS NOT NULL THEN cancel_by "
+                        "ELSE NULL END,"
+                        "cancel_reason=CASE "
+                        "WHEN pending_count=0 AND ready_item_json IS NOT NULL THEN cancel_reason "
+                        "ELSE NULL END,"
+                        "ready_item_json=CASE "
+                        "WHEN pending_count=0 THEN ready_item_json "
+                        "WHEN ready_item_json IS NOT NULL THEN '' "
+                        "ELSE NULL END,"
+                        "descriptor_json=COALESCE(next_descriptor_json,descriptor_json),"
+                        "descriptor_hash=COALESCE(next_descriptor_hash,descriptor_hash),"
+                        "next_descriptor_json=NULL,next_descriptor_hash=NULL,"
+                        f"owner_lease_until_ms={now_sql}+?,"
+                        "wake_pending_count=0,pending_count=0,pending_bytes=0,"
+                        f"updated_at={now_sql} "
+                        "WHERE session_id=? AND lifecycle='open' "
+                        "AND execution_state='queued' AND wake_pending_count>0 "
+                        "RETURNING owner_epoch,send_index,inbox_version,wake_inbox_seq,"
+                        "next_seq,cancel_seq,cancel_by,pending_tool_seq,depth,"
+                        "session_kind,tenant_id,principal_id,parent_session_id,"
+                        "root_session_id,result_route_json,start_input_message_id,"
+                        "ready_item_json,descriptor_json,updated_at",
+                        (node_id, boot_id, ttl_ms, target.session_id),
+                    )
+                    if srow is None:
+                        return None
+                    descriptor = RuntimeDescriptor(**json.loads(srow["descriptor_json"]))
+                    if can_execute is not None and not can_execute(descriptor):
+                        raise _ClaimRollback()
+                    # Optimization 6: 1-SQL Claim for pre-staged cross-container child!
+                    if srow["ready_item_json"] and srow["pending_tool_seq"] is None:
+                        return self._build_prestaged_batch(
+                            target, srow, descriptor, node_id, boot_id,
+                        )
+                    send_idx_tmp = int(srow["send_index"])
+                    is_drv_tmp = srow["session_kind"] == "workflow_driver"
+                    user_seq_tmp = None if is_drv_tmp else int(srow["next_seq"]) - 1
+                    rows = await tx.fetchall(
+                        f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
+                        f"delivered_seq=?,delivered_at={now_sql} "
+                        "WHERE session_id=? AND status='pending' "
+                        "RETURNING id,item_id,kind,priority,content_json,meta_json,"
+                        "cancel_by,reply_to_session_id,reply_result_kind",
+                        (send_idx_tmp, user_seq_tmp, target.session_id),
+                    )
+                    if not rows:
+                        raise _ClaimRollback()
+                    rows.sort(key=lambda r: (0 if r["priority"] == "urgent" else 1, int(r["id"])))
+                    pending_already_delivered = True
+
+                send_index = int(srow["send_index"])
+                is_driver = srow["session_kind"] == "workflow_driver"
+                db_now = int(srow["updated_at"])
+                seq = int(srow["next_seq"]) - (0 if is_driver else 1)
+
+                # Rare path: repair dangling pending_tool_seq from a previous interrupted send
+                if srow["pending_tool_seq"] is not None:
+                    # Rewind next_seq to pre-user allocation, repair old send's tools, then allocate user seq!
+                    pre_user_next_seq = seq
+                    repaired_state = {
+                        "pending_tool_seq": srow["pending_tool_seq"],
+                        "next_seq": pre_user_next_seq,
+                    }
+                    repaired = await self._repair_pending_tx(
+                        tx, target.session_id, send_index - 1, repaired_state,
+                    )
+                    if repaired:
+                        seq = pre_user_next_seq + repaired
+                        new_next_seq = seq + (0 if is_driver else 1)
+                        await tx.execute(
+                            f"UPDATE {self.s} SET next_seq=?,pending_tool_seq=NULL WHERE session_id=?",
+                            (new_next_seq, target.session_id),
+                        )
+                        if pending_already_delivered and not is_driver:
+                            ids = [int(r["id"]) for r in rows]
+                            await tx.execute(
+                                f"UPDATE {self.q} SET delivered_seq=? "
+                                f"WHERE session_id=? AND id IN ({','.join('?' for _ in ids)})",
+                                (seq, target.session_id, *ids),
+                            )
+
+                # Rare path: extra inputs arrived on a pre-staged child before first claim
+                if srow["ready_item_json"] == "":
+                    await tx.execute(
+                        f"UPDATE {self.s} SET ready_item_json=NULL WHERE session_id=?",
+                        (target.session_id,),
+                    )
+                    prestaged = await tx.fetchall(
+                        f"SELECT id,item_id,kind,priority,content_json,meta_json,cancel_by,"
+                        f"reply_to_session_id,reply_result_kind FROM {self.q} "
+                        "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                        "ORDER BY id ASC",
+                        (target.session_id, send_index),
+                    )
+                    row_ids = {int(r["id"]) for r in rows}
+                    extra_pre = [r for r in prestaged if int(r["id"]) not in row_ids]
+                    if extra_pre:
+                        rows = [*extra_pre, *rows]
+
                 refs = tuple(
-                    InputRef(target.store_id, target.session_id, row["item_id"])
-                    for row in rows
+                    InputRef(target.store_id, target.session_id, r["item_id"]) for r in rows
                 )
                 context["refs"] = refs
-                token = _owner_token or uuid.uuid4().hex
-                send_index = int(state["send_index"]) + 1
-                seq = int(state["next_seq"]) + repaired
-                epoch = int(state["owner_epoch"]) + 1
-                deadline = database_now + int(ttl_s * 1000)
-                changed = await tx.execute(
-                    f"UPDATE {self.state} SET execution_state='running',send_index=?,"
-                    "active_send_index=?,next_seq=next_seq+1,owner_epoch=?,owner_token=?,"
-                    "owner_node_id=?,owner_boot_id=?,owner_lease_until_ms=?,"
-                    "cancel_send_index=NULL,cancel_reason=NULL "
-                    "WHERE session_id=? AND execution_state='queued' AND send_index=? AND next_seq=? "
-                    "AND active_send_index IS NULL AND owner_token IS NULL",
-                    (
-                        send_index, send_index, epoch, token, node_id, boot_id, deadline,
-                        target.session_id, state["send_index"], seq,
-                    ),
-                )
-                if changed != 1:
-                    return None
+                deliv_seq = None if is_driver else seq
+                if not pending_already_delivered:
+                    ids = [int(r["id"]) for r in rows]
+                    delivered = await tx.execute(
+                        f"UPDATE {self.q} SET status='delivered',delivered_at={now_sql},"
+                        "delivered_seq=?,delivered_send_index=? "
+                        f"WHERE session_id=? AND status='pending' AND id IN ({','.join('?' for _ in ids)})",
+                        (deliv_seq, send_index, target.session_id, *ids),
+                    )
+                    if delivered != len(ids):
+                        raise SessionLeaseLost(target.session_id)
+
                 merged = self.merge_batch(rows)
-                content = canonical(merged)
+                merged_json = canonical(merged)
                 message_meta = {
                     "content_encoding": "json",
                     "input_refs": [plain(ref) for ref in refs],
                 }
-                await self._insert_message(
-                    tx, target.session_id, seq, "user", content, message_meta,
-                    send_index, database_now,
-                )
-                ids = [int(row["id"]) for row in rows]
-                delivered = await tx.execute(
-                    f"UPDATE {self.q} SET status='delivered',delivered_at=?,delivered_seq=?,"
-                    f"delivered_send_index=? WHERE session_id=? AND status='pending' "
-                    f"AND id IN ({','.join('?' for _ in ids)})",
-                    (database_now, seq, send_index, target.session_id, *ids),
-                )
-                if delivered != len(ids):
-                    raise SessionLeaseLost(target.session_id)
+                if not is_driver:
+                    await self._insert_message(
+                        tx, target.session_id, seq, "user", merged_json, message_meta,
+                        send_index, db_now,
+                    )
                 user_row = StoredMessageRow(
                     session_id=target.session_id, seq=seq, role="user", name=None,
-                    content=content, tool_calls=None, tool_call_id=None, round_index=None,
-                    state=MessageState.ACTIVE, meta=message_meta, created_at=database_now,
+                    content=merged_json, tool_calls=None, tool_call_id=None, round_index=0,
+                    state=MessageState.ACTIVE, meta=message_meta, created_at=db_now,
                     send_index=send_index,
                 )
+                reply_to_sid = next(
+                    (r.get("reply_to_session_id") for r in rows if r.get("reply_to_session_id")), None
+                )
+                reply_rk = next(
+                    (r.get("reply_result_kind") for r in rows if r.get("reply_to_session_id")), None
+                )
                 batch = ClaimedBatch(
-                    target, send_index, seq, refs, epoch, token, node_id, boot_id,
-                    descriptor=descriptor, tenant_id=first["tenant_id"],
-                    principal_id=first["principal_id"],
-                    parent_session_id=first["parent_session_id"],
+                    target=target,
+                    send_index=send_index,
+                    message_seq=seq,
+                    input_refs=refs,
+                    owner_epoch=int(srow["owner_epoch"]),
+                    owner_node_id=node_id,
+                    owner_boot_id=boot_id,
+                    descriptor=descriptor,
+                    tenant_id=srow["tenant_id"],
+                    principal_id=srow["principal_id"],
+                    parent_session_id=srow["parent_session_id"],
                     user_row=user_row,
                     result_route=(
-                        json.loads(first["result_route_json"])
-                        if first["result_route_json"] else None
+                        json.loads(srow["result_route_json"])
+                        if srow["result_route_json"] else None
                     ),
-                    inbox_version=int(state["inbox_version"]),
-                    session_updated_at=int(first["session_updated_at"]),
-                    start_input_message_id=first["start_input_message_id"],
+                    session_updated_at=db_now,
+                    inbox_version=int(srow["inbox_version"]),
+                    wake_inbox_seq=int(srow["wake_inbox_seq"]),
+                    cancel_seq=int(srow["cancel_seq"]),
+                    cancel_by=srow["cancel_by"],
+                    start_input_message_id=srow["start_input_message_id"],
+                    root_session_id=str(srow["root_session_id"]),
+                    depth=int(srow["depth"]),
+                    reply_to_session_id=reply_to_sid,
+                    reply_result_kind=reply_rk,
                 )
-                context.update(batch=batch)
+                context["batch"] = batch
                 return batch
+        except _ClaimRollback:
+            return None
         except RuntimeRequestError:
             raise
         except (Exception, asyncio.CancelledError) as exc:
@@ -848,35 +1715,73 @@ class RuntimeInputStore:
             ref = context.get("refs", (None,))[0]
             raise StoreError(ref) from exc
 
+    def _build_prestaged_batch(
+        self, target: TargetRef, srow, descriptor: RuntimeDescriptor, node_id: str, boot_id: str,
+    ) -> ClaimedBatch:
+        ready = json.loads(srow["ready_item_json"])
+        ref = InputRef(target.store_id, target.session_id, ready["item_id"])
+        send_index = int(srow["send_index"])
+        db_now = int(srow["updated_at"])
+        user_seq = int(ready.get("user_seq") or 1) if srow["session_kind"] != "workflow_driver" else 0
+        user_content = ready.get("user_content") or canonical(self.merge_batch([ready]))
+        msg_meta = {"content_encoding": "json", "input_refs": [plain(ref)]}
+        user_row = StoredMessageRow(
+            session_id=target.session_id, seq=user_seq, role="user", name=None,
+            content=user_content, tool_calls=None, tool_call_id=None, round_index=0,
+            state=MessageState.ACTIVE, meta=msg_meta, created_at=db_now, send_index=send_index,
+        )
+        return ClaimedBatch(
+            target=target,
+            send_index=send_index,
+            message_seq=user_seq,
+            input_refs=(ref,),
+            owner_epoch=int(srow["owner_epoch"]),
+            owner_node_id=node_id,
+            owner_boot_id=boot_id,
+            descriptor=descriptor,
+            tenant_id=srow["tenant_id"],
+            principal_id=srow["principal_id"],
+            parent_session_id=srow["parent_session_id"],
+            user_row=user_row,
+            result_route=(
+                json.loads(srow["result_route_json"]) if srow["result_route_json"] else None
+            ),
+            session_updated_at=db_now,
+            inbox_version=int(srow["inbox_version"]),
+            wake_inbox_seq=int(srow["wake_inbox_seq"]),
+            cancel_seq=int(srow["cancel_seq"]),
+            cancel_by=srow["cancel_by"],
+            start_input_message_id=srow["start_input_message_id"],
+            root_session_id=str(srow["root_session_id"]),
+            depth=int(srow["depth"]),
+            reply_to_session_id=ready.get("reply_to_session_id"),
+            reply_result_kind=ready.get("reply_result_kind"),
+        )
+
     async def release_claim(self, batch: ClaimedBatch):
         """Atomically release an unexecuted claim, honouring active cancellation."""
         self.check_store(batch.target)
         ids = [ref.message_id for ref in batch.input_refs]
         async with self.db.transaction() as tx:
-            session = await self._session(tx, batch.target.session_id)
-            route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
-            lock_ids = {batch.target.session_id}
-            if route is not None:
-                lock_ids.add(route["target"]["session_id"])
-            states = {}
-            for sid in sorted(lock_ids):
-                states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
-            state = states[batch.target.session_id]
+            state = await self.db.dialect.lock_state(tx, self.s, batch.target.session_id)
             if (
                 state["execution_state"] != "running"
-                or state["active_send_index"] != batch.send_index
-                or state["owner_epoch"] != batch.owner_epoch
-                or state["owner_token"] != batch.owner_token
+                or int(state["send_index"]) != batch.send_index
+                or int(state["owner_epoch"]) != batch.owner_epoch
             ):
                 raise SessionLeaseLost(batch.target.session_id)
-            if state["cancel_send_index"] == batch.send_index:
-                # Reuse final's batch cancellation and trusted result routing. The merged
-                # user row is removed because no model execution consumed this batch.
+            if int(state["cancel_seq"]) > batch.cancel_seq or state["lifecycle"] in ("closing", "closed"):
                 await self._final_tx(
                     tx, batch, batch.input_refs, "cancelled", "", {}, None,
                     state["cancel_reason"] or "cancelled", "cancelled",
                 )
             else:
+                qrows = await tx.fetchall(
+                    f"SELECT wake,content_bytes FROM {self.q} "
+                    "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                    f"AND item_id IN ({','.join('?' for _ in ids)})",
+                    (batch.target.session_id, batch.send_index, *ids),
+                )
                 restored = await tx.execute(
                     f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
                     "delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
@@ -885,13 +1790,19 @@ class RuntimeInputStore:
                 )
                 if restored != len(ids):
                     raise SessionLeaseLost(batch.target.session_id)
+                w_add = sum(int(r["wake"]) for r in qrows)
+                b_add = sum(int(r["content_bytes"]) for r in qrows)
                 changed = await tx.execute(
-                    f"UPDATE {self.state} SET execution_state='queued',active_send_index=NULL,"
-                    "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-                    "cancel_send_index=NULL,cancel_reason=NULL "
-                    "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
-                    "AND owner_epoch=? AND owner_token=?",
-                    (batch.target.session_id, batch.send_index, batch.owner_epoch, batch.owner_token),
+                    f"UPDATE {self.s} SET execution_state='queued',"
+                    "send_index=CASE WHEN send_index>0 THEN send_index-1 ELSE 0 END,"
+                    "next_seq=CASE WHEN next_seq>1 THEN next_seq-1 ELSE 1 END,"
+                    "wake_pending_count=wake_pending_count+?,"
+                    "pending_count=pending_count+?,"
+                    "pending_bytes=pending_bytes+?,"
+                    "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+                    "cancel_reason=NULL,cancel_by=NULL "
+                    "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+                    (w_add, len(ids), b_add, batch.target.session_id, batch.owner_epoch),
                 )
                 if changed != 1:
                     raise SessionLeaseLost(batch.target.session_id)
@@ -907,67 +1818,44 @@ class RuntimeInputStore:
         return session_batch_content(rows)
 
     async def boundary(self, target):
-        """One current-version read at a loop boundary (design 215 §7.4).
-
-        Returns the live ``session_state`` control fields so the caller can detect new
-        inbox input, a matching cancellation, or a lost owner fence. This is the fixed
-        per-boundary control cost; the inbox batch is only read when the version moved.
-        """
+        """Read current control boundary fields from ``sessions`` (slow/diagnostic path)."""
         self.check_store(target)
         return await self.db.fetchone(
-            f"SELECT execution_state,active_send_index,owner_epoch,owner_token,"
-            f"inbox_version,background_version,runtime_version,cancel_send_index,cancel_reason "
-            f"FROM {self.state} WHERE session_id=?",
+            "SELECT execution_state,send_index,owner_epoch,lifecycle,"
+            "inbox_version,wake_inbox_seq,background_version,runtime_version,"
+            f"cancel_seq,cancel_by,cancel_reason FROM {self.s} WHERE session_id=?",
             (target.session_id,),
         )
 
     async def session_entry(self, target):
-        """Session identity/control facts and DB time in one read.
-
-        Only used by the non-queued claim path and by topologies that must decide
-        acquire/recover before claim. It is never on the healthy queued claim path,
-        which gets the same facts from the post-lock batch read. The time is a hint for
-        deciding whether to attempt recovery; ``recover`` re-reads it under the lock.
-        """
+        """Session identity/control facts and DB time in one read."""
         self.check_store(target)
         return await self.db.fetchone(
-            "SELECT s.lifecycle AS lifecycle,s.descriptor_json AS descriptor_json,"
-            "s.tenant_id AS tenant_id,s.principal_id AS principal_id,"
-            "s.parent_session_id AS parent_session_id,"
-            "st.execution_state AS execution_state,"
-            "st.owner_lease_until_ms AS owner_lease_until_ms,"
-            f"{self._now_sql()} AS db_now "
-            f"FROM {self.store.t.sessions} s JOIN {self.state} st "
-            "ON st.session_id=s.session_id WHERE s.session_id=?",
+            "SELECT lifecycle,descriptor_json,tenant_id,principal_id,parent_session_id,"
+            f"execution_state,owner_lease_until_ms,owner_epoch,{self._now_sql()} AS db_now "
+            f"FROM {self.s} WHERE session_id=?",
             (target.session_id,),
         )
 
     async def claim_follow_up(self, batch: ClaimedBatch):
-        """Atomically claim the pending inbox snapshot into the RUNNING send.
-
-        Same atomic boundary as :meth:`claim` but fenced on the live owner: lock the
-        state, verify running + active_send_index + epoch/token, read the pending batch and
-        DB time once, write one merged user message and bind every input to this
-        send_index. Returns ``(refs, seq, merged, version)`` or ``None`` when nothing is
-        pending or the fence moved.
-        """
+        """Atomically drain ALL pending inbox items (normal + urgent) into the RUNNING send."""
         self.check_store(batch.target)
+        now_sql = self._now_sql()
+        from power_loop.runtime.store import send_reads
+        holding = send_reads.current(self.store, batch.target.session_id)
         async with self.db.transaction() as tx:
-            state = await self.db.dialect.lock_state(tx, self.state, batch.target.session_id)
+            state = await self.db.dialect.lock_state(tx, self.s, batch.target.session_id)
             if (
                 state["execution_state"] != "running"
-                or state["active_send_index"] != batch.send_index
-                or state["owner_epoch"] != batch.owner_epoch
-                or state["owner_token"] != batch.owner_token
+                or int(state["send_index"]) != batch.send_index
+                or int(state["owner_epoch"]) != batch.owner_epoch
             ):
                 raise SessionLeaseLost(batch.target.session_id)
             rows = await tx.fetchall(
-                "SELECT q.id AS id,q.item_id AS item_id,q.kind AS kind,"
-                "q.priority AS priority,q.content_json AS content_json,"
-                "q.meta_json AS meta_json,"
-                f"{self._now_sql()} AS db_now FROM {self.q} q "
-                "WHERE q.session_id=? AND q.status='pending' "
-                "ORDER BY CASE q.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.id",
+                "SELECT id,item_id,kind,priority,wake,content_json,content_bytes,"
+                f"meta_json,cancel_by,reply_to_session_id,reply_result_kind,{now_sql} AS db_now "
+                f"FROM {self.q} WHERE session_id=? AND status='pending' "
+                "ORDER BY CASE priority WHEN 'urgent' THEN 0 ELSE 1 END,id",
                 (batch.target.session_id,),
             )
             if not rows:
@@ -976,15 +1864,24 @@ class RuntimeInputStore:
                 InputRef(batch.target.store_id, batch.target.session_id, row["item_id"])
                 for row in rows
             )
-            seq = int(state["next_seq"])
+            db_next_seq = int(state["next_seq"])
+            seq = max(db_next_seq, int(holding.next_seq)) if (holding is not None and holding.next_seq is not None) else db_next_seq
             database_now = int(rows[0]["db_now"])
             merged = self.merge_batch(rows)
+            w_sub = sum(int(r["wake"]) for r in rows)
+            p_sub = len(rows)
+            b_sub = sum(int(r["content_bytes"]) for r in rows)
             changed = await tx.execute(
-                f"UPDATE {self.state} SET next_seq=next_seq+1,inbox_version=inbox_version "
-                "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
-                "AND owner_epoch=? AND owner_token=? AND next_seq=?",
-                (batch.target.session_id, batch.send_index, batch.owner_epoch,
-                 batch.owner_token, seq),
+                f"UPDATE {self.s} SET next_seq=?,"
+                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+                f"updated_at={now_sql} "
+                "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+                (
+                    seq + 1, w_sub, w_sub, p_sub, p_sub, b_sub, b_sub,
+                    batch.target.session_id, batch.owner_epoch,
+                ),
             )
             if changed != 1:
                 raise SessionLeaseLost(batch.target.session_id)
@@ -1003,43 +1900,73 @@ class RuntimeInputStore:
             if delivered != len(ids):
                 raise SessionLeaseLost(batch.target.session_id)
             version = int(state["inbox_version"])
-        # The merged follow-up row consumed a seq outside SessionStore.append_message;
-        # advance the live send's in-memory cursor so its next conditional append matches
-        # (otherwise the stale next_seq fence would reject the loop's own next write).
-        from power_loop.runtime.store import send_reads
-        holding = send_reads.current(self.store, batch.target.session_id)
+            wake_seq = int(state["wake_inbox_seq"])
         if holding is not None:
             holding.next_seq = seq + 1
+            holding.wake_inbox_seq = wake_seq
             holding.change_snapshot = None
         return refs, seq, merged, version
 
-    async def _repair_pending_tx(self, tx, session_id, send_index, state):
-        """Synthesize unknown tool results for unresolved calls (design 215 §8.3).
-
-        Runs inside the caller's fenced transaction. Only ids without a stored result
-        get a fixed interrupted marker; existing results are never duplicated and no
-        unknown tool is replayed. The synthetic rows carry the interrupted run's
-        send_index. Returns the number of rows appended (so the caller can advance its
-        seq cursor). pending_json is cleared in the same transaction.
-        """
-        pending = json.loads(state["pending_json"]) if state["pending_json"] else None
-        if not pending:
+    async def _repair_pending_tx(self, tx, session_id: str, send_index: int, state) -> int:
+        """Synthesize unknown tool results for unresolved tool calls (explicit pending_tool_seq OR messages scan)."""
+        pts = state.get("pending_tool_seq") if isinstance(state, dict) else state["pending_tool_seq"]
+        assistant = None
+        tool_calls: list[dict] = []
+        seq = int(state["next_seq"])
+        if pts is not None:
+            from .pending_tools import read_pending_tools
+            # Ensure upper bound covers any messages written via fenced_fast without bumping next_seq
+            max_row = await tx.fetchone(
+                f"SELECT COALESCE(MAX(seq),0) AS max_seq FROM {self.store.t.messages} WHERE session_id=?",
+                (session_id,),
+            )
+            seq = max(seq, int(max_row["max_seq"]) + 1) if max_row else seq
+            assistant, tool_calls = await read_pending_tools(
+                self.store, tx, session_id, {"assistant_seq": int(pts)}, seq,
+            )
+        else:
+            # Also detect dangling assistant(tool_calls) written via fenced_fast without pending_tool_seq
+            turn_msgs = await tx.fetchall(
+                f"SELECT id,seq,role,tool_call_id,send_index,round_index,tool_calls_json "
+                f"FROM {self.store.t.messages} WHERE session_id=? AND send_index=? ORDER BY seq ASC",
+                (session_id, send_index),
+            )
+            if turn_msgs:
+                seq = max(seq, max(int(m["seq"]) for m in turn_msgs) + 1)
+                last_asst = None
+                for m in turn_msgs:
+                    if m["role"] == "assistant" and m["tool_calls_json"]:
+                        last_asst = m
+                if last_asst is not None:
+                    calls = json.loads(last_asst["tool_calls_json"])
+                    completed = {
+                        m["tool_call_id"]
+                        for m in turn_msgs
+                        if m["role"] == "tool" and int(m["seq"]) > int(last_asst["seq"]) and m["tool_call_id"]
+                    }
+                    missing = [tc for tc in calls if str(tc.get("id") or "") not in completed]
+                    if missing:
+                        assistant = last_asst
+                        tool_calls = missing
+        if assistant is None or not tool_calls:
+            if pts is not None:
+                await tx.execute(
+                    f"UPDATE {self.s} SET pending_tool_seq=NULL,next_seq=? WHERE session_id=?",
+                    (seq, session_id),
+                )
             return 0
-        from .pending_tools import read_pending_tools
-        assistant, tool_calls = await read_pending_tools(
-            self.store, tx, session_id, pending, int(state["next_seq"]),
-        )
-        assistant_seq = assistant["seq"]
-        round_index, send_index = assistant["round_index"], assistant["send_index"]
-        names = {str(tc.get("id") or ""): (tc.get("function", {}) or {}).get("name")
-                 if "function" in tc else tc.get("name") for tc in tool_calls}
+        assistant_seq = int(assistant["seq"])
+        round_index, asst_send_index = assistant["round_index"], assistant["send_index"]
+        names = {
+            str(tc.get("id") or ""): (tc.get("function", {}) or {}).get("name")
+            if "function" in tc else tc.get("name")
+            for tc in tool_calls
+        }
         from power_loop.runtime.message_ref import MessageRef
         call_ref = MessageRef(
-            self.store.store_id, session_id, assistant["id"], assistant["seq"],
-            assistant["role"], assistant["tool_call_id"], assistant["send_index"],
-            assistant["round_index"],
+            self.store.store_id, session_id, assistant["id"], assistant_seq,
+            assistant["role"], assistant["tool_call_id"], asst_send_index, round_index,
         )
-        seq = int(state["next_seq"])
         database_now = await self._db_now(tx)
         appended = 0
         for tc in tool_calls:
@@ -1047,49 +1974,38 @@ class RuntimeInputStore:
             if not cid:
                 continue
             content = "<aborted: 执行中断，结果未知>"
-            meta = {"interrupted": True}
-            if assistant_seq is not None:
-                meta["_assistant_seq"] = assistant_seq
-            if call_ref is not None:
-                child = await tx.fetchone(
-                    f"SELECT session_id,start_input_message_id FROM {self.store.t.sessions} "
-                    "WHERE parent_session_id=? AND creation_call_ref_json=? AND creation_tool_call_id=?",
-                    (session_id, canonical(call_ref.to_dict()), cid),
-                )
-                if child is not None and child["start_input_message_id"] is not None:
-                    child_target = TargetRef(self.store.store_id, child["session_id"])
-                    start = InputRef(self.store.store_id, child["session_id"], child["start_input_message_id"])
-                    content = canonical({
-                        "creation_result_uncertain": True,
-                        "target_ref": plain(child_target),
-                        "input_ref": plain(start),
-                        "status": "accepted",
-                    })
-                    meta["creation_result_uncertain"] = True
+            meta: dict[str, Any] = {"interrupted": True, "_assistant_seq": assistant_seq}
+            child = await tx.fetchone(
+                f"SELECT session_id,start_input_message_id FROM {self.s} "
+                "WHERE parent_session_id=? AND creation_call_ref_json=? AND creation_tool_call_id=?",
+                (session_id, canonical(call_ref.to_dict()), cid),
+            )
+            if child is not None and child["start_input_message_id"] is not None:
+                child_target = TargetRef(self.store.store_id, child["session_id"])
+                start = InputRef(self.store.store_id, child["session_id"], child["start_input_message_id"])
+                content = canonical({
+                    "creation_result_uncertain": True,
+                    "target_ref": plain(child_target),
+                    "input_ref": plain(start),
+                    "status": "accepted",
+                })
+                meta["creation_result_uncertain"] = True
             await tx.execute(
                 f"INSERT INTO {self.store.t.messages} (session_id,seq,role,name,content,"
                 "tool_call_id,round_index,state,meta_json,send_index,created_at) "
-                "VALUES (?,?, 'tool', ?, ?, ?, ?, 'active', ?, ?, ?)",
+                "VALUES (?,?,'tool',?,?,?,?,'active',?,?,?)",
                 (session_id, seq, names.get(cid), content, cid,
-                 round_index, canonical(meta), send_index, database_now),
+                 round_index, canonical(meta), asst_send_index, database_now),
             )
             seq += 1
             appended += 1
         await tx.execute(
-            f"UPDATE {self.state} SET pending_json=NULL,next_seq=? WHERE session_id=?",
+            f"UPDATE {self.s} SET pending_tool_seq=NULL,next_seq=? WHERE session_id=?",
             (seq, session_id),
         )
         return appended
 
     async def _insert_message(self, tx, session_id, seq, role, content, meta, send_index, created_at):
-        """Insert one claim/final message row.
-
-        Every internal caller addresses the row by its already-allocated ``seq`` (claim,
-        follow-up claim and final all return the seq, not a global row id), so no
-        ``LAST_INSERT_ID()`` round trip is needed here. The public
-        ``SessionStore.append_message`` builds a real ``MessageRef`` and keeps its own id
-        read.
-        """
         sql = (
             f"INSERT INTO {self.store.t.messages} (session_id,seq,role,content,meta_json,"
             "send_index,created_at) VALUES (?,?,?,?,?,?,?)"
@@ -1099,26 +2015,18 @@ class RuntimeInputStore:
         )
 
     async def _claim_after_unknown(self, target, context):
-        """Return the original batch if the unknown commit actually landed.
-
-        ``context["batch"]`` is only populated after the state UPDATE, merged-message
-        INSERT and delivered UPDATE all returned, so its ``user_row`` is exactly the row
-        those statements wrote. The checks below prove the same transaction committed
-        (running + matching epoch/token + every input delivered to this send/seq); an
-        uncommitted attempt rolled all of it back and returns None. This recovery-only
-        read stays out of the healthy claim path.
-        """
         if "batch" not in context:
             return None
         batch = context["batch"]
         state = await self.db.fetchone(
-            f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
+            f"SELECT * FROM {self.s} WHERE session_id=?", (target.session_id,)
         )
-        if not state or state["active_send_index"] != batch.send_index:
+        if not state or int(state["send_index"]) != batch.send_index:
             return None
         if (
-            state["owner_epoch"], state["owner_token"], state["execution_state"]
-        ) != (batch.owner_epoch, batch.owner_token, "running"):
+            int(state["owner_epoch"]), state["execution_state"],
+            state["owner_node_id"], state["owner_boot_id"],
+        ) != (batch.owner_epoch, "running", batch.owner_node_id, batch.owner_boot_id):
             return None
         ids = [ref.message_id for ref in batch.input_refs]
         rows = await self.db.fetchall(
@@ -1133,14 +2041,14 @@ class RuntimeInputStore:
             return None
         return batch
 
+    # ── Final + River Same-Tx Non-Cascading Delivery (0 final_settle_inbox!) ─
+
     async def final(
         self, batch: ClaimedBatch, *, consumed=None, status="completed", final_text="",
         usage=None, structured_output=None, error=None, error_code=None, result_seq=None,
-        assistant_meta=None,
+        assistant_meta=None, next_seq: int | None = None, result_json: dict | None = None,
+        settle_start_input: bool = False,
     ) -> FinalBatch:
-        # consumed=None means "every input delivered to this send" — including follow-ups
-        # claimed at loop boundaries, which share send_index but are not in the original
-        # ClaimedBatch.input_refs (design 215 §3.4/§7.4). An explicit consumed narrows it.
         if consumed is not None:
             consumed = tuple(consumed)
             if any(ref.session_id != batch.target.session_id for ref in consumed):
@@ -1152,6 +2060,8 @@ class RuntimeInputStore:
                 return await self._final_tx(
                     tx, batch, consumed, status, final_text, usage or {},
                     structured_output, error, error_code, result_seq, assistant_meta,
+                    next_seq=next_seq, result_json=result_json,
+                    settle_start_input=settle_start_input,
                 )
         except (RuntimeRequestError, SessionLeaseLost):
             raise
@@ -1162,174 +2072,463 @@ class RuntimeInputStore:
             raise StoreError(consumed[0] if consumed else batch.input_refs[0]) from exc
 
     async def _final_tx(
-        self, tx, batch, consumed, status, final_text, usage, structured_output,
-        error, error_code, result_seq=None, assistant_meta=None,
-    ):
-        # The claim read the frozen route with the state lock; the session row is not read
-        # again here. A live run also passes the meta of the assistant row it just appended,
-        # so the result fields are merged without a second read of that row.
-        route = batch.result_route
-        lock_ids = [batch.target.session_id]
-        if route is not None:
-            lock_ids.append(route["target"]["session_id"])
-        states = {}
-        for sid in sorted(set(lock_ids)):
-            states[sid] = await self.db.dialect.lock_state(tx, self.state, sid)
-        state = states[batch.target.session_id]
-        if state["cancel_send_index"] == batch.send_index:
-            status, error = "cancelled", state["cancel_reason"] or "cancelled"
-        if consumed is None:
+        self, tx, batch: ClaimedBatch, consumed, status, final_text, usage, structured_output,
+        error, error_code, result_seq=None, assistant_meta=None, *, next_seq=None,
+        result_json=None, settle_start_input=False,
+    ) -> FinalBatch:
+        sid = batch.target.session_id
+        now_sql = self._now_sql()
+        consumed_refs = tuple(batch.input_refs) if consumed is None else tuple(consumed)
+        unconsumed_ids = [ref.message_id for ref in batch.input_refs if ref not in consumed_refs]
+        has_unconsumed = bool(unconsumed_ids)
+
+        # Compute effective next_seq before releasing the session row (so 1 UPDATE suffices!).
+        # On abnormal/untracked final (exception, cancel, recovery), sync with MAX(seq)+1 so
+        # fenced appends made before the failure never cause a next_seq collision on the next send.
+        if next_seq is None or status != "completed":
+            max_row = await tx.fetchone(
+                f"SELECT COALESCE(MAX(seq),0) AS max_seq FROM {self.store.t.messages} WHERE session_id=?",
+                (sid,),
+            )
+            if max_row is not None:
+                next_seq = max(int(next_seq or 0), int(max_row["max_seq"]) + 1)
+        write_message = result_seq is None and status == "completed"
+        effective_next_seq = max(
+            int(next_seq or 0),
+            (int(result_seq) + 1) if result_seq is not None else 0,
+            batch.message_seq + 1,
+        )
+        keep_pending_tool = status == "interrupted"
+
+        # Step 1 (Deep-first lock order): Fenced UPDATE on child session FIRST (1 control SQL!).
+        if self._dialect == "mysql":
+            # 4-bit LAST_INSERT_ID packing in 1st SET slot:
+            # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced | bit 3: closed_raced
+            rc, packed = await tx.execute_packed(
+                f"UPDATE {self.s} SET "
+                "owner_epoch=(LAST_INSERT_ID("
+                "(owner_epoch<<4)"
+                "|(CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) THEN 1 ELSE 0 END)"
+                "|(CASE WHEN cancel_by='subtree' AND cancel_seq>? THEN 2 ELSE 0 END)"
+                "|(CASE WHEN cancel_seq>? THEN 4 ELSE 0 END)"
+                "|(CASE WHEN lifecycle IN ('closing','closed') THEN 8 ELSE 0 END)"
+                ")>>4),"
+                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
+                "THEN 'queued' ELSE 'idle' END,"
+                "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+                "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
+                "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
+                "pending_tool_seq=CASE WHEN ?=1 THEN pending_tool_seq ELSE NULL END,"
+                "ready_item_json=NULL,"
+                "cancel_by=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? THEN NULL ELSE cancel_by END,"
+                "cancel_reason=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? THEN NULL ELSE cancel_reason END,"
+                f"updated_at={now_sql} "
+                "WHERE session_id=? AND owner_epoch=? AND execution_state='running'",
+                (
+                    int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
+                    int(has_unconsumed),
+                    effective_next_seq, effective_next_seq, int(write_message),
+                    int(keep_pending_tool), batch.cancel_seq, batch.cancel_seq,
+                    sid, batch.owner_epoch,
+                ),
+            )
+            if rc == 0:
+                raise SessionLeaseLost(sid)
+            has_more_wake = bool(packed & 1)
+            subtree_raced = bool(packed & 2)
+            cancel_raced = bool(packed & 4)
+            closed_raced = bool(packed & 8)
+            next_state = "queued" if has_more_wake else "idle"
+            cancel_by_db = "subtree" if subtree_raced else None
+            cancel_reason_db = None
+            post_next_seq = effective_next_seq + int(write_message)
+            database_now = None
+            if closed_raced or cancel_raced or write_message:
+                diag = await tx.fetchone(
+                    f"SELECT next_seq,cancel_by,cancel_reason,updated_at FROM {self.s} WHERE session_id=?",
+                    (sid,),
+                )
+                if diag is not None:
+                    post_next_seq = int(diag["next_seq"])
+                    cancel_by_db = diag["cancel_by"]
+                    cancel_reason_db = diag["cancel_reason"]
+                    database_now = int(diag["updated_at"])
+        else:
+            srow = await tx.fetchone(
+                f"UPDATE {self.s} SET "
+                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
+                "THEN 'queued' ELSE 'idle' END,"
+                "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+                "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
+                "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
+                "pending_tool_seq=CASE WHEN ?=1 THEN pending_tool_seq ELSE NULL END,"
+                "ready_item_json=NULL,"
+                "cancel_by=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? THEN NULL ELSE cancel_by END,"
+                "cancel_reason=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? THEN NULL ELSE cancel_reason END,"
+                f"updated_at={now_sql} "
+                "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
+                "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
+                "cancel_by,cancel_reason,next_seq,updated_at",
+                (
+                    int(has_unconsumed),
+                    effective_next_seq, effective_next_seq, int(write_message),
+                    int(keep_pending_tool), batch.cancel_seq, batch.cancel_seq,
+                    sid, batch.owner_epoch,
+                ),
+            )
+            if srow is None:
+                raise SessionLeaseLost(sid)
+            next_state = str(srow["execution_state"])
+            closed_raced = srow["lifecycle"] in ("closing", "closed")
+            cancel_raced = int(srow["cancel_seq"]) > batch.cancel_seq
+            subtree_raced = cancel_raced and srow["cancel_by"] == "subtree"
+            cancel_by_db = srow["cancel_by"]
+            cancel_reason_db = srow["cancel_reason"]
+            post_next_seq = int(srow["next_seq"])
+            database_now = int(srow["updated_at"])
+
+        effective_status = status
+        effective_cancel_by = batch.cancel_by or cancel_by_db
+        effective_error = error
+        effective_error_code = error_code
+        if closed_raced:
+            effective_status = "cancelled"
+            effective_cancel_by = effective_cancel_by or "removed"
+            effective_error = cancel_reason_db or "cancelled"
+            effective_error_code = "cancelled"
+            write_message = False
+        elif cancel_raced and effective_status == "completed":
+            effective_status = "cancelled"
+            effective_error = cancel_reason_db or "cancelled"
+            effective_error_code = "cancelled"
+            write_message = False
+
+        if write_message:
+            result_seq = post_next_seq - 1
+
+        # Resolve consumed inputs if caller passed consumed=None and we need exact list for abnormal settle or River
+        if consumed is None and (effective_status != "completed" or batch.result_route is not None or batch.reply_to_session_id is not None):
             delivered = await tx.fetchall(
                 f"SELECT item_id FROM {self.q} WHERE session_id=? AND status='delivered' "
-                "AND delivered_send_index=? AND terminal_status IS NULL",
-                (batch.target.session_id, batch.send_index),
+                "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id ASC",
+                (sid, batch.send_index),
             )
-            consumed = tuple(
-                InputRef(batch.target.store_id, batch.target.session_id, row["item_id"])
-                for row in delivered
-            )
-        consumed_ids = [ref.message_id for ref in consumed]
-        unconsumed_ids = [ref.message_id for ref in batch.input_refs if ref not in consumed]
-        result_ref, delivery_error = None, None
-        activations = []
-        database_now = None
-        # The running loop appends assistant turns in real time and passes the seq of its
-        # LAST assistant row as ``result_seq``: that row IS the result message (design 215
-        # §5.3), so final stamps its meta instead of writing a duplicate. A storage-only
-        # final (no loop, result_seq=None) inserts the result message itself; a failure with
-        # no assistant row leaves result_seq NULL and is expressed by the input terminal.
-        write_message = result_seq is None and status == "completed"
-        if write_message:
-            result_seq = int(state["next_seq"])
-        reuse_message = result_seq is not None and not write_message
-        if consumed and route is not None:
-            # Result delivery needs the clock before it inserts into the parent inbox.
-            database_now = await self._db_now(tx)
-            child_session = {
-                "session_id": batch.target.session_id,
-                "tenant_id": batch.tenant_id,
-                "principal_id": batch.principal_id,
-                "parent_session_id": batch.parent_session_id,
-            }
-            route_result = Result(
-                consumed[0], batch.target, status, batch.send_index, result_seq,
-                final_text, usage, structured_output, error, error_code,
-            )
-            result_ref, delivery_error = await self._route_result_tx(
-                tx, child_session, route, route_result, route["result_kind"], database_now,
-                activations, parent_state=states[route["target"]["session_id"]],
-            )
-        next_seq = int(state["next_seq"]) + int(write_message)
-        next_state, state_now = await self._finish_final_state_tx(
-            tx, batch, next_seq=next_seq, has_unconsumed=bool(unconsumed_ids),
-        )
-        if database_now is None:
-            database_now = state_now
-        result_meta = {
-            "usage": plain(usage), "structured_output": plain(structured_output),
-            "error": error, "error_code": error_code,
-            "result_delivery_error": delivery_error,
-        }
-        if write_message:
-            await self._insert_message(
-                tx, batch.target.session_id, result_seq, "assistant", final_text,
-                result_meta, batch.send_index, database_now,
-            )
-        elif reuse_message:
-            # Merge into the loop's assistant row, preserving reasoning/round-usage meta.
-            # The live run passes that exact meta from the append; recovery/cancel callers
-            # without the in-memory fact keep the stored read.
-            if assistant_meta is None:
-                row = await tx.fetchone(
-                    f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
-                    (batch.target.session_id, result_seq),
+            if delivered:
+                consumed_refs = tuple(
+                    InputRef(batch.target.store_id, sid, row["item_id"]) for row in delivered
                 )
-                meta = json.loads(row["meta_json"] or "{}") if row is not None else {}
-            else:
-                meta = dict(assistant_meta)
-            meta.update(result_meta)
-            await tx.execute(
-                f"UPDATE {self.store.t.messages} SET meta_json=? WHERE session_id=? AND seq=?",
-                (canonical(meta), batch.target.session_id, result_seq),
-            )
+
+        # Restore any unconsumed items back to pending (rare partial-consume path)
         if unconsumed_ids:
+            urows = await tx.fetchall(
+                f"SELECT wake,content_bytes FROM {self.q} WHERE session_id=? AND status='delivered' "
+                f"AND delivered_send_index=? AND item_id IN ({','.join('?' for _ in unconsumed_ids)})",
+                (sid, batch.send_index, *unconsumed_ids),
+            )
             await tx.execute(
                 f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
                 "delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
                 f"AND delivered_send_index=? AND item_id IN ({','.join('?' for _ in unconsumed_ids)})",
-                (batch.target.session_id, batch.send_index, *unconsumed_ids),
+                (sid, batch.send_index, *unconsumed_ids),
             )
-        if consumed_ids:
-            changed = await tx.execute(
-                f"UPDATE {self.q} SET terminal_status=?,result_seq=?,result_send_index=?,"
-                "error_code=?,error_detail=?,result_delivery_error=?,completed_at=? "
-                "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
-                f"AND item_id IN ({','.join('?' for _ in consumed_ids)})",
+            w_add = sum(int(r["wake"]) for r in urows)
+            b_add = sum(int(r["content_bytes"]) for r in urows)
+            await tx.execute(
+                f"UPDATE {self.s} SET wake_pending_count=wake_pending_count+?,"
+                "pending_count=pending_count+?,pending_bytes=pending_bytes+? WHERE session_id=?",
+                (w_add, len(urows), b_add, sid),
+            )
+
+        # Step 2 (Deep-first lock order): River delivery to parent AFTER child UPDATE (0 final_lock_asc!).
+        result_ref, delivery_error = None, None
+        activations: list[TargetRef] = []
+        route = batch.result_route
+        deliver_parent_sid = None
+        deliver_res_kind = None
+        deliver_start_ref = None
+        if not closed_raced and consumed_refs:
+            if route is not None:
+                deliver_parent_sid = route["target"]["session_id"]
+                deliver_res_kind = route["result_kind"]
+                deliver_start_ref = InputRef(**route["input_ref"])
+            elif batch.reply_to_session_id is not None:
+                deliver_parent_sid = batch.reply_to_session_id
+                deliver_res_kind = batch.reply_result_kind or "agent_result"
+                deliver_start_ref = (
+                    InputRef(batch.target.store_id, sid, batch.start_input_message_id)
+                    if batch.start_input_message_id else consumed_refs[0]
+                )
+
+        if deliver_parent_sid is not None and deliver_res_kind is not None:
+            child_wake = 0 if (effective_cancel_by == "subtree" or subtree_raced) else 1
+            route_result = Result(
+                consumed_refs[0], batch.target, effective_status, batch.send_index, result_seq,
+                final_text, usage, structured_output, effective_error, effective_error_code,
+            )
+            result_ref, delivery_error = await self._river_deliver_tx(
+                tx,
+                child_target=batch.target,
+                child_tenant_id=batch.tenant_id,
+                child_principal_id=batch.principal_id,
+                parent_session_id=deliver_parent_sid,
+                start_ref=deliver_start_ref or consumed_refs[0],
+                result=route_result,
+                result_kind=deliver_res_kind,
+                child_wake=child_wake,
+                activations=activations,
+            )
+
+        # Step 3: Assistant message write / meta stamp (skipped when already written cleanly by sink!)
+        result_meta = {
+            "usage": plain(usage),
+            "structured_output": plain(structured_output),
+            "error": effective_error,
+            "error_code": effective_error_code,
+            "result_delivery_error": delivery_error,
+        }
+        if write_message:
+            if database_now is None:
+                database_now = await self._db_now(tx)
+            await self._insert_message(
+                tx, sid, result_seq, "assistant", final_text,
+                result_meta, batch.send_index, database_now,
+            )
+        elif result_seq is not None and not closed_raced:
+            need_meta_update = (
+                structured_output is not None
+                or effective_error is not None
+                or effective_error_code is not None
+                or delivery_error is not None
+                or assistant_meta is None
+                or assistant_meta.get("usage") != plain(usage)
+            )
+            if need_meta_update:
+                if assistant_meta is None:
+                    mrow = await tx.fetchone(
+                        f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
+                        (sid, result_seq),
+                    )
+                    meta = json.loads(mrow["meta_json"] or "{}") if mrow is not None else {}
+                else:
+                    meta = dict(assistant_meta)
+                meta.update(result_meta)
+                await tx.execute(
+                    f"UPDATE {self.store.t.messages} SET meta_json=? WHERE session_id=? AND seq=?",
+                    (canonical(meta), sid, result_seq),
+                )
+
+        # Step 4: 0 UPDATE follow_up_queue on normal completion!
+        # Only update follow_up_queue on abnormal status, delivery_error, or explicit settle_start_input.
+        res_json_str = canonical(result_json) if result_json is not None else None
+        if settle_start_input and batch.start_input_message_id is not None:
+            await tx.execute(
+                f"UPDATE {self.q} SET terminal_status=?,cancel_by=?,result_seq=?,"
+                "result_send_index=?,result_json=?,error_code=?,error_detail=?,"
+                f"result_delivery_error=?,completed_at={now_sql} "
+                "WHERE session_id=? AND item_id=?",
                 (
-                    status, result_seq, batch.send_index, error_code, error, delivery_error,
-                    database_now, batch.target.session_id, batch.send_index, *consumed_ids,
+                    effective_status, effective_cancel_by, result_seq, batch.send_index,
+                    res_json_str, effective_error_code, effective_error, delivery_error,
+                    sid, batch.start_input_message_id,
                 ),
             )
-            if changed != len(consumed_ids):
-                raise SessionLeaseLost(batch.target.session_id)
+        elif (
+            effective_status != "completed"
+            or delivery_error is not None
+            or effective_cancel_by is not None
+            or result_json is not None
+        ):
+            consumed_ids = [ref.message_id for ref in consumed_refs]
+            if consumed_ids:
+                changed = await tx.execute(
+                    f"UPDATE {self.q} SET terminal_status=?,cancel_by=?,result_seq=?,"
+                    "result_send_index=?,result_json=?,error_code=?,error_detail=?,"
+                    f"result_delivery_error=?,completed_at={now_sql} "
+                    "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                    f"AND item_id IN ({','.join('?' for _ in consumed_ids)})",
+                    (
+                        effective_status, effective_cancel_by, result_seq, batch.send_index,
+                        res_json_str, effective_error_code, effective_error, delivery_error,
+                        sid, batch.send_index, *consumed_ids,
+                    ),
+                )
+                if changed != len(consumed_ids):
+                    raise SessionLeaseLost(sid)
+
         results = tuple(
             Result(
-                ref, batch.target, status, batch.send_index, result_seq, final_text,
-                usage, structured_output, error, error_code, delivery_error,
+                ref, batch.target, effective_status, batch.send_index, result_seq, final_text,
+                usage, structured_output, effective_error, effective_error_code, delivery_error,
             )
-            for ref in consumed
+            for ref in consumed_refs
         )
         return FinalBatch(
             next_state, results, result_ref,
             activations[0] if activations else None,
+            delivery_error,
         )
 
-    async def _finish_final_state_tx(self, tx, batch, *, next_seq, has_unconsumed):
-        """Release the owner and set the next state in one conditional write.
+    async def _river_deliver_tx(
+        self,
+        tx,
+        *,
+        child_target: TargetRef,
+        child_tenant_id: str,
+        child_principal_id: str,
+        parent_session_id: str,
+        start_ref: InputRef,
+        result: Result,
+        result_kind: str,
+        child_wake: int,
+        activations: list[TargetRef] | None = None,
+    ) -> tuple[InputRef, str | None]:
+        """Same-tx non-cascading River delivery (parent lifecycle IN ('open','suspended')).
 
-        SQLite/PostgreSQL decide ``idle`` vs ``queued`` from an EXISTS in the same UPDATE
-        and take the database time from RETURNING, so the ordinary no-route final needs no
-        separate pending or clock read. MySQL has no RETURNING: it reads the pending flag
-        and database time once after the lock, then runs the same conditional UPDATE. The
-        owner fence is unchanged; a stale owner still updates zero rows.
+        - Parent closed / missing / over-capacity NEVER rolls back child result; returns error code.
+        - Parent suspended accepts the receipt into inbox without waking (keeps execution_state='idle').
+        - Uses STABLE_API ``result_message_id`` for deterministic dedupe.
         """
-        owner = (
-            "WHERE session_id=? AND execution_state='running' AND active_send_index=? "
-            "AND owner_epoch=? AND owner_token=?"
-        )
-        owner_values = (
-            batch.target.session_id, batch.send_index, batch.owner_epoch, batch.owner_token,
-        )
-        if self.db.dialect.name == "mysql":
-            pending = await tx.fetchone(
-                f"SELECT EXISTS(SELECT 1 FROM {self.q} WHERE session_id=? AND status='pending') "
-                f"AS has_pending,{self._now_sql()} AS db_now",
-                (batch.target.session_id,),
+        parent_target = TargetRef(self.store.store_id, parent_session_id)
+        effective_start = result.input_ref if result.send_index is None else start_ref
+        message_id = result_message_id(child_target, effective_start, result.send_index, result_kind)
+        ref = InputRef(parent_target.store_id, parent_session_id, message_id)
+        body = {
+            "child_target": plain(child_target),
+            "input_ref": plain(result.input_ref),
+            "status": result.status,
+            "final_text": result.final_text,
+            "usage": plain(result.usage),
+            "structured_output": plain(result.structured_output),
+            "error": result.error,
+            "error_code": result.error_code,
+            "result_seq": result.result_seq,
+        }
+        content = canonical(body)
+        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        content_bytes = len(content.encode()) + len(meta.encode())
+        digest = self.request_hash(parent_target, body, "normal")
+        now_sql = self._now_sql()
+
+        if self._dialect == "mysql":
+            p_rc, p_packed = await tx.execute_packed(
+                f"UPDATE {self.s} SET "
+                "inbox_version=(LAST_INSERT_ID("
+                "((inbox_version+1)<<1)|"
+                "(CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                ")>>1),"
+                "wake_inbox_seq=wake_inbox_seq+?,"
+                "wake_pending_count=wake_pending_count+?,"
+                "pending_count=pending_count+1,"
+                "pending_bytes=pending_bytes+?,"
+                "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 "
+                "THEN 'queued' ELSE execution_state END,"
+                f"updated_at={now_sql} "
+                "WHERE session_id=? AND lifecycle IN ('open','suspended') "
+                "AND tenant_id=? AND principal_id=? "
+                "AND pending_count<? AND (pending_bytes+?)<=? "
+                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)",
+                (
+                    child_wake, child_wake, child_wake, content_bytes, child_wake,
+                    parent_session_id, child_tenant_id, child_principal_id,
+                    self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
+                    parent_session_id, message_id,
+                ),
             )
-            next_state = (
-                "queued" if bool(int(pending["has_pending"])) or has_unconsumed else "idle"
+            parent_updated = p_rc == 1
+            parent_need_wake = bool(p_packed & 1) if parent_updated else False
+            parent_inbox_ver = (p_packed >> 1) if parent_updated else 0
+        else:
+            prow = await tx.fetchone(
+                f"UPDATE {self.s} SET "
+                "inbox_version=inbox_version+1,"
+                "wake_inbox_seq=wake_inbox_seq+?,"
+                "wake_pending_count=wake_pending_count+?,"
+                "pending_count=pending_count+1,"
+                "pending_bytes=pending_bytes+?,"
+                "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 "
+                "THEN 'queued' ELSE execution_state END,"
+                f"updated_at={now_sql} "
+                "WHERE session_id=? AND lifecycle IN ('open','suspended') "
+                "AND tenant_id=? AND principal_id=? "
+                "AND pending_count<? AND (pending_bytes+?)<=? "
+                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?) "
+                "RETURNING inbox_version,lifecycle,execution_state,wake_pending_count",
+                (
+                    child_wake, child_wake, content_bytes, child_wake,
+                    parent_session_id, child_tenant_id, child_principal_id,
+                    self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
+                    parent_session_id, message_id,
+                ),
             )
-            changed = await tx.execute(
-                f"UPDATE {self.state} SET execution_state=?,active_send_index=NULL,"
-                "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-                "cancel_send_index=NULL,cancel_reason=NULL,next_seq=? " + owner,
-                (next_state, next_seq, *owner_values),
+            parent_updated = prow is not None
+            parent_inbox_ver = int(prow["inbox_version"]) if parent_updated else 0
+            parent_need_wake = (
+                parent_updated
+                and prow["lifecycle"] == "open"
+                and child_wake == 1
+                and prow["execution_state"] == "queued"
+                and int(prow["wake_pending_count"]) == 1
             )
-            if changed != 1:
-                raise SessionLeaseLost(batch.target.session_id)
-            return next_state, int(pending["db_now"])
-        row = await tx.fetchone(
-            f"UPDATE {self.state} SET execution_state=CASE WHEN EXISTS("
-            f"SELECT 1 FROM {self.q} WHERE session_id=? AND status='pending') OR ? "
-            "THEN 'queued' ELSE 'idle' END,active_send_index=NULL,"
-            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-            f"cancel_send_index=NULL,cancel_reason=NULL,next_seq=? {owner} "
-            f"RETURNING execution_state,{self._now_sql()} AS db_now",
-            (batch.target.session_id, has_unconsumed, next_seq, *owner_values),
+
+        if parent_updated:
+            await tx.execute(
+                f"INSERT INTO {self.q} ("
+                "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                "content_json,content_bytes,meta_json,request_hash,result_kind,created_at) "
+                f"VALUES (?,?,?,?,'normal',?,'pending',?,?,?,?,?,{now_sql})",
+                (
+                    parent_session_id, message_id, parent_inbox_ver, result_kind,
+                    child_wake, content, content_bytes, meta, digest, result_kind,
+                ),
+            )
+            if activations is not None and parent_need_wake:
+                activations.append(parent_target)
+            return ref, None
+
+        # Non-cascading diagnosis: never roll back child's result!
+        pdiag = await tx.fetchone(
+            "SELECT s.session_id,s.tenant_id,s.principal_id,s.lifecycle,"
+            "s.pending_count,s.pending_bytes,"
+            "q.id AS dup_id,q.request_hash AS dup_hash "
+            f"FROM {self.s} s LEFT JOIN {self.q} q "
+            "ON q.session_id=s.session_id AND q.item_id=? "
+            "WHERE s.session_id=?",
+            (message_id, parent_session_id),
         )
-        if row is None:
-            raise SessionLeaseLost(batch.target.session_id)
-        return row["execution_state"], int(row["db_now"])
+        if pdiag is None:
+            return ref, "not_found"
+        if pdiag["dup_id"] is not None:
+            if pdiag["dup_hash"] != digest:
+                return ref, "request_conflict"
+            return ref, None
+        if pdiag["tenant_id"] != child_tenant_id or pdiag["principal_id"] != child_principal_id:
+            return ref, "forbidden"
+        if pdiag["lifecycle"] not in ("open", "suspended"):
+            return ref, "session_closed"
+        return ref, "capacity_exceeded"
+
+    async def accept_result(self, child_target, result: Result, *, result_kind):
+        """Trusted delivery using only the child's frozen direct-parent route."""
+        self.check_store(child_target)
+        async with self.db.transaction() as tx:
+            session = await self._session(tx, child_target.session_id)
+            if not session["result_route_json"]:
+                return None
+            route = json.loads(session["result_route_json"])
+            activations: list[TargetRef] = []
+            ref, error = await self._river_deliver_tx(
+                tx,
+                child_target=child_target,
+                child_tenant_id=session["tenant_id"],
+                child_principal_id=session["principal_id"],
+                parent_session_id=route["target"]["session_id"],
+                start_ref=InputRef(**route["input_ref"]),
+                result=result,
+                result_kind=result_kind,
+                child_wake=1,
+                activations=activations,
+            )
+            return ref, error, activations[0] if activations else None
 
     async def _complete_managed_recovery_tx(
         self, tx, session, state, route, parent_state, ref, result_document, database_now,
@@ -1342,29 +2541,45 @@ class RuntimeInputStore:
         seq = int(state["next_seq"]) + await self._repair_pending_tx(tx, sid, previous_send, state)
         body = {"managed_effect": "recovered", "result": result_document}
         content = canonical(body)
-        result = Result(ref, target, "completed", send_index, seq + 1,
-                        result_document["display"], {}, result_document)
-        activations = []
-        parent_ref, error = await self._route_result_tx(
-            tx, session, route, result, route["result_kind"], database_now,
-            activations, parent_state=parent_state,
+        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        content_bytes = len(content.encode()) + len(meta.encode())
+        result = Result(
+            ref, target, "completed", send_index, seq + 1,
+            result_document["display"], {}, result_document,
+        )
+        activations: list[TargetRef] = []
+        parent_ref, error = await self._river_deliver_tx(
+            tx,
+            child_target=target,
+            child_tenant_id=session["tenant_id"],
+            child_principal_id=session["principal_id"],
+            parent_session_id=route["target"]["session_id"],
+            start_ref=InputRef(**route["input_ref"]),
+            result=result,
+            result_kind=route["result_kind"],
+            child_wake=1,
+            activations=activations,
         )
         changed = await tx.execute(
-            f"UPDATE {self.state} SET send_index=?,next_seq=?,inbox_version=inbox_version+1 "
+            f"UPDATE {self.s} SET send_index=?,next_seq=?,inbox_version=inbox_version+1,"
+            "updated_at=? "
             "WHERE session_id=? AND execution_state=? AND send_index=? AND next_seq=? "
-            "AND active_send_index IS NULL AND owner_token IS NULL",
-            (send_index, seq + 2, sid, state["execution_state"], previous_send, seq),
+            "AND owner_node_id IS NULL",
+            (send_index, seq + 2, database_now, sid, state["execution_state"], previous_send, seq),
         )
         if changed != 1:
             raise SessionLeaseLost(sid)
         await tx.execute(
-            f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
-            "meta_json,request_hash,created_at,delivered_at,delivered_seq,delivered_send_index,"
-            "terminal_status,result_seq,result_send_index,result_delivery_error,completed_at) "
-            "VALUES (?,?,'user','normal','delivered',?,?,?,?,?,?,?,'completed',?,?,?,?)",
-            (sid, ref.message_id, content, canonical({"accepted_protocol": PROTOCOL_VERSION}),
-             self.request_hash(target, body, "normal"), database_now, database_now, seq,
-             send_index, seq + 1, send_index, error, database_now),
+            f"INSERT INTO {self.q} (session_id,item_id,inbox_version,kind,priority,wake,status,"
+            "content_json,content_bytes,meta_json,request_hash,created_at,delivered_at,"
+            "delivered_seq,delivered_send_index,terminal_status,result_seq,result_send_index,"
+            "result_delivery_error,completed_at) "
+            "VALUES (?,?,1,'user','normal',1,'delivered',?,?,?,?,?,?,?,?,'completed',?,?,?,?)",
+            (
+                sid, ref.message_id, content, content_bytes, meta,
+                self.request_hash(target, body, "normal"), database_now, database_now, seq,
+                send_index, seq + 1, send_index, error, database_now,
+            ),
         )
         merged = self.merge_batch([{
             "item_id": ref.message_id, "kind": "user", "priority": "normal",
@@ -1379,93 +2594,23 @@ class RuntimeInputStore:
             {"usage": {}, "structured_output": result_document, "error": None,
              "error_code": None, "result_delivery_error": error}, send_index, database_now,
         )
-        return FinalBatch(state["execution_state"], (replace(result, result_delivery_error=error),),
-                          parent_ref, activations[0] if activations else None)
-
-    async def _route_result_tx(
-        self, tx, child_session, route, result, result_kind, database_now, activations=None,
-        parent_state=None,
-    ):
-        child_target = TargetRef(self.store.store_id, child_session["session_id"])
-        route_start = InputRef(**route["input_ref"])
-        start = result.input_ref if result.send_index is None else route_start
-        target = TargetRef(**route["target"])
-        message_id = result_message_id(child_target, start, result.send_index, result_kind)
-        body = {
-            "child_target": plain(child_target), "input_ref": plain(result.input_ref),
-            "status": result.status, "final_text": result.final_text,
-            "usage": plain(result.usage), "structured_output": plain(result.structured_output),
-            "error": result.error, "error_code": result.error_code,
-            "result_seq": result.result_seq,
-        }
-        ref = InputRef(target.store_id, target.session_id, message_id)
-        try:
-            # One post-lock read of the parent serves the route's whole delivery decision:
-            # current lifecycle/identity, the idempotency input and the pending count/bytes
-            # (the same aggregate accept uses). The state row was already locked by the
-            # caller and is passed in, so it is not read a second time here.
-            current = await self._accept_read(tx, target.session_id, message_id)
-            if (
-                current["lifecycle"] != "open"
-                or current["tenant_id"] != child_session["tenant_id"]
-                or current["principal_id"] != child_session["principal_id"]
-                or child_session["parent_session_id"] != target.session_id
-                or target.store_id != self.store.store_id
-            ):
-                raise RuntimeRequestError(
-                    "session_closed" if current["lifecycle"] != "open" else "forbidden")
-            digest = self.request_hash(target, body, "normal")
-            if parent_state is None:
-                parent_state = await tx.fetchone(
-                    f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
-                )
-            execution_state = parent_state["execution_state"]
-            if current["id"] is None:
-                if int(current["pending_count"]) >= self.inbox_item_limit:
-                    raise CapacityError()
-                content = canonical(body)
-                meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
-                if (int(current["pending_bytes"]) + len(content.encode()) + len(meta.encode())
-                        > self.inbox_byte_limit):
-                    raise CapacityError()
-                next_state = "queued" if execution_state == "idle" else execution_state
-                if (
-                    execution_state == "running"
-                    and int(parent_state["owner_lease_until_ms"]) <= database_now
-                ):
-                    next_state = "recovering"
-                await tx.execute(
-                    f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
-                    "meta_json,request_hash,result_kind,created_at) VALUES (?,?,?,'normal','pending',?,?,?,?,?)",
-                    (
-                        target.session_id, message_id, result_kind, content, meta, digest,
-                        result_kind, database_now,
-                    ),
-                )
-                await tx.execute(
-                    f"UPDATE {self.state} SET execution_state=?,inbox_version=inbox_version+1 "
-                    "WHERE session_id=? AND execution_state=?",
-                    (next_state, target.session_id, execution_state),
-                )
-            elif current["request_hash"] != digest:
-                raise RuntimeRequestError("request_conflict")
-            if activations is not None and execution_state == "idle":
-                activations.append(target)
-            return ref, None
-        except (RuntimeRequestError, CapacityError) as exc:
-            code = exc.code if isinstance(exc, RuntimeRequestError) else "capacity_exceeded"
-            return ref, code
+        return FinalBatch(
+            state["execution_state"], (replace(result, result_delivery_error=error),),
+            parent_ref, activations[0] if activations else None, error,
+        )
 
     async def _final_after_unknown(self, batch, consumed):
         state = await self.db.fetchone(
-            f"SELECT * FROM {self.state} WHERE session_id=?", (batch.target.session_id,)
+            f"SELECT * FROM {self.s} WHERE session_id=?", (batch.target.session_id,)
         )
         if not state or state["execution_state"] not in {"idle", "queued"}:
             return None
+        if int(state["send_index"]) < batch.send_index:
+            return None
         if consumed is None:
             rows = await self.db.fetchall(
-                f"SELECT item_id FROM {self.q} WHERE session_id=? AND result_send_index=? "
-                "AND terminal_status IS NOT NULL",
+                f"SELECT item_id FROM {self.q} WHERE session_id=? AND delivered_send_index=? "
+                "AND status='delivered'",
                 (batch.target.session_id, batch.send_index),
             )
             consumed = tuple(
@@ -1474,19 +2619,15 @@ class RuntimeInputStore:
             )
         results = []
         for ref in consumed:
-            record = await self.input(self.db, ref)
-            if (
-                record is None or record.row["terminal_status"] is None
-                or record.row["result_send_index"] != batch.send_index
-            ):
+            info = await self.inspect_input(ref)
+            if info["terminal_status"] is None or info["result_send_index"] != batch.send_index:
                 return None
-            row = record.row
             final_text, usage, structured = "", {}, None
-            if row["result_seq"] is not None:
+            if info["result_seq"] is not None:
                 message = await self.db.fetchone(
                     f"SELECT content,meta_json FROM {self.store.t.messages} "
                     "WHERE session_id=? AND seq=? AND send_index=?",
-                    (ref.session_id, row["result_seq"], row["result_send_index"]),
+                    (ref.session_id, info["result_seq"], info["result_send_index"]),
                 )
                 if message is not None:
                     final_text = message["content"] or ""
@@ -1494,123 +2635,288 @@ class RuntimeInputStore:
                     usage = meta.get("usage") or {}
                     structured = meta.get("structured_output")
             results.append(Result(
-                ref, batch.target, row["terminal_status"], row["result_send_index"],
-                row["result_seq"], final_text, usage, structured, row["error_detail"],
-                row["error_code"], row["result_delivery_error"],
+                ref, batch.target, info["terminal_status"], info["result_send_index"],
+                info["result_seq"], final_text, usage, structured, info["error_detail"],
+                info["error_code"], info["result_delivery_error"],
             ))
         return FinalBatch(state["execution_state"], tuple(results), None)
 
-    async def recover(self, target, *, node_id, boot_id, ttl_s=30.0, ownership=None) -> FinalBatch | None:
+    # ── Crash Takeover & Periodic Node SQL (3 / 3 / 4 Budget) ────────────────
+
+    async def batch_renew(self, *, node_id: str, boot_id: str, ttl_s: float = 30.0) -> list[dict[str, Any]]:
+        """1 SQL (SQLite/PG) or 2 SQL (MySQL) per node to renew all active leases (idx_sessions_node_active)."""
+        now_sql = self._now_sql()
+        ttl_ms = int(ttl_s * 1000)
+        if self._dialect == "mysql":
+            await self.db.execute(
+                f"UPDATE {self.s} SET owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
+                "WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=?",
+                (ttl_ms, node_id, boot_id),
+            )
+            rows = await self.db.fetchall(
+                "SELECT session_id,owner_epoch,cancel_seq,cancel_by,lifecycle "
+                f"FROM {self.s} WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=?",
+                (node_id, boot_id),
+            )
+            return [dict(r) for r in rows]
+        rows = await self.db.fetchall(
+            f"UPDATE {self.s} SET owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
+            "WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=? "
+            "RETURNING session_id,owner_epoch,cancel_seq,cancel_by,lifecycle",
+            (ttl_ms, node_id, boot_id),
+        )
+        return [dict(r) for r in rows]
+
+    async def discover_queued(self, *, limit: int = 32) -> list[str]:
+        """1 bounded index scan on ``idx_session_recovery``."""
+        if not 1 <= limit <= 1000:
+            raise RuntimeRequestError("invalid_options", "limit")
+        rows = await self.db.fetchall(
+            f"SELECT session_id FROM {self.s} "
+            "WHERE execution_state='queued' AND lifecycle='open' AND wake_pending_count>0 "
+            "ORDER BY session_id ASC LIMIT ?",
+            (limit,),
+        )
+        return [str(r["session_id"]) for r in rows]
+
+    async def graceful_release(self, *, node_id: str, boot_id: str) -> int:
+        """1-SQL batch lease release on graceful node shutdown (idx_sessions_node_active)."""
+        now_sql = self._now_sql()
+        return await self.db.execute(
+            f"UPDATE {self.s} SET owner_lease_until_ms=0,updated_at={now_sql} "
+            "WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=?",
+            (node_id, boot_id),
+        )
+
+    async def sweep_expired_leases(
+        self, *, node_id: str, boot_id: str, ttl_s: float = 30.0, limit: int = 32,
+    ) -> list[ClaimedBatch]:
+        """1 bounded index scan on ``idx_session_recovery``; reclaims expired running sessions."""
+        now_sql = self._now_sql()
+        expired = await self.db.fetchall(
+            f"SELECT session_id,owner_epoch FROM {self.s} "
+            f"WHERE execution_state='running' AND owner_lease_until_ms<{now_sql} "
+            "ORDER BY owner_lease_until_ms ASC LIMIT ?",
+            (limit,),
+        )
+        reclaimed: list[ClaimedBatch] = []
+        for row in expired:
+            batch = await self.reclaim_running(
+                TargetRef(self.store.store_id, row["session_id"]),
+                expected_epoch=int(row["owner_epoch"]),
+                node_id=node_id,
+                boot_id=boot_id,
+                ttl_s=ttl_s,
+            )
+            if batch is not None:
+                reclaimed.append(batch)
+        return reclaimed
+
+    async def reclaim_running(
+        self, target: TargetRef, *, expected_epoch: int | None = None, node_id: str, boot_id: str,
+        ttl_s: float = 30.0, can_execute=None,
+    ) -> ClaimedBatch | None:
+        """Atomically take over a crashed/expired running session (supports 0-assistant rerun!)."""
         self.check_store(target)
-        token = ownership.token if ownership is not None else uuid.uuid4().hex
+        now_sql = self._now_sql()
+        ttl_ms = int(ttl_s * 1000)
+        sid = target.session_id
+        epoch_cond = (
+            "AND owner_epoch=?"
+            if expected_epoch is not None else f"AND owner_lease_until_ms<={now_sql}"
+        )
+        extra_params = (expected_epoch,) if expected_epoch is not None else ()
+        try:
+            async with self.db.transaction() as tx:
+                if self._dialect == "mysql":
+                    rc = await tx.execute(
+                        f"UPDATE {self.s} SET owner_node_id=?,owner_boot_id=?,"
+                        f"owner_epoch=owner_epoch+1,owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
+                        f"WHERE session_id=? AND execution_state='running' {epoch_cond}",
+                        (node_id, boot_id, ttl_ms, sid, *extra_params),
+                    )
+                    if rc == 0:
+                        return None
+                    srow = await tx.fetchone(f"SELECT * FROM {self.s} WHERE session_id=?", (sid,))
+                else:
+                    srow = await tx.fetchone(
+                        f"UPDATE {self.s} SET owner_node_id=?,owner_boot_id=?,"
+                        f"owner_epoch=owner_epoch+1,owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
+                        f"WHERE session_id=? AND execution_state='running' {epoch_cond} "
+                        "RETURNING *",
+                        (node_id, boot_id, ttl_ms, sid, *extra_params),
+                    )
+                if srow is None:
+                    return None
+                if can_execute is not None:
+                    desc_check = RuntimeDescriptor(**json.loads(srow["descriptor_json"]))
+                    if not can_execute(desc_check):
+                        raise _ClaimRollback()
+                cur_send_index = int(srow["send_index"])
+                turn_msgs = await tx.fetchall(
+                    f"SELECT id,seq,role,name,content,tool_calls_json,tool_call_id,"
+                    f"round_index,state,meta_json,send_index,created_at "
+                    f"FROM {self.store.t.messages} WHERE session_id=? AND send_index=? ORDER BY seq ASC",
+                    (sid, cur_send_index),
+                )
+                has_assistant = any(m["role"] == "assistant" for m in turn_msgs)
+                await self._repair_pending_tx(tx, sid, cur_send_index, srow)
+                qrows = await tx.fetchall(
+                    f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
+                    "WHERE session_id=? AND delivered_send_index=? AND status='delivered' ORDER BY id ASC",
+                    (sid, cur_send_index),
+                )
+        except _ClaimRollback:
+            return None
+        refs = tuple(InputRef(target.store_id, sid, r["item_id"]) for r in qrows)
+        first_user = next((m for m in turn_msgs if m["role"] == "user"), None)
+        if first_user is not None:
+            user_row = StoredMessageRow(
+                session_id=sid, seq=int(first_user["seq"]), role="user",
+                name=first_user["name"], content=first_user["content"],
+                tool_calls=None, tool_call_id=None, round_index=first_user["round_index"],
+                state=MessageState(first_user["state"]),
+                meta=json.loads(first_user["meta_json"] or "{}"),
+                created_at=int(first_user["created_at"]), send_index=cur_send_index,
+            )
+            msg_seq = max(int(m["seq"]) for m in turn_msgs)
+        else:
+            msg_seq = max(0, int(srow["next_seq"]) - 1)
+            user_row = StoredMessageRow(
+                session_id=sid, seq=msg_seq, role="user", name=None, content="",
+                tool_calls=None, tool_call_id=None, round_index=0,
+                state=MessageState.ACTIVE, meta={}, created_at=int(srow["updated_at"]),
+                send_index=cur_send_index,
+            )
+        reply_to_sid = next((r["reply_to_session_id"] for r in qrows if r["reply_to_session_id"]), None)
+        reply_rk = next((r["reply_result_kind"] for r in qrows if r["reply_to_session_id"]), None)
+        return ClaimedBatch(
+            target=target,
+            send_index=cur_send_index,
+            message_seq=msg_seq,
+            input_refs=refs,
+            owner_epoch=int(srow["owner_epoch"]),
+            owner_node_id=node_id,
+            owner_boot_id=boot_id,
+            descriptor=RuntimeDescriptor(**json.loads(srow["descriptor_json"])),
+            tenant_id=srow["tenant_id"],
+            principal_id=srow["principal_id"],
+            parent_session_id=srow["parent_session_id"],
+            user_row=user_row,
+            result_route=(
+                json.loads(srow["result_route_json"]) if srow["result_route_json"] else None
+            ),
+            session_updated_at=int(srow["updated_at"]),
+            inbox_version=int(srow["inbox_version"]),
+            wake_inbox_seq=int(srow["wake_inbox_seq"]),
+            cancel_seq=int(srow["cancel_seq"]),
+            cancel_by=srow["cancel_by"],
+            start_input_message_id=srow["start_input_message_id"],
+            root_session_id=str(srow["root_session_id"]),
+            depth=int(srow["depth"]),
+            reply_to_session_id=reply_to_sid,
+            reply_result_kind=reply_rk,
+            is_reclaimed=True,
+            reclaimed_has_assistant=has_assistant,
+            reclaimed_cancelled=bool(
+                srow["cancel_by"] is not None or srow["lifecycle"] in ("closing", "closed")
+            ),
+        )
+
+    async def recover(self, target, *, node_id: str, boot_id: str, ttl_s: float = 30.0, ownership=None) -> FinalBatch | None:
+        """Atomically take over an expired running session without any 'recovering' state."""
+        self.check_store(target)
+        now_sql = self._now_sql()
+        sid = target.session_id
         async with self.db.transaction() as tx:
-            session = await self._session(tx, target.session_id)
-            route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
-            for sid in sorted({target.session_id, *( [route["target"]["session_id"]] if route else [] )}):
-                state = await self.db.dialect.lock_state(tx, self.state, sid)
-                if sid == target.session_id:
-                    own_state = state
+            try:
+                own_state = await self.db.dialect.lock_state(tx, self.s, sid)
+            except ValueError:
+                return None
+            if own_state["execution_state"] != "running":
+                return None
             database_now = await self._db_now(tx)
-            execution_state = own_state["execution_state"]
             expired = (
                 own_state["owner_lease_until_ms"] is not None
                 and int(own_state["owner_lease_until_ms"]) <= database_now
             )
-            if own_state["active_send_index"] is None:
-                return None
-            active = int(own_state["active_send_index"])
+            active = int(own_state["send_index"])
             if ownership is not None:
                 ownership.require_owned()
-                if not (
-                    execution_state == "recovering"
-                    and own_state["owner_token"] == ownership.token
-                    and own_state["owner_epoch"] == ownership.epoch
-                    and own_state["owner_node_id"] == node_id
-                    and own_state["owner_boot_id"] == boot_id
+                if (
+                    int(own_state["owner_epoch"]) != int(ownership.epoch)
+                    or own_state["owner_node_id"] != node_id
+                    or own_state["owner_boot_id"] != boot_id
                 ):
-                    raise SessionLeaseLost(target.session_id)
+                    raise SessionLeaseLost(sid)
                 epoch = int(own_state["owner_epoch"])
-                changed = await tx.execute(
-                    f"UPDATE {self.state} SET owner_lease_until_ms=? "
-                    "WHERE session_id=? AND execution_state='recovering' AND active_send_index=? "
-                    "AND owner_epoch=? AND owner_token=?",
-                    (
-                        database_now + int(ttl_s * 1000), target.session_id, active,
-                        epoch, token,
-                    ),
-                )
             else:
-                if execution_state not in {"running", "recovering"} or (
-                    execution_state == "running" and not expired
-                ) or (execution_state == "recovering" and own_state["owner_token"] and not expired):
+                if not expired:
                     return None
                 epoch = int(own_state["owner_epoch"]) + 1
                 changed = await tx.execute(
-                    f"UPDATE {self.state} SET execution_state='recovering',owner_epoch=?,owner_token=?,"
-                    "owner_node_id=?,owner_boot_id=?,owner_lease_until_ms=? "
-                    "WHERE session_id=? AND execution_state=? AND active_send_index=?",
-                    (
-                        epoch, token, node_id, boot_id, database_now + int(ttl_s * 1000),
-                        target.session_id, execution_state, active,
-                    ),
+                    f"UPDATE {self.s} SET owner_epoch=?,owner_node_id=?,owner_boot_id=?,"
+                    f"owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
+                    "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+                    (epoch, node_id, boot_id, int(ttl_s * 1000), sid, own_state["owner_epoch"]),
                 )
-            if changed != 1:
-                return None
-            # Repair unresolved tool calls of the interrupted run before its terminal
-            # state, stamped with the interrupted active_send_index (design 215 §9.3).
-            await self._repair_pending_tx(tx, target.session_id, active, own_state)
-            if session["session_kind"] == "workflow_driver":
-                return await self._recover_workflow_tx(
-                    tx, session, own_state, active, epoch, token, node_id, boot_id,
-                    ttl_s, database_now,
-                )
+                if changed != 1:
+                    return None
+
+            await self._repair_pending_tx(tx, sid, active, own_state)
+
             rows = await tx.fetchall(
                 f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
-                "AND delivered_send_index=? AND terminal_status IS NULL",
-                (target.session_id, active),
+                "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id ASC",
+                (sid, active),
             )
-            cancelled = own_state["cancel_send_index"] == active
+            cancelled = own_state["cancel_by"] is not None or own_state["lifecycle"] in ("closing", "closed")
             terminal = "cancelled" if cancelled else "interrupted"
             detail = own_state["cancel_reason"] if cancelled else "execution owner lost"
             delivery_error = None
             result_ref = None
-            activations = []
+            activations: list[TargetRef] = []
+            route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
             if rows and route is not None:
                 first = self.record(rows[0])
                 route_result = Result(
                     first.ref, target, terminal, active, None,
                     error=detail, error_code=terminal,
                 )
-                result_ref, delivery_error = await self._route_result_tx(
-                    tx, session, route, route_result, route["result_kind"], database_now,
-                    activations,
+                result_ref, delivery_error = await self._river_deliver_tx(
+                    tx,
+                    child_target=target,
+                    child_tenant_id=own_state["tenant_id"],
+                    child_principal_id=own_state["principal_id"],
+                    parent_session_id=route["target"]["session_id"],
+                    start_ref=InputRef(**route["input_ref"]),
+                    result=route_result,
+                    result_kind=route["result_kind"],
+                    child_wake=0 if own_state["cancel_by"] == "subtree" else 1,
+                    activations=activations,
                 )
             if rows:
                 await tx.execute(
-                    f"UPDATE {self.q} SET terminal_status=?,result_send_index=?,error_code=?,"
-                    "error_detail=?,result_delivery_error=?,completed_at=? "
+                    f"UPDATE {self.q} SET terminal_status=?,result_send_index=?,"
+                    "error_code=?,error_detail=?,result_delivery_error=?,completed_at=? "
                     "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
                     "AND terminal_status IS NULL",
-                    (
-                        terminal, active, terminal, detail, delivery_error, database_now,
-                        target.session_id, active,
-                    ),
+                    (terminal, active, terminal, detail, delivery_error, database_now, sid, active),
                 )
-            pending = await tx.fetchone(
-                f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? AND status='pending'",
-                (target.session_id,),
+            next_state = (
+                "queued"
+                if own_state["lifecycle"] == "open" and int(own_state["wake_pending_count"]) > 0
+                else "idle"
             )
-            next_state = "queued" if int(pending["n"]) else "idle"
             changed = await tx.execute(
-                f"UPDATE {self.state} SET execution_state=?,active_send_index=NULL,"
-                "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-                "cancel_send_index=NULL,cancel_reason=NULL "
-                "WHERE session_id=? AND execution_state='recovering' AND active_send_index=? "
-                "AND owner_epoch=? AND owner_token=?",
-                (next_state, target.session_id, active, epoch, token),
+                f"UPDATE {self.s} SET execution_state=?,owner_node_id=NULL,owner_boot_id=NULL,"
+                "owner_lease_until_ms=NULL,pending_tool_seq=NULL,ready_item_json=NULL,"
+                f"cancel_by=NULL,cancel_reason=NULL,updated_at={now_sql} "
+                "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+                (next_state, sid, epoch),
             )
             if changed != 1:
-                raise SessionLeaseLost(target.session_id)
+                raise SessionLeaseLost(sid)
             results = tuple(
                 Result(
                     self.record(row).ref, target, terminal, active, None,
@@ -1620,395 +2926,393 @@ class RuntimeInputStore:
             )
             return FinalBatch(
                 next_state, results, result_ref,
-                activations[0] if activations else None,
+                activations[0] if activations else None, delivery_error,
             )
 
-    async def _continuation_child(self, reader, record):
-        row = await reader.fetchone(
-            "SELECT q.session_id AS session_id,q.item_id AS input_item_id,"
-            "q.kind AS input_kind,q.status AS input_status,"
-            "q.terminal_status AS input_terminal_status,"
-            "q.result_seq AS input_result_seq,"
-            "q.result_send_index AS input_result_send_index,"
-            "q.error_code AS input_error_code,q.error_detail AS input_error_detail,"
-            "q.result_delivery_error AS input_result_delivery_error,"
-            "q.delivered_send_index AS input_delivered_send_index,"
-            "q.continuation_of AS input_continuation_of "
-            f"FROM {self.q} q WHERE q.session_id=? AND q.continuation_of=? "
-            "ORDER BY q.continuation_index DESC LIMIT 1",
-            (record.ref.session_id, record.ref.message_id),
-        )
-        return self._result_input(row) if row is not None else None
-
-    async def _continuation_root(self, reader, record):
-        current = record
-        for _ in range(10000):
-            parent_id = current.row["continuation_of"]
-            if parent_id is None:
-                return current
-            parent = await self.input(
-                reader, InputRef(current.ref.store_id, current.ref.session_id, parent_id),
-            )
-            if parent is None:
-                raise RuntimeRequestError("workflow_continuation_broken")
-            current = parent
-        raise CapacityError("workflow continuation chain limit exceeded")
-
-    async def _latest_continuation(self, reader, record):
-        current = record
-        for _ in range(10000):
-            if current.row["status"] != "waiting_continuation":
-                return current
-            child = await self._continuation_child(reader, current)
-            if child is None:
-                return current
-            current = child
-        raise CapacityError("workflow continuation chain limit exceeded")
-
-    async def _recover_workflow_tx(
-        self, tx, session, own_state, active, epoch, token, node_id, boot_id,
-        ttl_s, database_now,
-    ):
-        """Continue a non-LLM driver instead of interrupting its original start."""
-        rows = await tx.fetchall(
-            f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
-            "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id",
-            (session["session_id"], active),
-        )
-        target = TargetRef(self.store.store_id, session["session_id"])
-        if own_state["cancel_send_index"] == active:
-            origins = [self.record(row) for row in rows if row["kind"] in {"user", "workflow_continue"}]
-            if origins:
-                origin = origins[-1]
-                root = await self._continuation_root(tx, origin)
-                route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
-                delivery_error = None
-                activations = []
-                if route is not None:
-                    cancelled = Result(
-                        root.ref, target, "cancelled", active, None,
-                        error=own_state["cancel_reason"] or "cancelled", error_code="cancelled",
-                    )
-                    _ref, delivery_error = await self._route_result_tx(
-                        tx, session, route, cancelled, route["result_kind"], database_now, activations,
-                    )
-                reason = own_state["cancel_reason"] or "cancelled"
-                await tx.execute(
-                    f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
-                    "result_send_index=?,error_code='cancelled',error_detail=?,"
-                    "result_delivery_error=?,completed_at=? WHERE session_id=? "
-                    "AND delivered_send_index=? AND terminal_status IS NULL",
-                    (active, reason, delivery_error, database_now, session["session_id"], active),
-                )
-                # Ancestors were bound to earlier sends. They still share the final
-                # continuation's terminal result, just like wait(original) does.
-                current = origin
-                ancestors = []
-                while current.row["continuation_of"] is not None:
-                    current = await self.input(tx, InputRef(
-                        current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
-                    ))
-                    ancestors.append(current.ref.message_id)
-                if ancestors:
-                    await tx.execute(
-                        f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
-                        "result_send_index=?,error_code='cancelled',error_detail=?,"
-                        "result_delivery_error=?,completed_at=? WHERE session_id=? "
-                        f"AND item_id IN ({','.join('?' for _ in ancestors)})",
-                        (active, reason, delivery_error, database_now, session["session_id"], *ancestors),
-                    )
-                await tx.execute(
-                    f"UPDATE {self.state} SET execution_state='idle',active_send_index=NULL,"
-                    "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-                    "cancel_send_index=NULL,cancel_reason=NULL WHERE session_id=? "
-                    "AND execution_state='recovering' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
-                    (session["session_id"], active, epoch, token),
-                )
-                return FinalBatch(
-                    "idle", (), result_activation=activations[0] if activations else None,
-                )
-
-        # Result notifications from the interrupted send are reconsidered by the
-        # continuation. A committed journal/result consumption can never reach here.
-        await tx.execute(
-            f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
-            "delivered_send_index=NULL WHERE session_id=? AND kind='workflow_node_result' "
-            "AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL",
-            (session["session_id"], active),
-        )
-        origins = [self.record(row) for row in rows if row["kind"] in {"user", "workflow_continue"}]
-        if not origins:
-            next_state = "queued" if rows else "idle"
-        else:
-            origin = origins[-1]
-            root = await self._continuation_root(tx, origin)
-            index = int(origin.row["continuation_index"] or 0) + 1
-            message_id = "wfc_" + sha256_canonical([
-                "workflow_continue", self.store.store_id, session["session_id"],
-                root.ref.message_id, index,
-            ])[:56]
-            continuation = InputRef(self.store.store_id, session["session_id"], message_id)
-            body = {
-                "workflow_continue": {
-                    "origin_input_ref": plain(root.ref),
-                    "previous_input_ref": plain(origin.ref),
-                    "continuation_index": index,
-                },
-            }
-            existing = await self.input(tx, continuation)
-            if existing is None:
-                await tx.execute(
-                    f"INSERT INTO {self.q} (session_id,item_id,kind,priority,status,content_json,"
-                    "meta_json,request_hash,created_at,continuation_of,continuation_index) "
-                    "VALUES (?,?,'workflow_continue','normal','pending',?,?,?,?,?,?)",
-                    (
-                        session["session_id"], message_id, canonical(body),
-                        canonical({"accepted_protocol": PROTOCOL_VERSION}),
-                        self.request_hash(target, body, "normal"), database_now,
-                        origin.ref.message_id, index,
-                    ),
-                )
-            elif existing.row["request_hash"] != self.request_hash(target, body, "normal"):
-                raise RuntimeRequestError("request_conflict")
-            await tx.execute(
-                f"UPDATE {self.q} SET status='waiting_continuation' WHERE session_id=? "
-                "AND item_id=? AND status='delivered' AND delivered_send_index=? "
-                "AND terminal_status IS NULL",
-                (session["session_id"], origin.ref.message_id, active),
-            )
-            next_state = "queued"
-        changed = await tx.execute(
-            f"UPDATE {self.state} SET execution_state=?,active_send_index=NULL,"
-            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-            "cancel_send_index=NULL,cancel_reason=NULL WHERE session_id=? "
-            "AND execution_state='recovering' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
-            (next_state, session["session_id"], active, epoch, token),
-        )
-        if changed != 1:
-            raise SessionLeaseLost(session["session_id"])
-        return FinalBatch(next_state, ())
-
-    async def discover_unfinished(self, *, limit=100):
+    async def discover_unfinished(self, *, limit: int = 100):
+        """Bounded discovery of queued or expired running sessions via ``idx_session_recovery``."""
         if not 1 <= limit <= 1000:
             raise RuntimeRequestError("invalid_options", "limit")
         columns = "session_id,execution_state,owner_lease_until_ms"
         order = "execution_state,owner_lease_until_ms,session_id"
-        branches = []
-        # Each state has its own index range. The global first L rows are among
-        # these three first-L sets, so the final merge sorts at most 3L candidates.
-        for state in ("queued", "recovering", "running"):
-            condition = f"execution_state='{state}'"
-            if state == "running":
-                condition += f" AND owner_lease_until_ms<=(SELECT {self._now_sql()})"
-            branches.append(
-                f"SELECT {columns} FROM (SELECT {columns} FROM {self.state} "
-                f"WHERE {condition} ORDER BY {order} LIMIT ?) AS {state}_candidates"
-            )
+        now_sql = self._now_sql()
+        branches = [
+            f"SELECT {columns} FROM (SELECT {columns} FROM {self.s} "
+            f"WHERE execution_state='queued' AND lifecycle='open' AND wake_pending_count>0 "
+            f"ORDER BY {order} LIMIT ?) AS queued_candidates",
+            f"SELECT {columns} FROM (SELECT {columns} FROM {self.s} "
+            f"WHERE execution_state='running' AND owner_lease_until_ms<={now_sql} "
+            f"ORDER BY {order} LIMIT ?) AS running_candidates",
+        ]
         rows = await self.db.fetchall(
             "SELECT session_id FROM (" + " UNION ALL ".join(branches)
             + f") AS candidates ORDER BY {order} LIMIT ?",
-            (limit, limit, limit, limit),
+            (limit, limit, limit),
         )
         return tuple(TargetRef(self.store.store_id, row["session_id"]) for row in rows)
 
-    async def cancel(self, ref, *, actor, scope="self", reason="cancelled", _with_activation=False):
+    # ── Stop / Cancel (cancel_seq + cancel_by + active-only depth DESC locking) ──
+
+    async def _collect_active_descendants(
+        self, tx, *, session_id: str, root_session_id: str, target_depth: int,
+        only_linked: bool = True,
+    ) -> list[tuple[str, int, bool]]:
+        """Bounded active-only subtree scan using ``idx_sessions_root`` (0 idle rows scanned!)."""
+        active_rows = await tx.fetchall(
+            "SELECT session_id,parent_session_id,depth,send_index,ready_item_json,cancel_propagation "
+            f"FROM {self.s} WHERE root_session_id=? AND execution_state IN ('queued','running')",
+            (root_session_id,),
+        )
+        if session_id == root_session_id and not only_linked:
+            return [
+                (
+                    str(r["session_id"]), int(r["depth"]),
+                    int(r["send_index"]) == 0 and bool(r["ready_item_json"]),
+                )
+                for r in active_rows if r["session_id"] != session_id
+            ]
+        deeper = [r for r in active_rows if int(r["depth"]) > target_depth]
+        by_id = {r["session_id"]: r for r in active_rows}
+        result: list[tuple[str, int, bool]] = []
+        for r in deeper:
+            cur_id = r["session_id"]
+            cur_parent = r["parent_session_id"]
+            cur_prop = r["cancel_propagation"]
+            matched = False
+            visited: set[str] = set()
+            while cur_parent is not None and cur_parent not in visited:
+                if only_linked and cur_prop != "linked":
+                    break
+                if cur_parent == session_id:
+                    matched = True
+                    break
+                visited.add(cur_id)
+                if cur_parent in by_id:
+                    cur_id = cur_parent
+                    cur_prop = by_id[cur_parent]["cancel_propagation"]
+                    cur_parent = by_id[cur_parent]["parent_session_id"]
+                else:
+                    prow = await tx.fetchone(
+                        f"SELECT parent_session_id,cancel_propagation FROM {self.s} WHERE session_id=?",
+                        (cur_parent,),
+                    )
+                    if prow is None:
+                        break
+                    cur_id = cur_parent
+                    cur_prop = prow["cancel_propagation"]
+                    cur_parent = prow["parent_session_id"]
+            if matched:
+                result.append((
+                    str(r["session_id"]), int(r["depth"]),
+                    int(r["send_index"]) == 0 and bool(r["ready_item_json"]),
+                ))
+        return result
+
+    async def cancel(
+        self, ref, *, actor, scope="self", reason="cancelled",
+        cancel_by: str | None = None, only_linked: bool = True,
+        _with_activation: bool = False,
+    ):
+        """Cancel/stop an input, a single session, or its active subtree.
+
+        - ``scope='subtree'`` scans ONLY active descendants (``execution_state IN ('queued','running')``)
+          via ``idx_sessions_root`` and locks level-by-level in ``depth DESC``, within each level
+          ``ORDER BY session_id ASC FOR UPDATE``.
+        - Cascaded descendants receive ``cancel_by='subtree'`` so their River receipts use ``wake=0``.
+        """
         if scope not in {"self", "subtree"}:
             raise RuntimeRequestError("invalid_options", "scope")
         if isinstance(ref, InputRef) and scope == "subtree":
             raise RuntimeRequestError("invalid_options", "InputRef subtree")
         target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
-        activations = []
-        completed_refs = []
+        eff_cancel_by = cancel_by or ("agent" if actor.session_id is not None else "user")
+        now_sql = self._now_sql()
+        activations: list[TargetRef] = []
+        completed_refs: list[InputRef] = []
+        stopped_descendants: list[str] = []
+
         async with self.db.transaction() as tx:
             session = await self.authorize(tx, target, actor)
-            route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
-            lock_ids = {target.session_id}
-            if route is not None:
-                lock_ids.add(route["target"]["session_id"])
-            for sid in sorted(lock_ids):
-                locked = await self.db.dialect.lock_state(tx, self.state, sid)
-                if sid == target.session_id:
-                    state = locked
-            database_now = await self._db_now(tx)
+            desc_by_depth: dict[int, list[str]] = {}
+            prestaged_desc: list[str] = []
+            if scope == "subtree":
+                active_desc = await self._collect_active_descendants(
+                    tx,
+                    session_id=target.session_id,
+                    root_session_id=str(session["root_session_id"]),
+                    target_depth=int(session["depth"]),
+                    only_linked=only_linked,
+                )
+                for d_sid, d_val, d_pre in active_desc:
+                    desc_by_depth.setdefault(d_val, []).append(d_sid)
+                    if d_pre:
+                        prestaged_desc.append(d_sid)
+                for lvl_ids in desc_by_depth.values():
+                    lvl_ids.sort()
+
+            # Level-by-level deep-first locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
+            cascaded_delivered: dict[str, set[str]] = {}
+            for d_val in sorted(desc_by_depth, reverse=True):
+                lvl_ids = desc_by_depth[d_val]
+                stopped_descendants.extend(lvl_ids)
+                ph = ",".join("?" for _ in lvl_ids)
+                if self._dialect in ("postgres", "mysql") and len(lvl_ids) > 1:
+                    await tx.fetchall(
+                        f"SELECT session_id FROM {self.s} WHERE session_id IN ({ph}) "
+                        "ORDER BY session_id ASC FOR UPDATE",
+                        tuple(lvl_ids),
+                    )
+                lvl_rows = await tx.fetchall(
+                    f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) ORDER BY session_id ASC",
+                    tuple(lvl_ids),
+                )
+                for drow in lvl_rows:
+                    await self._cancel_single_session_tx(
+                        tx, drow, reason=reason, cancel_by="subtree",
+                        is_subtree_cascade=True, activations=activations,
+                        completed_refs=completed_refs,
+                        skip_item_ids=cascaded_delivered.get(drow["session_id"]),
+                        cascaded_delivered=cascaded_delivered,
+                    )
+
+            # Now lock target itself (strictly shallower than all descendants)
+            state = await self.db.dialect.lock_state(tx, self.s, target.session_id)
             if isinstance(ref, InputRef):
                 record = await self.input(tx, ref)
                 if record is None:
                     raise RuntimeRequestError("not_found")
-                if record.row["kind"] == "workflow_continue" or record.row["status"] == "waiting_continuation":
-                    receipt = await self._cancel_workflow_input_tx(
-                        tx, session, state, record, reason, database_now, activations,
-                        completed_refs,
-                    )
-                else:
-                    receipt = await self._cancel_input_tx(
-                        tx, session, state, record, reason, database_now, activations,
-                        completed_refs,
-                    )
-            elif state["execution_state"] in {"running", "recovering"}:
-                active = state["active_send_index"]
-                await tx.execute(
-                    f"UPDATE {self.state} SET cancel_send_index=?,cancel_reason=? "
-                    "WHERE session_id=? AND active_send_index=?",
-                    (active, reason, target.session_id, active),
+                receipt = await self._cancel_input_tx(
+                    tx, state, record, reason=reason, cancel_by=eff_cancel_by,
+                    activations=activations, completed_refs=completed_refs,
                 )
-                receipt = Receipt(None, target, None, False, "cancel_requested", active, "not_needed", reason)
             else:
-                unfinished_rows = await tx.fetchall(
-                    f"SELECT * FROM {self.q} WHERE session_id=? "
-                    "AND status IN ('pending','waiting_continuation') ORDER BY id",
-                    (target.session_id,),
+                receipt = await self._cancel_single_session_tx(
+                    tx, state, reason=reason, cancel_by=eff_cancel_by,
+                    is_subtree_cascade=False, activations=activations,
+                    completed_refs=completed_refs,
+                    skip_item_ids=cascaded_delivered.get(target.session_id),
                 )
-                pending_rows = [row for row in unfinished_rows if row["status"] == "pending"]
-                waiting_by_item = {
-                    row["item_id"]: row for row in unfinished_rows
-                    if row["status"] == "waiting_continuation"
-                }
-                changed = 0
-                for row in pending_rows:
-                    record = self.record(row)
-                    delivery_error = None
-                    if route is not None:
-                        cancelled = Result(
-                            record.ref, target, "cancelled", None, None,
-                            error=reason, error_code="cancelled",
-                        )
-                        _result_ref, delivery_error = await self._route_result_tx(
-                            tx, session, route, cancelled, route["result_kind"], database_now,
-                            activations,
-                        )
-                    affected = await tx.execute(
-                        f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
-                        "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
-                        "WHERE session_id=? AND item_id=? AND status='pending'",
-                        (reason, delivery_error, database_now, target.session_id, record.ref.message_id),
-                    )
-                    changed += affected
-                    if affected:
-                        completed_refs.append(record.ref)
-                        parent_id = row["continuation_of"]
-                        while parent_id in waiting_by_item:
-                            parent = waiting_by_item.pop(parent_id)
-                            completed_refs.append(InputRef(
-                                self.store.store_id, target.session_id, parent_id,
-                            ))
-                            parent_id = parent["continuation_of"]
-                if not pending_rows and route is not None:
-                    start = await self.input(tx, InputRef(**route["input_ref"]))
-                    if start is not None and start.row["terminal_status"] is not None:
-                        await self._route_stored_result_tx(
-                            tx, session, route, start, database_now, activations,
-                        )
-                if state["execution_state"] == "queued":
-                    await tx.execute(
-                        f"UPDATE {self.state} SET execution_state='idle' WHERE session_id=? "
-                        "AND execution_state='queued' AND owner_token IS NULL", (target.session_id,)
-                    )
-                receipt = Receipt(
-                    None, target, None, False, "voided" if changed else "already_finished",
-                    None, "not_needed", reason if changed else None,
+
+            if prestaged_desc:
+                pre_ph = ",".join("?" for _ in prestaged_desc)
+                await tx.execute(
+                    f"UPDATE {self.q} SET cancel_by='subtree' "
+                    f"WHERE session_id IN ({pre_ph}) AND status='delivered' "
+                    "AND delivered_send_index=1 AND terminal_status IS NULL",
+                    tuple(prestaged_desc),
                 )
-        if scope == "subtree":
-            rows = await self.db.fetchall(
-                f"SELECT session_id FROM {self.store.t.sessions} "
-                "WHERE parent_session_id=? AND cancel_propagation='linked' ORDER BY session_id",
-                (target.session_id,),
-            )
-            for row in rows:
-                child = TargetRef(self.store.store_id, row["session_id"])
-                _receipt, child_activations, child_completed = await self.cancel(
-                    child, actor=actor, scope="subtree", reason=reason, _with_activation=True,
-                )
-                activations.extend(child_activations)
-                completed_refs.extend(child_completed)
+
+            _ = now_sql  # used via helpers
+
         if _with_activation:
             return receipt, activations, completed_refs
         return receipt
 
-    async def _cancel_workflow_input_tx(
-        self, tx, session, state, record, reason, database_now, activations,
-        completed_refs,
-    ):
-        """Resolve cancel(original) to the newest continuation, then close its chain."""
-        root = await self._continuation_root(tx, record)
-        latest = await self._latest_continuation(tx, self._result_input_from_record(record))
-        target = TargetRef(self.store.store_id, record.ref.session_id)
-        if latest.row["terminal_status"] is not None:
+    async def _cancel_single_session_tx(
+        self, tx, state, *, reason: str, cancel_by: str, is_subtree_cascade: bool,
+        activations: list[TargetRef], completed_refs: list[InputRef],
+        skip_item_ids: set[str] | None = None,
+        cascaded_delivered: dict[str, set[str]] | None = None,
+    ) -> Receipt:
+        sid = state["session_id"]
+        target = TargetRef(self.store.store_id, sid)
+        now_sql = self._now_sql()
+        route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
+        child_wake = 0 if is_subtree_cascade else 1
+
+        if state["execution_state"] == "running":
+            await tx.execute(
+                f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
+                f"updated_at={now_sql} WHERE session_id=?",
+                (cancel_by, reason, sid),
+            )
+            return Receipt(None, target, None, False, "cancel_requested", int(state["send_index"]), "not_needed", reason)
+
+        # Idle or queued: void pending items & pre-staged delivered turn-1 input if any
+        unfinished = await tx.fetchall(
+            f"SELECT * FROM {self.q} WHERE session_id=? "
+            "AND status IN ('pending','waiting_continuation') ORDER BY id",
+            (sid,),
+        )
+        skip = skip_item_ids or set()
+        pending_rows = [r for r in unfinished if r["status"] == "pending" and r["item_id"] not in skip]
+        waiting_by_item = {r["item_id"]: r for r in unfinished if r["status"] == "waiting_continuation"}
+        changed = 0
+        voided_bytes = 0
+        voided_wake = 0
+        for row in pending_rows:
+            rec = self.record(row)
+            delivery_error = None
+            if route is not None:
+                cancelled_res = Result(
+                    rec.ref, target, "cancelled", None, None,
+                    error=reason, error_code="cancelled",
+                )
+                parent_ref, delivery_error = await self._river_deliver_tx(
+                    tx,
+                    child_target=target,
+                    child_tenant_id=state["tenant_id"],
+                    child_principal_id=state["principal_id"],
+                    parent_session_id=route["target"]["session_id"],
+                    start_ref=InputRef(**route["input_ref"]),
+                    result=cancelled_res,
+                    result_kind=route["result_kind"],
+                    child_wake=child_wake,
+                    activations=activations,
+                )
+                if delivery_error is None and cascaded_delivered is not None:
+                    cascaded_delivered.setdefault(parent_ref.session_id, set()).add(parent_ref.message_id)
+            affected = await tx.execute(
+                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
+                "error_code='cancelled',error_detail=?,result_delivery_error=?,"
+                f"completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+                (cancel_by, reason, delivery_error, sid, rec.ref.message_id),
+            )
+            changed += affected
+            if affected:
+                voided_bytes += int(row["content_bytes"])
+                voided_wake += int(row["wake"])
+                completed_refs.append(rec.ref)
+                parent_id = row["continuation_of"]
+                while parent_id in waiting_by_item:
+                    parent_row = waiting_by_item.pop(parent_id)
+                    completed_refs.append(InputRef(self.store.store_id, sid, parent_id))
+                    parent_id = parent_row["continuation_of"]
+
+        # Handle queued pre-staged child (send_index=0 and ready_item_json IS NOT NULL)
+        is_prestaged = int(state["send_index"]) == 0 and bool(state["ready_item_json"])
+        if is_prestaged:
+            ready = json.loads(state["ready_item_json"])
+            pre_ref = InputRef(self.store.store_id, sid, ready["item_id"])
+            delivery_error = None
+            if route is not None:
+                cancelled_res = Result(
+                    pre_ref, target, "cancelled", None, None,
+                    error=reason, error_code="cancelled",
+                )
+                parent_ref, delivery_error = await self._river_deliver_tx(
+                    tx,
+                    child_target=target,
+                    child_tenant_id=state["tenant_id"],
+                    child_principal_id=state["principal_id"],
+                    parent_session_id=route["target"]["session_id"],
+                    start_ref=InputRef(**route["input_ref"]),
+                    result=cancelled_res,
+                    result_kind=route["result_kind"],
+                    child_wake=child_wake,
+                    activations=activations,
+                )
+                if delivery_error is None and cascaded_delivered is not None:
+                    cascaded_delivered.setdefault(parent_ref.session_id, set()).add(parent_ref.message_id)
+            affected = await tx.execute(
+                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
+                "delivered_send_index=NULL,delivered_seq=NULL,error_code='cancelled',"
+                f"error_detail=?,result_delivery_error=?,completed_at={now_sql} "
+                "WHERE session_id=? AND item_id=? AND status='delivered' AND delivered_send_index=1",
+                (cancel_by, reason, delivery_error, sid, ready["item_id"]),
+            )
+            changed += affected
+            if affected:
+                voided_wake += 1
+                completed_refs.append(pre_ref)
+
+        if not pending_rows and not is_prestaged and route is not None:
+            start = await self.input(tx, InputRef(**route["input_ref"]))
+            if start is not None and start.row["terminal_status"] is not None:
+                await self._route_stored_result_tx(tx, state, route, start, activations)
+
+        if state["execution_state"] == "queued" or changed > 0:
+            rem_count = max(0, int(state["pending_count"]) - (changed - (1 if is_prestaged and changed else 0)))
+            rem_bytes = max(0, int(state["pending_bytes"]) - voided_bytes)
+            rem_wake = max(0, int(state["wake_pending_count"]) - voided_wake)
+            await tx.execute(
+                f"UPDATE {self.s} SET execution_state='idle',cancel_seq=cancel_seq+1,"
+                "cancel_by=?,cancel_reason=?,wake_pending_count=?,pending_count=?,"
+                f"pending_bytes=?,ready_item_json=NULL,updated_at={now_sql} "
+                "WHERE session_id=? AND execution_state IN ('idle','queued')",
+                (cancel_by, reason, rem_wake, rem_count, rem_bytes, sid),
+            )
+        return Receipt(
+            None, target, None, False,
+            "voided" if changed else "already_finished",
+            None, "not_needed", reason if changed else None,
+        )
+
+    async def _cancel_input_tx(
+        self, tx, state, record: InputRecord, *, reason: str, cancel_by: str,
+        activations: list[TargetRef], completed_refs: list[InputRef],
+    ) -> Receipt:
+        row = record.row
+        ref = record.ref
+        sid = ref.session_id
+        now_sql = self._now_sql()
+        route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
+        # Check derived terminal status for normal completed rows (no final_settle_inbox)
+        derived = await self._derive_input_terminal(tx, state, row)
+        if derived["terminal_status"] is not None:
+            if route is not None and row["terminal_status"] is not None:
+                await self._route_stored_result_tx(tx, state, route, record, activations)
             return self.receipt(record, state="already_finished")
-        active = state["active_send_index"]
+        if row["status"] == "pending":
+            delivery_error = None
+            if route is not None:
+                cancelled = Result(
+                    ref, TargetRef(self.store.store_id, sid), "cancelled", None, None,
+                    error=reason, error_code="cancelled",
+                )
+                _, delivery_error = await self._river_deliver_tx(
+                    tx,
+                    child_target=TargetRef(self.store.store_id, sid),
+                    child_tenant_id=state["tenant_id"],
+                    child_principal_id=state["principal_id"],
+                    parent_session_id=route["target"]["session_id"],
+                    start_ref=InputRef(**route["input_ref"]),
+                    result=cancelled,
+                    result_kind=route["result_kind"],
+                    child_wake=1,
+                    activations=activations,
+                )
+            changed = await tx.execute(
+                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
+                "error_code='cancelled',error_detail=?,result_delivery_error=?,"
+                f"completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+                (cancel_by, reason, delivery_error, sid, ref.message_id),
+            )
+            if changed:
+                w_val = int(row["wake"])
+                b_val = int(row["content_bytes"])
+                await tx.execute(
+                    f"UPDATE {self.s} SET "
+                    "execution_state=CASE WHEN execution_state='queued' AND (wake_pending_count-?)<=0 "
+                    "THEN 'idle' ELSE execution_state END,"
+                    "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                    "pending_count=CASE WHEN pending_count>=1 THEN pending_count-1 ELSE 0 END,"
+                    "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+                    f"updated_at={now_sql} WHERE session_id=?",
+                    (w_val, w_val, w_val, b_val, b_val, sid),
+                )
+                completed_refs.append(ref)
+                new_row = dict(
+                    row, status="void", terminal_status="cancelled", error_detail=reason,
+                    result_delivery_error=delivery_error,
+                )
+                return self.receipt(InputRecord(ref, new_row, record.meta), state="voided", reason=reason)
         if (
-            latest.row["status"] == "delivered" and active is not None
-            and latest.row["delivered_send_index"] == active
-            and state["execution_state"] in {"running", "recovering"}
+            row["status"] == "delivered"
+            and state["execution_state"] == "running"
+            and row["delivered_send_index"] == int(state["send_index"])
         ):
             await tx.execute(
-                f"UPDATE {self.state} SET cancel_send_index=?,cancel_reason=? "
-                "WHERE session_id=? AND active_send_index=? AND execution_state IN ('running','recovering')",
-                (active, reason, target.session_id, active),
+                f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
+                f"updated_at={now_sql} WHERE session_id=? AND execution_state='running'",
+                (cancel_by, reason, sid),
             )
-            return Receipt(
-                record.ref, target, record.ref.message_id, False, "cancel_requested",
-                active, "not_needed", reason,
-            )
-        if latest.row["status"] != "pending":
-            return self.receipt(record, state="already_finished")
+            return self.receipt(record, state="cancel_requested", reason=reason)
+        return self.receipt(record, state="already_finished")
 
-        route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
-        delivery_error = None
-        if route is not None:
-            cancelled = Result(
-                root.ref, target, "cancelled", None, None,
-                error=reason, error_code="cancelled",
-            )
-            _ref, delivery_error = await self._route_result_tx(
-                tx, session, route, cancelled, route["result_kind"], database_now, activations,
-            )
-        changed = await tx.execute(
-            f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
-            "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
-            "WHERE session_id=? AND item_id=? AND status='pending'",
-            (reason, delivery_error, database_now, target.session_id, latest.ref.message_id),
-        )
-        if changed != 1:
-            raise SessionLeaseLost(target.session_id)
-        completed_refs.append(latest.ref)
-        ancestors = []
-        closed_refs = []
-        current = latest
-        while current.row["continuation_of"] is not None:
-            current = await self.input(tx, InputRef(
-                current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
-            ))
-            ancestors.append(current.ref.message_id)
-            if current.row["status"] == "waiting_continuation" and current.row["terminal_status"] is None:
-                closed_refs.append(current.ref)
-        if record.ref.message_id not in ancestors:
-            ancestors.append(record.ref.message_id)
-            if record.row["status"] == "waiting_continuation" and record.row["terminal_status"] is None:
-                closed_refs.append(record.ref)
-        if ancestors:
-            await tx.execute(
-                f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',"
-                "result_send_index=delivered_send_index,error_code='cancelled',error_detail=?,"
-                "result_delivery_error=?,completed_at=? WHERE session_id=? "
-                f"AND item_id IN ({','.join('?' for _ in ancestors)}) "
-                "AND status='waiting_continuation' AND terminal_status IS NULL",
-                (reason, delivery_error, database_now, target.session_id, *ancestors),
-            )
-            completed_refs.extend(closed_refs)
-        remaining = await tx.fetchone(
-            f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
-            "AND status IN ('pending','waiting_continuation')",
-            (target.session_id,),
-        )
-        if not int(remaining["n"]) and state["execution_state"] == "queued":
-            await tx.execute(
-                f"UPDATE {self.state} SET execution_state='idle' WHERE session_id=? "
-                "AND execution_state='queued' AND owner_token IS NULL",
-                (target.session_id,),
-            )
-        return self.receipt(record, state="voided", reason=reason)
-
-    async def _stored_result_tx(self, tx, record):
+    async def _route_stored_result_tx(
+        self, tx, session, route, record, activations=None, *, parent_state=None,
+    ):
         row = record.row
         final_text, usage, structured = "", {}, None
         if row["result_seq"] is not None:
@@ -2022,22 +3326,24 @@ class RuntimeInputStore:
                 meta = json.loads(message["meta_json"] or "{}")
                 usage = meta.get("usage") or {}
                 structured = meta.get("structured_output")
-        return Result(
+        existing = Result(
             record.ref, TargetRef(self.store.store_id, record.ref.session_id),
             row["terminal_status"], row["result_send_index"], row["result_seq"],
             final_text, usage, structured, row["error_detail"], row["error_code"],
             row["result_delivery_error"],
         )
-
-    async def _route_stored_result_tx(
-        self, tx, session, route, record, database_now, activations=None, *, parent_state=None,
-    ):
-        existing = await self._stored_result_tx(tx, record)
-        result_ref, delivery_error = await self._route_result_tx(
-            tx, session, route, existing, route["result_kind"], database_now, activations,
-            parent_state=parent_state,
+        result_ref, delivery_error = await self._river_deliver_tx(
+            tx,
+            child_target=TargetRef(self.store.store_id, record.ref.session_id),
+            child_tenant_id=session["tenant_id"],
+            child_principal_id=session["principal_id"],
+            parent_session_id=route["target"]["session_id"],
+            start_ref=InputRef(**route["input_ref"]),
+            result=existing,
+            result_kind=route["result_kind"],
+            child_wake=1,
+            activations=activations,
         )
-        row = record.row
         if delivery_error != row["result_delivery_error"]:
             await tx.execute(
                 f"UPDATE {self.q} SET result_delivery_error=? WHERE session_id=? AND item_id=?",
@@ -2056,76 +3362,12 @@ class RuntimeInputStore:
                 )
         return result_ref, delivery_error
 
-    async def _cancel_input_tx(
-        self, tx, session, state, record, reason, database_now, activations=None,
-        completed_refs=None,
-    ):
-        row = record.row
-        ref = record.ref
-        route = json.loads(session["result_route_json"]) if session["result_route_json"] else None
-        if row["terminal_status"] is not None:
-            if route is not None:
-                await self._route_stored_result_tx(
-                    tx, session, route, record, database_now, activations,
-                )
-            return self.receipt(record, state="already_finished")
-        if row["status"] == "pending":
-            delivery_error = None
-            if route is not None:
-                cancelled = Result(
-                    ref, TargetRef(self.store.store_id, ref.session_id), "cancelled", None, None,
-                    error=reason, error_code="cancelled",
-                )
-                _result_ref, delivery_error = await self._route_result_tx(
-                    tx, session, route, cancelled, route["result_kind"], database_now,
-                    activations,
-                )
-            changed = await tx.execute(
-                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
-                "error_code='cancelled',error_detail=?,result_delivery_error=?,completed_at=? "
-                "WHERE session_id=? AND item_id=? AND status='pending'",
-                (reason, delivery_error, database_now, ref.session_id, ref.message_id),
-            )
-            if changed:
-                remaining = await tx.fetchone(
-                    f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
-                    "AND status IN ('pending','waiting_continuation')", (ref.session_id,),
-                )
-                if not int(remaining["n"]) and state["execution_state"] == "queued":
-                    await tx.execute(
-                        f"UPDATE {self.state} SET execution_state='idle' WHERE session_id=? "
-                        "AND execution_state='queued' AND owner_token IS NULL", (ref.session_id,)
-                    )
-                row = dict(
-                    row, status="void", terminal_status="cancelled", error_detail=reason,
-                    result_delivery_error=delivery_error,
-                )
-                if completed_refs is not None:
-                    completed_refs.append(ref)
-                return self.receipt(InputRecord(ref, row, record.meta), state="voided", reason=reason)
-        active = state["active_send_index"]
-        if (
-            row["status"] == "delivered" and active is not None
-            and row["delivered_send_index"] == active
-            and state["execution_state"] in {"running", "recovering"}
-        ):
-            await tx.execute(
-                f"UPDATE {self.state} SET cancel_send_index=?,cancel_reason=? "
-                "WHERE session_id=? AND active_send_index=? AND execution_state IN ('running','recovering')",
-                (active, reason, ref.session_id, active),
-            )
-            return self.receipt(record, state="cancel_requested", reason=reason)
-        return self.receipt(record, state="already_finished")
-
-    async def cancel_active(self, batch: ClaimedBatch, *, reason="cancelled"):
+    async def cancel_active(self, batch: ClaimedBatch, *, reason="cancelled", cancel_by="agent"):
+        now_sql = self._now_sql()
         changed = await self.db.execute(
-            f"UPDATE {self.state} SET cancel_send_index=?,cancel_reason=? "
-            "WHERE session_id=? AND active_send_index=? AND owner_epoch=? AND owner_token=? "
-            "AND execution_state='running'",
-            (
-                batch.send_index, reason, batch.target.session_id, batch.send_index,
-                batch.owner_epoch, batch.owner_token,
-            ),
+            f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
+            f"updated_at={now_sql} WHERE session_id=? AND owner_epoch=? AND execution_state='running'",
+            (cancel_by, reason, batch.target.session_id, batch.owner_epoch),
         )
         if changed != 1:
             raise SessionLeaseLost(batch.target.session_id)
@@ -2134,22 +3376,14 @@ class RuntimeInputStore:
             "not_needed", reason,
         )
 
-    async def release_owner(self, batch: ClaimedBatch):
-        return bool(await self.db.execute(
-            f"UPDATE {self.state} SET owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,"
-            "owner_lease_until_ms=NULL WHERE session_id=? AND owner_epoch=? AND owner_token=? "
-            "AND execution_state IN ('idle','queued')",
-            (batch.target.session_id, batch.owner_epoch, batch.owner_token),
-        ))
-
     async def close(self, target, *, actor):
         from power_loop.contracts.errors import SessionBusy
 
         self.check_store(target)
         async with self.db.transaction() as tx:
-            await self.authorize(tx, target, actor)
-            state = await self.db.dialect.lock_state(tx, self.state, target.session_id)
-            if state["execution_state"] in {"running", "recovering"}:
+            state = await self.db.dialect.lock_state(tx, self.s, target.session_id)
+            await self._authorize_known(tx, target, actor, state)
+            if state["execution_state"] == "running" or int(state["wake_pending_count"]) > 0:
                 raise SessionBusy(target.session_id)
             pending = await tx.fetchone(
                 f"SELECT COUNT(*) AS n FROM {self.q} WHERE session_id=? "
@@ -2158,79 +3392,162 @@ class RuntimeInputStore:
             if int(pending["n"]):
                 raise SessionBusy(target.session_id)
             linked_child = await tx.fetchone(
-                f"SELECT session_id FROM {self.store.t.sessions} "
+                f"SELECT session_id FROM {self.s} "
                 "WHERE parent_session_id=? AND cancel_propagation='linked' "
-                "AND lifecycle='open' LIMIT 1",
+                "AND lifecycle IN ('open','suspended') LIMIT 1",
                 (target.session_id,),
             )
             if linked_child is not None:
                 raise SessionBusy(target.session_id)
             changed = await tx.execute(
-                f"UPDATE {self.store.t.sessions} SET lifecycle='closed',updated_at=? "
-                "WHERE session_id=? AND lifecycle='open'",
+                f"UPDATE {self.s} SET lifecycle='closed',updated_at=? "
+                "WHERE session_id=? AND lifecycle IN ('open','suspended')",
                 (now_ms(), target.session_id),
             )
             if changed != 1:
                 raise RuntimeRequestError("session_closed")
 
+    # ── Unified inspect_input / inspect / read_result_state / get_result ─────
+
+    async def _derive_input_terminal(self, reader, session_row: dict, input_row: dict) -> dict:
+        """Derive terminal_status / result_send_index / result_seq when normal Final skipped final_settle_inbox.
+
+        Probe 1 invariant: for ``session_kind == 'workflow_driver'``, ``start_input_message_id``
+        MUST NEVER derive premature ``'completed'`` from ``delivered_send_index <= send_index`` —
+        only an explicit ``terminal_status`` written at the driver's final commit counts!
+        """
+        out = dict(input_row)
+        if out["status"] != "delivered" or out["terminal_status"] is not None:
+            return out
+        dsi = out.get("delivered_send_index")
+        if dsi is None:
+            return out
+        is_driver = session_row["session_kind"] == "workflow_driver"
+        start_id = session_row.get("start_input_message_id")
+        if is_driver and start_id is not None and out["item_id"] == start_id:
+            return out
+        cur_si = int(session_row["send_index"])
+        is_running = session_row["execution_state"] == "running"
+        dsi_i = int(dsi)
+        if dsi_i <= cur_si and not (is_running and dsi_i == cur_si):
+            out["terminal_status"] = "completed"
+            out["result_send_index"] = dsi_i
+            if out.get("result_seq") is None and not is_driver:
+                msg = await reader.fetchone(
+                    f"SELECT seq FROM {self.store.t.messages} "
+                    "WHERE session_id=? AND send_index=? AND role='assistant' "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (session_row["session_id"], dsi_i),
+                )
+                if msg is not None:
+                    out["result_seq"] = int(msg["seq"])
+                else:
+                    proj = await reader.fetchone(
+                        f"SELECT MAX(source_seq_hi) AS max_hi FROM {self.store.t.project_messages} "
+                        "WHERE session_id=? AND send_index=?",
+                        (session_row["session_id"], dsi_i),
+                    )
+                    if proj is not None and proj["max_hi"] is not None:
+                        out["result_seq"] = int(proj["max_hi"])
+        return out
+
+    async def inspect_input(self, ref: InputRef, *, actor=None) -> dict[str, Any]:
+        """Unified point lookup for one InputRef with derived normal-completion state."""
+        self.check_store(ref)
+        target = TargetRef(ref.store_id, ref.session_id)
+        async with self.db.read_snapshot() as reader:
+            srow = await self._session(reader, ref.session_id)
+            if actor is not None:
+                await self._authorize_known(reader, target, actor, srow)
+            irow = await reader.fetchone(
+                f"SELECT * FROM {self.q} WHERE session_id=? AND item_id=?",
+                (ref.session_id, ref.message_id),
+            )
+            if irow is None:
+                raise RuntimeRequestError("not_found")
+            return await self._derive_input_terminal(reader, dict(srow), dict(irow))
+
     async def inspect(self, ref, *, actor):
         target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
         async with self.db.read_snapshot() as reader:
-            await self.authorize(reader, target, actor)
-            state = await reader.fetchone(
-                f"SELECT * FROM {self.state} WHERE session_id=?", (target.session_id,)
+            state = await self.authorize(reader, target, actor)
+            is_running = state["execution_state"] == "running"
+            active_send = int(state["send_index"]) if is_running else None
+            cancel_active = is_running and (
+                state["cancel_by"] is not None or state["lifecycle"] in ("closing", "closed")
             )
             if isinstance(ref, TargetRef):
-                send_index = state["active_send_index"] or state["send_index"] or None
+                send_index = int(state["send_index"]) or None
                 return Status(
                     None, target, state["execution_state"], None, None, send_index, False,
-                    None, bool(
-                        state["active_send_index"] is not None
-                        and state["cancel_send_index"] == state["active_send_index"]
-                    ),
-                    state["cancel_reason"], None, None, None, None,
+                    None, cancel_active, state["cancel_reason"], None, None, None, None,
                 )
             record = await self.input(reader, ref)
             if record is None:
                 raise RuntimeRequestError("not_found")
-            row = record.row
+            row = await self._derive_input_terminal(reader, dict(state), record.row)
             return Status(
                 ref, target, state["execution_state"], row["status"], row["terminal_status"],
                 row["result_send_index"] or row["delivered_send_index"],
                 row["terminal_status"] is not None, row["result_seq"],
-                bool(
-                    state["active_send_index"] is not None
-                    and state["cancel_send_index"] == state["active_send_index"]
-                    and row["delivered_send_index"] == state["active_send_index"]
-                ),
+                bool(cancel_active and row["delivered_send_index"] == active_send),
                 row["error_detail"] or (
-                    state["cancel_reason"] if state["cancel_send_index"] == row["delivered_send_index"] else None
+                    state["cancel_reason"]
+                    if cancel_active and row["delivered_send_index"] == active_send else None
                 ),
                 row["error_code"], row["result_delivery_error"], row["continuation_of"],
                 row["continuation_index"],
             )
 
-    def _input_row(self, row):
-        values = {key[6:]: value for key, value in row.items() if key.startswith("input_")}
-        values["session_id"] = row["session_id"]
-        return values
-
-    def _result_input(self, row):
-        values = self._input_row(row)
+    async def _continuation_child(self, reader, record):
+        row = await reader.fetchone(
+            f"SELECT session_id,item_id,kind,status,terminal_status,result_seq,"
+            "result_send_index,error_code,error_detail,result_delivery_error,"
+            "delivered_send_index,continuation_of,result_json,cancel_by "
+            f"FROM {self.q} WHERE session_id=? AND continuation_of=? "
+            "ORDER BY continuation_index DESC LIMIT 1",
+            (record.ref.session_id, record.ref.message_id),
+        )
+        if row is None:
+            return None
         return ResultInput(
-            InputRef(self.store.store_id, values["session_id"], values["item_id"]),
-            {name: values[name] for name in _RESULT_INPUT_COLUMNS},
+            InputRef(self.store.store_id, row["session_id"], row["item_id"]),
+            {name: row[name] for name in _RESULT_INPUT_COLUMNS},
         )
 
-    @staticmethod
-    def _result_input_from_record(record):
-        return ResultInput(
-            record.ref,
-            {name: record.row[name] for name in _RESULT_INPUT_COLUMNS},
-        )
+    async def _latest_continuation(self, reader, record):
+        current = record
+        for _ in range(10000):
+            if current.row["status"] != "waiting_continuation":
+                return current
+            child = await self._continuation_child(reader, current)
+            if child is None:
+                return current
+            current = child
+        raise CapacityError()
 
-    async def _result_state(self, reader, ref, target, actor, *, follow_continuation):
-        row = await reader.fetchone(self._result_sql, (ref.message_id, ref.session_id))
+    async def _result_state(self, reader, ref: InputRef, target: TargetRef, actor, *, follow_continuation: bool):
+        row = await reader.fetchone(
+            "SELECT s.session_id,s.tenant_id,s.principal_id,s.parent_session_id,"
+            "s.session_kind,s.execution_state,s.send_index,s.start_input_message_id,"
+            "q.item_id AS input_item_id,q.kind AS input_kind,q.status AS input_status,"
+            "q.terminal_status AS input_terminal_status,q.result_seq AS input_result_seq,"
+            "q.result_send_index AS input_result_send_index,q.error_code AS input_error_code,"
+            "q.error_detail AS input_error_detail,q.result_delivery_error AS input_result_delivery_error,"
+            "q.delivered_send_index AS input_delivered_send_index,q.continuation_of AS input_continuation_of,"
+            "q.result_json AS input_result_json,q.cancel_by AS input_cancel_by,"
+            "m.seq AS message_seq,m.content AS message_content,m.meta_json AS message_meta_json "
+            f"FROM {self.s} s LEFT JOIN {self.q} q "
+            "ON q.session_id=s.session_id AND q.item_id=? "
+            f"LEFT JOIN {self.store.t.messages} m "
+            "ON m.session_id=s.session_id AND m.seq=COALESCE("
+            "q.result_seq,"
+            f"(SELECT MAX(m2.seq) FROM {self.store.t.messages} m2 "
+            "WHERE m2.session_id=s.session_id AND m2.send_index=q.delivered_send_index "
+            "AND m2.role='assistant')) "
+            "WHERE s.session_id=?",
+            (ref.message_id, ref.session_id),
+        )
         if row is None:
             raise RuntimeRequestError("not_found")
         session = {
@@ -2238,59 +3555,98 @@ class RuntimeInputStore:
             "tenant_id": row["tenant_id"],
             "principal_id": row["principal_id"],
             "parent_session_id": row["parent_session_id"],
+            "session_kind": row["session_kind"],
+            "execution_state": row["execution_state"],
+            "send_index": row["send_index"],
+            "start_input_message_id": row["start_input_message_id"],
         }
         await self._authorize_known(reader, target, actor, session)
         if row["input_item_id"] is None:
             return ResultRead(ref, target, session, None, None, None), False
-        record = self._result_input(row)
+        input_dict = {
+            "session_id": row["session_id"],
+            "item_id": row["input_item_id"],
+            "kind": row["input_kind"],
+            "status": row["input_status"],
+            "terminal_status": row["input_terminal_status"],
+            "result_seq": row["input_result_seq"],
+            "result_send_index": row["input_result_send_index"],
+            "error_code": row["input_error_code"],
+            "error_detail": row["input_error_detail"],
+            "result_delivery_error": row["input_result_delivery_error"],
+            "delivered_send_index": row["input_delivered_send_index"],
+            "continuation_of": row["input_continuation_of"],
+            "result_json": row["input_result_json"],
+            "cancel_by": row["input_cancel_by"],
+        }
+        record = ResultInput(ref, input_dict)
         continuation = (
             record.row["status"] == "waiting_continuation"
             or record.row["kind"] == "workflow_continue"
         )
         if continuation and not follow_continuation:
             return ResultRead(ref, target, session, record, record, None), True
-        resolved = await self._latest_continuation(reader, record) if continuation else record
-        result = await self._terminal_result(reader, ref, target, record, resolved, row)
+        if not continuation:
+            # Pure in-memory derivation from the single joined row (0 extra SQL!).
+            derived = dict(input_dict)
+            if derived["status"] == "delivered" and derived["terminal_status"] is None:
+                dsi = derived.get("delivered_send_index")
+                is_driver = session["session_kind"] == "workflow_driver"
+                start_id = session.get("start_input_message_id")
+                if dsi is not None and not (is_driver and start_id is not None and derived["item_id"] == start_id):
+                    cur_si = int(session["send_index"])
+                    is_running = session["execution_state"] == "running"
+                    dsi_i = int(dsi)
+                    if dsi_i <= cur_si and not (is_running and dsi_i == cur_si):
+                        derived["terminal_status"] = "completed"
+                        derived["result_send_index"] = dsi_i
+                        if derived.get("result_seq") is None and row["message_seq"] is not None:
+                            derived["result_seq"] = int(row["message_seq"])
+            resolved = ResultInput(ref, derived)
+            joined_msg = (
+                {"content": row["message_content"], "meta_json": row["message_meta_json"]}
+                if row["message_seq"] is not None else None
+            )
+            result = await self._terminal_result(reader, ref, target, resolved, message_row=joined_msg)
+            return ResultRead(ref, target, session, record, resolved, result), False
+        resolved = await self._latest_continuation(reader, record)
+        derived = await self._derive_input_terminal(reader, session, resolved.row)
+        resolved = ResultInput(resolved.ref, derived)
+        result = await self._terminal_result(reader, ref, target, resolved)
         return ResultRead(ref, target, session, record, resolved, result), False
 
-    async def _terminal_result(self, reader, ref, target, record, resolved, row):
+    async def _terminal_result(self, reader, ref, target, resolved: ResultInput, *, message_row=None):
         terminal = resolved.row["terminal_status"]
         if terminal is None:
             return None
         final_text, usage, structured = "", {}, None
         result_seq = resolved.row["result_seq"]
-        if result_seq is not None:
-            if resolved is record:
-                found = row["result_message_id"] is not None
-                content, meta_json = row["result_content"], row["result_meta_json"]
-            else:
-                message = await reader.fetchone(
-                    f"SELECT content,meta_json FROM {self.store.t.messages} "
-                    "WHERE session_id=? AND seq=? AND send_index=?",
-                    (ref.session_id, result_seq, resolved.row["result_send_index"]),
-                )
-                found = message is not None
-                content = message["content"] if found else None
-                meta_json = message["meta_json"] if found else None
-            if found:
-                final_text = content or ""
-                meta = json.loads(meta_json or "{}")
+        result_si = resolved.row["result_send_index"]
+        if message_row is not None and result_seq is not None:
+            final_text = message_row["content"] or ""
+            meta = json.loads(message_row["meta_json"] or "{}")
+            usage = meta.get("usage") or {}
+            structured = meta.get("structured_output")
+        elif result_seq is not None and result_si is not None:
+            message = await reader.fetchone(
+                f"SELECT content,meta_json FROM {self.store.t.messages} "
+                "WHERE session_id=? AND seq=? AND send_index=?",
+                (ref.session_id, result_seq, result_si),
+            )
+            if message is not None:
+                final_text = message["content"] or ""
+                meta = json.loads(message["meta_json"] or "{}")
                 usage = meta.get("usage") or {}
                 structured = meta.get("structured_output")
+        if structured is None and resolved.row.get("result_json"):
+            structured = json.loads(resolved.row["result_json"])
         return Result(
-            ref, target, terminal, resolved.row["result_send_index"], result_seq,
+            ref, target, terminal, result_si, result_seq,
             final_text, usage, structured, resolved.row["error_detail"],
             resolved.row["error_code"], resolved.row["result_delivery_error"],
         )
 
-    async def read_result_state(self, ref, *, actor) -> ResultRead:
-        """Authorize and read the addressed input plus its durable result.
-
-        A normal root read is one SELECT over the session, the addressed input and its
-        result message, so it is already a single snapshot. Ancestor authorization and
-        continuation chains need more rows; those keep the original read-snapshot
-        semantics and their extra reads are counted separately.
-        """
+    async def read_result_state(self, ref: InputRef, *, actor) -> ResultRead:
         self.check_store(ref)
         target = TargetRef(ref.store_id, ref.session_id)
         if actor.session_id is None or actor.session_id == ref.session_id:
@@ -2305,7 +3661,7 @@ class RuntimeInputStore:
             )
         return state
 
-    async def get_result(self, ref, *, actor):
+    async def get_result(self, ref: InputRef, *, actor):
         state = await self.read_result_state(ref, actor=actor)
         if state.record is None:
             raise RuntimeRequestError("not_found")
@@ -2337,7 +3693,7 @@ class RuntimeInputStore:
         async with self.db.read_snapshot() as reader:
             await self.authorize(reader, target, actor)
             rows = await reader.fetchall(
-                f"SELECT session_id FROM {self.store.t.sessions} WHERE parent_session_id=? "
+                f"SELECT session_id FROM {self.s} WHERE parent_session_id=? "
                 "AND session_id>? ORDER BY session_id LIMIT ?",
                 (target.session_id, cursor or "", limit),
             )
@@ -2345,7 +3701,7 @@ class RuntimeInputStore:
         return SessionPage(items, items[-1].session_id if len(items) == limit else None)
 
     async def poll_notifications(self, binding, *, cursor=None, limit=100):
-        """Bounded shared-store discovery; notifications never become a second ledger."""
+        """Bounded shared-store discovery (supports both explicit terminal and derived normal completion)."""
         from .runtime_transport import PROTOCOL_VERSION, TransportPacket
 
         if binding.channel in {"work", "activation"}:
@@ -2361,28 +3717,42 @@ class RuntimeInputStore:
             return packets, None
         if binding.channel != "output":
             return [], cursor
+
+        settled_cond = (
+            "(q.terminal_status IS NOT NULL OR ("
+            "q.status='delivered' AND q.terminal_status IS NULL AND q.delivered_send_index IS NOT NULL "
+            "AND q.delivered_send_index<=s.send_index "
+            "AND NOT (s.execution_state='running' AND q.delivered_send_index=s.send_index) "
+            "AND NOT (s.session_kind='workflow_driver' AND s.start_input_message_id IS NOT NULL "
+            "AND q.item_id=s.start_input_message_id)))"
+        )
         select = (
-            "SELECT id,session_id,item_id,terminal_status,result_send_index,completed_at "
-            f"FROM {self.q} WHERE "
+            "SELECT q.id,q.session_id,q.item_id,"
+            "COALESCE(q.terminal_status,'completed') AS terminal_status,"
+            "COALESCE(q.result_send_index,q.delivered_send_index) AS result_send_index,"
+            "COALESCE(q.completed_at,q.delivered_at,q.created_at) AS done_at "
+            f"FROM {self.q} q JOIN {self.s} s ON s.session_id=q.session_id WHERE "
         )
         if binding.discovery_message_id is not None:
             rows = await self.db.fetchall(
-                select + "session_id=? AND item_id=? AND terminal_status IS NOT NULL",
+                select + f"q.session_id=? AND q.item_id=? AND {settled_cond}",
                 (binding.session_id, binding.discovery_message_id),
             )
         else:
-            # Filter by session before LIMIT, and advance by the full ordering key.
-            where, params = ["terminal_status IS NOT NULL"], []
+            where, params = [settled_cond], []
             if cursor is not None:
-                completed_at, row_id = cursor
-                where.append("(completed_at>? OR (completed_at=? AND id>?))")
-                params.extend((completed_at, completed_at, row_id))
+                done_at, row_id = cursor
+                where.append(
+                    "(COALESCE(q.completed_at,q.delivered_at,q.created_at)>? "
+                    "OR (COALESCE(q.completed_at,q.delivered_at,q.created_at)=? AND q.id>?))"
+                )
+                params.extend((done_at, done_at, row_id))
             if binding.session_id is not None:
-                where.append("session_id=?")
+                where.append("q.session_id=?")
                 params.append(binding.session_id)
             params.append(limit)
             rows = await self.db.fetchall(
-                select + f"{' AND '.join(where)} ORDER BY completed_at,id LIMIT ?",
+                select + f"{' AND '.join(where)} ORDER BY done_at,q.id LIMIT ?",
                 tuple(params),
             )
         packets = []
@@ -2393,7 +3763,7 @@ class RuntimeInputStore:
                 PROTOCOL_VERSION, binding.namespace, row["item_id"],
                 TargetRef(self.store.store_id, row["session_id"]), "output", ref,
                 {"kind": "completed", "session_id": row["session_id"],
-                 "send_index": row["result_send_index"], "status": row["terminal_status"]},
+                 "send_index": row["result_send_index"]},
             ))
-            next_cursor = (int(row["completed_at"]), int(row["id"]))
+            next_cursor = (row["done_at"], row["id"])
         return packets, next_cursor

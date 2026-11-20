@@ -203,7 +203,7 @@ async def test_unknown_pending_tool_is_not_replayed_and_keeps_its_send_index(sto
     llm = _Scripted([LLMResponse(raw_text='continued')])
     loop = await _projection_loop_with_tools(runtime_agent, store, llm, registry)
     sid = loop.target.session_id
-    await store._db.execute(f'UPDATE {store.t.session_state} SET send_index=1 WHERE session_id=?', (sid,))
+    await store._db.execute(f'UPDATE {store.t.sessions} SET send_index=1 WHERE session_id=?', (sid,))
     await store.append_message(sid, role='user', content='old input', send_index=1)
     call = {'id':'unknown-tool','type':'function','function':{'name':'echo','arguments':'{"text":"original"}'}}
     seq = await store.append_message(sid, role='assistant', send_index=1, round_index=0, tool_calls=[call])
@@ -556,7 +556,7 @@ async def test_interrupted_send_is_lazily_projected_on_next_send(store: SessionS
     loop = await _projection_loop_with_tools(runtime_agent, store, llm, _echo_registry())
     sid = loop.target.session_id
     # 模拟中断的 send 1：只有原始行，没有投影行
-    await store._db.execute(f'UPDATE {store.t.session_state} SET send_index=1 WHERE session_id=?', (sid,))
+    await store._db.execute(f'UPDATE {store.t.sessions} SET send_index=1 WHERE session_id=?', (sid,))
     await store.append_message(sid, role="user", content="kick off", send_index=1)
     await store.append_message(
         sid, role="assistant", send_index=1, round_index=0,

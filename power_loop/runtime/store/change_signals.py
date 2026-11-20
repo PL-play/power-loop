@@ -19,6 +19,12 @@ async def bump(store, tx, session_id, kind):
     send_reads.lease_writer(store, session_id)
     if guarded and changed != 1:
         raise SessionLeaseLost(session_id)
+    idx = ("inbox", "background", "runtime").index(kind)
+    active = reader(store, session_id)
+    if active is not None:
+        v = list(active.versions)
+        v[idx] = int(v[idx]) + 1
+        active.versions = tuple(v)
 
 
 
@@ -40,7 +46,7 @@ class ChangeReader:
                 self.snapshot_seq, self.versions = snapshot
             return
         row = await self.store._db.fetchone(
-            f"SELECT {','.join(COLUMNS)} FROM {self.store.t.session_state} WHERE session_id=?", (self.session_id,))
+            f"SELECT {','.join(COLUMNS)} FROM {self.store.t.sessions} WHERE session_id=?", (self.session_id,))
         self.versions = tuple(row[column] for column in COLUMNS)
         if snapshot is not None:
             self.snapshot_seq = snapshot[0]

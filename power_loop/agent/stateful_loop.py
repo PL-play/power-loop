@@ -92,7 +92,7 @@ class _SessionCache:
     ``next_seq`` was observed — the DURABLE projection, never the pipeline's mutated working
     copy (recall placeholders / microcompacted content are re-applied fresh each send, never
     cached). The validity token is the PAIR ``(next_seq, last_compact_seq)``: a send reuses
-    ``rows`` iff BOTH still match the live ``session_state``. ``next_seq`` alone is insufficient
+    ``rows`` iff BOTH still match the live ``sessions`` row. ``next_seq`` alone is insufficient
     — a fold (compaction) reshuffles the OLDER active set into ``compacted_out`` while only
     bumping ``next_seq`` by the note, so an out-of-band fold during a send could leave a stale
     delta-extended window whose ``next_seq`` happens to match. ``last_compact_seq`` advances on
@@ -130,6 +130,8 @@ class StatefulResult:
     #: The exact meta persisted for that assistant row (reasoning, round usage). final()
     #: merges the result fields into it instead of reading the row back.
     result_meta: dict[str, Any] | None = None
+    #: design 217: highest next_seq reached during this send (persisted back in Final).
+    next_seq: int | None = None
 
 
 class _SyncLoopRunner:
@@ -961,7 +963,7 @@ class _ExecutionLoop:
         if send_meta:
             meta = {**(meta or {}), "send": dict(send_meta)}
         # Allocate the next monotonic SEND index for this session (atomic RMW under the
-        # session_state row lock — never resets, unlike round_index). This is the single
+        # sessions row lock — never resets, unlike round_index). This is the single
         # send-begin point (exactly one user row per send; resume()/follow-up drains do
         # NOT pass through here, so they correctly inherit the in-flight send's index).
         # Stamped into meta so the transcript can delimit sends authoritatively.
@@ -1023,19 +1025,22 @@ class _ExecutionLoop:
                 reads.assistant_send_index = batch.send_index
                 reads.assistant_ref = None
                 # The claim already wrote the merged user message at batch.message_seq;
-                # seed the cursor so the loop's first append takes the conditional fast
-                # path instead of a locking read (design 215 §P2.4 per-round budget).
+                # seed the cursor and piggyback boundary markers (design 217).
                 reads.next_seq = batch.message_seq + 1
+                reads.wake_inbox_seq = batch.wake_inbox_seq
+                reads.cancel_seq = batch.cancel_seq
                 # The claim's post-lock session row already tells us when the session was last
                 # active. Seed the existing touch throttle with that fact; a scope holding a
                 # newer value keeps it. No extra read/cache: the claim write fence still runs.
                 reads.touched = max(reads.touched, batch.session_updated_at)
-                return await self._run_session_send_impl(
+                res = await self._run_session_send_impl(
                     sid, batch=batch, ownership=ownership, send=send, config=config,
                     tool_registry=tool_registry, hooks=hooks, event_bus=event_bus,
                     stop_event=stop_event, system_prompt=system_prompt, max_rounds=max_rounds,
                     response_format=response_format, with_history=with_history, boundary=boundary,
                 )
+                res.next_seq = reads.next_seq
+                return res
         finally:
             _SESSION_SEND.reset(token)
 
@@ -1503,16 +1508,27 @@ class StatefulAgentLoop:
     async def new_session(self, descriptor, *, actor):
         return await self.runtime.open_session(descriptor, actor=actor)
 
-    async def send(self, target, body, *, message_id, actor, priority="normal", deadline_ms=None):
+    async def send(
+        self, target, body, *, message_id, actor, priority="normal", deadline_ms=None,
+        wake=True, kind="user", reply_route=None,
+    ):
         """Accept once, then wait through the subscription opened before submission."""
         output = await self.client.send_and_subscribe(
             target, body, message_id=message_id, actor=actor, priority=priority,
-            deadline_ms=deadline_ms,
+            deadline_ms=deadline_ms, wake=wake, kind=kind, reply_route=reply_route,
         )
         try:
             return await output.wait(deadline_ms=deadline_ms)
         finally:
             await output.aclose()
+
+    async def configure_session(self, target, *, actor, descriptor=None, cancel_propagation=None):
+        return await self.client.configure_session(
+            target, actor=actor, descriptor=descriptor, cancel_propagation=cancel_propagation,
+        )
+
+    async def inspect_input(self, input_ref, *, actor):
+        return await self.client.inspect_input(input_ref, actor=actor)
 
     async def wait(self, input_ref, *, actor, deadline_ms=None):
         return await self.client.wait(input_ref, actor=actor, deadline_ms=deadline_ms)

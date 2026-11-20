@@ -24,17 +24,16 @@ async def _assistant_with_pending(store, port, batch, tool_ids):
         "state,meta_json,send_index,created_at) VALUES (?,?, 'assistant', '', ?, 0, 'active', ?, ?, 0)",
         (batch.target.session_id, seq, json.dumps(tool_calls), "{}", batch.send_index),
     )
-    pending = {"assistant_seq": seq}
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET pending_json=?,next_seq=? WHERE session_id=?",
-        (json.dumps(pending), seq + 1, batch.target.session_id),
+        f"UPDATE {store.t.sessions} SET pending_tool_seq=?,next_seq=? WHERE session_id=?",
+        (seq, seq + 1, batch.target.session_id),
     )
     return seq
 
 
 async def _expire(store, session_id):
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?", (session_id,))
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?", (session_id,))
 
 
 async def test_recover_repairs_missing_tools_without_replay(registry_store):
@@ -84,7 +83,7 @@ async def test_existing_tool_result_is_not_duplicated(registry_store):
         (root.session_id, assistant_seq + 1, "{}", batch.send_index),
     )
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET next_seq=? WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET next_seq=? WHERE session_id=?",
         (assistant_seq + 2, root.session_id),
     )
     before = await store.get_message(root.session_id, assistant_seq + 1)
@@ -142,9 +141,9 @@ async def test_running_expired_without_pending_input_terminates_wait(registry_st
     recovered = await port.recover(root, node_id="b", boot_id="b")
     assert recovered.results[0].status == "interrupted"
     state = await store._db.fetchone(
-        f"SELECT execution_state,active_send_index FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT execution_state,owner_node_id FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,))
-    assert state["execution_state"] == "idle" and state["active_send_index"] is None
+    assert state["execution_state"] == "idle" and state["owner_node_id"] is None
     assert (await port.get_result(batch.input_refs[0], actor=ACTOR)).status == "interrupted"
 
 
@@ -221,11 +220,11 @@ async def test_recovering_with_followup_terminates_old_then_claims_new(registry_
     await port.accept(root, "old", message_id="old", actor=ACTOR)
     batch = await port.claim(root, node_id="a", boot_id="a")
     await _expire(store, root.session_id)
-    # A new input arrives while the old run is expired: accept turns it recovering.
+    # A new input arrives while the old run is expired: execution_state remains running until recovery (no 'recovering' state).
     await port.accept(root, "new", message_id="new", actor=ACTOR)
     state = await store._db.fetchone(
-        f"SELECT execution_state FROM {store.t.session_state} WHERE session_id=?", (root.session_id,))
-    assert state["execution_state"] == "recovering"
+        f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?", (root.session_id,))
+    assert state["execution_state"] == "running"
     # Recovery terminates the old run, leaves the new input pending → queued.
     recovered = await port.recover(root, node_id="b", boot_id="b")
     assert recovered.results[0].status == "interrupted"
@@ -456,7 +455,7 @@ async def test_replaced_runtime_owner_rejects_old_sink(registry_store):
     await port.accept(root, 'go', message_id='m1', actor=ACTOR)
     batch = await port.claim(root, node_id='old', boot_id='old')
     lease = SessionOwnership((store.store_id, root.session_id), 'old', time.monotonic() + 60,
-                             lambda: None, token=batch.owner_token, epoch=batch.owner_epoch,
+                             lambda: None, epoch=batch.owner_epoch,
                              node_id='old', boot_id='old', installs_fence=True)
     async with store.send_read_scope(root.session_id, ownership=lease):
         await store.get_state(root.session_id)

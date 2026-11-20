@@ -55,7 +55,7 @@ async def test_leading_select_then_dml_rolls_back_atomically():
         sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
         await s.append_message(sid, role="user", content="first")
         before_row = await s._db.fetchone(
-            f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)
+            f"SELECT next_seq FROM {s.t.sessions} WHERE session_id=?", (sid,)
         )
         before = before_row["next_seq"]
 
@@ -63,17 +63,17 @@ async def test_leading_select_then_dml_rolls_back_atomically():
             async with s._db.transaction() as tx:
                 # leading SELECT inside the transaction
                 await tx.fetchone(
-                    f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)
+                    f"SELECT next_seq FROM {s.t.sessions} WHERE session_id=?", (sid,)
                 )
                 # a DML write …
                 await tx.execute(
-                    f"UPDATE {s.t.session_state} SET next_seq=next_seq+5 WHERE session_id=?",
+                    f"UPDATE {s.t.sessions} SET next_seq=next_seq+5 WHERE session_id=?",
                     (sid,),
                 )
                 raise RuntimeError("boom after leading select + dml")
 
         after_row = await s._db.fetchone(
-            f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)
+            f"SELECT next_seq FROM {s.t.sessions} WHERE session_id=?", (sid,)
         )
         assert after_row["next_seq"] == before  # the UPDATE rolled back atomically
     finally:

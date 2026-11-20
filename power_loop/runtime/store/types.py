@@ -102,7 +102,7 @@ class SessionStatsRow:
 
 @dataclass
 class SessionRow:
-    """Schema 17 session identity and frozen runtime descriptor."""
+    """Schema 18 session identity and frozen runtime descriptor."""
 
     session_id: str
     created_at: int
@@ -116,6 +116,8 @@ class SessionRow:
     principal_id: str
     descriptor: Any
     result_route: dict[str, Any] | None
+    root_session_id: str | None = None
+    depth: int = 0
 
 
 #: ``MessageRow.meta`` key recording that the row's ``content`` TEXT column holds a

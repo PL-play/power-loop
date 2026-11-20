@@ -518,7 +518,7 @@ async def test_poll_notifications_same_millisecond_crosses_page(registry_store):
     assert len(rows) == 2
     completed_at = 7_000
     await store._db.execute(
-        f"UPDATE {port.q} SET completed_at=? WHERE session_id=?", (completed_at, session.session_id))
+        f"UPDATE {port.q} SET delivered_at=? WHERE session_id=?", (completed_at, session.session_id))
 
     binding = SubscriptionSpec(NS, store.store_id, "output", "client", session.session_id)
     first, cursor = await port.poll_notifications(binding, limit=1)
@@ -537,9 +537,9 @@ async def test_poll_notifications_later_timestamp_with_smaller_id(registry_store
         f"SELECT id,item_id FROM {port.q} WHERE session_id=? ORDER BY id", (session.session_id,))
     earlier, later = rows
     await store._db.execute(
-        f"UPDATE {port.q} SET completed_at=? WHERE id=?", (1_000, int(earlier["id"])))
+        f"UPDATE {port.q} SET delivered_at=? WHERE id=?", (1_000, int(earlier["id"])))
     await store._db.execute(
-        f"UPDATE {port.q} SET completed_at=? WHERE id=?", (5_000, int(later["id"])))
+        f"UPDATE {port.q} SET delivered_at=? WHERE id=?", (5_000, int(later["id"])))
 
     binding = SubscriptionSpec(NS, store.store_id, "output", "client", session.session_id)
     first, cursor = await port.poll_notifications(binding, limit=1)

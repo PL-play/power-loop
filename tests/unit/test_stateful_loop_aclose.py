@@ -68,7 +68,7 @@ async def test_shutdown_cancellation_is_persisted_before_releasing_worker(store)
     assert result.drained
     result = await agent.loop.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
     assert result.status == 'cancelled'
-    state = await store._db.fetchone(f'SELECT execution_state FROM {store.t.session_state} WHERE session_id=?',
+    state = await store._db.fetchone(f'SELECT execution_state FROM {store.t.sessions} WHERE session_id=?',
                                     (agent.target.session_id,))
     assert state['execution_state'] == 'idle'
     await agent.aclose()
@@ -97,7 +97,10 @@ async def test_worker_shutdown_timeout_reports_interrupted_and_releases_slots(st
     status = await agent.loop.client.inspect(receipt.input_ref, actor=agent.actor)
     assert status.terminal_status is None
     assert status.execution_state == 'running'
-    state = await store._db.fetchone(f'SELECT owner_token FROM {store.t.session_state} WHERE session_id=?', (agent.target.session_id,))
-    assert state['owner_token'] is not None  # expired ownership is recovered by another worker
+    state = await store._db.fetchone(
+        f'SELECT owner_epoch,owner_lease_until_ms FROM {store.t.sessions} WHERE session_id=?',
+        (agent.target.session_id,),
+    )
+    assert state['owner_epoch'] >= 1 and state['owner_lease_until_ms'] == 0  # gracefully released for immediate takeover
     assert not agent.runtime.worker._active and not agent.runtime.worker._tasks
     await agent.aclose()

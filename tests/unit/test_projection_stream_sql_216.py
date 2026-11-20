@@ -663,7 +663,7 @@ async def test_projection_health_and_repair_paths(registry_store, monkeypatch):
         assert "question one" in model.requests[-1]  # Repaired rows still reach this model call.
         # An empty historical index has nothing to heal and keeps the original window facts.
         await original.execute(
-            f"UPDATE {store.t.session_state} SET send_index=4 WHERE session_id=?", (sid,))
+            f"UPDATE {store.t.sessions} SET send_index=4 WHERE session_id=?", (sid,))
         assert (await agent.send("after empty index")).status == "completed"
         await agent.drain()
         assert saved[-1][0] == 5 and saved[-1][1] is windows[-1]

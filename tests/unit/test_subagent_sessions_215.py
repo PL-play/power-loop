@@ -170,11 +170,13 @@ async def test_notifications_lost_still_runs_child_and_routes_result_by_polling(
         )
         assert handled.status == "completed" and handled.final_text == "parent handled child"
         parent_rows = await store._db.fetchall(
-            f"SELECT item_id,terminal_status FROM {store.t.follow_up_queue} "
+            f"SELECT item_id,status,delivered_send_index FROM {store.t.follow_up_queue} "
             "WHERE session_id=? AND kind='agent_result'",
             (parent.target.session_id,),
         )
-        assert parent_rows == [{"item_id": parent_ref.message_id, "terminal_status": "completed"}]
+        assert len(parent_rows) == 1 and parent_rows[0]["item_id"] == parent_ref.message_id
+        assert parent_rows[0]["status"] == "delivered" and parent_rows[0]["delivered_send_index"] is not None
+        assert (await parent.runtime.client.inspect(parent_ref, actor=parent.actor)).terminal_status == "completed"
     finally:
         await child.aclose()
         await parent.aclose()
@@ -194,11 +196,11 @@ async def test_follow_up_idempotence_preserves_text_and_running_session(registry
     assert duplicate.input_ref == first.input_ref
 
     state = await store._db.fetchone(
-        f"SELECT execution_state,active_send_index,inbox_version FROM {store.t.session_state} "
+        f"SELECT execution_state,send_index,inbox_version FROM {store.t.sessions} "
         "WHERE session_id=?",
         (root.session_id,),
     )
-    assert state == {"execution_state": "running", "active_send_index": 1, "inbox_version": 2}
+    assert state == {"execution_state": "running", "send_index": 1, "inbox_version": 2}
     row = await store._db.fetchone(
         f"SELECT content_json,status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='nudge'",
         (root.session_id,),

@@ -1,11 +1,15 @@
-"""Schema 17 DDL. Only the seven session-native tables are provisioned."""
+"""Schema 18 DDL (Design 217 §3). Only the five session-core tables are provisioned."""
 from __future__ import annotations
 
 CONTRACT_TABLES = (
-    "sessions", "session_state", "follow_up_queue", "messages",
-    "session_runtime_state", "project_messages",
+    "sessions",
+    "follow_up_queue",
+    "messages",
+    "session_runtime_state",
+    "project_messages",
 )
 FORBIDDEN_TABLES = (
+    "session_state",
     "jobs", "job_events", "task_store", "session_runs", "executions", "run_results",
     "execution_checkpoints", "session_controls", "session_obligations",
     "task_context_events", "task_executors", "task_executor_events",
@@ -14,15 +18,25 @@ FORBIDDEN_TABLES = (
 
 INDEXES = {
     "idx_sessions_parent": ("sessions", ("parent_session_id", "session_kind", "session_id")),
-    "idx_sessions_lifecycle": ("sessions", ("lifecycle", "updated_at", "session_id")),
+    "idx_sessions_root": ("sessions", ("root_session_id", "execution_state", "depth", "session_id")),
     "idx_session_recovery": (
-        "session_state", ("execution_state", "owner_lease_until_ms", "session_id")
+        "sessions", ("execution_state", "owner_lease_until_ms", "session_id")
     ),
-    "idx_inbox_session_status": ("follow_up_queue", ("session_id", "status", "id")),
-    "idx_inbox_pending": ("follow_up_queue", ("status", "id")),
-    "idx_inbox_retention": ("follow_up_queue", ("terminal_status", "completed_at", "id")),
-    "idx_inbox_output": ("follow_up_queue", ("session_id", "terminal_status", "completed_at", "id")),
-    "idx_inbox_expiry": ("follow_up_queue", ("status", "expires_at", "id")),
+    "idx_sessions_node_active": (
+        "sessions", ("owner_node_id", "execution_state", "owner_boot_id")
+    ),
+    "idx_sessions_lifecycle": (
+        "sessions", ("lifecycle", "execution_state", "updated_at", "session_id")
+    ),
+    "idx_inbox_session_status": (
+        "follow_up_queue", ("session_id", "status", "priority", "id")
+    ),
+    "idx_inbox_delivered_send": (
+        "follow_up_queue", ("session_id", "delivered_send_index", "id")
+    ),
+    "idx_inbox_output": (
+        "follow_up_queue", ("session_id", "terminal_status", "completed_at", "id")
+    ),
     "idx_messages_session_state": ("messages", ("session_id", "state", "seq")),
     "idx_messages_send": ("messages", ("session_id", "send_index", "seq")),
     "idx_messages_retention": ("messages", ("created_at", "id")),
@@ -66,54 +80,63 @@ def session_native_ddl(name: str, prefix: str) -> list[str]:
     statements = [
         f"""CREATE TABLE IF NOT EXISTS {p}sessions (
             session_id {sid} PRIMARY KEY, parent_session_id {sid}, created_by_session_id {sid},
+            root_session_id {sid} NOT NULL, depth {integer} NOT NULL DEFAULT 0,
             session_kind {small} NOT NULL CHECK (session_kind IN ('agent','workflow_driver','background')),
             descriptor_json {body} NOT NULL, descriptor_hash {small} NOT NULL,
+            next_descriptor_json {body}, next_descriptor_hash {small},
             creation_identity_hash {small} NOT NULL, creation_call_ref_json {body},
             creation_tool_call_id {sid}, start_input_message_id {small},
             tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL, result_route_json {body},
             cancel_propagation {small} NOT NULL CHECK (cancel_propagation IN ('linked','independent')),
-            lifecycle {small} NOT NULL DEFAULT 'open' CHECK (lifecycle IN ('open','closing','closed')),
-            created_at {integer} NOT NULL, updated_at {integer} NOT NULL,
-            CHECK (length(descriptor_hash)=64), CHECK (length(creation_identity_hash)=64)
-            {indexes('sessions')}){opts}""",
-        f"""CREATE TABLE IF NOT EXISTS {p}session_state (
-            session_id {sid} PRIMARY KEY, next_seq {integer} NOT NULL DEFAULT 1 CHECK (next_seq>=1),
+            lifecycle {small} NOT NULL DEFAULT 'open'
+                CHECK (lifecycle IN ('open','suspended','closing','closed')),
+            next_seq {integer} NOT NULL DEFAULT 1 CHECK (next_seq>=1),
             send_index {integer} NOT NULL DEFAULT 0 CHECK (send_index>=0),
-            active_send_index {integer} CHECK (active_send_index IS NULL OR active_send_index>=1),
             execution_state {small} NOT NULL DEFAULT 'idle'
-                CHECK (execution_state IN ('idle','queued','running','recovering')),
-            owner_epoch {integer} NOT NULL DEFAULT 0 CHECK (owner_epoch>=0), owner_token {small},
+                CHECK (execution_state IN ('idle','queued','running')),
+            owner_epoch {integer} NOT NULL DEFAULT 0 CHECK (owner_epoch>=0),
             owner_node_id {small}, owner_boot_id {small}, owner_lease_until_ms {integer},
-            inbox_version {integer} NOT NULL DEFAULT 0 CHECK (inbox_version>=0), pending_json {body},
-            cancel_send_index {integer} CHECK (cancel_send_index IS NULL OR cancel_send_index>=1),
-            cancel_reason {body}, round_index {integer} NOT NULL DEFAULT 0,
-            last_compact_seq {integer} NOT NULL DEFAULT 0,
+            inbox_version {integer} NOT NULL DEFAULT 0 CHECK (inbox_version>=0),
+            cancel_reason {body}, last_compact_seq {integer} NOT NULL DEFAULT 0,
             background_version {integer} NOT NULL DEFAULT 0, runtime_version {integer} NOT NULL DEFAULT 0,
-            CHECK ((owner_token IS NULL AND owner_node_id IS NULL AND owner_boot_id IS NULL
-                    AND owner_lease_until_ms IS NULL)
-                OR (owner_token IS NOT NULL AND owner_node_id IS NOT NULL AND owner_boot_id IS NOT NULL
-                    AND owner_lease_until_ms IS NOT NULL)),
-            CHECK ((execution_state IN ('idle','queued') AND active_send_index IS NULL)
-                OR (execution_state IN ('running','recovering') AND active_send_index IS NOT NULL)),
-            CHECK ((execution_state='running' AND owner_token IS NOT NULL)
-                OR (execution_state IN ('idle','queued') AND owner_token IS NULL)
-                OR execution_state='recovering'){indexes('session_state')}){opts}""",
+            wake_inbox_seq {integer} NOT NULL DEFAULT 0,
+            wake_pending_count {integer} NOT NULL DEFAULT 0,
+            pending_count {integer} NOT NULL DEFAULT 0,
+            pending_bytes {integer} NOT NULL DEFAULT 0,
+            ready_item_json {body}, pending_tool_seq {integer},
+            cancel_seq {integer} NOT NULL DEFAULT 0, cancel_by {small},
+            fold_stats_json {body},
+            created_at {integer} NOT NULL, updated_at {integer} NOT NULL,
+            CHECK (length(descriptor_hash)=64), CHECK (length(creation_identity_hash)=64),
+            CHECK ((owner_node_id IS NULL AND owner_boot_id IS NULL AND owner_lease_until_ms IS NULL)
+                OR (owner_node_id IS NOT NULL AND owner_boot_id IS NOT NULL AND owner_lease_until_ms IS NOT NULL)),
+            CHECK ((execution_state='running' AND owner_node_id IS NOT NULL)
+                OR (execution_state IN ('idle','queued') AND owner_node_id IS NULL))
+            {indexes('sessions')}){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
             id {identity}, session_id {sid} NOT NULL, item_id {small} NOT NULL,
+            inbox_version {integer} NOT NULL DEFAULT 0,
             kind {small} NOT NULL DEFAULT 'user' CHECK (kind IN
                 ('user','agent_result','workflow_result','workflow_node_result','background_result',
-                 'managed_effect_result','workflow_continue')),
+                 'managed_effect_result','workflow_continue','system_notice')),
             priority {small} NOT NULL DEFAULT 'normal' CHECK (priority IN ('normal','urgent')),
+            wake {integer} NOT NULL DEFAULT 1 CHECK (wake IN (0,1)),
             status {small} NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending','delivered','void','waiting_continuation')),
-            content_json {body} NOT NULL, meta_json {body} NOT NULL, request_hash {small} NOT NULL,
+            reply_to_session_id {sid}, reply_result_kind {small},
+            content_json {body} NOT NULL, content_bytes {integer} NOT NULL DEFAULT 0,
+            meta_json {body} NOT NULL, request_hash {small} NOT NULL,
             result_kind {small}, created_at {integer} NOT NULL, expires_at {integer},
             delivered_at {integer}, delivered_seq {integer}, delivered_send_index {integer},
             terminal_status {small}, result_seq {integer}, result_send_index {integer},
+            result_json {body}, cancel_by {small},
             error_code {small}, error_detail {body}, result_delivery_error {body}, completed_at {integer},
             continuation_of {small}, continuation_index {integer},
             CHECK (length(request_hash)=64),
             CHECK (result_kind IS NULL OR result_kind IN
+                ('agent_result','workflow_result','workflow_node_result','background_result',
+                 'managed_effect_result')),
+            CHECK (reply_result_kind IS NULL OR reply_result_kind IN
                 ('agent_result','workflow_result','workflow_node_result','background_result',
                  'managed_effect_result')),
             CHECK (terminal_status IS NULL OR
@@ -164,10 +187,6 @@ def session_native_ddl(name: str, prefix: str) -> list[str]:
         for index, table in enumerate(CONTRACT_TABLES):
             extra = "".join(constraints.get(table, ()))
             if extra:
-                # The index fragment is inline on some tables and newline-indented on others;
-                # match it without the surrounding whitespace so every table gets its UNIQUE
-                # key. A whitespace-sensitive marker silently dropped the key for messages,
-                # follow_up_queue and project_messages, turning their upserts into INSERTs.
                 marker = f"{indexes(table)}){opts}"
                 statements[index] = statements[index].replace(
                     marker, extra + marker, 1

@@ -212,7 +212,10 @@ async def run_session(worker, ctx, env, config):
     async def stop_original():
         while not ctx.stop.is_cancelled():
             state = await worker.inputs.boundary(ctx.batch.target)
-            if state["cancel_send_index"] == ctx.batch.send_index:
+            if state is not None and (
+                state["lifecycle"] in ("closing", "closed")
+                or int(state["cancel_seq"]) > ctx.batch.cancel_seq
+            ):
                 ctx.stop.cancel(state["cancel_reason"] or "cancelled")
                 break
             await asyncio.sleep(0.05)

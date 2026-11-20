@@ -15,7 +15,7 @@ async def test_empty_concurrent_initialization_and_current_reopen(registry_store
     stores = await asyncio.gather(*(connect(suffix="fresh_") for _ in range(4)))
     assert len({store.store_id for store in stores}) == 1
     for store in stores:
-        assert store.schema_version == TASK_SCHEMA_VERSION == 17
+        assert store.schema_version == TASK_SCHEMA_VERSION == 18
         row = await store._db.fetchone(
             f"SELECT protocol_version FROM {store.table_prefix}schema_migrations WHERE id=1"
         )

@@ -87,7 +87,7 @@ class StoreTimerBackend:
         due = due_at_ms if due_at_ms is not None else int(time.time()*1000 + delay_s*1000)
         # Creation and the live-timer limit share the existing session-state lock.
         async with self.store._db.transaction() as tx:
-            await self.store._db.dialect.lock_state(tx, self.store.t.session_state, source.session_id)
+            await self.store._db.dialect.lock_state(tx, self.store.t.sessions, source.session_id)
             row = await self._authorize(source, tx)
             if row['lifecycle'] != 'open':
                 raise RuntimeRequestError('session_closed')

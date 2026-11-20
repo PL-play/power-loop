@@ -8,7 +8,7 @@ from enum import Enum
 from power_loop.runtime.store.db import Database, Transaction
 from power_loop.runtime.store.session_native_ddl import CONTRACT_TABLES
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 _STORE_TABLES = CONTRACT_TABLES
 _STORE_VIEWS: tuple[str, ...] = ()
 _TABLE_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

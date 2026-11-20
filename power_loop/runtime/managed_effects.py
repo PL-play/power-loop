@@ -343,12 +343,15 @@ async def _write_owned_state(port, batch, key, value):
     sid = batch.target.session_id
     try:
         async with port.db.transaction() as tx:
-            state = await port.db.dialect.lock_state(tx, port.state, sid)
-            if (state["execution_state"], state["active_send_index"],
-                state["owner_epoch"], state["owner_token"]) != (
-                    "running", batch.send_index, batch.owner_epoch, batch.owner_token):
+            state = await port.db.dialect.lock_state(tx, port.store.t.sessions, sid)
+            if (state["execution_state"], int(state["send_index"]),
+                int(state["owner_epoch"])) != (
+                    "running", batch.send_index, batch.owner_epoch):
                 raise SessionLeaseLost(sid)
-            if value["phase"] == "dispatched" and state["cancel_send_index"] == batch.send_index:
+            if value["phase"] == "dispatched" and (
+                state["lifecycle"] in ("closing", "closed")
+                or int(state["cancel_seq"]) > batch.cancel_seq
+            ):
                 raise CancellationRequested(state["cancel_reason"] or "cancelled")
             await _write_state(tx, port, sid, key, value, now_ms())
     except (SessionLeaseLost, CancellationRequested):
@@ -447,11 +450,11 @@ _OBSERVATION = "managed_recovery_observation"
 
 async def _read_original(port, reader, start, *, key=None, recovery=None):
     """Read only by the frozen start, original action key and deterministic result ID."""
-    extra_columns = "st.active_send_index AS active_send_index"
-    extra_joins = f"JOIN {port.state} st ON st.session_id=s.session_id"
+    extra_columns = "s.execution_state AS execution_state"
+    extra_joins = ""
     params = (start.message_id, start.session_id)
     if recovery is not None:
-        # The session state has already been locked and is not read again here.
+        # The session row has already been locked and is not read again here.
         extra_columns = (
             "a.value_json AS managed_value,r.item_id AS recovery_item,"
             f"r.result_delivery_error AS recovery_error,{port._now_sql()} AS db_now"
@@ -521,8 +524,10 @@ async def _commit_recovery(port, actor, start, target, adapter, frozen, route, k
     try:
         async with port.db.transaction() as tx:
             try:
-                states = {s: await port.db.dialect.lock_state(tx, port.state, s)
-                          for s in sorted({sid, parent_sid})}
+                # Lock deep-first (child before parent) consistent with Design 217 lock ordering.
+                lock_order = [sid] if sid == parent_sid else [sid, parent_sid]
+                states = {s: await port.db.dialect.lock_state(tx, port.store.t.sessions, s)
+                          for s in lock_order}
             except ValueError as exc:
                 raise RuntimeRequestError("not_found") from exc
             row = await _read_original(port, tx, start, key=key, recovery=recovery)
@@ -550,7 +555,7 @@ async def _commit_recovery(port, actor, start, target, adapter, frozen, route, k
                 record = await port.input(tx, recovery)
                 activations = []
                 parent_ref, _ = await port._route_stored_result_tx(
-                    tx, row, route, record, db_now, activations, parent_state=states[parent_sid],
+                    tx, row, route, record, activations, parent_state=states[parent_sid],
                 )
                 return current["result"], None, parent_ref if activations else None
             if source is None or result_document is None:
@@ -558,7 +563,7 @@ async def _commit_recovery(port, actor, start, target, adapter, frozen, route, k
             if row["recovery_item"] is not None:
                 raise RuntimeRequestError("request_conflict", "managed recovery input identity occupied")
             child = states[sid]
-            busy = child["active_send_index"] is not None
+            busy = child["execution_state"] == "running"
             if source == "probe":
                 meta = json.loads(row["meta_json"])
                 observation = {"action_key": key, "preparation": current["preparation"], "result": result_document}
@@ -619,7 +624,7 @@ async def reconcile(store, actor, start: InputRef, adapter: ManagedTool, *, clie
         if state["phase"] == "completed" and state.get("recovered_send_index") is None:
             return ManagedToolResult.from_dict(state["result"])
         return None
-    if source != "published" and row["active_send_index"] is not None:
+    if source != "published" and row["execution_state"] == "running":
         return None
     if source == "stored":
         result_document = ManagedToolResult.from_dict(state["result"]).to_dict()

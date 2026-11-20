@@ -157,7 +157,7 @@ async def _session_runs(store, db, sid):
         f"SELECT DISTINCT send_index FROM {store.t.messages} "
         "WHERE session_id=? AND send_index IS NOT NULL ORDER BY send_index", (sid,))
     state = await db.fetchone(
-        f"SELECT send_index FROM {store.t.session_state} WHERE session_id=?", (sid,))
+        f"SELECT send_index FROM {store.t.sessions} WHERE session_id=?", (sid,))
     user_batches = await db.fetchall(
         f"SELECT send_index,COUNT(*) AS n FROM {store.t.messages} "
         "WHERE session_id=? AND role='user' GROUP BY send_index", (sid,))
@@ -331,7 +331,12 @@ async def test_subagent_tree_sql_profile(registry_store, count, arrival):
             assert len(rows) == count
             assert len({row["delivered_send_index"] for row in rows}) == 1
             assert len({row["delivered_seq"] for row in rows}) == 1
-            assert all(row["terminal_status"] == "completed" for row in rows)
+            for row in rows:
+                inspected = await runner.runtime.client.inspect(
+                    InputRef(store.store_id, runner.target.session_id, row["item_id"]),
+                    actor=runner.actor,
+                )
+                assert inspected.terminal_status == "completed"
         records, tx_sites = snapshot["records"], snapshot["tx_sites"]
         counts = _counts(records, tx_sites, snapshot["tx_categories"])
         assert counts["legacy_job_control"] == 0 and counts["billing"] == 0

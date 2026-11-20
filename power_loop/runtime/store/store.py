@@ -6,7 +6,7 @@ one transaction so it is atomic on any engine; the per-session ``seq`` counter i
 allocated under the dialect's ``lock_state`` so it is correct even with multiple writers.
 
 Schema 17 storage: sessions + lifecycle/cascade,
-messages + transactional seq allocation, compaction, session_state, timers, notes,
+messages + transactional seq allocation, compaction, sessions state, timers, notes,
 usage/stats, runtime + shared state, background tasks, retention/prune, and
 export/import. SQLite-only maintenance (checkpoint/vacuum/backup) is an optional
 :class:`~power_loop.runtime.store.capabilities.Maintenance` capability that no-ops on
@@ -152,35 +152,35 @@ class _Tables:
     def __init__(self, prefix: str) -> None:
         self.sessions = f"{prefix}sessions"
         self.messages = f"{prefix}messages"
-        self.session_state = f"{prefix}session_state"
         self.session_runtime_state = f"{prefix}session_runtime_state"
         self.project_messages = f"{prefix}project_messages"
         self.follow_up_queue = f"{prefix}follow_up_queue"
 
 
-# Logical schema 17 export. Derived projections and hook audit bodies are excluded.
+# Logical schema 18 export (5 core tables). Derived projections and hook audit bodies are excluded.
 _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
     ("sessions", lambda t: t.sessions, (
-        "session_id", "parent_session_id", "created_by_session_id", "session_kind",
-        "descriptor_json", "descriptor_hash", "creation_identity_hash",
-        "creation_call_ref_json", "creation_tool_call_id", "start_input_message_id",
-        "tenant_id", "principal_id", "result_route_json", "cancel_propagation",
-        "lifecycle", "created_at", "updated_at")),
-    ("session_state", lambda t: t.session_state, (
-        "session_id", "next_seq", "send_index", "active_send_index", "execution_state",
-        "owner_epoch", "owner_token", "owner_node_id", "owner_boot_id",
-        "owner_lease_until_ms", "inbox_version", "pending_json", "cancel_send_index",
-        "cancel_reason", "round_index", "last_compact_seq", "background_version",
-        "runtime_version")),
+        "session_id", "parent_session_id", "created_by_session_id", "root_session_id", "depth",
+        "session_kind", "descriptor_json", "descriptor_hash", "next_descriptor_json",
+        "next_descriptor_hash", "creation_identity_hash", "creation_call_ref_json",
+        "creation_tool_call_id", "start_input_message_id", "tenant_id", "principal_id",
+        "result_route_json", "cancel_propagation", "lifecycle", "next_seq", "send_index",
+        "execution_state", "owner_epoch", "owner_node_id", "owner_boot_id",
+        "owner_lease_until_ms", "inbox_version", "cancel_reason", "last_compact_seq",
+        "background_version", "runtime_version", "wake_inbox_seq", "wake_pending_count",
+        "pending_count", "pending_bytes", "ready_item_json", "pending_tool_seq",
+        "cancel_seq", "cancel_by", "fold_stats_json", "created_at", "updated_at")),
     ("messages", lambda t: t.messages, (
         "id", "session_id", "seq", "role", "name", "content", "tool_calls_json",
         "tool_call_id", "round_index", "state", "meta_json", "send_index", "created_at")),
     ("follow_up_queue", lambda t: t.follow_up_queue, (
-        "id", "session_id", "item_id", "kind", "priority", "status", "content_json",
+        "id", "session_id", "item_id", "inbox_version", "kind", "priority", "wake", "status",
+        "reply_to_session_id", "reply_result_kind", "content_json", "content_bytes",
         "meta_json", "request_hash", "result_kind", "created_at", "expires_at",
         "delivered_at", "delivered_seq", "delivered_send_index", "terminal_status",
-        "result_seq", "result_send_index", "error_code", "error_detail",
-        "result_delivery_error", "completed_at", "continuation_of", "continuation_index")),
+        "result_seq", "result_send_index", "result_json", "cancel_by", "error_code",
+        "error_detail", "result_delivery_error", "completed_at", "continuation_of",
+        "continuation_index")),
     ("session_runtime_state", lambda t: t.session_runtime_state, (
         "session_id", "state_key", "value_json", "updated_at")),
     ("project_messages", lambda t: t.project_messages, (
@@ -229,11 +229,14 @@ class SessionStore:
     def known_pending(self, session_id):
         """``(True, pending)`` when this holding committed the pending state."""
         holding = self._holding(session_id)
-        return holding.pending_known, _loads(holding.pending_json) if holding.pending_known else None
+        if not holding.pending_known:
+            return False, None
+        val = {"assistant_seq": int(holding.pending_tool_seq)} if holding.pending_tool_seq is not None else None
+        return True, val
 
     def forget_pending(self, session_id):
         holding = self._holding(session_id)
-        holding.pending_known, holding.pending_json = False, None
+        holding.pending_known, holding.pending_tool_seq = False, None
         send_reads.forget(self, session_id, "state")
 
     def defer_round_index(self, session_id: str, round_index: int) -> None:
@@ -415,21 +418,14 @@ class SessionStore:
             creation_tool_call_id, descriptor, start_input_message_id,
         ])
         async with self._db.transaction() as tx:
+            root_session_id = sid
+            depth = 0
             if parent_session_id is not None:
-                await self._db.dialect.lock_state(tx, self.t.session_state, parent_session_id)
-                parent = await tx.fetchone(
-                    f"WITH RECURSIVE ancestors AS ("
-                    f"SELECT session_id,parent_session_id,tenant_id,principal_id,lifecycle,1 AS depth "
-                    f"FROM {self.t.sessions} WHERE session_id=? UNION ALL "
-                    f"SELECT s.session_id,s.parent_session_id,s.tenant_id,s.principal_id,s.lifecycle,a.depth+1 "
-                    f"FROM {self.t.sessions} s JOIN ancestors a ON s.session_id=a.parent_session_id "
-                    "WHERE a.depth<=?) SELECT tenant_id,principal_id,lifecycle,"
-                    "(SELECT MAX(depth) FROM ancestors) AS child_depth FROM ancestors WHERE depth=1",
-                    (parent_session_id, self.max_spawn_depth),
-                )
-                if parent is None:
+                try:
+                    parent = await self._db.dialect.lock_state(tx, self.t.sessions, parent_session_id)
+                except ValueError as exc:
                     from power_loop.agent.runtime_types import RuntimeRequestError
-                    raise RuntimeRequestError("not_found", "parent session")
+                    raise RuntimeRequestError("not_found", "parent session") from exc
                 if parent["lifecycle"] != "open":
                     from power_loop.agent.runtime_types import RuntimeRequestError
                     raise RuntimeRequestError("session_closed")
@@ -438,24 +434,27 @@ class SessionStore:
                 ):
                     from power_loop.agent.runtime_types import RuntimeRequestError
                     raise RuntimeRequestError("forbidden")
-                if parent["child_depth"] > self.max_spawn_depth:
+                depth = int(parent["depth"]) + 1
+                if depth > self.max_spawn_depth:
                     from power_loop.agent.runtime_types import RuntimeRequestError
                     raise RuntimeRequestError("invalid_options", f"child depth exceeds max {self.max_spawn_depth}")
+                root_session_id = str(parent["root_session_id"])
             await tx.execute(
                 f"INSERT INTO {self.t.sessions} ("
-                "session_id,parent_session_id,created_by_session_id,session_kind,descriptor_json,"
-                "descriptor_hash,creation_identity_hash,creation_call_ref_json,creation_tool_call_id,"
-                "start_input_message_id,tenant_id,principal_id,result_route_json,cancel_propagation,"
-                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
+                "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
+                "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
+                "tenant_id,principal_id,result_route_json,cancel_propagation,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    sid, parent_session_id, created_by_session_id, descriptor.kind, descriptor_json,
-                    descriptor_hash, identity, canonical(creation_call_ref) if creation_call_ref else None,
+                    sid, parent_session_id, created_by_session_id, root_session_id, depth,
+                    descriptor.kind, descriptor_json, descriptor_hash, identity,
+                    canonical(creation_call_ref) if creation_call_ref else None,
                     creation_tool_call_id, start_input_message_id, actor.tenant_id, actor.principal_id,
                     canonical(result_route) if result_route is not None else None,
                     cancel_propagation, now, now,
                 ),
             )
-            await tx.execute(f"INSERT INTO {self.t.session_state} (session_id) VALUES (?)", (sid,))
         return sid
 
     async def get_session(self, session_id: str) -> SessionRow | None:
@@ -508,19 +507,24 @@ class SessionStore:
     async def get_state(self, session_id: str) -> SessionStateRow | None:
         holding = self._holding(session_id)
         row = await self._db.fetchone(
-            f"SELECT * FROM {self.t.session_state} WHERE session_id=?", (session_id,)
+            f"SELECT session_id,next_seq,last_compact_seq,pending_tool_seq "
+            f"FROM {self.t.sessions} WHERE session_id=?", (session_id,)
         )
         if row is None:
             return None
-        holding.pending_known, holding.pending_json = True, row["pending_json"]
+        pts = int(row["pending_tool_seq"]) if row["pending_tool_seq"] is not None else None
+        holding.pending_known, holding.pending_tool_seq = True, pts
         holding.next_seq = int(row["next_seq"])
         return SessionStateRow(
             session_id=row["session_id"],
-            next_seq=row["next_seq"],
-            round_index=holding.deferred_round if holding.deferred_round is not None else row["round_index"],
-            last_compact_seq=row["last_compact_seq"],
-            pending=_loads(row["pending_json"]),
+            next_seq=int(row["next_seq"]),
+            round_index=holding.deferred_round if holding.deferred_round is not None else 0,
+            last_compact_seq=int(row["last_compact_seq"]),
+            pending={"assistant_seq": pts} if pts is not None else None,
         )
+
+    def _reads_for(self, session_id: str) -> send_reads.SessionHolding | None:
+        return send_reads.current(self, session_id)
 
     def begin_polling(self, session_id):
         changes = change_signals.ChangeReader(self, session_id)
@@ -552,34 +556,40 @@ class SessionStore:
     async def set_round_index(self, session_id: str, round_index: int) -> None:
         send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
-        self._holding(session_id).deferred_round = None
-        async with self._db.transaction() as tx:
-            sql, arguments, guarded = self._state_update(session_id, ['round_index=?'], (round_index,))
-            changed = await tx.execute(sql, arguments)
-            send_reads.lease_writer(self, session_id)
-            if guarded and changed != 1:
-                raise SessionLeaseLost(session_id)
+        holding = self._holding(session_id)
+        holding.deferred_round = int(round_index)
         if prior is not None:
-            send_reads.remember_state(self, session_id, replace(prior, round_index=round_index))
+            send_reads.remember_state(self, session_id, replace(prior, round_index=int(round_index)))
 
-    async def set_pending(self, session_id: str, pending: dict[str, Any] | None) -> None:
+    @staticmethod
+    def _pending_tool_seq_value(pending: dict[str, Any] | int | None) -> int | None:
+        if not pending:
+            return None
+        if isinstance(pending, int):
+            return int(pending)
+        if isinstance(pending, Mapping) and pending.get("assistant_seq") is not None:
+            return int(pending["assistant_seq"])
+        return None
+
+    async def set_pending(self, session_id: str, pending: dict[str, Any] | int | None) -> None:
         holding = self._holding(session_id)
         send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
+        pts = self._pending_tool_seq_value(pending)
         async with self._db.transaction() as tx:
-            sql, arguments, guarded = self._state_update(session_id, ['pending_json=?'],
-                # Normalize a falsy-but-non-None pending ({}) to SQL NULL, matching the
-                # empty-state representation so get_state(...).pending round-trips to None, not {}.
-                (_dumps(pending) if pending else None,))
+            sql, arguments, guarded = self._state_update(session_id, ['pending_tool_seq=?'], (pts,))
             changed = await tx.execute(sql, arguments)
             send_reads.lease_writer(self, session_id)
             if guarded and changed != 1:
                 raise SessionLeaseLost(session_id)
         if not holding.active:
             return
-        holding.pending_known, holding.pending_json = True, _dumps(pending) if pending else None
+        holding.pending_known, holding.pending_tool_seq = True, pts
         if prior is not None:
-            send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
+            send_reads.remember_state(
+                self, session_id,
+                replace(prior, pending={"assistant_seq": pts} if pts is not None else None),
+            )
 
     # ── messages ──────────────────────────────────────────────────────────────
     def _lease_write_guard(self, session_id):
@@ -590,43 +600,39 @@ class SessionStore:
         if lease is None:
             return "", ()
         lease.require_owned()
-        return " AND owner_epoch=? AND owner_token=?", (lease.epoch, lease.token)
+        return " AND owner_epoch=? AND execution_state='running'", (lease.epoch,)
 
     def _state_update(self, session_id, sets, values, *, condition='', condition_values=()):
         """Declare an ordinary mutation with its owner condition in the DML."""
         guard, lease_arguments = self._lease_write_guard(session_id)
-        statement = f'UPDATE {self.t.session_state} SET '+', '.join(sets)+' WHERE session_id=?'+condition+guard
+        statement = f'UPDATE {self.t.sessions} SET '+', '.join(sets)+' WHERE session_id=?'+condition+guard
         arguments = (*values, session_id, *condition_values, *lease_arguments)
         return statement, arguments, bool(guard)
 
     async def fence_owner_tx(self, tx, session_id, ownership):
-        """Owner fence for a derived write (design 215 §8.2), inside its transaction.
+        """Owner fence for a derived write (design 215/217), inside its transaction.
 
-        A conditional locking read: the row is locked AND the epoch/token must match in
-        the same statement, so a stale owner's late projection/journal/state write is
-        rejected before any derived row is touched. No read-then-compare race.
+        A conditional locking read: the row is locked AND owner_epoch + execution_state='running'
+        must match in the same statement, so a stale owner's late write is rejected before any
+        derived row is touched. No read-then-compare race.
         """
         if ownership is None:
             return
         suffix = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
         row = await tx.fetchone(
-            f"SELECT 1 AS ok FROM {self.t.session_state} WHERE session_id=? "
-            "AND owner_epoch=? AND owner_token=?" + suffix,
-            (session_id, ownership.epoch, ownership.token),
+            f"SELECT 1 AS ok FROM {self.t.sessions} WHERE session_id=? "
+            "AND owner_epoch=? AND execution_state='running'" + suffix,
+            (session_id, ownership.epoch),
         )
         if row is None:
             raise SessionLeaseLost(session_id)
 
     @staticmethod
     def fence_owner_row(row: Row, session_id: str, ownership) -> None:
-        """Fence a write whose transaction already locked and returned the state row.
-
-        Reuses the same locked row instead of a second ``SELECT ... FOR UPDATE`` on it; the
-        values are read under the session lock in the caller's transaction.
-        """
+        """Fence a write whose transaction already locked and returned the session row."""
         if ownership is None:
             return
-        if int(row["owner_epoch"]) != int(ownership.epoch) or row["owner_token"] != ownership.token:
+        if int(row["owner_epoch"]) != int(ownership.epoch) or row["execution_state"] != "running":
             raise SessionLeaseLost(session_id)
 
     async def last_assistant_ref(self, session_id: str, send_index: int):
@@ -666,6 +672,130 @@ class SessionStore:
                                      (session_id, integer_id(message_id)))
         return _row_to_message(row) if row else None
 
+    async def append_message_fenced(
+        self,
+        session_id: str,
+        *,
+        owner_epoch: int,
+        seq: int,
+        role: str,
+        content: str | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+        tool_call_id: str | None = None,
+        name: str | None = None,
+        round_index: int | None = None,
+        meta: dict[str, Any] | None = None,
+        send_index: int | None = None,
+        round_usage: Mapping[str, Any] | None = None,
+        boundary_wake_inbox_seq: int | None = None,
+        boundary_cancel_seq: int | None = None,
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Single-statement fenced INSERT ... SELECT FROM sessions (Design 217 §4.3).
+
+        Adds +0 control SQL per message/tool round. When ``boundary_wake_inbox_seq`` and
+        ``boundary_cancel_seq`` are provided (last tool of a round), piggybacks the boundary
+        check on the same INSERT; on 0 rows, diagnoses once, raises SessionLeaseLost if epoch
+        moved, or re-inserts the tool message and returns the fresh boundary row for draining.
+        """
+        holding = self._holding(session_id)
+        send_reads.lease_writer(self, session_id)
+        reads = send_reads.current(self, session_id)
+        if reads is not None and role == "assistant":
+            reads.assistant_send_index, reads.assistant_ref = None, None
+        now = _now_ms()
+        if round_usage is not None:
+            meta = {**(meta or {}), message_usage.META_KEY: dict(round_usage)}
+        calls_json = _dumps(tool_calls) if tool_calls else None
+        stored_call_id = _nul_safe(tool_call_id)
+        stored_send = int(send_index) if send_index is not None else None
+        meta_json = _dumps(meta or {})
+        dialect = self._db.dialect.name
+        if dialect == "postgres":
+            select_vals = (
+                "CAST(? AS TEXT), CAST(? AS BIGINT), CAST(? AS TEXT), CAST(? AS TEXT), "
+                "CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS BIGINT), "
+                "CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS BIGINT), CAST(? AS BIGINT)"
+            )
+        else:
+            select_vals = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        base_sql = (
+            f"INSERT INTO {self.t.messages} ("
+            "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
+            "round_index, state, meta_json, send_index, created_at) "
+            f"SELECT {select_vals} FROM {self.t.sessions} "
+            "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
+            "AND lifecycle IN ('open','suspended')"
+        )
+        base_values = (
+            session_id, seq, role, _nul_safe(name), _nul_safe(content),
+            calls_json, stored_call_id, round_index,
+            MessageState.ACTIVE.value, meta_json, stored_send, now,
+            session_id, int(owner_epoch),
+        )
+        piggyback = boundary_wake_inbox_seq is not None and boundary_cancel_seq is not None
+        if piggyback:
+            sql = (
+                base_sql
+                + " AND ((lifecycle='open' AND wake_inbox_seq=?) OR lifecycle='suspended') "
+                "AND cancel_seq=?"
+            )
+            values = (*base_values, int(boundary_wake_inbox_seq), int(boundary_cancel_seq))
+        else:
+            sql = base_sql
+            values = base_values
+
+        async def _run_insert(stmt, vals):
+            if dialect != "mysql" and self.has_message_ids:
+                row = await self._db.fetchone(stmt + " RETURNING id", vals)
+                return (1, int(row["id"])) if row is not None else (0, None)
+            rc = await self._db.execute(stmt, vals)
+            return rc, None
+
+        rc, row_id = await _run_insert(sql, values)
+        boundary_row: dict[str, Any] | None = None
+        if rc == 0:
+            diag = await self._db.fetchone(
+                f"SELECT inbox_version,wake_inbox_seq,cancel_seq,owner_epoch,cancel_by,"
+                f"cancel_reason,lifecycle,execution_state,background_version,runtime_version "
+                f"FROM {self.t.sessions} WHERE session_id=?",
+                (session_id,),
+            )
+            if (
+                diag is None
+                or int(diag["owner_epoch"]) != int(owner_epoch)
+                or diag["execution_state"] != "running"
+            ):
+                raise SessionLeaseLost(session_id)
+            boundary_row = dict(diag)
+            if diag["lifecycle"] not in ("open", "suspended"):
+                if holding.active:
+                    holding.piggyback_boundary = boundary_row
+                    holding.piggyback_verified = False
+                return seq, boundary_row
+            if not piggyback:
+                raise SessionLeaseLost(session_id)
+            rc2, row_id = await _run_insert(base_sql, base_values)
+            if rc2 == 0:
+                raise SessionLeaseLost(session_id)
+
+        if holding.active:
+            holding.next_seq = max(holding.next_seq or 0, seq + 1)
+            if piggyback:
+                if boundary_row is None:
+                    holding.piggyback_verified = True
+                    holding.piggyback_boundary = None
+                else:
+                    holding.piggyback_verified = False
+                    holding.piggyback_boundary = boundary_row
+            if row_id is not None:
+                self._remember_appended(
+                    session_id, seq, int(row_id), role, stored_call_id,
+                    stored_send, round_index, calls_json,
+                )
+            elif calls_json is not None:
+                holding.appended_call = (seq, calls_json)
+        return seq, boundary_row
+
     async def append_message(
         self,
         session_id: str,
@@ -682,66 +812,77 @@ class SessionStore:
         pending_tool_calls: bool = False,
         pending: Any = _KEEP,
         round_usage: Mapping[str, Any] | None = None,
+        fenced_fast: bool = False,
+        boundary_wake_inbox_seq: int | None = None,
+        boundary_cancel_seq: int | None = None,
     ) -> int:
-        """Append one message and return its allocated per-session ``seq`` (allocated +
-        inserted atomically in one transaction). ``send_index`` is the authoritative per-session
-        send index (a real column, NULL outside a send).
-
-        ``hook_injected`` (audit-only) records the EPHEMERAL context an ``LLM_BEFORE`` hook injected
-        into this round's LLM call (e.g. recalled memory) in ``session_runtime_state`` in the SAME
-        transaction — linked to this message's ``seq``. It NEVER touches the ``messages`` row itself,
-        so it can't reach history or the LLM request. Shape:
-        ``{hook_point, hook, position, kind, payload}``.
-
-        ``pending`` (a dict or ``None``) replaces the pending state in the same statement
-        that allocates ``seq``; it cannot depend on that seq."""
+        """Append one message and return its allocated per-session ``seq``."""
         holding = self._holding(session_id)
         send_reads.lease_writer(self, session_id)
         if type(pending_tool_calls) is not bool or pending_tool_calls and (role != "assistant" or not tool_calls):
             raise ValueError("invalid_pending_tool_message")
         if pending is not _KEEP and pending_tool_calls:
             raise ValueError("invalid_pending_tool_message")
+        if (
+            fenced_fast
+            and hook_injected is None
+            and holding.ownership is not None
+            and holding.next_seq is not None
+        ):
+            seq, _ = await self.append_message_fenced(
+                session_id,
+                owner_epoch=holding.ownership.epoch,
+                seq=int(holding.next_seq),
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+                tool_call_id=tool_call_id,
+                name=name,
+                round_index=round_index,
+                meta=meta,
+                send_index=send_index,
+                round_usage=round_usage,
+                boundary_wake_inbox_seq=boundary_wake_inbox_seq,
+                boundary_cancel_seq=boundary_cancel_seq,
+            )
+            return seq
         reads = send_reads.current(self, session_id)
         if reads is not None and role == "assistant":
-            # An unknown append outcome requires a stored read on close.
             reads.assistant_send_index, reads.assistant_ref = None, None
         now = _now_ms()
         if round_usage is not None:
-            # One response original contains its usage;no separate per-round
-            # write or failure window between the response and its accounting.
             meta = {**(meta or {}), message_usage.META_KEY: dict(round_usage)}
-        pending_json = _KEEP if pending is _KEEP else (_dumps(pending) if pending else None)
+        pending_seq = _KEEP if pending is _KEEP else self._pending_tool_seq_value(pending)
         deferred_round, holding.deferred_round = holding.deferred_round, None
         sets, params = [], []
-        if pending_json is not _KEEP:
-            sets.append("pending_json=?")
-            params.append(pending_json)
-        if deferred_round is not None:
-            sets.append("round_index=?")
-            params.append(deferred_round)
+        if pending_seq is not _KEEP:
+            sets.append("pending_tool_seq=?")
+            params.append(pending_seq)
         mysql = self._db.dialect.name == "mysql"
         expected = holding.next_seq
 
-        def atomic_pending(seq):
-            return _dumps({"assistant_seq": seq})
         committed, lease_lost, claim_changed = False, False, False
         prior = send_reads.take_state(self, session_id)
         signal_columns = ','.join(change_signals.COLUMNS)
         signal_values = None
+        touched = None
         try:
             async with self._db.transaction() as tx:
                 seq, state_written = None, False
                 if expected is not None:
-                    # The lease holder knows its next seq: one conditional UPDATE allocates it and
-                    # applies every state change; a miss (another writer) takes the locking path.
                     fast_sets, fast_params = list(sets), list(params)
                     if pending_tool_calls:
-                        fast_sets.append("pending_json=?")
-                        fast_params.append(atomic_pending(expected))
-                    guard = " AND pending_json IS NULL" if pending_tool_calls else ""
+                        fast_sets.append("pending_tool_seq=?")
+                        fast_params.append(expected)
+                    if now - holding.touched >= _TOUCH_INTERVAL_MS:
+                        fast_sets.append("updated_at=?")
+                        fast_params.append(now)
+                        touched = now
+                    guard = " AND pending_tool_seq IS NULL" if pending_tool_calls else ""
+                    next_seq_cond = " AND next_seq<=?" if holding.ownership is not None else " AND next_seq=?"
                     statement, arguments, guarded = self._state_update(session_id,
                         ['next_seq=?', *fast_sets], (expected+1, *fast_params),
-                        condition=' AND next_seq=?'+guard, condition_values=(expected,))
+                        condition=next_seq_cond+guard, condition_values=(expected,))
                     if mysql:
                         matched = await tx.execute(statement, arguments) == 1
                     else:
@@ -752,31 +893,34 @@ class SessionStore:
                     if matched:
                         seq, state_written = expected, True
                     elif guarded:
-                        # An owned send cannot allocate past another writer.
                         raise SessionLeaseLost(session_id)
                 if seq is not None:
                     pass
                 elif mysql:
-                    st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+                    st = await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
                     seq = int(st["next_seq"])
-                    if pending_tool_calls and st["pending_json"] is not None:
+                    if pending_tool_calls and st["pending_tool_seq"] is not None:
                         raise ValueError("pending_tool_calls_exist")
                 else:
-                    # One statement locks the state row, allocates the seq and applies state changes.
-                    guard = " AND pending_json IS NULL" if pending_tool_calls else ""
+                    guard = " AND pending_tool_seq IS NULL" if pending_tool_calls else ""
+                    extra_sets, extra_params = list(sets), list(params)
+                    if now - holding.touched >= _TOUCH_INTERVAL_MS:
+                        extra_sets.append("updated_at=?")
+                        extra_params.append(now)
+                        touched = now
                     statement, arguments, guarded = self._state_update(session_id,
-                        ['next_seq=next_seq+1', *sets], params, condition=guard)
+                        ['next_seq=next_seq+1', *extra_sets], extra_params, condition=guard)
                     st = await tx.fetchone(statement+f' RETURNING next_seq,{signal_columns}', arguments)
                     if st is None:
                         if pending_tool_calls and await tx.fetchone(
-                                f"SELECT 1 AS present FROM {self.t.session_state} WHERE session_id=?", (session_id,)):
+                                f"SELECT 1 AS present FROM {self.t.sessions} WHERE session_id=?", (session_id,)):
                             raise ValueError("pending_tool_calls_exist")
                         if guarded:
                             raise SessionLeaseLost(session_id)
                         raise ValueError(f"unknown session: {session_id}")
                     seq = int(st["next_seq"]) - 1
                     signal_values = tuple(st[column] for column in change_signals.COLUMNS)
-                    state_written = None  # Allocation and plain state changes only.
+                    state_written = None
                 send_reads.lease_writer(self, session_id)
                 calls_json = _dumps(tool_calls) if tool_calls else None
                 stored_call_id = _nul_safe(tool_call_id)
@@ -797,30 +941,32 @@ class SessionStore:
                 elif self._db.dialect.name == "mysql":
                     await tx.execute(insert, values)
                     snapshot = await tx.fetchone(f"SELECT LAST_INSERT_ID() AS id,{signal_columns} "
-                                                 f"FROM {self.t.session_state} WHERE session_id=?", (session_id,))
+                                                 f"FROM {self.t.sessions} WHERE session_id=?", (session_id,))
                     row_id = snapshot["id"]
                     signal_values = tuple(snapshot[column] for column in change_signals.COLUMNS)
                 else:
                     row_id = (await tx.fetchone(insert + " RETURNING id", values))["id"]
                 if state_written is False:
+                    fin_sets, fin_params = list(sets), list(params)
+                    if pending_tool_calls:
+                        fin_sets.append("pending_tool_seq=?")
+                        fin_params.append(seq)
+                    if now - holding.touched >= _TOUCH_INTERVAL_MS:
+                        fin_sets.append("updated_at=?")
+                        fin_params.append(now)
+                        touched = now
                     statement, arguments, guarded = self._state_update(session_id,
-                        ['next_seq=?', *sets], (seq+1, *params))
+                        ['next_seq=?', *fin_sets], (seq+1, *fin_params))
                     changed = await tx.execute(statement, arguments)
                     if guarded and changed != 1:
                         raise SessionLeaseLost(session_id)
-                if now - holding.touched >= _TOUCH_INTERVAL_MS:
-                    # Activity time, not ordering: at most one write per session per interval.
+                elif pending_tool_calls and state_written is None:
                     await tx.execute(
-                        f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
+                        f"UPDATE {self.t.sessions} SET pending_tool_seq=? WHERE session_id=?",
+                        (seq, session_id),
                     )
-                    touched = now
-                else:
-                    touched = None
                 if pending_tool_calls:
-                    pending_json = atomic_pending(seq)
-                    if state_written is not True:
-                        await tx.execute(f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
-                                         (pending_json, session_id))
+                    pending_seq = seq
                 if hook_injected:
                     await self._put_aux(tx, session_id, f'hook:{seq}', {
                         'session_id': session_id, 'event_id': seq, 'message_seq': seq,
@@ -832,8 +978,6 @@ class SessionStore:
                     })
             committed = True
         except InboxClaimChanged:
-            # The transaction rolled back its allocation. Retain the known seq:
-            # NULL would make this live owner's next conditional write miss.
             claim_changed = True
             raise
         except SessionLeaseLost:
@@ -847,20 +991,18 @@ class SessionStore:
                 if deferred_round is not None:
                     holding.deferred_round = holding.deferred_round if holding.deferred_round is not None else deferred_round
         if not holding.active:
-            # The SQL committed before release, but its ACK arrived in a later
-            # period. Keep that period's mutable hints and pending marker.
             return seq
         holding.next_seq = seq + 1
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, next_seq=seq + 1,
-                pending=prior.pending if pending_json is _KEEP else _loads(pending_json),
+                pending=prior.pending if pending_seq is _KEEP else ({"assistant_seq": pending_seq} if pending_seq is not None else None),
                 round_index=deferred_round if deferred_round is not None else prior.round_index))
         if signal_values is not None:
             holding.change_snapshot = seq, signal_values
         if touched is not None:
             holding.touched = touched
-        if pending_json is not _KEEP:
-            holding.pending_known, holding.pending_json = True, pending_json
+        if pending_seq is not _KEEP:
+            holding.pending_known, holding.pending_tool_seq = True, pending_seq
         if row_id is not None:
             self._remember_appended(session_id, seq, int(row_id), role, stored_call_id, stored_send,
                                     round_index, calls_json)
@@ -1182,7 +1324,7 @@ class SessionStore:
         send_reads.forget(self, session_id, "state")
         now = _now_ms()
         async with self._db.transaction() as tx:
-            st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            st = await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
             send_reads.lease_writer(self, session_id)
             note_seq = int(st["next_seq"])
             compact_seq = int(st["last_compact_seq"]) + 1
@@ -1226,12 +1368,9 @@ class SessionStore:
                 to_seq=span_to,before_tokens=before_tokens,after_tokens=after_tokens,
                 round_index=round_index,created_at=now))
             statement, arguments, guarded = self._state_update(session_id,
-                ['next_seq=?', 'last_compact_seq=?'], (note_seq + 1, compact_seq))
+                ['next_seq=?', 'last_compact_seq=?', 'updated_at=?'], (note_seq + 1, compact_seq, now))
             if await tx.execute(statement, arguments) != 1 and guarded:
                 raise SessionLeaseLost(session_id)
-            await tx.execute(
-                f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
-            )
         if holding.active:
             holding.next_seq = note_seq + 1
         return compact_seq, note_seq
@@ -1348,7 +1487,7 @@ class SessionStore:
             # Standalone CRUD participates in the same revision fence. Low-level
             # callers may store unattached projections, so this row can be absent.
             suffix = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
-            await tx.fetchone(f"SELECT next_seq FROM {self.t.session_state} WHERE session_id=?" + suffix,
+            await tx.fetchone(f"SELECT next_seq FROM {self.t.sessions} WHERE session_id=?" + suffix,
                               (session_id,))
             await self.fence_owner_tx(tx, session_id, ownership)
             from .projection_fold import invalidate
@@ -1487,7 +1626,7 @@ class SessionStore:
             # Lock the state row first; the statistics are a mutable fact and must be read
             # with a fresh statement AFTER the lock, not from a join snapshot taken while
             # waiting for it (PostgreSQL keeps the pre-wait row version of an unlocked join).
-            locked = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            locked = await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
             self.fence_owner_row(locked, session_id, ownership)
             state = await read_state(self, tx, session_id)
             if expected_projection_revision is not None:
@@ -1586,7 +1725,7 @@ class SessionStore:
     async def create_timer(self, session_id, *, due_at, note, interval_s=None, tx=None):
         if tx is None:
             async with self._db.transaction() as tx:
-                await self._db.dialect.lock_state(tx,self.t.session_state,session_id)
+                await self._db.dialect.lock_state(tx,self.t.sessions,session_id)
                 return await self.create_timer(session_id,due_at=due_at,note=note,interval_s=interval_s,tx=tx)
         row = await tx.fetchone(f"SELECT COALESCE(MAX({self._json_field('timer_id',number=True)}),0)+1 AS id "
             f"FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key LIKE 'timer:%'", (session_id,))
@@ -1688,7 +1827,7 @@ class SessionStore:
 
     async def add_note(self, session_id,content, *, pinned=False):
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx,self.t.session_state,session_id)
+            await self._db.dialect.lock_state(tx,self.t.sessions,session_id)
             row = await tx.fetchone(f"SELECT COALESCE(MAX({self._json_field('note_id',number=True)}),0)+1 AS id "
                 f"FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key LIKE 'note:%'", (session_id,))
             now, nid = _now_ms(), int(row['id'])
@@ -1698,7 +1837,7 @@ class SessionStore:
 
     async def update_note(self,session_id,note_id, *, content=None,pinned=None):
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx,self.t.session_state,session_id)
+            await self._db.dialect.lock_state(tx,self.t.sessions,session_id)
             key = f'note:{int(note_id)}'
             row = await tx.fetchone(f'SELECT value_json FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?',(session_id,key))
             if row is None:
@@ -1796,7 +1935,7 @@ class SessionStore:
         values.update({k: int(usage.get(k) or 0) for k in ('prompt_tokens','completion_tokens','total_tokens')})
         values['cached_tokens'] = int(usage.get('cache_read_tokens') or usage.get('cached_tokens') or 0)
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
             await self._bump_stats(tx, session_id, values)
 
     async def record_auxiliary_usage(
@@ -1806,7 +1945,7 @@ class SessionStore:
         now = _now_ms()
         key = "tool_context_usage:" + attempt_id
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
             found = await tx.fetchone(
                 f"SELECT value_json FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?",
                 (session_id, key),
@@ -1858,7 +1997,7 @@ class SessionStore:
             raise ValueError('usage pruning requires a session')
         cutoff = None if older_than_ms is None else (_now_ms() if now is None else now)-int(older_than_ms)
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
             rows = await self.list_usage_rounds(session_id, transaction=tx)
             if keep_last and keep_last > 0:
                 rows = rows[:-keep_last]
@@ -1936,7 +2075,7 @@ class SessionStore:
         pair, whose two awaits yield the event loop between read and write and so lose
         updates when parallel coroutines interleave.
 
-        Locking the always-present ``session_state`` row (not the possibly-absent
+        Locking the always-present ``sessions`` row (not the possibly-absent
         runtime-state row) also serializes the *first* writer of a brand-new key. ``fn``
         must be a plain (non-coroutine) callable. Returns the persisted new value, or the
         unchanged current value when ``fn`` skips. Raises ``ValueError`` for an unknown
@@ -1944,7 +2083,7 @@ class SessionStore:
         holding = self._holding(session_id)
         now = _now_ms()
         async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
             row = await tx.fetchone(
                 f"SELECT value_json FROM {self.t.session_runtime_state} "
                 "WHERE session_id=? AND state_key=?",
@@ -2080,18 +2219,10 @@ class SessionStore:
     async def import_session(
         self, data: Mapping[str, Any], *, new_session_id: str | None = None
     ) -> str:
-        """Unsupported under schema 17 (design 215). Raises ``capability_unavailable``.
-
-        ``export_session`` remains available for audit; a schema-native import is a
-        later-phase concern and is not silently emulated with the old id-copying logic."""
-        # Schema 17 exports carry the raw messages.id and the session-native lineage
-        # columns; the pre-215 import copied ids verbatim (UNIQUE conflict) and reset
-        # spawn columns that no longer exist. Cross-store import is not part of the
-        # session-native main path; it is explicitly unsupported rather than silently
-        # producing a corrupt restore (design 215 G1-R1 residual).
+        """Unsupported under schema 18 (design 217). Raises ``capability_unavailable``."""
         from power_loop.agent.runtime_types import RuntimeRequestError
         raise RuntimeRequestError(
-            "capability_unavailable", "import_session is not supported by schema 17"
+            "capability_unavailable", "import_session is not supported by schema 18"
         )
 
 # ── row converters (dict rows; backend-agnostic) ────────────────────────────────
@@ -2107,6 +2238,7 @@ def _row_to_session(row: Row) -> SessionRow:
         cancel_propagation=row["cancel_propagation"], tenant_id=row["tenant_id"],
         principal_id=row["principal_id"], descriptor=RuntimeDescriptor(**json.loads(row["descriptor_json"])),
         result_route=_loads(row["result_route_json"]),
+        root_session_id=row["root_session_id"], depth=int(row["depth"]),
     )
 
 

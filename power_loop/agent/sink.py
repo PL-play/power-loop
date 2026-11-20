@@ -98,11 +98,9 @@ class SQLiteSink:
 
     Pending state machine
     ---------------------
-    ``session_state.pending_json`` is set the moment the assistant emits
-    ``tool_calls`` and is cleared once every matching ``tool`` message has
-    been appended. Crash anywhere in between leaves the session in a
-    *pending* state that the next :meth:`StatefulAgentLoop.send` will refuse
-    until the caller picks resume/abort.
+    ``sessions.pending_tool_seq`` (or dangling ``assistant(tool_calls)`` in
+    ``messages`` under session-core fenced appends) tracks unresolved tool calls
+    between the assistant emission and the last matching ``tool`` message.
     """
 
     def __init__(self, store: SessionStore, session_id: str) -> None:
@@ -212,13 +210,20 @@ class SQLiteSink:
     async def on_message_appended(
         self, message: LoopMessage, *, round_index: int | None
     ) -> None:
+        from power_loop.runtime.task_runtime import current_session_send
+
         role = message.get("role")
         usage = message.get("_round_usage")
         usage_options = {"round_usage": _usage_columns(usage)} if usage else {}
+        session_send = current_session_send(self.store, self.session_id)
+        reads_getter = getattr(self.store, "_reads_for", None)
+        holding = reads_getter(self.session_id) if (session_send is not None and reads_getter is not None) else None
+        use_fenced = holding is not None and holding.next_seq is not None and holding.ownership is not None
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
             text, structured = _encode_content(message.get("content"))
             resolves = bool(tool_call_id) and tool_call_id in self._unresolved
+            is_last_tool = resolves and len(self._unresolved) == 1
             meta = dict(message.get("meta") or {})
             meta.pop("_assistant_seq", None)
             if resolves and self._assistant_seq is not None:
@@ -226,8 +231,13 @@ class SQLiteSink:
             # Keep the caller's message untouched and capture the same source we persist,
             # before the last result clears this sink's pending assistant.
             message = {**message, "meta": meta}
-            options = dict(usage_options)
-            if resolves and len(self._unresolved) == 1:
+            options: dict[str, Any] = dict(usage_options)
+            if use_fenced:
+                options["fenced_fast"] = True
+                if is_last_tool and holding.wake_inbox_seq is not None and holding.cancel_seq is not None:
+                    options["boundary_wake_inbox_seq"] = holding.wake_inbox_seq
+                    options["boundary_cancel_seq"] = holding.cancel_seq
+            elif is_last_tool:
                 options["pending"] = None
             seq = await self.store.append_message(
                 self.session_id,
@@ -257,10 +267,16 @@ class SQLiteSink:
             if message.get("reasoning_content"):
                 meta = {**(meta or {}), "reasoning_content": message["reasoning_content"],
                         "reasoning_model": message.get("_reasoning_model", "")}
+            if not tool_calls and "_cumulative_usage" in message and message["_cumulative_usage"] is not None:
+                from .runtime_types import plain
+                meta = {**(meta or {}), "usage": plain(message["_cumulative_usage"])}
             from power_loop.runtime.task_runtime import atomic_pending_required
-            options = ({"pending_tool_calls": True}
-                       if tool_calls and atomic_pending_required(self.store, self.session_id) else {})
-            options.update(usage_options)
+            hook_injected = message.get("hook_injected")
+            options = dict(usage_options)
+            if use_fenced and hook_injected is None:
+                options["fenced_fast"] = True
+            elif tool_calls and atomic_pending_required(self.store, self.session_id):
+                options["pending_tool_calls"] = True
             seq = await self.store.append_message(
                 self.session_id,
                 role="assistant",
@@ -269,7 +285,7 @@ class SQLiteSink:
                 round_index=round_index,
                 meta=meta,
                 send_index=message.get("send_index"),
-                hook_injected=message.get("hook_injected"),
+                hook_injected=hook_injected,
                 **options,
             )
             self._history_seqs.append(seq)
@@ -296,6 +312,9 @@ class SQLiteSink:
             # Which inbox items this row carries (dedupe/audit; design/124 §6).
             meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
                                               if k in inbox}}
+        user_opts = dict(usage_options)
+        if use_fenced and inbox is None:
+            user_opts["fenced_fast"] = True
         seq = await self.store.append_message(
             self.session_id,
             role=str(role or "user"),
@@ -304,7 +323,7 @@ class SQLiteSink:
             round_index=round_index,
             meta=meta,
             send_index=message.get("send_index"),
-            **usage_options,
+            **user_opts,
         )
         self._history_seqs.append(seq)
         self._history_ord.append(seq)
@@ -320,22 +339,19 @@ class SQLiteSink:
     ) -> None:
         ids = [str(tc.get("id") or "") for tc in tool_calls if tc.get("id")]
         self._unresolved = set(ids)
-        # Prefer the DB seq captured when the assistant row was appended (on_message_appended set
-        # self._assistant_seq to the store seq) over the caller's in-memory history INDEX, which
-        # diverges from the store seq once history is compacted/projected/rebuilt — persisting the
-        # index as assistant_seq would point resume at the wrong row (pipeline-runner-4). Fall back
-        # to the passed value only if no row seq was captured.
         seq = self._assistant_seq if self._assistant_seq is not None else assistant_seq
         self._assistant_seq = seq
-        from power_loop.runtime.task_runtime import atomic_pending_required
+        from power_loop.runtime.task_runtime import atomic_pending_required, current_session_send
+        if current_session_send(self.store, self.session_id) is not None:
+            # Session-Core fenced appends carry +0 control SQL per tool round; crash
+            # recovery detects dangling assistant(tool_calls) directly from messages.
+            return
         if atomic_pending_required(self.store, self.session_id) and seq == self._assistant_seq:
-            # The assistant append already persisted pending atomically with the row
-            # (design 215 §8.3); a second set_pending would be a redundant control write.
             return
         pending = {"assistant_seq": seq}
         known = getattr(self.store, "known_pending", None)
         if known is not None and known(self.session_id) == (True, pending):
-            return  # The assistant append already committed exactly this state.
+            return
         await self.store.set_pending(self.session_id, pending)
 
     async def on_compaction(

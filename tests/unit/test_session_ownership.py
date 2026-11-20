@@ -53,7 +53,7 @@ async def test_owner_fence_renew_final_release_and_stale_handle(registry_store):
     coordinator = StoreSessionOwnershipCoordinator(store)
     lease = SessionOwnership(
         (store.store_id, root.session_id), "a", time.monotonic() + 90, lambda: None,
-        token=batch.owner_token, epoch=batch.owner_epoch, node_id="a", boot_id="a",
+        epoch=batch.owner_epoch, node_id="a", boot_id="a",
     )
     assert await coordinator.acquire(
         lease.key, owner_id="b", ttl_s=30, on_lost=lambda: None
@@ -70,10 +70,10 @@ async def test_owner_fence_renew_final_release_and_stale_handle(registry_store):
     assert new_batch.owner_epoch == batch.owner_epoch + 1
     await coordinator.release(lease)
     state = await store._db.fetchone(
-        f"SELECT owner_epoch,owner_token FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT owner_epoch,owner_node_id FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,),
     )
-    assert state == {"owner_epoch": new_batch.owner_epoch, "owner_token": new_batch.owner_token}
+    assert state == {"owner_epoch": new_batch.owner_epoch, "owner_node_id": "b"}
     await port.final(new_batch, final_text="new")
 
 
@@ -85,7 +85,7 @@ async def test_shared_coordinator_takeover_enters_recovery_before_release(regist
     await port.accept(root, "one", message_id="one", actor=ACTOR)
     await port.claim(root, node_id="old", boot_id="old")
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (root.session_id,),
     )
     coordinator = StoreSessionOwnershipCoordinator(store)
@@ -111,14 +111,14 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
     await port.accept(root, "one", message_id="one", actor=ACTOR)
     old = await port.claim(root, node_id="old", boot_id="old")
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (root.session_id,),
     )
     await port.accept(root, "two", message_id="two", actor=ACTOR)
-    with pytest.raises(SessionLeaseLost):
-        await port.cancel_active(old)
     recovered = await port.recover(root, node_id="new", boot_id="new")
     assert recovered.execution_state == "queued"
+    with pytest.raises(SessionLeaseLost):
+        await port.cancel_active(old)
 
     # A fresh claim replaces only an expired run through real recovery, never
     # through the removed standalone installer.
@@ -126,7 +126,7 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
     assert active.owner_epoch > old.owner_epoch
     assert await port.claim(root, node_id="replacement", boot_id="replacement") is None
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
         (root.session_id,),
     )
     await port.accept(root, "three", message_id="three", actor=ACTOR)
@@ -134,14 +134,13 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
     assert recovered.execution_state == "queued"
     replacement = await port.claim(root, node_id="replacement", boot_id="replacement")
     assert replacement.owner_epoch > active.owner_epoch
-    assert replacement.owner_token != active.owner_token
     with pytest.raises(SessionLeaseLost):
         await port.final(active, final_text="stale")
     state = await store._db.fetchone(
-        f"SELECT owner_epoch,owner_token FROM {store.t.session_state} WHERE session_id=?",
+        f"SELECT owner_epoch,owner_node_id FROM {store.t.sessions} WHERE session_id=?",
         (root.session_id,),
     )
-    assert state == {"owner_epoch": replacement.owner_epoch, "owner_token": replacement.owner_token}
+    assert state == {"owner_epoch": replacement.owner_epoch, "owner_node_id": "replacement"}
     await port.final(replacement, final_text="current")
     await port.accept(root, "closed input", message_id="closed", actor=ACTOR)
 
@@ -154,7 +153,7 @@ async def test_session_owner_fence_blocks_stale_active_writes(registry_store):
             await port.accept(root, "late", message_id="late", actor=ACTOR)
         assert await port.claim(root, node_id="late", boot_id="late") is None
         state = await store._db.fetchone(
-            f"SELECT owner_epoch,owner_token FROM {store.t.session_state} WHERE session_id=?",
+            f"SELECT owner_epoch,owner_node_id FROM {store.t.sessions} WHERE session_id=?",
             (root.session_id,),
         )
-        assert state == {"owner_epoch": replacement.owner_epoch, "owner_token": None}
+        assert state == {"owner_epoch": replacement.owner_epoch, "owner_node_id": None}

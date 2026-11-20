@@ -24,7 +24,7 @@ async def test_message_identity_reopen_old_reject(registry_store):
     assert first_ref.id != second_ref.id and first_ref.store_id == second_ref.store_id == store.store_id
     assert first_ref.to_dict()["id"] == str(first_ref.id)
     reopened = await connect(schema="verify")
-    assert reopened.schema_version == CURRENT_SCHEMA_VERSION == 17
+    assert reopened.schema_version == CURRENT_SCHEMA_VERSION == 18
     assert await reopened.message_ref(first, 1) == first_ref
 
 
