@@ -29,6 +29,14 @@ async def _waiter_probe(store, *, started, locked):
     original_transaction, original_lock = db.transaction, db.dialect.lock_state
     sessions_table = store.t.sessions
 
+    def _is_locking_sessions(sql: str) -> bool:
+        if sessions_table not in sql:
+            return False
+        upper = sql.lstrip().upper()
+        if upper.startswith(("UPDATE", "INSERT", "DELETE")):
+            return True
+        return "FOR UPDATE" in upper
+
     class _ProbedTx:
         def __init__(self, inner):
             self._inner = inner
@@ -38,25 +46,25 @@ async def _waiter_probe(store, *, started, locked):
 
         async def execute(self, sql, params=()):
             res = await self._inner.execute(sql, params)
-            if sessions_table in sql:
+            if _is_locking_sessions(sql):
                 locked.set()
             return res
 
         async def fetchone(self, sql, params=()):
             res = await self._inner.fetchone(sql, params)
-            if sessions_table in sql:
+            if _is_locking_sessions(sql):
                 locked.set()
             return res
 
         async def fetchall(self, sql, params=()):
             res = await self._inner.fetchall(sql, params)
-            if sessions_table in sql:
+            if _is_locking_sessions(sql):
                 locked.set()
             return res
 
         async def execute_packed(self, sql, params=()):
             res = await self._inner.execute_packed(sql, params)
-            if sessions_table in sql:
+            if _is_locking_sessions(sql):
                 locked.set()
             return res
 

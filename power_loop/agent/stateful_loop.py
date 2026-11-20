@@ -1029,6 +1029,8 @@ class _ExecutionLoop:
                 reads.next_seq = batch.message_seq + 1
                 reads.wake_inbox_seq = batch.wake_inbox_seq
                 reads.cancel_seq = batch.cancel_seq
+                reads.background_version = batch.background_version
+                reads.runtime_version = batch.runtime_version
                 # The claim's post-lock session row already tells us when the session was last
                 # active. Seed the existing touch throttle with that fact; a scope holding a
                 # newer value keeps it. No extra read/cache: the claim write fence still runs.
@@ -1173,6 +1175,9 @@ class _ExecutionLoop:
             loop_token = set_current_loop(self)
             tools_token = set_effective_tools(_eff_tools)
             changes, changes_token = store.begin_polling(sid)
+            changes.versions = (
+                batch.inbox_version, batch.background_version, batch.runtime_version,
+            )
             try:
                 async def _drain(*, force=False):
                     if boundary is None:

@@ -831,6 +831,12 @@ class RuntimeWorker:
                 holding.piggyback_boundary = None
                 holding.piggyback_verified = False
                 round_zero_fresh[0] = False
+                from power_loop.runtime.store.change_signals import COLUMNS, reader
+                changes = reader(self.runtime.store, target.session_id)
+                if changes is not None:
+                    changes.versions = tuple(diag[column] for column in COLUMNS)
+                holding.background_version = int(diag["background_version"])
+                holding.runtime_version = int(diag["runtime_version"])
                 if (
                     diag["lifecycle"] in ("closing", "closed")
                     or int(diag["cancel_seq"]) > batch.cancel_seq
@@ -887,6 +893,9 @@ class RuntimeWorker:
             changes = reader(self.runtime.store, target.session_id)
             if changes is not None:
                 changes.versions = tuple(row[column] for column in COLUMNS)
+            if holding is not None:
+                holding.background_version = int(row["background_version"])
+                holding.runtime_version = int(row["runtime_version"])
             if final:
                 # Final boundary only checks cancel/lease; final() transitions remaining pending to queued.
                 return []

@@ -129,6 +129,8 @@ class ClaimedBatch:
     result_route: dict | None
     session_updated_at: int
     inbox_version: int = 0
+    background_version: int = 0
+    runtime_version: int = 0
     wake_inbox_seq: int = 0
     cancel_seq: int = 0
     cancel_by: str | None = None
@@ -1292,7 +1294,8 @@ class RuntimeInputStore:
                         if rc == 0:
                             raise _AcceptSlowPath("not_idle_fast")
                         srow = await tx.fetchone(
-                            "SELECT owner_epoch,send_index,inbox_version,wake_inbox_seq,next_seq,"
+                            "SELECT owner_epoch,send_index,inbox_version,background_version,"
+                            "runtime_version,wake_inbox_seq,next_seq,"
                             "cancel_seq,depth,session_kind,tenant_id,principal_id,parent_session_id,"
                             "root_session_id,result_route_json,start_input_message_id,"
                             f"descriptor_json,updated_at FROM {self.s} WHERE session_id=?",
@@ -1323,7 +1326,8 @@ class RuntimeInputStore:
                             f"AND ({pt} IS NULL OR session_id={pt} OR parent_session_id={pt}) "
                             f"AND ({pi} IS NULL OR {pi}>{now_sql}) "
                             f"AND {pi}<={pi} "
-                            "RETURNING owner_epoch,send_index,inbox_version,wake_inbox_seq,next_seq,"
+                            "RETURNING owner_epoch,send_index,inbox_version,background_version,"
+                            "runtime_version,wake_inbox_seq,next_seq,"
                             "cancel_seq,depth,session_kind,tenant_id,principal_id,parent_session_id,"
                             "root_session_id,result_route_json,start_input_message_id,"
                             "descriptor_json,updated_at",
@@ -1405,6 +1409,8 @@ class RuntimeInputStore:
                         ),
                         session_updated_at=db_now,
                         inbox_version=new_inbox_ver,
+                        background_version=int(srow["background_version"]),
+                        runtime_version=int(srow["runtime_version"]),
                         wake_inbox_seq=new_wake_seq,
                         cancel_seq=int(srow["cancel_seq"]),
                         start_input_message_id=srow["start_input_message_id"],
@@ -1484,7 +1490,8 @@ class RuntimeInputStore:
                     if rc == 0:
                         return None
                     joined = await tx.fetchall(
-                        "SELECT s.owner_epoch,s.send_index,s.inbox_version,s.wake_inbox_seq,"
+                        "SELECT s.owner_epoch,s.send_index,s.inbox_version,s.background_version,"
+                        "s.runtime_version,s.wake_inbox_seq,"
                         "s.next_seq,s.cancel_seq,s.cancel_by,s.pending_tool_seq,s.depth,"
                         "s.session_kind,s.tenant_id,s.principal_id,s.parent_session_id,"
                         "s.root_session_id,s.result_route_json,s.start_input_message_id,"
@@ -1553,7 +1560,8 @@ class RuntimeInputStore:
                         f"updated_at={now_sql} "
                         "WHERE session_id=? AND lifecycle='open' "
                         "AND execution_state='queued' AND wake_pending_count>0 "
-                        "RETURNING owner_epoch,send_index,inbox_version,wake_inbox_seq,"
+                        "RETURNING owner_epoch,send_index,inbox_version,background_version,"
+                        "runtime_version,wake_inbox_seq,"
                         "next_seq,cancel_seq,cancel_by,pending_tool_seq,depth,"
                         "session_kind,tenant_id,principal_id,parent_session_id,"
                         "root_session_id,result_route_json,start_input_message_id,"
@@ -1693,6 +1701,8 @@ class RuntimeInputStore:
                     ),
                     session_updated_at=db_now,
                     inbox_version=int(srow["inbox_version"]),
+                    background_version=int(srow["background_version"]),
+                    runtime_version=int(srow["runtime_version"]),
                     wake_inbox_seq=int(srow["wake_inbox_seq"]),
                     cancel_seq=int(srow["cancel_seq"]),
                     cancel_by=srow["cancel_by"],
@@ -1748,6 +1758,8 @@ class RuntimeInputStore:
             ),
             session_updated_at=db_now,
             inbox_version=int(srow["inbox_version"]),
+            background_version=int(srow["background_version"]),
+            runtime_version=int(srow["runtime_version"]),
             wake_inbox_seq=int(srow["wake_inbox_seq"]),
             cancel_seq=int(srow["cancel_seq"]),
             cancel_by=srow["cancel_by"],
@@ -2808,6 +2820,8 @@ class RuntimeInputStore:
             ),
             session_updated_at=int(srow["updated_at"]),
             inbox_version=int(srow["inbox_version"]),
+            background_version=int(srow["background_version"]),
+            runtime_version=int(srow["runtime_version"]),
             wake_inbox_seq=int(srow["wake_inbox_seq"]),
             cancel_seq=int(srow["cancel_seq"]),
             cancel_by=srow["cancel_by"],
@@ -3056,14 +3070,10 @@ class RuntimeInputStore:
                 lvl_ids = desc_by_depth[d_val]
                 stopped_descendants.extend(lvl_ids)
                 ph = ",".join("?" for _ in lvl_ids)
-                if self._dialect in ("postgres", "mysql") and len(lvl_ids) > 1:
-                    await tx.fetchall(
-                        f"SELECT session_id FROM {self.s} WHERE session_id IN ({ph}) "
-                        "ORDER BY session_id ASC FOR UPDATE",
-                        tuple(lvl_ids),
-                    )
+                lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
                 lvl_rows = await tx.fetchall(
-                    f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) ORDER BY session_id ASC",
+                    f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) "
+                    f"ORDER BY session_id ASC{lock_suffix}",
                     tuple(lvl_ids),
                 )
                 for drow in lvl_rows:

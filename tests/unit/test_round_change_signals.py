@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 async def versions(store, sid):
-    row = await store._db.fetchone(f"SELECT {','.join(COLUMNS)} FROM {store.t.session_state} WHERE session_id=?", (sid,))
+    row = await store._db.fetchone(f"SELECT {','.join(COLUMNS)} FROM {store.t.sessions} WHERE session_id=?", (sid,))
     return tuple(row[column] for column in COLUMNS)
 
 
@@ -140,12 +140,16 @@ async def test_update_during_last_model_round_is_consumed_before_completion(regi
             await inject()
         model.release.set()
         result = await asyncio.wait_for(sending, 20)
-        assert result.status == "completed" and result.final_text == "updated"
-        assert len(model.calls) == 2 and "once" in model.calls[1]
+        # Design 217 §4.3: 0-tool final boundary pays 0 SQL; a normal-priority input arriving
+        # during the final model round transitions the session to 'queued' in final() and is
+        # consumed on the immediately following send without losing the input.
+        assert result.status == "completed" and result.final_text == "first"
         late = await runner.runtime.client.wait(
             __import__('power_loop').InputRef(store.store_id, runner.target.session_id, 'late'),
             actor=runner.actor, deadline_ms=now_ms()+5000)
-        assert late.send_index == result.send_index
+        assert late.status == "completed" and late.final_text == "updated"
+        assert late.send_index == result.send_index + 1
+        assert len(model.calls) == 2 and "once" in model.calls[1]
     finally:
         model.release.set()
         await runner.aclose()

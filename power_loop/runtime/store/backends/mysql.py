@@ -62,9 +62,19 @@ class _MyTransaction:
 
     async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
         # LAST_INSERT_ID(expr) in the 1st SET slot returns packed bits in the OK packet.
+        # When an AFTER UPDATE trigger runs DML on the table, MySQL 8.4 overwrites the OK
+        # packet's lastrowid with 0 while preserving session-level LAST_INSERT_ID(). Fall
+        # back to SELECT LAST_INSERT_ID() only when rowcount > 0 and lastrowid == 0 (all
+        # packed expressions are >= 2, so the normal trigger-free path pays 0 extra SQL).
         async with self._conn.cursor() as cur:
             await cur.execute(self._db.dialect.translate(sql), _args(params))
-            return cur.rowcount, int(cur.lastrowid or 0)
+            rc = cur.rowcount
+            packed = int(cur.lastrowid or 0)
+            if rc > 0 and packed == 0:
+                await cur.execute("SELECT LAST_INSERT_ID()")
+                row = await cur.fetchone()
+                packed = int(row[0] or 0) if row else 0
+            return rc, packed
 
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         import aiomysql  # optional extra: power-loop[mysql]

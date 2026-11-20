@@ -25,6 +25,12 @@ async def bump(store, tx, session_id, kind):
         v = list(active.versions)
         v[idx] = int(v[idx]) + 1
         active.versions = tuple(v)
+    holding = send_reads.current(store, session_id)
+    if holding is not None:
+        if kind == "background" and holding.background_version is not None:
+            holding.background_version += 1
+        elif kind == "runtime" and holding.runtime_version is not None:
+            holding.runtime_version += 1
 
 
 

@@ -517,6 +517,52 @@ async def test_river_suspended_parent_and_non_rollback_errors(registry_store):
     )
     assert p_in is not None and p_in["kind"] == "agent_result"
 
+    # Parent closed does NOT roll back child result and stamps result_delivery_error='session_closed'
+    p_closed = await target(port, "riv_parent_closed")
+    c_closed = await port.create_session(
+        DESCRIPTOR, actor=ACTOR, parent=p_closed,
+        result_route={"target": p_closed, "input_ref": InputRef(store.store_id, "riv_child_closed", "go"), "result_kind": "agent_result"},
+        options={"session_id": "riv_child_closed"},
+    )
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET lifecycle='closed' WHERE session_id=?",
+        (p_closed.session_id,),
+    )
+    _, b_closed, _ = await port.accept_and_claim(c_closed, "work", message_id="go", actor=ACTOR, node_id="n1", boot_id="b1")
+    fin_closed = await port.final(b_closed, final_text="child_still_committed")
+    assert fin_closed.result_delivery_error == "session_closed" and fin_closed.result_activation is None
+    child_res_closed = await port.get_result(InputRef(store.store_id, c_closed.session_id, "go"), actor=ACTOR)
+    assert child_res_closed is not None and child_res_closed.status == "completed"
+    assert child_res_closed.final_text == "child_still_committed"
+    assert child_res_closed.result_delivery_error == "session_closed"
+    closed_parent_q = await store._db.fetchall(
+        f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=?", (p_closed.session_id,),
+    )
+    assert closed_parent_q == []
+
+    # Parent full does NOT roll back child result and stamps result_delivery_error='capacity_exceeded'
+    tight_port = RuntimeInputStore(store, inbox_item_limit=1, hard_pending_limit=1)
+    p_full = await target(tight_port, "riv_parent_full")
+    c_full = await tight_port.create_session(
+        DESCRIPTOR, actor=ACTOR, parent=p_full,
+        result_route={"target": p_full, "input_ref": InputRef(store.store_id, "riv_child_full", "go"), "result_kind": "agent_result"},
+        options={"session_id": "riv_child_full"},
+    )
+    await tight_port.accept(p_full, "fill", message_id="fill_1", actor=ACTOR)
+    _, b_full, _ = await tight_port.accept_and_claim(c_full, "work", message_id="go", actor=ACTOR, node_id="n1", boot_id="b1")
+    fin_full = await tight_port.final(b_full, final_text="child_full_ok")
+    assert fin_full.result_delivery_error == "capacity_exceeded" and fin_full.result_activation is None
+    child_res_full = await tight_port.get_result(InputRef(store.store_id, c_full.session_id, "go"), actor=ACTOR)
+    assert child_res_full is not None and child_res_full.status == "completed"
+    assert child_res_full.final_text == "child_full_ok"
+    assert child_res_full.result_delivery_error == "capacity_exceeded"
+    full_mid = result_message_id(c_full, InputRef(store.store_id, "riv_child_full", "go"), 1, "agent_result")
+    full_parent_q = await store._db.fetchone(
+        f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (p_full.session_id, full_mid),
+    )
+    assert full_parent_q is None
+
 
 async def test_decision3_wake_transports_and_graceful_release(registry_store):
     """拍板三: InMemoryWakeTransport (0 SQL), DatabasePollingWakeTransport, aclose graceful_release."""
@@ -595,3 +641,113 @@ async def test_concurrent_child_final_and_parent_accept_cancel_no_deadlock(regis
     with pytest.raises(SessionLeaseLost):
         await port.final(old_batch, final_text="stale")
     await port.final(new_batch, final_text="fresh")
+
+
+async def test_b1_subtree_cancel_single_child_locks_for_update_no_deadlock(registry_store):
+    """B1: Single-child level (len(lvl_ids)==1) must still lock with ORDER BY session_id ASC FOR UPDATE."""
+    from contextlib import asynccontextmanager
+
+    store, connect = registry_store
+    other = await connect(schema="verify")
+    port, child_port = RuntimeInputStore(store), RuntimeInputStore(other)
+    dialect = store._db.dialect.name
+
+    for p_id, c_id in (("b1_aaa_parent", "b1_zzz_child"), ("b1_zzz_parent", "b1_aaa_child")):
+        parent = await port.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": p_id})
+        child = await port.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=parent,
+            result_route={"target": parent, "input_ref": InputRef(store.store_id, c_id, "go"), "result_kind": "agent_result"},
+            options={"session_id": c_id},
+        )
+        await port.accept(child, "go", message_id="go", actor=ACTOR)
+
+        # Capture SQL executed during cancel(parent, scope='subtree') with single active child.
+        captured_sql: list[str] = []
+        orig_tx = store._db.transaction
+
+        class _SpyTx:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            async def fetchall(self, sql, params=()):
+                captured_sql.append(sql)
+                return await self._inner.fetchall(sql, params)
+
+            async def fetchone(self, sql, params=()):
+                captured_sql.append(sql)
+                return await self._inner.fetchone(sql, params)
+
+            async def execute(self, sql, params=()):
+                captured_sql.append(sql)
+                return await self._inner.execute(sql, params)
+
+            async def execute_packed(self, sql, params=()):
+                captured_sql.append(sql)
+                return await self._inner.execute_packed(sql, params)
+
+        @asynccontextmanager
+        async def spy_tx():
+            async with orig_tx() as tx:
+                yield _SpyTx(tx)
+
+        async def _claim_and_maybe_final():
+            b = await child_port.claim(child, node_id="n1", boot_id="b1")
+            if b is not None:
+                await child_port.final(b, final_text="raced_done")
+
+        store._db.transaction = spy_tx
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    port.cancel(parent, actor=ACTOR, scope="subtree", reason="b1_stop"),
+                    _claim_and_maybe_final(),
+                ),
+                timeout=10,
+            )
+        finally:
+            store._db.transaction = orig_tx
+
+        if dialect in ("postgres", "mysql"):
+            assert any(
+                "ORDER BY session_id ASC FOR UPDATE" in s and store.t.sessions in s
+                for s in captured_sql
+            ), f"expected FOR UPDATE on single-child level, got: {captured_sql}"
+
+
+async def test_b2_mysql_execute_packed_survives_after_update_trigger(registry_store):
+    """B2: With an AFTER UPDATE trigger (WriteMeter) on sessions, execute_packed must not zero out."""
+    from tests.write_meter import WriteMeter
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    meter = await WriteMeter.install(store._db, store.table_prefix)
+    parent = await target(port, "b2_parent")
+    child = await port.create_session(
+        DESCRIPTOR, actor=ACTOR, parent=parent,
+        result_route={"target": parent, "input_ref": InputRef(store.store_id, "b2_child", "go"), "result_kind": "agent_result"},
+        options={"session_id": "b2_child"},
+    )
+    # 1. accept() under trigger: must compute real inbox_version=1 and need_wake=True
+    rec, need_wake = await port.accept(child, "work", message_id="go", actor=ACTOR, _with_activation=True)
+    assert rec.newly_accepted and need_wake is True
+    q_row = await store._db.fetchone(
+        f"SELECT inbox_version FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='go'",
+        (child.session_id,),
+    )
+    assert int(q_row["inbox_version"]) == 1
+    # 2. claim + final() with River delivery under trigger: parent_need_wake must be True & inbox_version=1
+    batch = await port.claim(child, node_id="n1", boot_id="b1")
+    assert batch is not None
+    fin = await port.final(batch, final_text="b2_done")
+    assert fin.result_delivery_error is None
+    assert fin.result_activation == parent
+    p_q = await store._db.fetchone(
+        f"SELECT inbox_version FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='agent_result'",
+        (parent.session_id,),
+    )
+    assert p_q is not None and int(p_q["inbox_version"]) == 1
+    report = await meter.report()
+    assert report is not None

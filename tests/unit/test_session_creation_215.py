@@ -765,32 +765,63 @@ async def test_loser_reentry_does_not_hold_parent_while_child_is_locked(
 
             final_locked = asyncio.Event()
             final_state = {"first": None, "calls": 0}
+            original_final_tx = final_store._db.transaction
+            sessions_table = final_store.t.sessions
 
-            async def gated_final(tx, table, sid):
-                row = await original_final_lock(tx, table, sid)
-                final_state["calls"] += 1
-                if final_state["calls"] == 1:
-                    final_state["first"] = sid
-                    final_locked.set()
-                    await release_final.wait()
-                return row
+            class _GatedFinalTx:
+                def __init__(self, inner):
+                    self._inner = inner
 
-            final_store._db.dialect.lock_state = gated_final
-            final_task = asyncio.create_task(
-                final_port.final(batch, consumed=batch.input_refs, final_text="done"))
-            await asyncio.wait_for(final_locked.wait(), 10)
-            assert final_state["first"] == target_id
-            gate_state["allow_reentry"].set()
-            assert gate_state["reentry_lock"] == target_id
-            loser_task = next(task for task in tasks if task is not winner_task)
-            await _confirm_creation_lock_wait(
-                gate_state["lost_store"], final_store, target_id, waiter_task=loser_task)
-            release_final.set()
-            final_batch = await asyncio.wait_for(final_task, 10)
-            assert final_batch.execution_state == "idle"
-            loser = await asyncio.wait_for(loser_task, 10)
-            assert loser[0] == winner[0] and loser[1] == winner[1]
-            assert loser[2].newly_accepted is False
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+                async def _maybe_gate(self, sql, params):
+                    if sessions_table in sql and sql.lstrip().upper().startswith("UPDATE"):
+                        final_state["calls"] += 1
+                        if final_state["calls"] == 1:
+                            final_state["first"] = target_id if target_id in params else None
+                            final_locked.set()
+                            await release_final.wait()
+
+                async def fetchone(self, sql, params=()):
+                    res = await self._inner.fetchone(sql, params)
+                    await self._maybe_gate(sql, params)
+                    return res
+
+                async def execute_packed(self, sql, params=()):
+                    res = await self._inner.execute_packed(sql, params)
+                    await self._maybe_gate(sql, params)
+                    return res
+
+                async def execute(self, sql, params=()):
+                    res = await self._inner.execute(sql, params)
+                    await self._maybe_gate(sql, params)
+                    return res
+
+            @asynccontextmanager
+            async def gated_final_transaction():
+                async with original_final_tx() as tx:
+                    yield _GatedFinalTx(tx)
+
+            final_store._db.transaction = gated_final_transaction
+            try:
+                final_task = asyncio.create_task(
+                    final_port.final(batch, consumed=batch.input_refs, final_text="done"))
+                await asyncio.wait_for(final_locked.wait(), 10)
+                assert final_state["first"] == target_id
+                gate_state["allow_reentry"].set()
+                assert gate_state["reentry_lock"] == target_id
+                loser_task = next(task for task in tasks if task is not winner_task)
+                await _confirm_creation_lock_wait(
+                    gate_state["lost_store"], final_store, target_id, waiter_task=loser_task)
+                release_final.set()
+                final_batch = await asyncio.wait_for(final_task, 10)
+                assert final_batch.execution_state == "idle"
+                loser = await asyncio.wait_for(loser_task, 10)
+                assert loser[0] == winner[0] and loser[1] == winner[1]
+                assert loser[2].newly_accepted is False
+            finally:
+                final_store._db.transaction = original_final_tx
     finally:
         release_final.set()
         final_store._db.dialect.lock_state = original_final_lock
@@ -914,9 +945,9 @@ async def test_cleaned_target_before_reentry_lock_returns_creation_conflict(
             winner = await winner_task
             assert winner[2].newly_accepted is True
             # The second existing read saw the winner's row; the loser is paused
-            # before its sorted state locks.
+            # before its deep-first (child, parent) state locks (Design 217).
             assert gate_state["rows"][-1] is False
-            assert gate_state["reentry_lock"] == min(parent.session_id, target_id)
+            assert gate_state["reentry_lock"] == target_id
             cancelled = await cleaner_port.cancel(winner[1], actor=ACTOR)
             assert cancelled.state == "voided"
             await cleaner_port.close(winner[0], actor=ACTOR)

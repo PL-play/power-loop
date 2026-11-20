@@ -139,7 +139,7 @@ async def test_transaction_classifies_only_its_own_statements(registry_store, mo
         release.set()
         await asyncio.gather(outer, return_exceptions=True)
 
-    accept_sql = 3 if raw.dialect.name == "mysql" else 2
+    accept_sql = 2
     expected = {
         "accept_poll": (accept_sql + 1, [list(range(accept_sql))], ["session_control"]),
         "snapshot_poll": (2, [[0]], ["message"]),
@@ -210,7 +210,7 @@ async def test_clear_inflight_accept_returns_the_committed_receipt(registry_stor
 
     monkeypatch.setattr(store, "_db", profile)
     monkeypatch.setattr(profile, "transaction", held_tx)
-    accept_sql = 3 if raw.dialect.name == "mysql" else 2
+    accept_sql = 2
     task = asyncio.create_task(port.accept(target, "A", message_id="A", actor=ACTOR))
     try:
         async with asyncio.timeout(10):
@@ -272,7 +272,7 @@ async def test_old_snapshot_does_not_write_the_new_window(registry_store, monkey
         release.set()
         await asyncio.gather(old, return_exceptions=True)
 
-    accept_sql = 3 if raw.dialect.name == "mysql" else 2
+    accept_sql = 2
     assert len(profile.records) == (accept_sql if replacement == "accept" else 1)
     assert profile.transactions == len(profile.tx_sites) == 1
     assert profile.tx_categories == ["session_control"]

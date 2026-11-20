@@ -689,6 +689,8 @@ class SessionStore:
         round_usage: Mapping[str, Any] | None = None,
         boundary_wake_inbox_seq: int | None = None,
         boundary_cancel_seq: int | None = None,
+        boundary_background_version: int | None = None,
+        boundary_runtime_version: int | None = None,
     ) -> tuple[int, dict[str, Any] | None]:
         """Single-statement fenced INSERT ... SELECT FROM sessions (Design 217 §4.3).
 
@@ -740,6 +742,12 @@ class SessionStore:
                 "AND cancel_seq=?"
             )
             values = (*base_values, int(boundary_wake_inbox_seq), int(boundary_cancel_seq))
+            if boundary_background_version is not None:
+                sql += " AND background_version=?"
+                values = (*values, int(boundary_background_version))
+            if boundary_runtime_version is not None:
+                sql += " AND runtime_version=?"
+                values = (*values, int(boundary_runtime_version))
         else:
             sql = base_sql
             values = base_values
@@ -815,6 +823,8 @@ class SessionStore:
         fenced_fast: bool = False,
         boundary_wake_inbox_seq: int | None = None,
         boundary_cancel_seq: int | None = None,
+        boundary_background_version: int | None = None,
+        boundary_runtime_version: int | None = None,
     ) -> int:
         """Append one message and return its allocated per-session ``seq``."""
         holding = self._holding(session_id)
@@ -844,6 +854,8 @@ class SessionStore:
                 round_usage=round_usage,
                 boundary_wake_inbox_seq=boundary_wake_inbox_seq,
                 boundary_cancel_seq=boundary_cancel_seq,
+                boundary_background_version=boundary_background_version,
+                boundary_runtime_version=boundary_runtime_version,
             )
             return seq
         reads = send_reads.current(self, session_id)

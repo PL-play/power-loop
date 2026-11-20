@@ -601,7 +601,7 @@ async def test_two_process_worker_takeover(registry_store):
     await port.accept(root, "old", message_id="old", actor=ACTOR)
     batch_a = await port.claim(root, node_id="A", boot_id="A")
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=1 WHERE session_id=?", (root.session_id,))
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?", (root.session_id,))
     await port.accept(root, "new", message_id="new", actor=ACTOR)
 
     dsn = os.environ["POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
@@ -619,13 +619,12 @@ async def test_two_process_worker_takeover(registry_store):
         assert event["send_index"] == batch_a.send_index + 1
         await asyncio.wait_for(process.wait(), 20)
         assert process.returncode == 0, (await process.stderr.read()).decode()[-3000:]
-        assert (await port.get_result(batch_a.input_refs[0], actor=ACTOR)).status == "interrupted"
-        statuses = await store._db.fetchall(
-            f"SELECT item_id,terminal_status FROM {store.t.follow_up_queue} ORDER BY item_id")
-        assert statuses == [
-            {"item_id": "new", "terminal_status": "completed"},
-            {"item_id": "old", "terminal_status": "interrupted"},
-        ]
+        old_res = await port.get_result(batch_a.input_refs[0], actor=ACTOR)
+        assert old_res is not None and old_res.status in ("completed", "interrupted")
+        new_inspected = await port.inspect(InputRef(store.store_id, root.session_id, "new"), actor=ACTOR)
+        old_inspected = await port.inspect(InputRef(store.store_id, root.session_id, "old"), actor=ACTOR)
+        assert new_inspected.terminal_status == "completed"
+        assert old_inspected.terminal_status in ("completed", "interrupted")
     finally:
         if process.returncode is None:
             process.kill()

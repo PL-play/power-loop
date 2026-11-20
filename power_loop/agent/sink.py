@@ -237,6 +237,8 @@ class SQLiteSink:
                 if is_last_tool and holding.wake_inbox_seq is not None and holding.cancel_seq is not None:
                     options["boundary_wake_inbox_seq"] = holding.wake_inbox_seq
                     options["boundary_cancel_seq"] = holding.cancel_seq
+                    options["boundary_background_version"] = holding.background_version
+                    options["boundary_runtime_version"] = holding.runtime_version
             elif is_last_tool:
                 options["pending"] = None
             seq = await self.store.append_message(

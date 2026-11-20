@@ -27,6 +27,8 @@ class SessionHolding:
         # Piggyback boundary state for tool rounds (Design 217 §4.3):
         self.wake_inbox_seq: int | None = None
         self.cancel_seq: int | None = None
+        self.background_version: int | None = None
+        self.runtime_version: int | None = None
         self.piggyback_boundary: dict | None = None
         self.piggyback_verified: bool = False
 
@@ -39,6 +41,7 @@ class SessionHolding:
         self.pending_known, self.pending_tool_seq = False, None
         self.touched, self.change_snapshot, self.appended_call = 0, None, None
         self.wake_inbox_seq = self.cancel_seq = None
+        self.background_version = self.runtime_version = None
         self.piggyback_boundary = None
         self.piggyback_verified = False
 

@@ -35,8 +35,8 @@ pytestmark = pytest.mark.unit
 async def test_set_pending_empty_dict_normalizes_to_none():
     s = await SessionStore.open(":memory:")
     sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
-    await s.set_pending(sid, {"round_index": 3})
-    assert (await s.get_state(sid)).pending == {"round_index": 3}
+    await s.set_pending(sid, {"assistant_seq": 3})
+    assert (await s.get_state(sid)).pending == {"assistant_seq": 3}
     # An empty (falsy) dict must round-trip to None, not {} — matches the legacy oracle.
     await s.set_pending(sid, {})
     assert (await s.get_state(sid)).pending is None
