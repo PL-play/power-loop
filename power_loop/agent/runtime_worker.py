@@ -70,6 +70,7 @@ class _SessionExecution:
         self.task = None
         self.loop = None
         self.closing = False
+        self.finalized = False
         self.shutdown_interrupted = False
         self._lost_notified = False
         self._lost_hook_task = None
@@ -182,8 +183,20 @@ class RuntimeWorker:
             await r.wake_transport.subscribe(on_wake=_on_wake, on_cancel=_on_cancel)
         self._listeners = [asyncio.create_task(self._listen(s), context=contextvars.Context()) for s in self._subscriptions]
         self._dispatcher = asyncio.create_task(self._dispatch(), context=contextvars.Context())
-        self._recovery = (asyncio.create_task(self._recover_periodically(), context=contextvars.Context())
-                          if r.recovery_interval_s is not None else None)
+        if self._uses_node_batch_renewal():
+            if r.recovery_interval_s is not None:
+                self._recovery = asyncio.create_task(
+                    self._periodic_maintenance(), context=contextvars.Context(),
+                )
+            else:
+                self._recovery = asyncio.create_task(
+                    self._batch_renew_periodically(), context=contextvars.Context(),
+                )
+        else:
+            self._recovery = (
+                asyncio.create_task(self._recover_periodically(), context=contextvars.Context())
+                if r.recovery_interval_s is not None else None
+            )
         r.client._accepting = True
         if r.process_guard is not None:
             self._guard_monitor = asyncio.create_task(self._watch_guard(), context=contextvars.Context())
@@ -259,19 +272,38 @@ class RuntimeWorker:
         self._pending.setdefault(sid, now_ms())
         self._wake.set()
 
+    def _uses_node_batch_renewal(self) -> bool:
+        """True when using the default database-fence coordinator (node-level O(1) batch_renew)."""
+        from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
+        coord = self.runtime.coordinator
+        return (
+            getattr(coord, "installs_session_fence", False)
+            and type(coord).renew is StoreSessionOwnershipCoordinator.renew
+        )
+
     async def batch_renew(self):
-        """Node-level 1-SQL (MySQL 2-SQL) lease renewal for all active sessions on this node."""
+        """Node-level 1-SQL (MySQL 2-SQL) lease renewal + cancel/close check for all active sessions."""
         r = self.runtime
+        started = time.monotonic()
         rows = await self.inputs.batch_renew(
             node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
         )
         by_sid = {row["session_id"]: row for row in rows}
-        now_mono = time.monotonic() + r.session_lease_ttl_s
+        now_mono = started + r.session_lease_ttl_s
         for sid, ctx in list(self._active.items()):
-            if ctx is None:
+            if (
+                ctx is None
+                or ctx.closing
+                or ctx.finalized
+                or (ctx.ownership is not None and ctx.ownership.released)
+            ):
                 continue
             row = by_sid.get(sid)
-            if row is None or int(row["owner_epoch"]) != ctx.batch.owner_epoch:
+            if (
+                row is None
+                or int(row["owner_epoch"]) != ctx.batch.owner_epoch
+                or (ctx.ownership is not None and ctx.ownership.expires_at <= started)
+            ):
                 if ctx.ownership is not None:
                     ctx.ownership.lose()
                 continue
@@ -287,10 +319,13 @@ class RuntimeWorker:
         renewed = await self.batch_renew()
         queued = await self.inputs.discover_queued(limit=limit)
         expired = await self.inputs.sweep_expired_leases(
-            node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s, limit=limit,
+            node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
+            limit=limit, can_execute=self._capable,
         )
         for sid in queued:
             self._activate(sid)
+        if len(queued) < limit:
+            self._overflow = False
         for batch in expired:
             if batch.reclaimed_cancelled:
                 recovered = await self.inputs.final(
@@ -300,7 +335,7 @@ class RuntimeWorker:
                 await self._notify_results(recovered)
                 if recovered.execution_state == "queued":
                     self._activate(batch.target.session_id)
-            elif not batch.reclaimed_has_assistant:
+            elif batch.descriptor.kind == "agent" and not batch.reclaimed_has_assistant:
                 self.dispatch_claimed(batch)
             else:
                 recovered = await self.inputs.final(
@@ -311,6 +346,36 @@ class RuntimeWorker:
                 if recovered.execution_state == "queued":
                     self._activate(batch.target.session_id)
         return {"renewed": renewed, "queued": queued, "expired": expired}
+
+    async def _periodic_maintenance(self):
+        r = self.runtime
+        interval = min(r.recovery_interval_s, r.session_lease_ttl_s / 3)
+        limit = min(32, r.claim_limit)
+        while not self._closing:
+            await asyncio.sleep(interval)
+            if self._closing:
+                return
+            try:
+                await self.periodic_tick(limit=limit)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("periodic maintenance tick failed")
+
+    async def _batch_renew_periodically(self):
+        interval = self.runtime.session_lease_ttl_s / 3
+        while not self._closing:
+            await asyncio.sleep(interval)
+            if self._closing:
+                return
+            if not self._active:
+                continue
+            try:
+                await self.batch_renew()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("periodic batch_renew failed")
 
     async def recover(self):
         # The ONLY discovery path: bounded scan of unfinished sessions. No job scan, no
@@ -534,10 +599,24 @@ class RuntimeWorker:
 
             ownership.on_lost = _on_ownership_lost
             ownership_token = _CURRENT.set(ownership)
-            renewal = asyncio.create_task(self._renew(sid, batch, ownership, ctx), context=contextvars.Context())
+            renewal = (
+                None if self._uses_node_batch_renewal()
+                else asyncio.create_task(self._renew(sid, batch, ownership, ctx), context=contextvars.Context())
+            )
 
             with _bind_execution_context(ctx.snapshot, r.host_context_fields):
                 await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
+                if batch.reclaimed_cancelled and descriptor.kind != "workflow_driver":
+                    final_batch = await self.inputs.final(
+                        batch, status="cancelled", final_text="",
+                        error="cancelled", error_code="cancelled",
+                    )
+                    ctx.finalized = True
+                    await self._notify_results(final_batch)
+                    if final_batch.execution_state == "queued":
+                        self._activate(sid)
+                    batch = None
+                    return
                 try:
                     env = await r.factory.build(descriptor, ctx.snapshot())
                 except Exception as exc:
@@ -546,6 +625,7 @@ class RuntimeWorker:
                                        "definition_ref": descriptor.definition_ref}
                     self.capability_missing.add(descriptor.definition_ref)
                     await self.inputs.release_claim(batch)
+                    ctx.finalized = True
                     batch = None
                     return
                 # The worker runs each session in a fresh context; honor the factory's
@@ -561,6 +641,7 @@ class RuntimeWorker:
                 if descriptor.kind == "workflow_driver":
                     from power_loop.workflow.runner import run_driver
                     final_batch = await run_driver(self, ctx, env)
+                    ctx.finalized = True
                     await self._notify_results(final_batch)
                     if final_batch.execution_state == "queued":
                         self._activate(sid)
@@ -595,6 +676,7 @@ class RuntimeWorker:
                         usage=dict(result.usage or {}), structured_output=result.structured_output,
                         error=result.error, error_code=result.error_code, result_seq=None,
                     )
+                    ctx.finalized = True
                     await self._notify_results(final_batch)
                     return
                 bus = env.event_bus if env.event_bus is not None else AgentEventBus()
@@ -626,15 +708,6 @@ class RuntimeWorker:
                 loop._runtime_worker_context = ctx
                 ctx.loop = loop
 
-                if batch.reclaimed_cancelled:
-                    final_batch = await self.inputs.final(
-                        batch, status="cancelled", final_text="",
-                        error="cancelled", error_code="cancelled",
-                    )
-                    await self._notify_results(final_batch)
-                    if final_batch.execution_state == "queued":
-                        self._activate(sid)
-                    return
                 if env.command is not None:
                     from power_loop.runtime.host_commands import run_session
                     result = await run_session(loop, ctx, env.command)
@@ -666,6 +739,7 @@ class RuntimeWorker:
                     next_seq=getattr(result, "next_seq", None),
                     projection=getattr(result, "pending_projection", None) if status == "completed" else None,
                 )
+                ctx.finalized = True
                 if env.command is None:
                     normal_final = final_batch
                 await self._notify_results(final_batch)
@@ -681,16 +755,22 @@ class RuntimeWorker:
         except CancellationRequested:
             if batch is not None:
                 await self._final_cancelled(batch, ctx)
+                if ctx is not None:
+                    ctx.finalized = True
         except RuntimeRequestError as exc:
             # Domain refusal before any model/tool call (e.g. projection_unavailable) keeps its
             # code and diagnostic detail instead of becoming a generic internal_error.
             log.warning("session send stopped for %s: %s", sid, exc)
             if batch is not None:
                 await self._final_failed(batch, exc.code, str(exc))
+                if ctx is not None:
+                    ctx.finalized = True
         except Exception:
             log.exception("session send failed for %s", sid)
             if batch is not None:
                 await self._final_failed(batch, "internal_error", "session send raised")
+                if ctx is not None:
+                    ctx.finalized = True
         finally:
             try:
                 if renewal is not None:

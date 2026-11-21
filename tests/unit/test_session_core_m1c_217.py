@@ -31,15 +31,24 @@ import pytest
 from power_loop import (
     AgentHooks,
     AgentLoopConfig,
+    ExecutionEnvironment,
     HookPoint,
     LLMResponse,
     LLMService,
     RebindResult,
+    RegistryRuntimeFactory,
+    Runtime,
     ToolDefinition,
     TrustedActor,
 )
 from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore, now_ms
-from power_loop.agent.runtime_types import InputRef, RuntimeRequestError, TargetRef
+from power_loop.agent.runtime_types import (
+    CapacityError,
+    InputRef,
+    RuntimeRequestError,
+    TargetRef,
+    sha256_canonical,
+)
 from power_loop.runtime import background_execution
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.stop_policy import StopPolicy
@@ -993,4 +1002,546 @@ async def test_m1c_concurrent_stop_and_lifecycle_race(registry_store):
         assert int(rrow["cancel_seq"]) >= 1
         assert crow is not None and crow["cancel_by"] == "subtree" and int(crow["cancel_seq"]) >= 1
     finally:
+        await peer.close()
+
+
+# ── 8. Rework B1–B4 Regressions ─────────────────────────────────────────────
+
+
+async def test_m1c_b1_3a_queued_prestaged_background_never_executes(registry_store, tmp_path):
+    """B1: Pre-staged queued background child stopped by 3A settles cancelled with 0 tool calls."""
+    store, _ = registry_store
+    tool_calls: list[str] = []
+
+    async def bg_tool() -> str:
+        tool_calls.append("ran")
+        return "MUST_NOT_RUN"
+
+    tool_def = ToolDefinition(
+        "bg_tool", "Background tool", async_capable=True, interrupt="abort",
+        pricing=Free("local"), input_schema={"type": "object"},
+    )
+    reg = create_default_tool_registry(workspace_dir=str(tmp_path))
+    reg.register(tool_def, bg_tool)
+    frozen = {
+        "tool": "bg_tool",
+        "arguments": {},
+        "definition_hash": sha256_canonical(tool_def.to_openai_tool()),
+        "call_ref": {"store_id": store.store_id, "session_id": "b1-main", "seq": 1},
+        "call_id": "tc-b1",
+    }
+
+    factory = RegistryRuntimeFactory()
+    model = _ScriptedModel(lambda _i, _r: LLMResponse(raw_text="unused"))
+
+    async def build(_desc, _ctx):
+        return ExecutionEnvironment(
+            model, reg, AgentLoopConfig(context_budget_tokens=10**9, stop_policy=StopPolicy(abort_tool_s=0.01)),
+        )
+
+    factory.register("test.agent@215", build)
+    port = RuntimeInputStore(store)
+    main = await target(port, "b1-main")
+    bg_desc = replace(DESCRIPTOR, kind="background", config={**dict(DESCRIPTOR.config), "background": frozen})
+    cm = await port.create_many(
+        parent=main,
+        actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="b1-bg-child",
+            message_id="b1-bg-m1",
+            body=frozen,
+            descriptor=bg_desc,
+            result_kind="background_result",
+        )],
+        node_id="n-creator",
+        boot_id="b-creator",
+        can_execute=False,
+        free_slots=0,
+    )
+    assert len(cm.queued_targets) == 1
+    bg_start = InputRef(store.store_id, "b1-bg-child", "b1-bg-m1")
+
+    # Submit Strategy 3A BEFORE worker starts -> child is queued + cancel_by='subtree'
+    st = await port.set_lifecycle(
+        main, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="removed_3a",
+    )
+    assert "b1-bg-child" in st.stopped_descendant_ids
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="n-worker", boot_id="b-worker",
+        capacity=2, recovery_interval_s=None, timers_enabled=False,
+    )
+    await rt.worker.start()
+    try:
+        res = await rt.client.wait(bg_start, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert tool_calls == []
+        assert res.status == "cancelled"
+        assert res.result_delivery_error == "session_closed"
+        parent_inbox = await store._db.fetchall(
+            f"SELECT * FROM {store.t.follow_up_queue} WHERE session_id=?",
+            ("b1-main",),
+        )
+        assert parent_inbox == []
+    finally:
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_m1c_b1_concurrent_create_many_and_3a_close_no_missed_child(registry_store):
+    """B1: Two-connection interleave between 3A active-descendant scan and create_many never misses child."""
+    store, connect = registry_store
+    p1 = RuntimeInputStore(store)
+    peer = await connect(schema="verify")
+    p2 = RuntimeInputStore(peer)
+    try:
+        root = await target(p1, "b1-race-root")
+        spec = ChildSpec(
+            session_id="b1-race-child",
+            message_id="b1-race-m1",
+            body={"text": "work"},
+            descriptor=DESCRIPTOR,
+            result_kind="agent_result",
+        )
+        dialect = store._db.dialect.name
+        if dialect in ("postgres", "mysql"):
+            # Deterministically place create_many AFTER initial active-descendant scan and BEFORE root lock!
+            orig_collect = p1._collect_active_descendants
+            scan_done = asyncio.Event()
+            spawn_done = asyncio.Event()
+            call_count = 0
+
+            async def hooked_collect(tx, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                rows = await orig_collect(tx, **kwargs)
+                if call_count == 1:
+                    scan_done.set()
+                    await asyncio.wait_for(spawn_done.wait(), 5)
+                return rows
+
+            p1._collect_active_descendants = hooked_collect  # type: ignore[method-assign]
+
+            async def run_spawn():
+                await asyncio.wait_for(scan_done.wait(), 5)
+                try:
+                    return await p2.create_many(
+                        parent=root, actor=ACTOR, specs=[spec],
+                        node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
+                    )
+                finally:
+                    spawn_done.set()
+
+            close_res, spawn_res = await asyncio.gather(
+                p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_race"),
+                run_spawn(),
+                return_exceptions=True,
+            )
+            assert not isinstance(close_res, Exception), close_res
+            assert call_count >= 2  # recheck detected new child & retried cleanly!
+        else:
+            close_res, spawn_res = await asyncio.gather(
+                p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_race"),
+                p2.create_many(
+                    parent=root, actor=ACTOR, specs=[spec],
+                    node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
+                ),
+                return_exceptions=True,
+            )
+            assert not isinstance(close_res, Exception), close_res
+
+        if isinstance(spawn_res, Exception):
+            assert isinstance(spawn_res, RuntimeRequestError) and spawn_res.code in ("session_closed", "cancelled")
+            assert await store.get_session("b1-race-child") is None
+        else:
+            # Child was accepted before root locked -> MUST be cancelled by retry (never left uncanceled!)
+            assert "b1-race-child" in close_res.stopped_descendant_ids
+            crow = await store._db.fetchone(
+                f"SELECT cancel_seq,cancel_by FROM {store.t.sessions} WHERE session_id=?",
+                ("b1-race-child",),
+            )
+            assert crow is not None and crow["cancel_by"] == "subtree" and int(crow["cancel_seq"]) >= 1
+    finally:
+        await peer.close()
+
+
+@pytest.mark.parametrize("old_parent_state", ["open", "closed"])
+async def test_m1c_b2_inflight_rebind_delivers_only_to_new_parent(registry_store, old_parent_state):
+    """B2: Rebinding a running child routes its in-flight Final result ONLY to new_parent."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    old_p = await target(port, f"b2-old-{old_parent_state}")
+    new_p = await target(port, f"b2-new-{old_parent_state}")
+    child_sid = f"b2-ch-{old_parent_state}"
+    cm = await port.create_many(
+        parent=old_p, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id=child_sid, message_id="m1", body={"text": "compute"},
+            descriptor=DESCRIPTOR, result_kind="agent_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=False, free_slots=0,
+    )
+    child = cm.queued_targets[0]
+    batch = await port.claim(child, node_id="n1", boot_id="b1")
+    assert batch is not None
+
+    if old_parent_state == "closed":
+        await port.set_lifecycle(old_p, "closed", actor=ACTOR, inflight="abort", subtree="none")
+
+    rb = await port.rebind_children(old_p, new_p, actor=ACTOR)
+    assert rb.rebound_children == (child.session_id,)
+
+    # Finalize using the ORIGINAL ClaimedBatch captured before rebind!
+    fb = await port.final(batch, final_text="rebound inflight answer")
+    assert fb.result_delivery_error is None
+    assert fb.result_activation == new_p
+
+    old_inbox = await store._db.fetchall(
+        f"SELECT * FROM {store.t.follow_up_queue} WHERE session_id=?", (old_p.session_id,),
+    )
+    new_inbox = await store._db.fetchall(
+        f"SELECT * FROM {store.t.follow_up_queue} WHERE session_id=?", (new_p.session_id,),
+    )
+    assert old_inbox == []
+    assert len(new_inbox) == 1
+    assert "rebound inflight answer" in new_inbox[0]["content_json"]
+    new_srow = await store._db.fetchone(
+        f"SELECT execution_state,wake_pending_count FROM {store.t.sessions} WHERE session_id=?",
+        (new_p.session_id,),
+    )
+    assert new_srow["execution_state"] == "queued" and int(new_srow["wake_pending_count"]) == 1
+
+
+@pytest.mark.parametrize("old_closed", [False, True])
+async def test_m1c_b2_concurrent_final_and_rebind_no_deadlock(registry_store, old_closed):
+    """B2: Concurrent Final (child->parent) and rebind_children unify deep-first lock order (0 deadlocks)."""
+    store, connect = registry_store
+    p1 = RuntimeInputStore(store)
+    peer = await connect(schema="verify")
+    p2 = RuntimeInputStore(peer)
+    try:
+        suffix = "closed" if old_closed else "open"
+        old_p = await target(p1, f"b2-dl-old-{suffix}")
+        new_p = await target(p1, f"b2-dl-new-{suffix}")
+        cm = await p1.create_many(
+            parent=old_p, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id=f"b2-dl-ch-{suffix}", message_id="m1", body={"text": "go"},
+                descriptor=DESCRIPTOR, result_kind="agent_result",
+            )],
+            node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        )
+        batch = cm.preclaimed[0]
+        child = batch.target
+        if old_closed:
+            await p1.set_lifecycle(old_p, "closed", actor=ACTOR, inflight="abort", subtree="none")
+
+        if store._db.dialect.name in ("postgres", "mysql"):
+            # Force Conn 1 (Final) to hold the child row lock before touching old_parent,
+            # then launch Conn 2 (rebind_children) and verify deep-first wait with 0 deadlock!
+            orig_river = p1._river_deliver_tx
+            child_locked = asyncio.Event()
+            release_final = asyncio.Event()
+
+            async def paused_river(tx, **kwargs):
+                child_locked.set()
+                await asyncio.wait_for(release_final.wait(), 5)
+                return await orig_river(tx, **kwargs)
+
+            p1._river_deliver_tx = paused_river  # type: ignore[method-assign]
+
+            final_task = asyncio.create_task(p1.final(batch, final_text="concurrent ok"))
+            await asyncio.wait_for(child_locked.wait(), 5)
+            rebind_task = asyncio.create_task(p2.rebind_children(old_p, new_p, actor=ACTOR))
+            await asyncio.sleep(0.08)
+            release_final.set()
+            fb, rb = await asyncio.wait_for(asyncio.gather(final_task, rebind_task), 10)
+        else:
+            fb, rb = await asyncio.gather(
+                p1.final(batch, final_text="concurrent ok"),
+                p2.rebind_children(old_p, new_p, actor=ACTOR),
+            )
+
+        assert rb.rebound_children == (child.session_id,)
+        if old_closed:
+            # Regardless of order, new_p MUST receive the result (either via live route or orphan replay!)
+            new_inbox = await store._db.fetchall(
+                f"SELECT * FROM {store.t.follow_up_queue} WHERE session_id=?", (new_p.session_id,),
+            )
+            assert len(new_inbox) == 1, (fb, rb)
+            assert "concurrent ok" in new_inbox[0]["content_json"]
+    finally:
+        await peer.close()
+
+
+async def test_m1c_b2_replay_undelivered_enforces_capacity_and_rolls_back_atomically(registry_store):
+    """B2: replay_undelivered respects item-count & byte limits, rolls back on overflow, succeeds after retry."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store, inbox_item_limit=1, hard_pending_limit=1)
+    old_p = await target(port, "b2-cap-old")
+    new_p = await target(port, "b2-cap-new")
+    cm = await port.create_many(
+        parent=old_p, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="b2-cap-ch", message_id="cm1", body={"text": "work"},
+            descriptor=DESCRIPTOR, result_kind="agent_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    cb = cm.preclaimed[0]
+    child = cb.target
+    await port.set_lifecycle(old_p, "closed", actor=ACTOR, inflight="abort", subtree="none")
+    fb = await port.final(cb, final_text="orphan payload")
+    assert fb.result_delivery_error == "session_closed"
+
+    # Fill new_p to its hard limit of 1 pending item
+    await port.accept(new_p, "blocker", message_id="blk1", actor=ACTOR)
+
+    with pytest.raises(CapacityError):
+        await port.rebind_children(old_p, new_p, replay_undelivered=True, actor=ACTOR)
+
+    # Verify full rollback: new_p count still 1, child still under old_p, session_closed preserved!
+    new_row = await store._db.fetchone(
+        f"SELECT pending_count FROM {store.t.sessions} WHERE session_id=?", (new_p.session_id,),
+    )
+    ch_row = await store._db.fetchone(
+        f"SELECT parent_session_id FROM {store.t.sessions} WHERE session_id=?", (child.session_id,),
+    )
+    ch_q = await store._db.fetchone(
+        f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='cm1'",
+        (child.session_id,),
+    )
+    assert int(new_row["pending_count"]) == 1
+    assert ch_row["parent_session_id"] == old_p.session_id
+    assert ch_q["result_delivery_error"] == "session_closed"
+
+    # Also verify byte capacity rollback before freeing space
+    byte_port = RuntimeInputStore(store, inbox_item_limit=10, hard_pending_limit=10, inbox_byte_limit=64)
+    with pytest.raises(CapacityError):
+        await byte_port.rebind_children(old_p, new_p, replay_undelivered=True, actor=ACTOR)
+    ch_q2 = await store._db.fetchone(
+        f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='cm1'",
+        (child.session_id,),
+    )
+    assert ch_q2["result_delivery_error"] == "session_closed"
+
+    # Free space in new_p -> retry succeeds cleanly and clears session_closed!
+    nb = await port.claim(new_p, node_id="n1", boot_id="b1")
+    await port.final(nb, final_text="cleared")
+    rb = await port.rebind_children(old_p, new_p, replay_undelivered=True, actor=ACTOR)
+    assert rb.replayed_results == 1
+    new_row_after = await store._db.fetchone(
+        f"SELECT pending_count FROM {store.t.sessions} WHERE session_id=?", (new_p.session_id,),
+    )
+    ch_q_after = await store._db.fetchone(
+        f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='cm1'",
+        (child.session_id,),
+    )
+    assert int(new_row_after["pending_count"]) == 1
+    assert ch_q_after["result_delivery_error"] is None
+
+
+async def test_m1c_b3_automatic_periodic_tick_stops_background_without_notification_and_meets_sql_budget(
+    registry_store, tmp_path,
+):
+    """B3: Real Worker automatic periodic_tick runs O(1) 3/3/4 SQL for 2 active tasks and stops remote 3A."""
+    store, connect = registry_store
+    started1, started2 = asyncio.Event(), asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_bg(slot: str = "1") -> str:
+        (started1 if slot == "1" else started2).set()
+        await release.wait()
+        return "unexpected"
+
+    tool_def = ToolDefinition(
+        "slow_bg", "Blocking background tool", async_capable=True, interrupt="abort",
+        pricing=Free("local"),
+        input_schema={"type": "object", "properties": {"slot": {"type": "string"}}},
+    )
+    reg = create_default_tool_registry(workspace_dir=str(tmp_path))
+    reg.register(tool_def, slow_bg)
+
+    factory = RegistryRuntimeFactory()
+    model = _ScriptedModel(lambda _i, _r: LLMResponse(raw_text="unused"))
+
+    async def build(_desc, _ctx):
+        return ExecutionEnvironment(
+            model, reg, AgentLoopConfig(context_budget_tokens=10**9, stop_policy=StopPolicy(abort_tool_s=0.01)),
+        )
+
+    factory.register("test.agent@215", build)
+
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="b3-node", boot_id="b3-boot",
+        capacity=4, session_lease_ttl_s=0.9, recovery_interval_s=0.18, timers_enabled=False,
+    )
+    # Observe real automatic periodic_tick calls without calling periodic_tick manually!
+    orig_tick = rt.worker.periodic_tick
+    tick_slices: list[tuple[list[dict[str, Any]], int]] = []
+    two_ticks_ready = asyncio.Event()
+    measure_ticks = False
+
+    async def observed_tick(*, limit: int = 32):
+        if measure_ticks:
+            start_rec = len(profiled.records)
+            start_tx = profiled.transactions
+            res = await orig_tick(limit=limit)
+            tick_slices.append((list(profiled.records[start_rec:]), profiled.transactions - start_tx))
+            if len(tick_slices) >= 2:
+                two_ticks_ready.set()
+            return res
+        return await orig_tick(limit=limit)
+
+    rt.worker.periodic_tick = observed_tick  # type: ignore[method-assign]
+    await rt.worker.start()
+    peer = await connect(schema="verify")
+    try:
+        main = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "b3-main"})
+        specs = []
+        starts = []
+        for idx, slot in enumerate(("1", "2"), start=1):
+            frozen = {
+                "tool": "slow_bg",
+                "arguments": {"slot": slot},
+                "definition_hash": sha256_canonical(tool_def.to_openai_tool()),
+                "call_ref": {"store_id": store.store_id, "session_id": "b3-main", "seq": idx},
+                "call_id": f"tc-b3-{slot}",
+            }
+            bg_desc = replace(DESCRIPTOR, kind="background", config={**dict(DESCRIPTOR.config), "background": frozen})
+            sid = f"b3-bg-{slot}"
+            mid = f"b3-m-{slot}"
+            specs.append(ChildSpec(
+                session_id=sid, message_id=mid, body=frozen,
+                descriptor=bg_desc, result_kind="background_result",
+            ))
+            starts.append(InputRef(store.store_id, sid, mid))
+        await rt.client.inputs.create_many(
+            parent=main, actor=ACTOR, specs=specs,
+            node_id="b3-node", boot_id="b3-boot", can_execute=False, free_slots=0,
+        )
+        # Wait for automatic discovery to launch BOTH background tasks
+        await asyncio.wait_for(asyncio.gather(started1.wait(), started2.wait()), 5)
+
+        # Phase 1: Measure 2 real automatic healthy maintenance ticks with BOTH sessions active!
+        measure_ticks = True
+        profiled.records.clear()
+        profiled.transactions = 0
+        await asyncio.wait_for(two_ticks_ready.wait(), 5)
+        measure_ticks = False
+        all_healthy_sql = list(profiled.records)
+
+        expected_sql = 4 if original.dialect.name == "mysql" else 3
+        assert len(tick_slices) >= 2
+        for recs, txs in tick_slices[:2]:
+            assert txs == 0, txs
+            assert len(recs) == expected_sql, [r["sql"] for r in recs]
+            for r in recs:
+                chain_str = " ".join(r["chain"])
+                assert "_db_now" not in chain_str, r
+                assert "store_session_ownership" not in chain_str, r
+                assert "discover_unfinished" not in chain_str, r
+        # Total SQL across the measured healthy ticks must equal exact tick_count * (3/3/4) (no side renewals!)
+        assert len(all_healthy_sql) == len(tick_slices) * expected_sql, [r["sql"] for r in all_healthy_sql]
+
+        # Phase 2: Remote 3A via independent connection (NO shared transport notification) ->
+        # real automatic periodic_tick MUST stop BOTH background tasks!
+        await RuntimeInputStore(peer).set_lifecycle(
+            main, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="remote_3a_b3",
+        )
+        results = await asyncio.gather(*(
+            rt.client.wait(ref, actor=ACTOR, deadline_ms=now_ms() + 5000) for ref in starts
+        ))
+        assert [r.status for r in results] == ["cancelled", "cancelled"]
+        assert not release.is_set()
+    finally:
+        release.set()
+        await peer.close()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+        store._db = original
+
+
+async def test_m1c_b4_release_claim_fires_result_undeliverable_post_commit(registry_store):
+    """B4: Factory build failure during 3A enters release_claim() and fires RESULT_UNDELIVERABLE post-commit."""
+    store, connect = registry_store
+    hooks = AgentHooks()
+    build_entered = asyncio.Event()
+    build_release = asyncio.Event()
+    undeliv_events: list[dict[str, Any]] = []
+    observer_seen: list[tuple[Any, Any]] = []
+
+    observer = await connect(schema="verify")
+    peer = await connect(schema="verify")
+
+    async def on_undeliv(ctx):
+        undeliv_events.append(dict(ctx.values))
+        # Independent connection MUST already see committed terminal_status + result_delivery_error!
+        row = await observer._db.fetchone(
+            f"SELECT terminal_status,result_delivery_error FROM {observer.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            ("b4-child", "b4-m1"),
+        )
+        observer_seen.append((row["terminal_status"], row["result_delivery_error"]) if row else (None, None))
+
+    hooks.register(HookPoint.RESULT_UNDELIVERABLE, on_undeliv)
+
+    factory = RegistryRuntimeFactory()
+
+    async def failing_build(_desc, _ctx):
+        build_entered.set()
+        await asyncio.wait_for(build_release.wait(), 5)
+        raise RuntimeRequestError("resource_unavailable", "simulated build failure")
+
+    factory.register("test.agent@215", failing_build)
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="b4-node", boot_id="b4-boot",
+        capacity=2, recovery_interval_s=None, timers_enabled=False, hooks=hooks,
+    )
+    try:
+        main = await rt.client.inputs.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "b4-main"})
+        await rt.client.inputs.create_many(
+            parent=main, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="b4-child", message_id="b4-m1", body={"text": "run"},
+                descriptor=DESCRIPTOR, result_kind="agent_result",
+            )],
+            node_id="b4-node", boot_id="b4-boot", can_execute=False, free_slots=0,
+        )
+        await rt.worker.start()
+        await asyncio.wait_for(build_entered.wait(), 5)
+
+        # Close parent tree while child is claimed and paused in factory.build
+        await RuntimeInputStore(peer).set_lifecycle(
+            main, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_during_build",
+        )
+        build_release.set()
+
+        child_ref = InputRef(store.store_id, "b4-child", "b4-m1")
+        res = await rt.client.wait(child_ref, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert res.status == "cancelled"
+        assert res.result_delivery_error == "session_closed"
+
+        # Wait briefly for worker task teardown to finish
+        for _ in range(50):
+            if undeliv_events:
+                break
+            await asyncio.sleep(0.02)
+        assert len(undeliv_events) == 1
+        assert undeliv_events[0]["reason"] == "session_closed"
+        assert undeliv_events[0]["child_session_id"] == "b4-child"
+        assert undeliv_events[0]["parent_session_id"] == "b4-main"
+        assert observer_seen == [("cancelled", "session_closed")]
+    finally:
+        build_release.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+        await observer.close()
         await peer.close()

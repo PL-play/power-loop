@@ -193,6 +193,14 @@ class _ClaimRollback(Exception):
     pass
 
 
+class _SubtreeChangedRetry(Exception):
+    pass
+
+
+class _RebindChangedRetry(Exception):
+    pass
+
+
 class RuntimeInputStore:
     """Session-Core schema-18 storage port (SQLite / PostgreSQL 16 / MySQL 8.4)."""
 
@@ -688,6 +696,8 @@ class RuntimeInputStore:
                     raise SessionLeaseLost(parent.session_id)
                 if parent_row["lifecycle"] != "open":
                     raise RuntimeRequestError("session_closed")
+                if parent_row["execution_state"] == "running" and parent_row["cancel_by"] is not None:
+                    raise RuntimeRequestError("cancelled", parent_row["cancel_reason"] or "parent_cancelled")
                 if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
                     raise RuntimeRequestError("cancelled", "parent_cancelled")
 
@@ -1976,6 +1986,7 @@ class RuntimeInputStore:
         self.check_store(batch.target)
         ids = [ref.message_id for ref in batch.input_refs]
         now_sql = self._now_sql()
+        undeliverable_out: list[tuple[TargetRef, str, Result, str, str]] = []
         async with self.db.transaction() as tx:
             state = await self.db.dialect.lock_state(tx, self.s, batch.target.session_id)
             if (
@@ -2014,6 +2025,7 @@ class RuntimeInputStore:
                 await self._final_tx(
                     tx, batch, batch.input_refs, "cancelled", "", {}, None,
                     state["cancel_reason"] or "cancelled", "cancelled",
+                    _undeliverable_out=undeliverable_out,
                 )
             else:
                 qrows = await tx.fetchall(
@@ -2055,6 +2067,14 @@ class RuntimeInputStore:
                 f"DELETE FROM {self.store.t.messages} WHERE session_id=? AND seq=? "
                 "AND role='user' AND send_index=?",
                 (batch.target.session_id, batch.message_seq, batch.send_index),
+            )
+        for c_target, p_sid, r_res, r_kind, r_reason in undeliverable_out:
+            await self._fire_result_undeliverable(
+                child_target=c_target,
+                parent_session_id=p_sid,
+                result=r_res,
+                result_kind=r_kind,
+                reason=r_reason,
             )
 
     @staticmethod
@@ -2613,9 +2633,12 @@ class RuntimeInputStore:
             cancel_reason_db = None
             post_next_seq = effective_next_seq + int(write_message)
             database_now = None
-            if closed_raced or cancel_raced or write_message:
+            live_route_json = None
+            has_route = batch.result_route is not None or batch.reply_to_session_id is not None
+            if closed_raced or cancel_raced or write_message or has_route:
                 diag = await tx.fetchone(
-                    f"SELECT next_seq,cancel_by,cancel_reason,updated_at FROM {self.s} WHERE session_id=?",
+                    f"SELECT next_seq,cancel_by,cancel_reason,updated_at,result_route_json "
+                    f"FROM {self.s} WHERE session_id=?",
                     (sid,),
                 )
                 if diag is not None:
@@ -2623,6 +2646,7 @@ class RuntimeInputStore:
                     cancel_by_db = diag["cancel_by"]
                     cancel_reason_db = diag["cancel_reason"]
                     database_now = int(diag["updated_at"])
+                    live_route_json = diag["result_route_json"]
         else:
             srow = await tx.fetchone(
                 f"UPDATE {self.s} SET "
@@ -2639,7 +2663,7 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} "
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
                 "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
-                "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at",
+                "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,result_route_json",
                 (
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
@@ -2658,6 +2682,7 @@ class RuntimeInputStore:
             post_next_seq = int(srow["next_seq"])
             post_fold_stats_json = srow["fold_stats_json"]
             database_now = int(srow["updated_at"])
+            live_route_json = srow["result_route_json"]
             fold_conflict = (
                 proj_fold_json is not None
                 and not closed_raced
@@ -2718,9 +2743,15 @@ class RuntimeInputStore:
             )
 
         # Step 2 (Deep-first lock order): River delivery to parent AFTER child UPDATE (0 final_lock_asc!).
+        # Use the live route read under the locked child row so in-flight rebind_children is honored
+        # atomically (0 extra SQL on root sends).
         result_ref, delivery_error = None, None
         activations: list[TargetRef] = []
         route = batch.result_route
+        if route is not None and live_route_json:
+            parsed_live = json.loads(live_route_json)
+            if isinstance(parsed_live, dict) and isinstance(parsed_live.get("target"), dict):
+                route = parsed_live
         deliver_parent_sid = None
         deliver_res_kind = None
         deliver_start_ref = None
@@ -2730,8 +2761,21 @@ class RuntimeInputStore:
                 deliver_res_kind = route["result_kind"]
                 deliver_start_ref = InputRef(**route["input_ref"])
             elif batch.reply_to_session_id is not None:
-                deliver_parent_sid = batch.reply_to_session_id
-                deliver_res_kind = batch.reply_result_kind or "agent_result"
+                q_live = await tx.fetchone(
+                    f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
+                    "WHERE session_id=? AND item_id=?",
+                    (sid, consumed_refs[0].message_id),
+                )
+                deliver_parent_sid = (
+                    q_live["reply_to_session_id"]
+                    if (q_live is not None and q_live["reply_to_session_id"] is not None)
+                    else batch.reply_to_session_id
+                )
+                deliver_res_kind = (
+                    (q_live["reply_result_kind"] if q_live is not None else None)
+                    or batch.reply_result_kind
+                    or "agent_result"
+                )
                 deliver_start_ref = (
                     InputRef(batch.target.store_id, sid, batch.start_input_message_id)
                     if batch.start_input_message_id else consumed_refs[0]
@@ -3171,18 +3215,21 @@ class RuntimeInputStore:
         if self._dialect == "mysql":
             await self.db.execute(
                 f"UPDATE {self.s} SET owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
-                "WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=?",
+                "WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=? "
+                f"AND owner_lease_until_ms>{now_sql}",
                 (ttl_ms, node_id, boot_id),
             )
             rows = await self.db.fetchall(
                 "SELECT session_id,owner_epoch,cancel_seq,cancel_by,cancel_reason,lifecycle "
-                f"FROM {self.s} WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=?",
+                f"FROM {self.s} WHERE owner_node_id=? AND execution_state='running' "
+                f"AND owner_boot_id=? AND owner_lease_until_ms>{now_sql}",
                 (node_id, boot_id),
             )
             return [dict(r) for r in rows]
         rows = await self.db.fetchall(
             f"UPDATE {self.s} SET owner_lease_until_ms={now_sql}+?,updated_at={now_sql} "
             "WHERE owner_node_id=? AND execution_state='running' AND owner_boot_id=? "
+            f"AND owner_lease_until_ms>{now_sql} "
             "RETURNING session_id,owner_epoch,cancel_seq,cancel_by,cancel_reason,lifecycle",
             (ttl_ms, node_id, boot_id),
         )
@@ -3210,7 +3257,7 @@ class RuntimeInputStore:
         )
 
     async def sweep_expired_leases(
-        self, *, node_id: str, boot_id: str, ttl_s: float = 30.0, limit: int = 32,
+        self, *, node_id: str, boot_id: str, ttl_s: float = 30.0, limit: int = 32, can_execute=None,
     ) -> list[ClaimedBatch]:
         """1 bounded index scan on ``idx_session_recovery``; reclaims expired running sessions."""
         now_sql = self._now_sql()
@@ -3228,6 +3275,7 @@ class RuntimeInputStore:
                 node_id=node_id,
                 boot_id=boot_id,
                 ttl_s=ttl_s,
+                can_execute=can_execute,
             )
             if batch is not None:
                 reclaimed.append(batch)
@@ -3769,117 +3817,136 @@ class RuntimeInputStore:
         target = ref if isinstance(ref, TargetRef) else TargetRef(ref.store_id, ref.session_id)
         eff_cancel_by = cancel_by or ("agent" if actor.session_id is not None else "user")
         now_sql = self._now_sql()
-        activations: list[TargetRef] = []
-        completed_refs: list[InputRef] = []
-        stopped_descendants: list[str] = []
-        undeliverables: list[tuple[TargetRef, str, Result, str, str]] = []
 
-        async with self.db.transaction() as tx:
-            session = await self.authorize(tx, target, actor)
-            desc_by_depth: dict[int, list[str]] = {}
-            prestaged_desc: list[str] = []
-            if scope == "subtree":
-                active_desc = await self._collect_active_descendants(
-                    tx,
-                    session_id=target.session_id,
-                    root_session_id=str(session["root_session_id"]),
-                    target_depth=int(session["depth"]),
-                    only_linked=only_linked,
-                )
-                for d_sid, d_val, d_pre in active_desc:
-                    desc_by_depth.setdefault(d_val, []).append(d_sid)
-                    if d_pre:
-                        prestaged_desc.append(d_sid)
-                for lvl_ids in desc_by_depth.values():
-                    lvl_ids.sort()
+        for _attempt in range(8):
+            activations: list[TargetRef] = []
+            completed_refs: list[InputRef] = []
+            stopped_descendants: list[str] = []
+            undeliverables: list[tuple[TargetRef, str, Result, str, str]] = []
+            try:
+                async with self.db.transaction() as tx:
+                    session = await self.authorize(tx, target, actor)
+                    desc_by_depth: dict[int, list[str]] = {}
+                    prestaged_desc: list[str] = []
+                    seen_desc_ids: set[str] = set()
+                    if scope == "subtree":
+                        active_desc = await self._collect_active_descendants(
+                            tx,
+                            session_id=target.session_id,
+                            root_session_id=str(session["root_session_id"]),
+                            target_depth=int(session["depth"]),
+                            only_linked=only_linked,
+                        )
+                        for d_sid, d_val, d_pre in active_desc:
+                            seen_desc_ids.add(d_sid)
+                            desc_by_depth.setdefault(d_val, []).append(d_sid)
+                            if d_pre:
+                                prestaged_desc.append(d_sid)
+                        for lvl_ids in desc_by_depth.values():
+                            lvl_ids.sort()
 
-            # Level-by-level deep-first locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
-            cascaded_delivered: dict[str, set[str]] = {}
-            for d_val in sorted(desc_by_depth, reverse=True):
-                lvl_ids = desc_by_depth[d_val]
-                stopped_descendants.extend(lvl_ids)
-                ph = ",".join("?" for _ in lvl_ids)
-                lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
-                lvl_rows = await tx.fetchall(
-                    f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) "
-                    f"ORDER BY session_id ASC{lock_suffix}",
-                    tuple(lvl_ids),
-                )
-                for drow in lvl_rows:
-                    await self._cancel_single_session_tx(
-                        tx, drow, reason=reason, cancel_by="subtree",
-                        is_subtree_cascade=True, activations=activations,
-                        completed_refs=completed_refs,
-                        skip_item_ids=cascaded_delivered.get(drow["session_id"]),
-                        cascaded_delivered=cascaded_delivered,
-                        undeliverables=undeliverables,
-                    )
+                    # Level-by-level deep-first locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
+                    cascaded_delivered: dict[str, set[str]] = {}
+                    for d_val in sorted(desc_by_depth, reverse=True):
+                        lvl_ids = desc_by_depth[d_val]
+                        stopped_descendants.extend(lvl_ids)
+                        ph = ",".join("?" for _ in lvl_ids)
+                        lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
+                        lvl_rows = await tx.fetchall(
+                            f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) "
+                            f"ORDER BY session_id ASC{lock_suffix}",
+                            tuple(lvl_ids),
+                        )
+                        for drow in lvl_rows:
+                            await self._cancel_single_session_tx(
+                                tx, drow, reason=reason, cancel_by="subtree",
+                                is_subtree_cascade=True, activations=activations,
+                                completed_refs=completed_refs,
+                                skip_item_ids=cascaded_delivered.get(drow["session_id"]),
+                                cascaded_delivered=cascaded_delivered,
+                                undeliverables=undeliverables,
+                            )
 
-            # Now lock target itself (strictly shallower than all descendants)
-            state = await self.db.dialect.lock_state(tx, self.s, target.session_id)
-            if isinstance(ref, InputRef):
-                record = await self.input(tx, ref)
-                if record is None:
-                    raise RuntimeRequestError("not_found")
-                receipt = await self._cancel_input_tx(
-                    tx, state, record, reason=reason, cancel_by=eff_cancel_by,
-                    activations=activations, completed_refs=completed_refs,
-                    undeliverables=undeliverables,
-                )
-            else:
-                receipt = await self._cancel_single_session_tx(
-                    tx, state, reason=reason, cancel_by=eff_cancel_by,
-                    is_subtree_cascade=False, activations=activations,
-                    completed_refs=completed_refs,
-                    skip_item_ids=cascaded_delivered.get(target.session_id),
-                    undeliverables=undeliverables,
-                )
+                    # Now lock target itself (strictly shallower than all descendants)
+                    state = await self.db.dialect.lock_state(tx, self.s, target.session_id)
+                    if scope == "subtree":
+                        recheck = await self._collect_active_descendants(
+                            tx,
+                            session_id=target.session_id,
+                            root_session_id=str(state["root_session_id"]),
+                            target_depth=int(state["depth"]),
+                            only_linked=only_linked,
+                        )
+                        if any(d_sid not in seen_desc_ids for d_sid, _, _ in recheck):
+                            raise _SubtreeChangedRetry()
+                    if isinstance(ref, InputRef):
+                        record = await self.input(tx, ref)
+                        if record is None:
+                            raise RuntimeRequestError("not_found")
+                        receipt = await self._cancel_input_tx(
+                            tx, state, record, reason=reason, cancel_by=eff_cancel_by,
+                            activations=activations, completed_refs=completed_refs,
+                            undeliverables=undeliverables,
+                        )
+                    else:
+                        receipt = await self._cancel_single_session_tx(
+                            tx, state, reason=reason, cancel_by=eff_cancel_by,
+                            is_subtree_cascade=False, activations=activations,
+                            completed_refs=completed_refs,
+                            skip_item_ids=cascaded_delivered.get(target.session_id),
+                            undeliverables=undeliverables,
+                        )
 
-            if prestaged_desc:
-                pre_ph = ",".join("?" for _ in prestaged_desc)
-                await tx.execute(
-                    f"UPDATE {self.q} SET cancel_by='subtree' "
-                    f"WHERE session_id IN ({pre_ph}) AND status='delivered' "
-                    "AND delivered_send_index=1 AND terminal_status IS NULL",
-                    tuple(prestaged_desc),
-                )
+                    if prestaged_desc:
+                        pre_ph = ",".join("?" for _ in prestaged_desc)
+                        await tx.execute(
+                            f"UPDATE {self.q} SET cancel_by='subtree' "
+                            f"WHERE session_id IN ({pre_ph}) AND status='delivered' "
+                            "AND delivered_send_index=1 AND terminal_status IS NULL",
+                            tuple(prestaged_desc),
+                        )
 
-            # Probe 4A: human single-target stop on a child session notifies root_session_id
-            # with wake=0 system_notice keyed by sys_stop_{session_id}_c{new_cancel_seq}.
-            root_sid = str(state["root_session_id"])
-            if (
-                not isinstance(ref, InputRef)
-                and scope == "self"
-                and actor.session_id is None
-                and eff_cancel_by == "user"
-                and root_sid != target.session_id
-                and receipt.state in ("cancel_requested", "voided")
-            ):
-                new_cancel_seq = int(state["cancel_seq"]) + 1
-                raw_notice_id = f"sys_stop_{target.session_id}_c{new_cancel_seq}"
-                if len(raw_notice_id) <= 64:
-                    notice_id = raw_notice_id
-                else:
-                    suffix = f"_c{new_cancel_seq}"
-                    digest_len = max(16, 64 - len("sys_stop_") - len(suffix))
-                    notice_id = f"sys_stop_{sha256_canonical([target.session_id])[:digest_len]}{suffix}"
-                notice_body = {
-                    "kind": "system_notice",
-                    "event": "child_stopped_by_user",
-                    "session_id": target.session_id,
-                    "cancel_seq": new_cancel_seq,
-                    "reason": reason,
-                }
-                await self._deliver_system_notice_tx(
-                    tx,
-                    target_session_id=root_sid,
-                    tenant_id=state["tenant_id"],
-                    principal_id=state["principal_id"],
-                    item_id=notice_id,
-                    body=notice_body,
-                )
+                    # Probe 4A: human single-target stop on a child session notifies root_session_id
+                    # with wake=0 system_notice keyed by sys_stop_{session_id}_c{new_cancel_seq}.
+                    root_sid = str(state["root_session_id"])
+                    if (
+                        not isinstance(ref, InputRef)
+                        and scope == "self"
+                        and actor.session_id is None
+                        and eff_cancel_by == "user"
+                        and root_sid != target.session_id
+                        and receipt.state in ("cancel_requested", "voided")
+                    ):
+                        new_cancel_seq = int(state["cancel_seq"]) + 1
+                        raw_notice_id = f"sys_stop_{target.session_id}_c{new_cancel_seq}"
+                        if len(raw_notice_id) <= 64:
+                            notice_id = raw_notice_id
+                        else:
+                            suffix = f"_c{new_cancel_seq}"
+                            digest_len = max(16, 64 - len("sys_stop_") - len(suffix))
+                            notice_id = f"sys_stop_{sha256_canonical([target.session_id])[:digest_len]}{suffix}"
+                        notice_body = {
+                            "kind": "system_notice",
+                            "event": "child_stopped_by_user",
+                            "session_id": target.session_id,
+                            "cancel_seq": new_cancel_seq,
+                            "reason": reason,
+                        }
+                        await self._deliver_system_notice_tx(
+                            tx,
+                            target_session_id=root_sid,
+                            tenant_id=state["tenant_id"],
+                            principal_id=state["principal_id"],
+                            item_id=notice_id,
+                            body=notice_body,
+                        )
 
-            _ = now_sql  # used via helpers
+                    _ = now_sql  # used via helpers
+                break
+            except _SubtreeChangedRetry:
+                continue
+        else:
+            raise RuntimeRequestError("request_conflict", "concurrent subtree mutation")
 
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverables:
             await self._fire_result_undeliverable(
@@ -4330,232 +4397,255 @@ class RuntimeInputStore:
         sid = target.session_id
         now_sql = self._now_sql()
         eff_reason = reason or ("removed" if lifecycle == "closed" else lifecycle)
-        stopped_map: dict[str, str] = {}
-        descendants: list[str] = []
-        completed_refs: list[InputRef] = []
-        voided = 0
-        need_wake = False
 
-        async with self.db.transaction() as tx:
-            session = await self.authorize(tx, target, actor)
-            if session["lifecycle"] in ("closing", "closed") and lifecycle != "closed":
-                raise RuntimeRequestError("session_closed")
-
-            if lifecycle == "open":
-                if self._dialect == "mysql":
-                    rc, packed = await tx.execute_packed(
-                        f"UPDATE {self.s} SET "
-                        "lifecycle=(CASE WHEN LAST_INSERT_ID("
-                        "2|(CASE WHEN execution_state='idle' AND wake_pending_count>0 THEN 1 ELSE 0 END)"
-                        ")>=0 THEN 'open' ELSE 'open' END),"
-                        "execution_state=CASE WHEN execution_state='idle' AND wake_pending_count>0 "
-                        "THEN 'queued' ELSE execution_state END,"
-                        "cancel_by=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_by END,"
-                        "cancel_reason=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_reason END,"
-                        f"updated_at={now_sql} "
-                        "WHERE session_id=? AND lifecycle='suspended'",
-                        (sid,),
-                    )
-                    need_wake = rc == 1 and bool(packed & 1)
-                    rrow = await tx.fetchone(
-                        f"SELECT lifecycle,execution_state,send_index,cancel_by,cancel_reason "
-                        f"FROM {self.s} WHERE session_id=?",
-                        (sid,),
-                    )
-                    if rrow is None:
-                        raise RuntimeRequestError("not_found")
-                    if rrow["lifecycle"] in ("closing", "closed"):
+        for _attempt in range(8):
+            stopped_map: dict[str, str] = {}
+            descendants: list[str] = []
+            completed_refs: list[InputRef] = []
+            voided = 0
+            need_wake = False
+            try:
+                async with self.db.transaction() as tx:
+                    session = await self.authorize(tx, target, actor)
+                    if session["lifecycle"] in ("closing", "closed") and lifecycle != "closed":
                         raise RuntimeRequestError("session_closed")
-                else:
-                    rrow = await tx.fetchone(
-                        f"UPDATE {self.s} SET "
-                        "lifecycle='open',"
-                        "execution_state=CASE WHEN execution_state='idle' AND wake_pending_count>0 "
-                        "THEN 'queued' ELSE execution_state END,"
-                        "cancel_by=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_by END,"
-                        "cancel_reason=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_reason END,"
-                        f"updated_at={now_sql} "
-                        "WHERE session_id=? AND lifecycle='suspended' "
-                        "RETURNING lifecycle,execution_state,send_index,wake_pending_count,cancel_by,cancel_reason",
-                        (sid,),
-                    )
-                    if rrow is None:
-                        rrow = await tx.fetchone(
-                            f"SELECT lifecycle,execution_state,send_index,wake_pending_count,cancel_by,cancel_reason "
-                            f"FROM {self.s} WHERE session_id=?",
-                            (sid,),
+
+                    if lifecycle == "open":
+                        if self._dialect == "mysql":
+                            rc, packed = await tx.execute_packed(
+                                f"UPDATE {self.s} SET "
+                                "lifecycle=(CASE WHEN LAST_INSERT_ID("
+                                "2|(CASE WHEN execution_state='idle' AND wake_pending_count>0 THEN 1 ELSE 0 END)"
+                                ")>=0 THEN 'open' ELSE 'open' END),"
+                                "execution_state=CASE WHEN execution_state='idle' AND wake_pending_count>0 "
+                                "THEN 'queued' ELSE execution_state END,"
+                                "cancel_by=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_by END,"
+                                "cancel_reason=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_reason END,"
+                                f"updated_at={now_sql} "
+                                "WHERE session_id=? AND lifecycle='suspended'",
+                                (sid,),
+                            )
+                            need_wake = rc == 1 and bool(packed & 1)
+                            rrow = await tx.fetchone(
+                                f"SELECT lifecycle,execution_state,send_index,cancel_by,cancel_reason "
+                                f"FROM {self.s} WHERE session_id=?",
+                                (sid,),
+                            )
+                            if rrow is None:
+                                raise RuntimeRequestError("not_found")
+                            if rrow["lifecycle"] in ("closing", "closed"):
+                                raise RuntimeRequestError("session_closed")
+                        else:
+                            rrow = await tx.fetchone(
+                                f"UPDATE {self.s} SET "
+                                "lifecycle='open',"
+                                "execution_state=CASE WHEN execution_state='idle' AND wake_pending_count>0 "
+                                "THEN 'queued' ELSE execution_state END,"
+                                "cancel_by=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_by END,"
+                                "cancel_reason=CASE WHEN execution_state<>'running' THEN NULL ELSE cancel_reason END,"
+                                f"updated_at={now_sql} "
+                                "WHERE session_id=? AND lifecycle='suspended' "
+                                "RETURNING lifecycle,execution_state,send_index,wake_pending_count,cancel_by,cancel_reason",
+                                (sid,),
+                            )
+                            if rrow is None:
+                                rrow = await tx.fetchone(
+                                    f"SELECT lifecycle,execution_state,send_index,wake_pending_count,cancel_by,cancel_reason "
+                                    f"FROM {self.s} WHERE session_id=?",
+                                    (sid,),
+                                )
+                                if rrow is None:
+                                    raise RuntimeRequestError("not_found")
+                                if rrow["lifecycle"] in ("closing", "closed"):
+                                    raise RuntimeRequestError("session_closed")
+                                need_wake = False
+                            else:
+                                need_wake = (
+                                    rrow["execution_state"] == "queued"
+                                    and int(rrow["wake_pending_count"]) > 0
+                                )
+                        status_obj = Status(
+                            None, target, rrow["execution_state"], None, None,
+                            int(rrow["send_index"]) or None, False, None,
+                            bool(rrow["execution_state"] == "running" and rrow["cancel_by"] is not None),
+                            rrow["cancel_reason"], None, None, None, None,
+                            lifecycle=rrow["lifecycle"],
+                            need_wake=need_wake,
+                            stopped_descendant_ids=(),
+                            voided_pending_inputs=0,
                         )
-                        if rrow is None:
-                            raise RuntimeRequestError("not_found")
-                        if rrow["lifecycle"] in ("closing", "closed"):
-                            raise RuntimeRequestError("session_closed")
-                        need_wake = False
+                        return (status_obj, stopped_map, completed_refs) if _with_effects else status_obj
+
+                    # lifecycle in ('suspended', 'closed')
+                    prestaged_descendants: list[str] = []
+                    desc_by_depth: dict[int, list[str]] = {}
+                    seen_desc_ids: set[str] = set()
+                    if subtree in ("linked", "all"):
+                        active_desc = await self._collect_active_descendants(
+                            tx,
+                            session_id=sid,
+                            root_session_id=str(session["root_session_id"]),
+                            target_depth=int(session["depth"]),
+                            only_linked=(subtree == "linked"),
+                        )
+                        for d_sid, d_val, d_pre in active_desc:
+                            seen_desc_ids.add(d_sid)
+                            desc_by_depth.setdefault(d_val, []).append(d_sid)
+                            if d_pre:
+                                prestaged_descendants.append(d_sid)
+                        for lvl_ids in desc_by_depth.values():
+                            lvl_ids.sort()
+                        for d_val in sorted(desc_by_depth, reverse=True):
+                            descendants.extend(desc_by_depth[d_val])
+
+                    # Deep-first level-by-level locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
+                    for d_val in sorted(desc_by_depth, reverse=True):
+                        lvl_ids = desc_by_depth[d_val]
+                        ph = ",".join("?" for _ in lvl_ids)
+                        if self._dialect in ("postgres", "mysql"):
+                            await tx.fetchall(
+                                f"SELECT session_id FROM {self.s} WHERE session_id IN ({ph}) "
+                                "ORDER BY session_id ASC FOR UPDATE",
+                                tuple(lvl_ids),
+                            )
+                        await tx.execute(
+                            f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by='subtree',"
+                            f"cancel_reason=?,updated_at={now_sql} WHERE session_id IN ({ph})",
+                            (eff_reason, *lvl_ids),
+                        )
+
+                    # Now lock target itself (strictly shallower than all descendants)
+                    locked = await self.db.dialect.lock_state(tx, self.s, sid)
+                    if locked["lifecycle"] in ("closing", "closed") and lifecycle != "closed":
+                        raise RuntimeRequestError("session_closed")
+
+                    # Close concurrent child-spawn gap without violating deep-first lock ordering:
+                    # under READ COMMITTED, any create_child/create_many committed before target was
+                    # locked is visible now; roll back and retry so the new child is locked deeper first.
+                    if subtree in ("linked", "all"):
+                        recheck = await self._collect_active_descendants(
+                            tx,
+                            session_id=sid,
+                            root_session_id=str(locked["root_session_id"]),
+                            target_depth=int(locked["depth"]),
+                            only_linked=(subtree == "linked"),
+                        )
+                        if any(d_sid not in seen_desc_ids for d_sid, _, _ in recheck):
+                            raise _SubtreeChangedRetry()
+
+                    if lifecycle == "suspended":
+                        if inflight == "abort":
+                            await tx.execute(
+                                f"UPDATE {self.s} SET lifecycle='suspended',"
+                                "cancel_seq=cancel_seq+1,cancel_by='suspended',cancel_reason=?,"
+                                "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
+                                f"updated_at={now_sql} "
+                                "WHERE session_id=? AND lifecycle IN ('open','suspended')",
+                                (eff_reason, sid),
+                            )
+                            stopped_map[sid] = "suspended"
+                        else:
+                            # inflight == 'drain': do NOT bump cancel_seq or signal local stop!
+                            await tx.execute(
+                                f"UPDATE {self.s} SET lifecycle='suspended',"
+                                "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
+                                f"updated_at={now_sql} "
+                                "WHERE session_id=? AND lifecycle IN ('open','suspended')",
+                                (sid,),
+                            )
                     else:
-                        need_wake = (
-                            rrow["execution_state"] == "queued"
-                            and int(rrow["wake_pending_count"]) > 0
-                        )
-                status_obj = Status(
-                    None, target, rrow["execution_state"], None, None,
-                    int(rrow["send_index"]) or None, False, None,
-                    bool(rrow["execution_state"] == "running" and rrow["cancel_by"] is not None),
-                    rrow["cancel_reason"], None, None, None, None,
-                    lifecycle=rrow["lifecycle"],
-                    need_wake=need_wake,
-                    stopped_descendant_ids=(),
-                    voided_pending_inputs=0,
-                )
-                return (status_obj, stopped_map, completed_refs) if _with_effects else status_obj
+                        # lifecycle == 'closed': soft-close, NEVER delete sessions row
+                        if inflight == "abort":
+                            await tx.execute(
+                                f"UPDATE {self.s} SET lifecycle='closed',"
+                                "cancel_seq=cancel_seq+1,cancel_by='removed',cancel_reason=?,"
+                                "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
+                                "wake_pending_count=0,pending_count=0,pending_bytes=0,ready_item_json=NULL,"
+                                f"updated_at={now_sql} WHERE session_id=?",
+                                (eff_reason, sid),
+                            )
+                            stopped_map[sid] = "removed"
+                        else:
+                            await tx.execute(
+                                f"UPDATE {self.s} SET lifecycle='closed',"
+                                "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
+                                "wake_pending_count=0,pending_count=0,pending_bytes=0,ready_item_json=NULL,"
+                                f"updated_at={now_sql} WHERE session_id=?",
+                                (sid,),
+                            )
 
-            # lifecycle in ('suspended', 'closed')
-            prestaged_descendants: list[str] = []
-            desc_by_depth: dict[int, list[str]] = {}
-            if subtree in ("linked", "all"):
-                active_desc = await self._collect_active_descendants(
-                    tx,
-                    session_id=sid,
-                    root_session_id=str(session["root_session_id"]),
-                    target_depth=int(session["depth"]),
-                    only_linked=(subtree == "linked"),
-                )
-                for d_sid, d_val, d_pre in active_desc:
-                    desc_by_depth.setdefault(d_val, []).append(d_sid)
-                    if d_pre:
-                        prestaged_descendants.append(d_sid)
-                for lvl_ids in desc_by_depth.values():
-                    lvl_ids.sort()
-                for d_val in sorted(desc_by_depth, reverse=True):
-                    descendants.extend(desc_by_depth[d_val])
+                    if descendants:
+                        ph = ",".join("?" for _ in descendants)
+                        if prestaged_descendants:
+                            pre_ph = ",".join("?" for _ in prestaged_descendants)
+                            await tx.execute(
+                                f"UPDATE {self.q} SET cancel_by='subtree' "
+                                f"WHERE (session_id IN ({ph}) AND status='pending') "
+                                f"OR (session_id IN ({pre_ph}) AND status='delivered' "
+                                "AND delivered_send_index=1 AND terminal_status IS NULL)",
+                                (*descendants, *prestaged_descendants),
+                            )
+                        else:
+                            await tx.execute(
+                                f"UPDATE {self.q} SET cancel_by='subtree' "
+                                f"WHERE session_id IN ({ph}) AND status='pending'",
+                                tuple(descendants),
+                            )
+                        for d_sid in descendants:
+                            stopped_map[d_sid] = "subtree"
 
-            # Deep-first level-by-level locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
-            for d_val in sorted(desc_by_depth, reverse=True):
-                lvl_ids = desc_by_depth[d_val]
-                ph = ",".join("?" for _ in lvl_ids)
-                if self._dialect in ("postgres", "mysql"):
-                    await tx.fetchall(
-                        f"SELECT session_id FROM {self.s} WHERE session_id IN ({ph}) "
-                        "ORDER BY session_id ASC FOR UPDATE",
-                        tuple(lvl_ids),
-                    )
-                await tx.execute(
-                    f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by='subtree',"
-                    f"cancel_reason=?,updated_at={now_sql} WHERE session_id IN ({ph})",
-                    (eff_reason, *lvl_ids),
-                )
+                    if lifecycle == "closed":
+                        target_is_prestaged = int(locked["send_index"]) == 0 and bool(locked["ready_item_json"])
+                        if target_is_prestaged:
+                            void_rows = await tx.fetchall(
+                                f"SELECT item_id FROM {self.q} WHERE session_id=? "
+                                "AND (status='pending' OR (status='delivered' AND delivered_send_index=1 "
+                                "AND terminal_status IS NULL))",
+                                (sid,),
+                            )
+                            voided = await tx.execute(
+                                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
+                                "cancel_by='removed',error_code='session_closed',error_detail=?,"
+                                f"delivered_send_index=NULL,delivered_seq=NULL,delivered_at=NULL,completed_at={now_sql} "
+                                "WHERE session_id=? "
+                                "AND (status='pending' OR (status='delivered' AND delivered_send_index=1 "
+                                "AND terminal_status IS NULL))",
+                                (eff_reason, sid),
+                            )
+                        else:
+                            void_rows = await tx.fetchall(
+                                f"SELECT item_id FROM {self.q} WHERE session_id=? AND status='pending'",
+                                (sid,),
+                            )
+                            voided = await tx.execute(
+                                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
+                                "cancel_by='removed',error_code='session_closed',error_detail=?,"
+                                f"completed_at={now_sql} WHERE session_id=? AND status='pending'",
+                                (eff_reason, sid),
+                            )
+                        for vr in void_rows:
+                            completed_refs.append(InputRef(target.store_id, sid, vr["item_id"]))
 
-            # Now lock target itself (strictly shallower than all descendants)
-            locked = await self.db.dialect.lock_state(tx, self.s, sid)
-            if locked["lifecycle"] in ("closing", "closed") and lifecycle != "closed":
-                raise RuntimeRequestError("session_closed")
-
-            if lifecycle == "suspended":
-                if inflight == "abort":
-                    await tx.execute(
-                        f"UPDATE {self.s} SET lifecycle='suspended',"
-                        "cancel_seq=cancel_seq+1,cancel_by='suspended',cancel_reason=?,"
-                        "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
-                        f"updated_at={now_sql} "
-                        "WHERE session_id=? AND lifecycle IN ('open','suspended')",
-                        (eff_reason, sid),
+                    post_exec = (
+                        "idle" if locked["execution_state"] == "queued"
+                        else str(locked["execution_state"])
                     )
-                    stopped_map[sid] = "suspended"
-                else:
-                    # inflight == 'drain': do NOT bump cancel_seq or signal local stop!
-                    await tx.execute(
-                        f"UPDATE {self.s} SET lifecycle='suspended',"
-                        "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
-                        f"updated_at={now_sql} "
-                        "WHERE session_id=? AND lifecycle IN ('open','suspended')",
-                        (sid,),
+                    status_obj = Status(
+                        None, target, post_exec, None, None,
+                        int(locked["send_index"]) or None, False, None,
+                        bool(sid in stopped_map and post_exec == "running"),
+                        eff_reason if sid in stopped_map else locked["cancel_reason"],
+                        None, None, None, None,
+                        lifecycle=lifecycle,
+                        need_wake=False,
+                        stopped_descendant_ids=tuple(descendants),
+                        voided_pending_inputs=int(voided),
                     )
-            else:
-                # lifecycle == 'closed': soft-close, NEVER delete sessions row
-                if inflight == "abort":
-                    await tx.execute(
-                        f"UPDATE {self.s} SET lifecycle='closed',"
-                        "cancel_seq=cancel_seq+1,cancel_by='removed',cancel_reason=?,"
-                        "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
-                        "wake_pending_count=0,pending_count=0,pending_bytes=0,ready_item_json=NULL,"
-                        f"updated_at={now_sql} WHERE session_id=?",
-                        (eff_reason, sid),
-                    )
-                    stopped_map[sid] = "removed"
-                else:
-                    await tx.execute(
-                        f"UPDATE {self.s} SET lifecycle='closed',"
-                        "execution_state=CASE WHEN execution_state='queued' THEN 'idle' ELSE execution_state END,"
-                        "wake_pending_count=0,pending_count=0,pending_bytes=0,ready_item_json=NULL,"
-                        f"updated_at={now_sql} WHERE session_id=?",
-                        (sid,),
-                    )
-
-            if descendants:
-                ph = ",".join("?" for _ in descendants)
-                if prestaged_descendants:
-                    pre_ph = ",".join("?" for _ in prestaged_descendants)
-                    await tx.execute(
-                        f"UPDATE {self.q} SET cancel_by='subtree' "
-                        f"WHERE (session_id IN ({ph}) AND status='pending') "
-                        f"OR (session_id IN ({pre_ph}) AND status='delivered' "
-                        "AND delivered_send_index=1 AND terminal_status IS NULL)",
-                        (*descendants, *prestaged_descendants),
-                    )
-                else:
-                    await tx.execute(
-                        f"UPDATE {self.q} SET cancel_by='subtree' "
-                        f"WHERE session_id IN ({ph}) AND status='pending'",
-                        tuple(descendants),
-                    )
-                for d_sid in descendants:
-                    stopped_map[d_sid] = "subtree"
-
-            if lifecycle == "closed":
-                target_is_prestaged = int(locked["send_index"]) == 0 and bool(locked["ready_item_json"])
-                if target_is_prestaged:
-                    void_rows = await tx.fetchall(
-                        f"SELECT item_id FROM {self.q} WHERE session_id=? "
-                        "AND (status='pending' OR (status='delivered' AND delivered_send_index=1 "
-                        "AND terminal_status IS NULL))",
-                        (sid,),
-                    )
-                    voided = await tx.execute(
-                        f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
-                        "cancel_by='removed',error_code='session_closed',error_detail=?,"
-                        f"delivered_send_index=NULL,delivered_seq=NULL,delivered_at=NULL,completed_at={now_sql} "
-                        "WHERE session_id=? "
-                        "AND (status='pending' OR (status='delivered' AND delivered_send_index=1 "
-                        "AND terminal_status IS NULL))",
-                        (eff_reason, sid),
-                    )
-                else:
-                    void_rows = await tx.fetchall(
-                        f"SELECT item_id FROM {self.q} WHERE session_id=? AND status='pending'",
-                        (sid,),
-                    )
-                    voided = await tx.execute(
-                        f"UPDATE {self.q} SET status='void',terminal_status='cancelled',"
-                        "cancel_by='removed',error_code='session_closed',error_detail=?,"
-                        f"completed_at={now_sql} WHERE session_id=? AND status='pending'",
-                        (eff_reason, sid),
-                    )
-                for vr in void_rows:
-                    completed_refs.append(InputRef(target.store_id, sid, vr["item_id"]))
-
-            post_exec = (
-                "idle" if locked["execution_state"] == "queued"
-                else str(locked["execution_state"])
-            )
-            status_obj = Status(
-                None, target, post_exec, None, None,
-                int(locked["send_index"]) or None, False, None,
-                bool(sid in stopped_map and post_exec == "running"),
-                eff_reason if sid in stopped_map else locked["cancel_reason"],
-                None, None, None, None,
-                lifecycle=lifecycle,
-                need_wake=False,
-                stopped_descendant_ids=tuple(descendants),
-                voided_pending_inputs=int(voided),
-            )
+                break
+            except _SubtreeChangedRetry:
+                continue
+        else:
+            raise RuntimeRequestError("request_conflict", "concurrent subtree mutation")
         return (status_obj, stopped_map, completed_refs) if _with_effects else status_obj
 
     async def deactivate(
@@ -4619,350 +4709,456 @@ class RuntimeInputStore:
                     filter_ids.append(str(item))
 
         now_sql = self._now_sql()
-        need_wake = False
+        suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
 
-        async with self.db.transaction() as tx:
-            suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
-            pair = await tx.fetchall(
-                f"SELECT * FROM {self.s} WHERE session_id IN (?,?) ORDER BY session_id ASC{suffix}",
-                (fp_sid, tp_sid),
-            )
-            by_p = {r["session_id"]: dict(r) for r in pair}
-            if fp_sid not in by_p or tp_sid not in by_p:
-                raise RuntimeRequestError("not_found")
-            fp, tp = by_p[fp_sid], by_p[tp_sid]
-
-            # Invariant 2a: tenant/principal + actor authorization + to_parent lifecycle
-            if (fp["tenant_id"], fp["principal_id"]) != (actor.tenant_id, actor.principal_id):
-                raise RuntimeRequestError("forbidden")
-            if (tp["tenant_id"], tp["principal_id"]) != (fp["tenant_id"], fp["principal_id"]):
-                raise RuntimeRequestError("forbidden", "cross-tenant/principal rebind forbidden")
-            if actor.session_id is not None:
-                await self._authorize_known(tx, from_parent, actor, fp)
-                await self._authorize_known(tx, to_parent, actor, tp)
-            if tp["lifecycle"] not in ("open", "suspended"):
-                raise RuntimeRequestError("session_closed")
-
-            # Invariant 1: forbid rebind while from_parent has synchronous tool wait
-            if fp["execution_state"] == "running":
-                if fp["pending_tool_seq"] is not None:
-                    raise RuntimeRequestError(
-                        "request_conflict", "from_parent has active synchronous tool wait"
+        for _attempt in range(8):
+            need_wake = False
+            try:
+                async with self.db.transaction() as tx:
+                    # Step 1 (Unlocked discovery): read parents + entire descendant subtree so we
+                    # can lock ALL affected rows in strict global deep-first order (-depth, session_id),
+                    # eliminating AB-BA deadlocks with concurrent Final / cancel / set_lifecycle.
+                    disc_pair = await tx.fetchall(
+                        f"SELECT * FROM {self.s} WHERE session_id IN (?,?) ORDER BY session_id ASC",
+                        (fp_sid, tp_sid),
                     )
-                fp_msgs = await tx.fetchall(
-                    f"SELECT seq,round_index,role,tool_calls_json,tool_call_id "
-                    f"FROM {self.store.t.messages} WHERE session_id=? AND send_index=? ORDER BY seq ASC",
-                    (fp_sid, int(fp["send_index"])),
-                )
-                if fp_msgs:
-                    norm_fp = [
-                        {
-                            "seq": int(m["seq"]),
-                            "round_index": int(m["round_index"]) if m["round_index"] is not None else 0,
-                            "role": m["role"],
-                            "tool_calls": json.loads(m["tool_calls_json"]) if m["tool_calls_json"] else None,
-                            "tool_call_id": m["tool_call_id"],
-                        }
-                        for m in fp_msgs
-                    ]
-                    if find_dangling_tool_calls(norm_fp):
+                    disc_by_p = {r["session_id"]: dict(r) for r in disc_pair}
+                    if fp_sid not in disc_by_p or tp_sid not in disc_by_p:
+                        raise RuntimeRequestError("not_found")
+                    disc_fp, disc_tp = disc_by_p[fp_sid], disc_by_p[tp_sid]
+
+                    if (disc_fp["tenant_id"], disc_fp["principal_id"]) != (actor.tenant_id, actor.principal_id):
+                        raise RuntimeRequestError("forbidden")
+                    if (disc_tp["tenant_id"], disc_tp["principal_id"]) != (disc_fp["tenant_id"], disc_fp["principal_id"]):
+                        raise RuntimeRequestError("forbidden", "cross-tenant/principal rebind forbidden")
+                    if disc_tp["lifecycle"] not in ("open", "suspended"):
+                        raise RuntimeRequestError("session_closed")
+
+                    if filter_ids is not None:
+                        if not filter_ids:
+                            return RebindResult(
+                                from_parent=from_parent,
+                                to_parent=to_parent,
+                                rebound_children=(),
+                                updated_descendants=(),
+                                replayed_results=0,
+                                new_root_session_id=str(disc_tp["root_session_id"]),
+                                depth_delta=0,
+                                need_wake=False,
+                            )
+                        ph = ",".join("?" for _ in filter_ids)
+                        disc_direct = [
+                            dict(r) for r in await tx.fetchall(
+                                f"SELECT * FROM {self.s} WHERE parent_session_id=? AND session_id IN ({ph}) "
+                                "ORDER BY session_id ASC",
+                                (fp_sid, *filter_ids),
+                            )
+                        ]
+                    else:
+                        disc_direct = [
+                            dict(r) for r in await tx.fetchall(
+                                f"SELECT * FROM {self.s} WHERE parent_session_id=? ORDER BY session_id ASC",
+                                (fp_sid,),
+                            )
+                        ]
+
+                    # BFS collect ENTIRE descendant subtree (INCLUDING idle descendants!)
+                    disc_all: list[dict[str, Any]] = list(disc_direct)
+                    frontier = list(disc_direct)
+                    seen_ids: set[str] = {r["session_id"] for r in disc_direct}
+                    while frontier:
+                        p_ids = [r["session_id"] for r in frontier]
+                        p_ph = ",".join("?" for _ in p_ids)
+                        nxt = [
+                            dict(r) for r in await tx.fetchall(
+                                f"SELECT * FROM {self.s} WHERE parent_session_id IN ({p_ph}) ORDER BY session_id ASC",
+                                tuple(p_ids),
+                            )
+                        ]
+                        frontier = [r for r in nxt if r["session_id"] not in seen_ids]
+                        for r in frontier:
+                            seen_ids.add(r["session_id"])
+                            disc_all.append(r)
+
+                    if tp_sid in seen_ids:
                         raise RuntimeRequestError(
-                            "request_conflict", "from_parent has active synchronous tool wait"
+                            "request_conflict", f"cycle detected: to_parent {tp_sid} is a descendant"
                         )
 
-            if filter_ids is not None:
-                if not filter_ids:
-                    return RebindResult(
-                        from_parent=from_parent,
-                        to_parent=to_parent,
-                        rebound_children=(),
-                        updated_descendants=(),
-                        replayed_results=0,
-                        new_root_session_id=str(tp["root_session_id"]),
-                        depth_delta=0,
-                        need_wake=False,
-                    )
-                ph = ",".join("?" for _ in filter_ids)
-                direct_children = [
-                    dict(r) for r in await tx.fetchall(
-                        f"SELECT * FROM {self.s} WHERE parent_session_id=? AND session_id IN ({ph}) "
-                        "ORDER BY session_id ASC",
-                        (fp_sid, *filter_ids),
-                    )
-                ]
-            else:
-                direct_children = [
-                    dict(r) for r in await tx.fetchall(
-                        f"SELECT * FROM {self.s} WHERE parent_session_id=? ORDER BY session_id ASC",
-                        (fp_sid,),
-                    )
-                ]
+                    # Step 2 (Unified deep-first locking): lock all descendants + (from_parent, to_parent)
+                    # strictly by depth DESC, session_id ASC FOR UPDATE!
+                    lock_by_depth: dict[int, list[str]] = {}
+                    expected_depth: dict[str, int] = {}
+                    expected_parent: dict[str, str | None] = {}
+                    for r in (*disc_all, disc_fp, disc_tp):
+                        rsid = str(r["session_id"])
+                        if rsid in expected_depth:
+                            continue
+                        d_val = int(r["depth"])
+                        expected_depth[rsid] = d_val
+                        expected_parent[rsid] = r["parent_session_id"]
+                        lock_by_depth.setdefault(d_val, []).append(rsid)
 
-            if not direct_children:
-                return RebindResult(
-                    from_parent=from_parent,
-                    to_parent=to_parent,
-                    rebound_children=(),
-                    updated_descendants=(),
-                    replayed_results=0,
-                    new_root_session_id=str(tp["root_session_id"]),
-                    depth_delta=0,
-                    need_wake=False,
-                )
-
-            # Invariant 2b: BFS collect ENTIRE descendant subtree (INCLUDING idle descendants!)
-            all_moved: list[dict[str, Any]] = list(direct_children)
-            frontier = list(direct_children)
-            seen_ids: set[str] = {r["session_id"] for r in direct_children}
-            while frontier:
-                p_ids = [r["session_id"] for r in frontier]
-                p_ph = ",".join("?" for _ in p_ids)
-                nxt = [
-                    dict(r) for r in await tx.fetchall(
-                        f"SELECT * FROM {self.s} WHERE parent_session_id IN ({p_ph}) ORDER BY session_id ASC",
-                        tuple(p_ids),
-                    )
-                ]
-                frontier = [r for r in nxt if r["session_id"] not in seen_ids]
-                for r in frontier:
-                    seen_ids.add(r["session_id"])
-                    all_moved.append(r)
-
-            if tp_sid in seen_ids:
-                raise RuntimeRequestError(
-                    "request_conflict", f"cycle detected: to_parent {tp_sid} is a descendant"
-                )
-
-            new_root = str(tp["root_session_id"])
-            tp_depth = int(tp["depth"])
-            old_child_depth = int(direct_children[0]["depth"])
-            depth_delta = (tp_depth + 1) - old_child_depth
-
-            direct_ids = [r["session_id"] for r in direct_children]
-            d_ph = ",".join("?" for _ in direct_ids)
-            all_ids = [r["session_id"] for r in all_moved]
-            a_ph = ",".join("?" for _ in all_ids)
-
-            # Update direct children's parent_session_id and result_route_json
-            for child in direct_children:
-                new_route_json = child["result_route_json"]
-                if new_route_json:
-                    route_obj = json.loads(new_route_json)
-                    if (
-                        isinstance(route_obj, dict)
-                        and isinstance(route_obj.get("target"), dict)
-                        and route_obj["target"].get("session_id") == fp_sid
-                    ):
-                        route_obj["target"] = {**route_obj["target"], "session_id": tp_sid}
-                        new_route_json = canonical(route_obj)
-                        child["result_route_json"] = new_route_json
-                child["parent_session_id"] = tp_sid
-                await tx.execute(
-                    f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,updated_at={now_sql} "
-                    "WHERE session_id=?",
-                    (tp_sid, new_route_json, child["session_id"]),
-                )
-
-            # Recursively update root_session_id & relative depth for ALL descendants (incl. idle)
-            await tx.execute(
-                f"UPDATE {self.s} SET root_session_id=?,depth=depth+?,updated_at={now_sql} "
-                f"WHERE session_id IN ({a_ph})",
-                (new_root, depth_delta, *all_ids),
-            )
-            for node in all_moved:
-                node["root_session_id"] = new_root
-                node["depth"] = int(node["depth"]) + depth_delta
-
-            # Retarget active per-input reply routes on direct children
-            await tx.execute(
-                f"UPDATE {self.q} SET reply_to_session_id=? "
-                f"WHERE session_id IN ({d_ph}) AND reply_to_session_id=? "
-                "AND status IN ('pending','delivered') AND terminal_status IS NULL",
-                (tp_sid, *direct_ids, fp_sid),
-            )
-
-            # Optional host context rewrite callback across every moved node
-            if rewrite_host_context is not None:
-                tp_desc = json.loads(tp["descriptor_json"])
-                parent_info = {
-                    **tp,
-                    "descriptor": tp_desc,
-                    "host_context": dict(tp_desc.get("host_context") or {}),
-                }
-                for node in all_moved:
-                    cur_desc = json.loads(node["descriptor_json"])
-                    child_info = {
-                        **node,
-                        "descriptor": cur_desc,
-                        "host_context": dict(cur_desc.get("host_context") or {}),
-                    }
-                    rewritten = rewrite_host_context(child_info, parent_info)
-                    if inspect.isawaitable(rewritten):
-                        rewritten = await rewritten
-                    if rewritten is None:
-                        continue
-                    if isinstance(rewritten, RuntimeDescriptor):
-                        new_desc_obj = rewritten
-                    elif isinstance(rewritten, dict) and {
-                        "schema_version", "definition_ref",
-                    } <= rewritten.keys():
-                        new_desc_obj = RuntimeDescriptor(**rewritten)
-                    elif isinstance(rewritten, dict):
-                        new_desc_obj = RuntimeDescriptor(**{**cur_desc, "host_context": rewritten})
-                    else:
-                        raise RuntimeRequestError("invalid_options", "rewrite_host_context return type")
-                    nd_json = canonical(new_desc_obj)
-                    nd_hash = sha256_canonical(new_desc_obj)
-                    if node.get("next_descriptor_json"):
-                        staged = json.loads(node["next_descriptor_json"])
-                        staged_obj = RuntimeDescriptor(
-                            **{**staged, "host_context": plain(new_desc_obj.host_context)}
+                    locked_by_id: dict[str, dict[str, Any]] = {}
+                    for d_val in sorted(lock_by_depth, reverse=True):
+                        lvl_ids = sorted(lock_by_depth[d_val])
+                        l_ph = ",".join("?" for _ in lvl_ids)
+                        lrows = await tx.fetchall(
+                            f"SELECT * FROM {self.s} WHERE session_id IN ({l_ph}) ORDER BY session_id ASC{suffix}",
+                            tuple(lvl_ids),
                         )
-                        await tx.execute(
-                            f"UPDATE {self.s} SET descriptor_json=?,descriptor_hash=?,"
-                            "next_descriptor_json=?,next_descriptor_hash=?,"
-                            f"updated_at={now_sql} WHERE session_id=?",
-                            (nd_json, nd_hash, canonical(staged_obj), sha256_canonical(staged_obj),
-                             node["session_id"]),
+                        for lr in lrows:
+                            locked_by_id[str(lr["session_id"])] = dict(lr)
+
+                    if fp_sid not in locked_by_id or tp_sid not in locked_by_id:
+                        raise RuntimeRequestError("not_found")
+                    if len(locked_by_id) != len(expected_depth):
+                        raise _RebindChangedRetry()
+                    for rsid, exp_d in expected_depth.items():
+                        cur_r = locked_by_id[rsid]
+                        if int(cur_r["depth"]) != exp_d or cur_r["parent_session_id"] != expected_parent[rsid]:
+                            raise _RebindChangedRetry()
+
+                    fp, tp = locked_by_id[fp_sid], locked_by_id[tp_sid]
+
+                    # Re-check under locks that no concurrent child/descendant was added in the discovery gap
+                    if filter_ids is not None:
+                        ph = ",".join("?" for _ in filter_ids)
+                        re_direct = await tx.fetchall(
+                            f"SELECT session_id FROM {self.s} WHERE parent_session_id=? AND session_id IN ({ph})",
+                            (fp_sid, *filter_ids),
                         )
                     else:
-                        await tx.execute(
-                            f"UPDATE {self.s} SET descriptor_json=?,descriptor_hash=?,"
-                            f"updated_at={now_sql} WHERE session_id=?",
-                            (nd_json, nd_hash, node["session_id"]),
+                        re_direct = await tx.fetchall(
+                            f"SELECT session_id FROM {self.s} WHERE parent_session_id=?",
+                            (fp_sid,),
+                        )
+                    re_direct_ids = {str(r["session_id"]) for r in re_direct}
+                    if re_direct_ids != {str(r["session_id"]) for r in disc_direct}:
+                        raise _RebindChangedRetry()
+                    if seen_ids:
+                        check_ids = list(seen_ids)
+                        c_ph = ",".join("?" for _ in check_ids)
+                        re_sub = await tx.fetchall(
+                            f"SELECT session_id FROM {self.s} WHERE parent_session_id IN ({c_ph})",
+                            tuple(check_ids),
+                        )
+                        if any(str(r["session_id"]) not in seen_ids for r in re_sub):
+                            raise _RebindChangedRetry()
+
+                    # Invariant 2a (re-verified under locks): tenant/principal + actor auth + to_parent lifecycle
+                    if (fp["tenant_id"], fp["principal_id"]) != (actor.tenant_id, actor.principal_id):
+                        raise RuntimeRequestError("forbidden")
+                    if (tp["tenant_id"], tp["principal_id"]) != (fp["tenant_id"], fp["principal_id"]):
+                        raise RuntimeRequestError("forbidden", "cross-tenant/principal rebind forbidden")
+                    if actor.session_id is not None:
+                        await self._authorize_known(tx, from_parent, actor, fp)
+                        await self._authorize_known(tx, to_parent, actor, tp)
+                    if tp["lifecycle"] not in ("open", "suspended"):
+                        raise RuntimeRequestError("session_closed")
+
+                    # Invariant 1 (under locked from_parent): forbid rebind while from_parent has sync tool wait
+                    if fp["execution_state"] == "running":
+                        if fp["pending_tool_seq"] is not None:
+                            raise RuntimeRequestError(
+                                "request_conflict", "from_parent has active synchronous tool wait"
+                            )
+                        fp_msgs = await tx.fetchall(
+                            f"SELECT seq,round_index,role,tool_calls_json,tool_call_id "
+                            f"FROM {self.store.t.messages} WHERE session_id=? AND send_index=? ORDER BY seq ASC",
+                            (fp_sid, int(fp["send_index"])),
+                        )
+                        if fp_msgs:
+                            norm_fp = [
+                                {
+                                    "seq": int(m["seq"]),
+                                    "round_index": int(m["round_index"]) if m["round_index"] is not None else 0,
+                                    "role": m["role"],
+                                    "tool_calls": json.loads(m["tool_calls_json"]) if m["tool_calls_json"] else None,
+                                    "tool_call_id": m["tool_call_id"],
+                                }
+                                for m in fp_msgs
+                            ]
+                            if find_dangling_tool_calls(norm_fp):
+                                raise RuntimeRequestError(
+                                    "request_conflict", "from_parent has active synchronous tool wait"
+                                )
+
+                    direct_children = [locked_by_id[str(r["session_id"])] for r in disc_direct]
+                    all_moved = [locked_by_id[str(r["session_id"])] for r in disc_all]
+
+                    if not direct_children:
+                        return RebindResult(
+                            from_parent=from_parent,
+                            to_parent=to_parent,
+                            rebound_children=(),
+                            updated_descendants=(),
+                            replayed_results=0,
+                            new_root_session_id=str(tp["root_session_id"]),
+                            depth_delta=0,
+                            need_wake=False,
                         )
 
-            # Invariant 3: atomically replay orphan 'session_closed' receipts to to_parent
-            replayed = 0
-            if replay_undelivered:
-                child_by_id = {c["session_id"]: c for c in direct_children}
-                undeliv = await tx.fetchall(
-                    f"SELECT id,session_id,item_id,delivered_send_index,terminal_status,"
-                    "cancel_by,result_json,result_send_index,result_seq,error_code,error_detail "
-                    f"FROM {self.q} WHERE session_id IN ({d_ph}) "
-                    "AND result_delivery_error='session_closed' ORDER BY id ASC",
-                    tuple(direct_ids),
-                )
-                for urow in undeliv:
-                    c_sid = str(urow["session_id"])
-                    c_si = urow["result_send_index"] or urow["delivered_send_index"]
-                    c_si_int = int(c_si) if c_si is not None else 0
-                    raw_replay_id = f"res_rebind_{c_sid}_s{c_si_int}"
-                    replay_id = (
-                        raw_replay_id if len(raw_replay_id) <= 64
-                        else "res_rebind_" + sha256_canonical([c_sid, urow["item_id"], c_si_int])[:48]
-                    )
-                    c_row = child_by_id[c_sid]
-                    c_route = json.loads(c_row["result_route_json"]) if c_row.get("result_route_json") else None
-                    c_result_kind = (
-                        c_route.get("result_kind")
-                        if isinstance(c_route, dict) and c_route.get("result_kind") in _VALID_RESULT_KINDS
-                        else "agent_result"
-                    )
-                    orig_txt = ""
-                    if urow["result_json"]:
-                        try:
-                            parsed_rj = json.loads(urow["result_json"])
-                            if isinstance(parsed_rj, dict):
-                                orig_txt = str(parsed_rj.get("final_text") or parsed_rj.get("text") or "")
-                        except ValueError:
-                            pass
-                    if not orig_txt and c_si is not None:
-                        mrow = await tx.fetchone(
-                            f"SELECT content FROM {self.store.t.messages} "
-                            "WHERE session_id=? AND send_index=? AND role='assistant' "
-                            "ORDER BY seq DESC LIMIT 1",
-                            (c_sid, int(c_si)),
-                        )
-                        if mrow is not None and mrow["content"]:
-                            orig_txt = str(mrow["content"])
-                    header = f"[接管自前任会话 {fp_sid} 的子任务结果]"
-                    combined_txt = f"{header}\n{orig_txt}".strip() if orig_txt else header
-                    body = {
-                        "child_target": plain(TargetRef(self.store.store_id, c_sid)),
-                        "input_ref": plain(InputRef(self.store.store_id, c_sid, urow["item_id"])),
-                        "source_session_id": c_sid,
-                        "rebound_from_parent": fp_sid,
-                        "status": urow["terminal_status"] or "completed",
-                        "cancel_by": urow["cancel_by"],
-                        "final_text": combined_txt,
-                        "text": combined_txt,
-                        "send_index": int(c_si) if c_si is not None else None,
-                        "result_seq": urow["result_seq"],
-                        "error": urow["error_detail"],
-                        "error_code": urow["error_code"],
-                    }
-                    b_json = canonical(body)
-                    b_meta = canonical({
-                        "accepted_protocol": PROTOCOL_VERSION,
-                        "rebound_from_parent": fp_sid,
-                        "source_session_id": c_sid,
-                    })
-                    b_bytes = len(b_json.encode()) + len(b_meta.encode())
-                    b_hash = self.request_hash(to_parent, body, "normal")
-                    if self._dialect == "mysql":
-                        rc_rp, rp_packed = await tx.execute_packed(
-                            f"UPDATE {self.s} SET "
-                            "inbox_version=(LAST_INSERT_ID("
-                            "((inbox_version+1)<<1)|"
-                            "(CASE WHEN lifecycle='open' AND execution_state='idle' THEN 1 ELSE 0 END)"
-                            ")>>1),"
-                            "wake_inbox_seq=wake_inbox_seq+1,"
-                            "wake_pending_count=wake_pending_count+1,"
-                            "pending_count=pending_count+1,"
-                            "pending_bytes=pending_bytes+?,"
-                            "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' "
-                            "THEN 'queued' ELSE execution_state END,"
-                            f"updated_at={now_sql} "
-                            "WHERE session_id=? AND lifecycle IN ('open','suspended') "
-                            f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)",
-                            (b_bytes, tp_sid, tp_sid, replay_id),
-                        )
-                        ok_rp = rc_rp == 1
-                        rp_seq = (rp_packed >> 1) if ok_rp else 0
-                        if ok_rp and bool(rp_packed & 1):
-                            need_wake = True
-                    else:
-                        rprow = await tx.fetchone(
-                            f"UPDATE {self.s} SET "
-                            "inbox_version=inbox_version+1,"
-                            "wake_inbox_seq=wake_inbox_seq+1,"
-                            "wake_pending_count=wake_pending_count+1,"
-                            "pending_count=pending_count+1,"
-                            "pending_bytes=pending_bytes+?,"
-                            "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' "
-                            "THEN 'queued' ELSE execution_state END,"
-                            f"updated_at={now_sql} "
-                            "WHERE session_id=? AND lifecycle IN ('open','suspended') "
-                            f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?) "
-                            "RETURNING inbox_version,lifecycle,execution_state,wake_pending_count",
-                            (b_bytes, tp_sid, tp_sid, replay_id),
-                        )
-                        ok_rp = rprow is not None
-                        rp_seq = int(rprow["inbox_version"]) if ok_rp else 0
-                        if (
-                            ok_rp
-                            and rprow["lifecycle"] == "open"
-                            and rprow["execution_state"] == "queued"
-                            and int(rprow["wake_pending_count"]) == 1
-                        ):
-                            need_wake = True
-                    if ok_rp:
+                    new_root = str(tp["root_session_id"])
+                    tp_depth = int(tp["depth"])
+                    old_child_depth = int(direct_children[0]["depth"])
+                    depth_delta = (tp_depth + 1) - old_child_depth
+
+                    direct_ids = [r["session_id"] for r in direct_children]
+                    d_ph = ",".join("?" for _ in direct_ids)
+                    all_ids = [r["session_id"] for r in all_moved]
+                    a_ph = ",".join("?" for _ in all_ids)
+
+                    # Update direct children's parent_session_id and result_route_json
+                    for child in direct_children:
+                        new_route_json = child["result_route_json"]
+                        if new_route_json:
+                            route_obj = json.loads(new_route_json)
+                            if (
+                                isinstance(route_obj, dict)
+                                and isinstance(route_obj.get("target"), dict)
+                                and route_obj["target"].get("session_id") == fp_sid
+                            ):
+                                route_obj["target"] = {**route_obj["target"], "session_id": tp_sid}
+                                new_route_json = canonical(route_obj)
+                                child["result_route_json"] = new_route_json
+                        child["parent_session_id"] = tp_sid
                         await tx.execute(
-                            f"INSERT INTO {self.q} ("
-                            "session_id,item_id,inbox_version,kind,priority,wake,status,"
-                            "content_json,content_bytes,meta_json,request_hash,result_kind,created_at) "
-                            f"VALUES (?,?,?,?,'normal',1,'pending',?,?,?,?,?,{now_sql})",
-                            (
-                                tp_sid, replay_id, rp_seq, c_result_kind,
-                                b_json, b_bytes, b_meta, b_hash, c_result_kind,
-                            ),
+                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,updated_at={now_sql} "
+                            "WHERE session_id=?",
+                            (tp_sid, new_route_json, child["session_id"]),
                         )
-                        await tx.execute(
-                            f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id=?",
-                            (int(urow["id"]),),
+
+                    # Recursively update root_session_id & relative depth for ALL descendants (incl. idle)
+                    await tx.execute(
+                        f"UPDATE {self.s} SET root_session_id=?,depth=depth+?,updated_at={now_sql} "
+                        f"WHERE session_id IN ({a_ph})",
+                        (new_root, depth_delta, *all_ids),
+                    )
+                    for node in all_moved:
+                        node["root_session_id"] = new_root
+                        node["depth"] = int(node["depth"]) + depth_delta
+
+                    # Retarget active per-input reply routes on direct children
+                    await tx.execute(
+                        f"UPDATE {self.q} SET reply_to_session_id=? "
+                        f"WHERE session_id IN ({d_ph}) AND reply_to_session_id=? "
+                        "AND status IN ('pending','delivered') AND terminal_status IS NULL",
+                        (tp_sid, *direct_ids, fp_sid),
+                    )
+
+                    # Optional host context rewrite callback across every moved node
+                    if rewrite_host_context is not None:
+                        tp_desc = json.loads(tp["descriptor_json"])
+                        parent_info = {
+                            **tp,
+                            "descriptor": tp_desc,
+                            "host_context": dict(tp_desc.get("host_context") or {}),
+                        }
+                        for node in all_moved:
+                            cur_desc = json.loads(node["descriptor_json"])
+                            child_info = {
+                                **node,
+                                "descriptor": cur_desc,
+                                "host_context": dict(cur_desc.get("host_context") or {}),
+                            }
+                            rewritten = rewrite_host_context(child_info, parent_info)
+                            if inspect.isawaitable(rewritten):
+                                rewritten = await rewritten
+                            if rewritten is None:
+                                continue
+                            if isinstance(rewritten, RuntimeDescriptor):
+                                new_desc_obj = rewritten
+                            elif isinstance(rewritten, dict) and {
+                                "schema_version", "definition_ref",
+                            } <= rewritten.keys():
+                                new_desc_obj = RuntimeDescriptor(**rewritten)
+                            elif isinstance(rewritten, dict):
+                                new_desc_obj = RuntimeDescriptor(**{**cur_desc, "host_context": rewritten})
+                            else:
+                                raise RuntimeRequestError("invalid_options", "rewrite_host_context return type")
+                            nd_json = canonical(new_desc_obj)
+                            nd_hash = sha256_canonical(new_desc_obj)
+                            if node.get("next_descriptor_json"):
+                                staged = json.loads(node["next_descriptor_json"])
+                                staged_obj = RuntimeDescriptor(
+                                    **{**staged, "host_context": plain(new_desc_obj.host_context)}
+                                )
+                                await tx.execute(
+                                    f"UPDATE {self.s} SET descriptor_json=?,descriptor_hash=?,"
+                                    "next_descriptor_json=?,next_descriptor_hash=?,"
+                                    f"updated_at={now_sql} WHERE session_id=?",
+                                    (nd_json, nd_hash, canonical(staged_obj), sha256_canonical(staged_obj),
+                                     node["session_id"]),
+                                )
+                            else:
+                                await tx.execute(
+                                    f"UPDATE {self.s} SET descriptor_json=?,descriptor_hash=?,"
+                                    f"updated_at={now_sql} WHERE session_id=?",
+                                    (nd_json, nd_hash, node["session_id"]),
+                                )
+
+                    # Invariant 3: atomically replay orphan 'session_closed' receipts to to_parent
+                    # enforcing River's exact item-count and byte capacity limits (rolls back on overflow!).
+                    replayed = 0
+                    if replay_undelivered:
+                        child_by_id = {c["session_id"]: c for c in direct_children}
+                        undeliv = await tx.fetchall(
+                            f"SELECT id,session_id,item_id,delivered_send_index,terminal_status,"
+                            "cancel_by,result_json,result_send_index,result_seq,error_code,error_detail "
+                            f"FROM {self.q} WHERE session_id IN ({d_ph}) "
+                            "AND result_delivery_error='session_closed' ORDER BY id ASC",
+                            tuple(direct_ids),
                         )
-                        replayed += 1
+                        for urow in undeliv:
+                            c_sid = str(urow["session_id"])
+                            c_si = urow["result_send_index"] or urow["delivered_send_index"]
+                            c_si_int = int(c_si) if c_si is not None else 0
+                            raw_replay_id = f"res_rebind_{c_sid}_s{c_si_int}"
+                            replay_id = (
+                                raw_replay_id if len(raw_replay_id) <= 64
+                                else "res_rebind_" + sha256_canonical([c_sid, urow["item_id"], c_si_int])[:48]
+                            )
+                            c_row = child_by_id[c_sid]
+                            c_route = json.loads(c_row["result_route_json"]) if c_row.get("result_route_json") else None
+                            c_result_kind = (
+                                c_route.get("result_kind")
+                                if isinstance(c_route, dict) and c_route.get("result_kind") in _VALID_RESULT_KINDS
+                                else "agent_result"
+                            )
+                            orig_txt = ""
+                            if urow["result_json"]:
+                                try:
+                                    parsed_rj = json.loads(urow["result_json"])
+                                    if isinstance(parsed_rj, dict):
+                                        orig_txt = str(parsed_rj.get("final_text") or parsed_rj.get("text") or "")
+                                except ValueError:
+                                    pass
+                            if not orig_txt and c_si is not None:
+                                mrow = await tx.fetchone(
+                                    f"SELECT content FROM {self.store.t.messages} "
+                                    "WHERE session_id=? AND send_index=? AND role='assistant' "
+                                    "ORDER BY seq DESC LIMIT 1",
+                                    (c_sid, int(c_si)),
+                                )
+                                if mrow is not None and mrow["content"]:
+                                    orig_txt = str(mrow["content"])
+                            header = f"[接管自前任会话 {fp_sid} 的子任务结果]"
+                            combined_txt = f"{header}\n{orig_txt}".strip() if orig_txt else header
+                            body = {
+                                "child_target": plain(TargetRef(self.store.store_id, c_sid)),
+                                "input_ref": plain(InputRef(self.store.store_id, c_sid, urow["item_id"])),
+                                "source_session_id": c_sid,
+                                "rebound_from_parent": fp_sid,
+                                "status": urow["terminal_status"] or "completed",
+                                "cancel_by": urow["cancel_by"],
+                                "final_text": combined_txt,
+                                "text": combined_txt,
+                                "send_index": int(c_si) if c_si is not None else None,
+                                "result_seq": urow["result_seq"],
+                                "error": urow["error_detail"],
+                                "error_code": urow["error_code"],
+                            }
+                            b_json = canonical(body)
+                            b_meta = canonical({
+                                "accepted_protocol": PROTOCOL_VERSION,
+                                "rebound_from_parent": fp_sid,
+                                "source_session_id": c_sid,
+                            })
+                            b_bytes = len(b_json.encode()) + len(b_meta.encode())
+                            b_hash = self.request_hash(to_parent, body, "normal")
+                            if self._dialect == "mysql":
+                                rc_rp, rp_packed = await tx.execute_packed(
+                                    f"UPDATE {self.s} SET "
+                                    "inbox_version=(LAST_INSERT_ID("
+                                    "((inbox_version+1)<<1)|"
+                                    "(CASE WHEN lifecycle='open' AND execution_state='idle' THEN 1 ELSE 0 END)"
+                                    ")>>1),"
+                                    "wake_inbox_seq=wake_inbox_seq+1,"
+                                    "wake_pending_count=wake_pending_count+1,"
+                                    "pending_count=pending_count+1,"
+                                    "pending_bytes=pending_bytes+?,"
+                                    "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' "
+                                    "THEN 'queued' ELSE execution_state END,"
+                                    f"updated_at={now_sql} "
+                                    "WHERE session_id=? AND lifecycle IN ('open','suspended') "
+                                    "AND tenant_id=? AND principal_id=? "
+                                    "AND pending_count<? AND (pending_bytes+?)<=? "
+                                    f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)",
+                                    (
+                                        b_bytes, tp_sid, tp["tenant_id"], tp["principal_id"],
+                                        self.hard_pending_limit, b_bytes, self.inbox_byte_limit,
+                                        tp_sid, replay_id,
+                                    ),
+                                )
+                                ok_rp = rc_rp == 1
+                                rp_seq = (rp_packed >> 1) if ok_rp else 0
+                                if ok_rp and bool(rp_packed & 1):
+                                    need_wake = True
+                            else:
+                                rprow = await tx.fetchone(
+                                    f"UPDATE {self.s} SET "
+                                    "inbox_version=inbox_version+1,"
+                                    "wake_inbox_seq=wake_inbox_seq+1,"
+                                    "wake_pending_count=wake_pending_count+1,"
+                                    "pending_count=pending_count+1,"
+                                    "pending_bytes=pending_bytes+?,"
+                                    "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' "
+                                    "THEN 'queued' ELSE execution_state END,"
+                                    f"updated_at={now_sql} "
+                                    "WHERE session_id=? AND lifecycle IN ('open','suspended') "
+                                    "AND tenant_id=? AND principal_id=? "
+                                    "AND pending_count<? AND (pending_bytes+?)<=? "
+                                    f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?) "
+                                    "RETURNING inbox_version,lifecycle,execution_state,wake_pending_count",
+                                    (
+                                        b_bytes, tp_sid, tp["tenant_id"], tp["principal_id"],
+                                        self.hard_pending_limit, b_bytes, self.inbox_byte_limit,
+                                        tp_sid, replay_id,
+                                    ),
+                                )
+                                ok_rp = rprow is not None
+                                rp_seq = int(rprow["inbox_version"]) if ok_rp else 0
+                                if (
+                                    ok_rp
+                                    and rprow["lifecycle"] == "open"
+                                    and rprow["execution_state"] == "queued"
+                                    and int(rprow["wake_pending_count"]) == 1
+                                ):
+                                    need_wake = True
+                            if ok_rp:
+                                await tx.execute(
+                                    f"INSERT INTO {self.q} ("
+                                    "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                                    "content_json,content_bytes,meta_json,request_hash,result_kind,created_at) "
+                                    f"VALUES (?,?,?,?,'normal',1,'pending',?,?,?,?,?,{now_sql})",
+                                    (
+                                        tp_sid, replay_id, rp_seq, c_result_kind,
+                                        b_json, b_bytes, b_meta, b_hash, c_result_kind,
+                                    ),
+                                )
+                                await tx.execute(
+                                    f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id=?",
+                                    (int(urow["id"]),),
+                                )
+                                replayed += 1
+                            else:
+                                dup = await tx.fetchone(
+                                    f"SELECT id FROM {self.q} WHERE session_id=? AND item_id=?",
+                                    (tp_sid, replay_id),
+                                )
+                                if dup is not None:
+                                    await tx.execute(
+                                        f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id=?",
+                                        (int(urow["id"]),),
+                                    )
+                                else:
+                                    raise CapacityError()
+                break
+            except _RebindChangedRetry:
+                continue
+        else:
+            raise RuntimeRequestError("request_conflict", "concurrent rebind mutation")
 
         return RebindResult(
             from_parent=from_parent,
