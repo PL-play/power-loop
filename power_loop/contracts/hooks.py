@@ -29,6 +29,9 @@ class HookPoint(str, Enum):
     EXECUTION_RELEASED = "execution_released"
     MESSAGE_ACCEPTED = "message_accepted"
     EXECUTION_FINISHED = "execution_finished"
+    SESSION_TAKEOVER = "session_takeover"
+    TURN_REPAIR = "turn_repair"
+    RESULT_UNDELIVERABLE = "result_undeliverable"
 
 
 class HookDirective(str, Enum):

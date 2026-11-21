@@ -607,7 +607,11 @@ async def _commit_recovery(port, actor, start, target, adapter, frozen, route, k
 
 async def reconcile(store, actor, start: InputRef, adapter: ManagedTool, *, client=None):
     """Publish a stored outcome or query the original action outside locks."""
-    port = RuntimeInputStore(store)
+    port = RuntimeInputStore(
+        store,
+        hooks=client.hooks if client is not None else None,
+        hook_timeout_s=client.hook_timeout_s if client is not None else 1.0,
+    )
     port.check_store(start)
     target = TargetRef(start.store_id, start.session_id)
     row = await _read_original(port, port.db, start)
@@ -644,6 +648,14 @@ async def reconcile(store, actor, start: InputRef, adapter: ManagedTool, *, clie
     result, recovered, parent_ref = await _commit_recovery(
         port, actor, start, target, adapter, frozen, route, key, original_send, state, result_document,
     )
+    if recovered is not None and recovered.result_delivery_error is not None:
+        await port._fire_result_undeliverable(
+            child_target=target,
+            parent_session_id=route["target"]["session_id"],
+            result=recovered,
+            result_kind=route["result_kind"],
+            reason=recovered.result_delivery_error,
+        )
     if client is not None and recovered is not None:
         await client._notify(
             target, recovered.input_ref.message_id, recovered.input_ref, ["output"],

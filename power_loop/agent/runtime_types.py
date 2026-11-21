@@ -210,6 +210,10 @@ class Status:
     result_delivery_error: str | None
     continuation_of: str | None
     continuation_index: int | None
+    lifecycle: Lifecycle = "open"
+    need_wake: bool = False
+    stopped_descendant_ids: tuple[str, ...] = ()
+    voided_pending_inputs: int = 0
 
 
 @dataclass(frozen=True)
@@ -325,3 +329,17 @@ class RepairResult:
     send_index: int
     next_seq: int
     summary: str | None = None
+
+
+@dataclass(frozen=True)
+class RebindResult:
+    """Result of an atomic ``RuntimeClient.rebind_children`` / ``RuntimeInputStore.rebind_children`` call."""
+
+    from_parent: TargetRef
+    to_parent: TargetRef
+    rebound_children: tuple[str, ...]
+    updated_descendants: tuple[str, ...]
+    replayed_results: int
+    new_root_session_id: str
+    depth_delta: int
+    need_wake: bool = False

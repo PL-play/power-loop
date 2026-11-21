@@ -38,6 +38,18 @@ from .runtime_types import (
 log = logging.getLogger(__name__)
 
 
+class _NotifyingCancellationToken(CancellationToken):
+    """CancellationToken that immediately wakes an asyncio.Event (0 DB polling)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.event = asyncio.Event()
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        super().cancel(reason)
+        self.event.set()
+
+
 class _SessionExecution:
     """The local context of one running send (no job identity)."""
 
@@ -53,11 +65,14 @@ class _SessionExecution:
         self.ownership = None
         self.input_ref = batch.input_refs[0]
         self.actor = actor
-        self.stop = CancellationToken()
+        self.stop = _NotifyingCancellationToken()
+        self.stop_event = self.stop.event
         self.task = None
         self.loop = None
         self.closing = False
         self.shutdown_interrupted = False
+        self._lost_notified = False
+        self._lost_hook_task = None
         # The ordinary LLM boundary extends this same run-local list. None means
         # claim/factory or a non-LLM path has not established that consumption fact.
         self.consumed: list[InputRef] | None = None
@@ -89,7 +104,11 @@ class _SessionExecution:
 class RuntimeWorker:
     def __init__(self, runtime):
         self.runtime = runtime
-        self.inputs = RuntimeInputStore(runtime.store)
+        self.inputs = RuntimeInputStore(
+            runtime.store,
+            hooks_provider=lambda: self.runtime.hooks,
+            hook_timeout_s=runtime.hook_timeout_s,
+        )
         self._subscriptions, self._listeners = [], []
         self._wake_subscription = None
         self._wake_listener = None
@@ -259,7 +278,7 @@ class RuntimeWorker:
             if ctx.ownership is not None:
                 ctx.ownership.expires_at = now_mono
             if row["lifecycle"] in ("closing", "closed") or int(row["cancel_seq"]) > ctx.batch.cancel_seq:
-                ctx.stop.cancel(row["cancel_reason"] or "cancelled")
+                ctx.stop.cancel(row.get("cancel_reason") or "cancelled")
         return rows
 
     async def periodic_tick(self, *, limit: int = 32):
@@ -498,7 +517,22 @@ class RuntimeWorker:
             ctx.task = asyncio.current_task()
             ctx.ownership = ownership
             self._active[sid] = ctx
-            ownership.on_lost = lambda: ctx.stop.cancel("session ownership lost")
+
+            def _on_ownership_lost() -> None:
+                ctx.stop.cancel("session ownership lost")
+                if not ctx._lost_notified and r.hooks is not None:
+                    ctx._lost_notified = True
+                    payload = {
+                        "execution": ctx.snapshot(),
+                        "session_id": sid,
+                        "owner_epoch": ctx.batch.owner_epoch,
+                    }
+                    ctx._lost_hook_task = asyncio.create_task(
+                        notify(r.hooks, HookPoint.EXECUTION_LOST, payload, timeout_s=r.hook_timeout_s),
+                        context=contextvars.Context(),
+                    )
+
+            ownership.on_lost = _on_ownership_lost
             ownership_token = _CURRENT.set(ownership)
             renewal = asyncio.create_task(self._renew(sid, batch, ownership, ctx), context=contextvars.Context())
 
@@ -636,8 +670,10 @@ class RuntimeWorker:
                     normal_final = final_batch
                 await self._notify_results(final_batch)
         except SessionLeaseLost:
-            # Another owner took over; stop quietly. No compensation writes.
+            # Another owner took over; stop immediately and trigger EXECUTION_LOST hook.
             # Hint any local output waiter to re-check durable result state without DB writes.
+            if ownership is not None:
+                ownership.lose()
             if ctx is not None:
                 ctx.stop.cancel("session ownership lost")
                 if not ctx.output.full():
@@ -680,8 +716,16 @@ class RuntimeWorker:
                 await bus.drain(timeout=r.hook_timeout_s)
             if ctx is not None:
                 ctx.closing = True
-                if ownership is not None and ownership.lost:
-                    await notify(r.hooks, HookPoint.EXECUTION_LOST, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
+                if ctx._lost_hook_task is not None:
+                    await asyncio.gather(ctx._lost_hook_task, return_exceptions=True)
+                elif ownership is not None and ownership.lost and not ctx._lost_notified:
+                    ctx._lost_notified = True
+                    await notify(
+                        r.hooks,
+                        HookPoint.EXECUTION_LOST,
+                        {"execution": ctx.snapshot(), "session_id": sid, "owner_epoch": ctx.batch.owner_epoch},
+                        timeout_s=r.hook_timeout_s,
+                    )
                 await notify(r.hooks, HookPoint.EXECUTION_FINISHED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
                 ctx.loop = None
             self._active.pop(sid, None)

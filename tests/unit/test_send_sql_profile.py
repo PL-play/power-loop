@@ -424,17 +424,18 @@ async def _measure(store, models, *, history=0, tools_per_round=1, backlog=1,
 
 
 def _per_round_ceiling(db, tools_per_round):
-    base = 7 if db == "mysql" else 5
-    extra = 3 if db == "mysql" else 2
-    return base + (tools_per_round - 1) * extra
+    # Design 217 Session-Core: +0 control SQL per tool round across SQLite/PG/MySQL;
+    # business SQL is 1 assistant INSERT + tools_per_round tool INSERTs (last tool piggybacks boundary).
+    _ = db
+    return 1 + tools_per_round
 
 
 async def test_frozen_fixed_send_budget(registry_store):
-    """P0-R2's fixed allowance includes the complete ordinary send, not only growth."""
+    """Design 217 M1c tightened fixed budget: 3-tx standard <= 10/10/11 (worker-only 8/8/9)."""
     store, _ = registry_store
     records, _, sites, _, _ = await _measure(store, 1, fused=False)
     fixed = sum(_category(record["chain"], record["sql"]) != "periodic" for record in records)
-    maximum = 24 if store._db.dialect.name == "mysql" else 22
+    maximum = 11 if store._db.dialect.name == "mysql" else 10
     control_transactions = sum(any(site in {
         "agent.runtime_store:accept", "agent.runtime_store:accept_and_claim",
         "agent.runtime_store:claim", "agent.runtime_store:final",

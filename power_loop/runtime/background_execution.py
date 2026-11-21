@@ -210,15 +210,16 @@ async def run_session(worker, ctx, env, config):
             reset(token)
 
     async def stop_original():
-        while not ctx.stop.is_cancelled():
-            state = await worker.inputs.boundary(ctx.batch.target)
-            if state is not None and (
-                state["lifecycle"] in ("closing", "closed")
-                or int(state["cancel_seq"]) > ctx.batch.cancel_seq
-            ):
-                ctx.stop.cancel(state["cancel_reason"] or "cancelled")
-                break
-            await asyncio.sleep(0.05)
+        # P1-4: zero DB polling — wait purely on the worker's in-memory stop_event
+        # (driven by client.cancel / set_lifecycle / WakeTransport / periodic batch_renew / lease loss).
+        stop_event = getattr(ctx, "stop_event", None)
+        if stop_event is not None:
+            await stop_event.wait()
+        else:
+            await ctx.stop.wait()
+        if ctx.ownership is not None and ctx.ownership.lost:
+            ctx.task.cancel("session ownership lost")
+            return
         policy = config.stop_policy
         grace = (
             policy.abort_tool_s if registered.definition.interrupt == "abort"

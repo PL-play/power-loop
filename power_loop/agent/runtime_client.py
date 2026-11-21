@@ -37,7 +37,11 @@ class RuntimeClient:
         self.hooks, self.hook_timeout_s = hooks, hook_timeout_s
         self.wake_transport = wake_transport
         self._local_worker = None
-        self.inputs = RuntimeInputStore(store)
+        self.inputs = RuntimeInputStore(
+            store,
+            hooks_provider=lambda: self.hooks,
+            hook_timeout_s=hook_timeout_s,
+        )
         self._waiters, self._outputs = set(), set()
         self._closed = False
         self._slots = 0
@@ -155,26 +159,39 @@ class RuntimeClient:
 
     async def cancel(self, ref, *, actor, scope="self", reason="cancelled") -> Receipt:
         self._require_open()
-        receipt, activations, completed_refs = await self.inputs.cancel(
-            ref, actor=actor, scope=scope, reason=reason, _with_activation=True,
+        receipt, activations, completed_refs, stopped_descendants = await self.inputs.cancel(
+            ref, actor=actor, scope=scope, reason=reason, _with_activation=True, _with_stopped=True,
         )
         target = receipt.target
+        cancel_by = "agent" if actor.session_id is not None else "user"
         if self._local_worker is not None:
             self._local_worker._activate(
                 target.session_id, receipt.input_ref,
                 cancelled=True, cancel_reason=reason, cancel_verified=True,
             )
+            for d_sid in stopped_descendants:
+                self._local_worker._activate(
+                    d_sid, None, cancelled=True, cancel_reason=reason, cancel_verified=True,
+                )
         if self.wake_transport is not None:
             try:
-                await self.wake_transport.publish_cancel(
-                    target.session_id, cancel_by=("agent" if actor.session_id is not None else "user"),
-                )
+                await self.wake_transport.publish_cancel(target.session_id, cancel_by=cancel_by)
             except Exception:
                 log.warning("wake_transport publish_cancel failed for %s", target.session_id, exc_info=True)
+            for d_sid in stopped_descendants:
+                try:
+                    await self.wake_transport.publish_cancel(d_sid, cancel_by="subtree")
+                except Exception:
+                    log.warning("wake_transport publish_cancel failed for %s", d_sid, exc_info=True)
         # Wake the owner so it can observe the cancel marker at its next checkpoint; the
         # marker itself is durable and is also read at every loop boundary.
         await self._notify(target, receipt.message_id or "cancel", receipt.input_ref,
                            ["activation", "work"], {"cancelled": True, "reason": reason, "verified": True})
+        for d_sid in stopped_descendants:
+            await self._notify(
+                TargetRef(target.store_id, d_sid), "cancel", None,
+                ["activation", "work"], {"cancelled": True, "reason": reason, "verified": True},
+            )
         for parent in dict.fromkeys(activations):
             result_ref = InputRef(parent.store_id, parent.session_id, "cancel-result")
             await self._notify(parent, result_ref.message_id, result_ref, ["work", "activation"])
@@ -186,6 +203,82 @@ class RuntimeClient:
                  "session_id": completed_ref.session_id},
             )
         return receipt
+
+    async def set_lifecycle(
+        self, target, lifecycle, *, actor, inflight="abort", subtree="none", reason=None,
+    ):
+        self._require_open()
+        status, stopped_map, completed_refs = await self.inputs.set_lifecycle(
+            target, lifecycle, actor=actor, inflight=inflight, subtree=subtree,
+            reason=reason, _with_effects=True,
+        )
+        eff_reason = reason or ("removed" if lifecycle == "closed" else lifecycle)
+        if status.need_wake:
+            if self._local_worker is not None:
+                self._local_worker._activate(target.session_id)
+            await self._notify(target, "lifecycle-open", None, ["work", "activation"])
+            if self.wake_transport is not None:
+                try:
+                    await self.wake_transport.publish_wake(target.session_id)
+                except Exception:
+                    log.warning("wake_transport publish_wake failed for %s", target.session_id, exc_info=True)
+        for tid, cby in stopped_map.items():
+            if self._local_worker is not None:
+                self._local_worker._activate(
+                    tid, None, cancelled=True, cancel_reason=eff_reason, cancel_verified=True,
+                )
+            if self.wake_transport is not None:
+                try:
+                    await self.wake_transport.publish_cancel(tid, cancel_by=cby)
+                except Exception:
+                    log.warning("wake_transport publish_cancel failed for %s", tid, exc_info=True)
+            await self._notify(
+                TargetRef(target.store_id, tid), "lifecycle-stop", None,
+                ["activation", "work"], {"cancelled": True, "reason": eff_reason, "verified": True},
+            )
+        for completed_ref in dict.fromkeys(completed_refs):
+            await self._notify(
+                TargetRef(completed_ref.store_id, completed_ref.session_id),
+                completed_ref.message_id, completed_ref, ["output"],
+                {"kind": "completed", "status": "cancelled",
+                 "session_id": completed_ref.session_id},
+            )
+        return status
+
+    async def deactivate(self, target, *, actor, stop_subtree=False, reason="removed"):
+        """Thin alias for ``set_lifecycle(target, 'closed', ...)``."""
+        return await self.set_lifecycle(
+            target,
+            "closed",
+            actor=actor,
+            inflight="abort",
+            subtree="all" if stop_subtree else "none",
+            reason=reason,
+        )
+
+    async def rebind_children(
+        self, from_parent, to_parent, *, child_targets=None, replay_undelivered=True,
+        rewrite_host_context=None, actor,
+    ):
+        self._require_open()
+        result = await self.inputs.rebind_children(
+            from_parent,
+            to_parent,
+            child_targets=child_targets,
+            replay_undelivered=replay_undelivered,
+            rewrite_host_context=rewrite_host_context,
+            actor=actor,
+        )
+        if result.need_wake:
+            if self._local_worker is not None:
+                self._local_worker._activate(to_parent.session_id)
+            await self._notify(to_parent, "rebind-replay", None, ["work", "activation"])
+            if self.wake_transport is not None:
+                try:
+                    await self.wake_transport.publish_wake(to_parent.session_id)
+                except Exception:
+                    log.warning("wake_transport publish_wake failed for %s", to_parent.session_id, exc_info=True)
+        return result
 
     async def inspect(self, ref, *, actor):
         self._require_open(reading=True)

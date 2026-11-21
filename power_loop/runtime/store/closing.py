@@ -9,6 +9,12 @@ from .retention import batch_limit, delete_batch
 
 
 async def busy(store, tx, session_id, state=None):
+    """Check whether a session has active/queued work based on ``sessions`` state.
+
+    Readiness for closing depends on ``sessions`` state (``execution_state='idle' AND
+    wake_pending_count=0``, no unresolved ``pending_tool_seq`` or active lease) and active
+    ``waiting_continuation`` rows.
+    """
     if state is None:
         state = await tx.fetchone(
             f'SELECT * FROM {store.t.sessions} WHERE session_id=?', (session_id,))
@@ -23,7 +29,7 @@ async def busy(store, tx, session_id, state=None):
         return True
     return bool(await tx.fetchone(
         f'SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? '
-        "AND terminal_status IS NULL AND status IN ('pending','waiting_continuation') LIMIT 1",
+        "AND status='waiting_continuation' LIMIT 1",
         (session_id,),
     ))
 
@@ -47,11 +53,21 @@ async def lock_sessions(store, tx, session_id, cascade):
 
 
 async def mark_closing(store, tx, row):
+    now = time.time_ns() // 1_000_000
     changed = await tx.execute(
-        f"UPDATE {store.t.sessions} SET lifecycle='closing',updated_at=? "
+        f"UPDATE {store.t.sessions} SET lifecycle='closing',"
+        "pending_count=0,pending_bytes=0,updated_at=? "
         "WHERE session_id=? AND lifecycle IN ('open','suspended')",
-        (time.time_ns() // 1_000_000, row['session_id']),
+        (now, row['session_id']),
     )
+    if changed and int(row.get('pending_count') or 0) > 0:
+        # Void any residual wake=0 pending notices so retention can purge the closed session.
+        await tx.execute(
+            f"UPDATE {store.t.follow_up_queue} SET status='void',terminal_status='cancelled',"
+            "cancel_by='removed',error_code='session_closed',completed_at=? "
+            "WHERE session_id=? AND status='pending'",
+            (now, row['session_id']),
+        )
     return changed
 
 
