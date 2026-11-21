@@ -72,6 +72,25 @@ class RuntimeClient:
             target, actor=actor, descriptor=descriptor, cancel_propagation=cancel_propagation,
         )
 
+    async def context_budget(self, target_or_descriptor, *, actor=None):
+        self._require_open(reading=True)
+        return await self.inputs.context_budget(target_or_descriptor, actor=actor)
+
+    async def seed_context(
+        self, target, messages, *, actor, overflow="truncate_oldest", max_tokens=None, summary_fn=None,
+    ) -> dict:
+        self._require_open()
+        return await self.inputs.seed_context(
+            target, messages, actor=actor, overflow=overflow,
+            max_tokens=max_tokens, summary_fn=summary_fn,
+        )
+
+    async def repair(self, target, *, mode="heal_broken", transform=None, actor):
+        self._require_open()
+        return await self.inputs.repair(
+            target, mode=mode, transform=transform, actor=actor,
+        )
+
     async def inspect_input(self, input_ref, *, actor):
         self._require_open(reading=True)
         return await self.inputs.inspect_input(input_ref, actor=actor)

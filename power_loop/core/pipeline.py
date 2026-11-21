@@ -1267,7 +1267,10 @@ class AgentPipeline:
                            StreamDeltaPayload(text=text, is_think=True),
                            round_index=round_index, stream_id="main")
 
-        from power_loop.runtime.history_sanitize import sanitize_request_messages
+        from power_loop.runtime.history_sanitize import (
+            fold_tool_rounds_by_send_index,
+            sanitize_request_messages,
+        )
         from power_loop.runtime.retry import request_repair_kind
         model_name = (self.config.model
                       or getattr(getattr(self.llm, "capabilities", None), "model", None) or "")
@@ -1280,8 +1283,8 @@ class AgentPipeline:
             if origin is not None and (not origin or origin != model_name):
                 message.pop("reasoning_content", None)
             prepared.append(message)
-        messages = prepared
-        messages = sanitize_request_messages(messages)
+        pre_sanitize_messages = prepared
+        messages = sanitize_request_messages(pre_sanitize_messages)
         if messages and messages[0]["role"] == "system":
             system_prompt = "\n\n".join(filter(None, (system_prompt, messages[0].get("content"))))
             messages = messages[1:]
@@ -1477,7 +1480,44 @@ class AgentPipeline:
             try:
                 async with recovery_clock:
                     if kind == "format":
-                        messages = sanitize_request_messages(messages, strict=True)
+                        hist_end = getattr(self, "_historical_end_idx", None)
+                        cur_si = int(self.send_index or 1)
+                        folded_msgs, folded_by_send, cur_folded = fold_tool_rounds_by_send_index(
+                            pre_sanitize_messages,
+                            current_send_index=cur_si,
+                            historical_end_idx=hist_end,
+                        )
+                        if self.store is not None and self.session_id:
+                            if folded_by_send:
+                                for orig_si, f_text in sorted(folded_by_send.items()):
+                                    await self.store.upsert_repaired_projection(
+                                        self.session_id,
+                                        send_index=orig_si,
+                                        rendered_text=f_text,
+                                        content={
+                                            "folded_on_400": True,
+                                            "scope": "historical",
+                                            "orig_send_index": orig_si,
+                                            "text": f_text,
+                                        },
+                                    )
+                            elif cur_folded:
+                                await self.store.upsert_repaired_projection(
+                                    self.session_id,
+                                    send_index=cur_si,
+                                    rendered_text=cur_folded,
+                                    content={
+                                        "folded_on_400": True,
+                                        "scope": "current_turn",
+                                        "text": cur_folded,
+                                    },
+                                )
+                        if folded_by_send or cur_folded:
+                            if folded_msgs and folded_msgs[0]["role"] == "system":
+                                folded_msgs = folded_msgs[1:]
+                            messages = folded_msgs
+                        else:
+                            messages = sanitize_request_messages(messages, strict=True)
                     else:
                         messages = await self._compact_rejected_request(messages)
                     request = replace(request, messages=messages)

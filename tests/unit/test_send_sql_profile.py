@@ -520,37 +520,61 @@ def _split_m1a_core_vs_m1b(records):
 
 
 async def test_m1a_fused_2tx_sql_profile(registry_store):
-    """Design 217 M1a fused 2-tx: core control SQL == 3/3/4 (SQLite/PG/MySQL), 2 control txs."""
+    """Design 217 M1b fused 2-tx: core control SQL == 3/3/4, m1b_ctrl == 0, 0 KV SQL, 2 total txs, 3 biz SQL."""
     store, _ = registry_store
     db = store._db.dialect.name
-    records, _, tx_sites, _, tx_categories = await _measure(store, 1, fused=True)
+    records, transactions, tx_sites, _, tx_categories = await _measure(store, 1, tools_per_round=0, fused=True)
     counts = _counts(records, tx_sites, tx_categories)
     core_ctrl, m1b_ctrl, _, business = _split_m1a_core_vs_m1b(records)
     core_txs = [
         chain for chain in tx_sites
         if any(s in {"agent.runtime_store:accept_and_claim", "agent.runtime_store:final"} for s in chain)
     ]
+    kv_sql = [r for r in records if store.t.session_runtime_state in r["sql"]]
+    proj_inserts = [r for r in business if f"INSERT INTO {store.t.project_messages}" in r["sql"]]
     assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
-    assert len(core_txs) == 2, tx_sites
+    assert len(kv_sql) == 0, kv_sql
+    assert len(m1b_ctrl) == 0, m1b_ctrl
+    assert transactions == 2 and len(core_txs) == 2, (transactions, tx_sites)
     expected_core = 4 if db == "mysql" else 3
     assert len(core_ctrl) == expected_core, {"core_ctrl": core_ctrl, "m1b_ctrl": m1b_ctrl, "business": business}
+    assert len(business) == 3, business
+    assert len(proj_inserts) == 1, proj_inserts
 
 
 async def test_m1a_standard_3tx_sql_profile(registry_store):
-    """Design 217 M1a standard 3-tx: core control SQL == 5/5/6 (SQLite/PG/MySQL), 3 control txs."""
+    """Design 217 M1b standard 3-tx: core control SQL == 5/5/6, m1b_ctrl == 0, 0 KV SQL, 3 total txs, 3 biz SQL."""
     store, _ = registry_store
     db = store._db.dialect.name
-    records, _, tx_sites, _, tx_categories = await _measure(store, 1, fused=False)
+    records, transactions, tx_sites, _, tx_categories = await _measure(store, 1, tools_per_round=0, fused=False)
     counts = _counts(records, tx_sites, tx_categories)
     core_ctrl, m1b_ctrl, _, business = _split_m1a_core_vs_m1b(records)
     core_txs = [
         chain for chain in tx_sites
         if any(s in {"agent.runtime_store:accept", "agent.runtime_store:claim", "agent.runtime_store:final"} for s in chain)
     ]
+    kv_sql = [r for r in records if store.t.session_runtime_state in r["sql"]]
     assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
-    assert len(core_txs) == 3, tx_sites
+    assert len(kv_sql) == 0, kv_sql
+    assert len(m1b_ctrl) == 0, m1b_ctrl
+    assert transactions == 3 and len(core_txs) == 3, (transactions, tx_sites)
     expected_core = 6 if db == "mysql" else 5
     assert len(core_ctrl) == expected_core, {"core_ctrl": core_ctrl, "m1b_ctrl": m1b_ctrl, "business": business}
+    assert len(business) == 3, business
+
+
+async def test_m1b_warm_session_projection_read_plus_one_business_sql(registry_store):
+    """Design 217 M1b warm session (history=20) adds +1 business SQL (load_projections) and +0 control/KV SQL."""
+    store, _ = registry_store
+    cold_recs, cold_txs, cold_sites, _, cold_cats = await _measure(store, 1, tools_per_round=0, history=0, fused=True)
+    warm_recs, warm_txs, warm_sites, _, warm_cats = await _measure(store, 1, tools_per_round=0, history=20, fused=True)
+    cold_core, cold_m1b, _, cold_biz = _split_m1a_core_vs_m1b(cold_recs)
+    warm_core, warm_m1b, _, warm_biz = _split_m1a_core_vs_m1b(warm_recs)
+    assert cold_txs == 2 and warm_txs == 2
+    assert len(cold_m1b) == 0 and len(warm_m1b) == 0
+    assert len(warm_core) == len(cold_core)
+    assert len(warm_biz) - len(cold_biz) == 1, (cold_biz, warm_biz)
+    assert sum(store.t.session_runtime_state in r["sql"] for r in warm_recs) == 0
 
 
 @pytest.mark.parametrize("tools_per_round", [1, 4])

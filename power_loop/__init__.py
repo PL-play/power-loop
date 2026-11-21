@@ -63,9 +63,11 @@ from power_loop.agent.runtime_types import (
 )
 from power_loop.agent.runtime_types import (
     CapacityError,
+    ContextBudget,
     InputRef,
     MessageRow,
     Receipt,
+    RepairResult,
     RequestOptions,
     Result,
     RuntimeDescriptor,
@@ -399,6 +401,7 @@ __all__ = [
 	"TimerRunner",
 	"TimerBackend", "TimerContext", "timer_context", "TimerDriver", "TimerDriverStatus", "StoreTimerBackend",
 	"WakeTransport", "InMemoryWakeTransport", "DatabasePollingWakeTransport",
+	"ContextBudget", "RepairResult",
 	"TimerFireCtx",
 	"TimerFiredPayload",
 	"SessionStatus",

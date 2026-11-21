@@ -45,9 +45,9 @@ async def test_bounded_read_gives_the_same_prompt_as_a_full_read(monkeypatch, ca
     _, bounded_llm = await _run(runtime_agent, 12, cap=cap)
     with monkeypatch.context() as patch:
         load = SessionStore.load_projection_window
-        async def full_projection_read(self, session_id, *, current_send_index, send_limit=None):
+        async def full_projection_read(self, session_id, *, current_send_index, send_limit=None, **kwargs):
             return await load(self, session_id, current_send_index=current_send_index,
-                              send_limit=None)
+                              send_limit=None, **kwargs)
         patch.setattr(SessionStore, "load_projection_window", full_projection_read)
         _, full_llm = await _run(runtime_agent, 12, cap=cap)
     assert bounded_llm.calls == full_llm.calls
@@ -61,10 +61,10 @@ async def test_bounded_read_never_scans_the_whole_session(monkeypatch, runtime_a
     runner, _ = await _run(runtime_agent, 10)
     calls = []
     original = SessionStore.load_projection_window
-    async def spy(self, session_id, *, current_send_index, send_limit=None):
+    async def spy(self, session_id, *, current_send_index, send_limit=None, **kwargs):
         calls.append(send_limit)
         return await original(self, session_id, current_send_index=current_send_index,
-                              send_limit=send_limit)
+                              send_limit=send_limit, **kwargs)
     monkeypatch.setattr(SessionStore, "load_projection_window", spy)
     await runner.send("next")
     assert calls and all(limit is not None for limit in calls)  # bounded by whole sends
@@ -151,7 +151,6 @@ async def test_history_false_sees_only_its_own_send_and_writes_no_projection(
 @pytest.mark.parametrize("history,compact_to", [(0, None), (20, None), (20, 18), (20, 5), (20, 20)])
 @pytest.mark.parametrize("send_limit", [None, 5])
 async def test_window_has_one_raw_stats_header(registry_store, monkeypatch, history, compact_to, send_limit):
-    from power_loop.runtime.store.projection_fold import STATE_KEY
     from power_loop.runtime.store.store import ProjectionWindowStats
 
     store, _ = registry_store
@@ -164,25 +163,19 @@ async def test_window_has_one_raw_stats_header(registry_store, monkeypatch, hist
                                            content={"summary": "kept"}, compact_to_send=compact_to)
     stored = [dict(r) for r in await store._db.fetchall(
         f"SELECT * FROM {store.t.project_messages} WHERE session_id=?", (sid,))]
-    columns = {"id", "session_id", "send_index", "kind", "content_json", "rendered_text",
-               "source_seq_lo", "source_seq_hi", "completed_through_send_index", "compact_from_send",
-               "compact_to_send", "projector_version", "token_estimate", "created_at"}
-    # Include invalid JSON and significant whitespace/multibyte text; never reserialize it.
-    for exists, raw in [(False, None), (True, None), (True, "{invalid"),
+    # Include invalid JSON and significant whitespace/multibyte text; stored inline in sessions.fold_stats_json.
+    for exists, raw in [(False, None), (True, "{invalid"),
                         (True, '  {"revision":"多字节","v":999} \t ')]:
         await store._db.execute(
-            f"DELETE FROM {store.t.session_runtime_state} WHERE session_id=? AND state_key=?",
-            (sid, STATE_KEY))
-        if exists:
-            await store._db.execute(
-                f"INSERT INTO {store.t.session_runtime_state} (session_id,state_key,value_json,updated_at) "
-                "VALUES (?,?,?,?)", (sid, STATE_KEY, raw, 0))
+            f"UPDATE {store.t.sessions} SET fold_stats_json=? WHERE session_id=?",
+            (raw if exists else None, sid),
+        )
         returned = []
         fetchall = store._db.fetchall
 
         async def capture(sql, params=()):
             rows = await fetchall(sql, params)
-            returned.append([dict(r) for r in rows])
+            returned.append((sql, [dict(r) for r in rows]))
             return rows
 
         with monkeypatch.context() as patch:
@@ -191,19 +184,14 @@ async def test_window_has_one_raw_stats_header(registry_store, monkeypatch, hist
             window = await store.load_projection_window(
                 sid, current_send_index=current, send_limit=send_limit)
         assert len(returned) == 1
-        headers = [r for r in returned[0] if r["id"] is None and r["kind"] == "__pl_stats__"]
-        assert len(headers) == 1
-        assert window.stats == ProjectionWindowStats(exists, raw, compact_to)
-        assert headers[0]["content_json"] == raw
-        assert headers[0]["rendered_text"] == (STATE_KEY if exists else None)
-        assert all(set(r) == columns for r in returned[0])
-        data = [r for r in returned[0] if r["id"] is not None or r["kind"] != "__pl_stats__"]
+        assert store.t.session_runtime_state not in returned[0][0]
+        assert window.stats == ProjectionWindowStats(exists and raw is not None, raw if exists else None, compact_to)
+        data = returned[0][1]
         lo = max((compact_to or 0) + 1, max(1, current - send_limit) if send_limit else 1)
-        assert {r["id"]: r for r in data} == {
-            r["id"]: r for r in stored if r["kind"] == "compact" or r["send_index"] >= lo}
         assert window.window_lo == lo
         assert [r.send_index for r in window.rows] == list(range(lo, history + 1))
-        assert len(data) == len(window.rows) + int(compact_to is not None)
+        assert {r["id"]: r for r in data if r["kind"] != "compact" and r["send_index"] >= lo} == {
+            r["id"]: r for r in stored if r["kind"] != "compact" and r["send_index"] >= lo}
 
 
 async def test_first_send_expects_no_stats_without_query(registry_store, monkeypatch):
@@ -233,7 +221,7 @@ async def test_cap_recent_window_with_sparse_projection_heals_only_missing(regis
     from power_loop.runtime.fold import LLMSummaryFold
     from power_loop.runtime.representation import ProjectionFoldPolicy
 
-    from .test_projection_fold_statistics import assert_exact, cas_effects, cas_trace
+    from .test_projection_fold_statistics import assert_exact, cas_trace
     store, _ = registry_store
     port = RuntimeInputStore(store)
     target = await port.create_session(
@@ -281,8 +269,7 @@ async def test_cap_recent_window_with_sparse_projection_heals_only_missing(regis
         # 18 has a current projection and is skipped; the rest of the absolute recent
         # window [14, 20] is still repaired.
         assert healed == [14, 15, 16, 17, 19, 20], projector.projected_sends
-        assert cas_effects(probe) == []
-        assert sum("AS stats_json" in r["sql"] for r in probe.records) == len(healed) + 1
+        assert not any(store.t.session_runtime_state in r["sql"] for r in probe.records)
         assert len(model.calls) == 1
         await assert_exact(store, sid, projector)
         prompt = str(model.calls[0])

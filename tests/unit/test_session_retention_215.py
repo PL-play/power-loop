@@ -101,7 +101,7 @@ async def test_terminal_inputs_graph_projection_cleanup_and_row_limit(registry_s
             totals[k] = totals.get(k, 0) + v
         if await store.get_session(root.session_id) is None:
             break
-    assert totals == {'inbox': 1, 'projections': 1, 'runtime': 2, 'messages': 2, 'sessions': 1}
+    assert totals == {'inbox': 1, 'projections': 1, 'runtime': 1, 'messages': 2, 'sessions': 1}
     assert await store.get_session(root.session_id) is None
 
 

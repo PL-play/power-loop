@@ -273,7 +273,15 @@ class RuntimeWorker:
         for sid in queued:
             self._activate(sid)
         for batch in expired:
-            if not batch.reclaimed_has_assistant:
+            if batch.reclaimed_cancelled:
+                recovered = await self.inputs.final(
+                    batch, status="cancelled", final_text="",
+                    error="cancelled", error_code="cancelled",
+                )
+                await self._notify_results(recovered)
+                if recovered.execution_state == "queued":
+                    self._activate(batch.target.session_id)
+            elif not batch.reclaimed_has_assistant:
                 self.dispatch_claimed(batch)
             else:
                 recovered = await self.inputs.final(
@@ -584,6 +592,15 @@ class RuntimeWorker:
                 loop._runtime_worker_context = ctx
                 ctx.loop = loop
 
+                if batch.reclaimed_cancelled:
+                    final_batch = await self.inputs.final(
+                        batch, status="cancelled", final_text="",
+                        error="cancelled", error_code="cancelled",
+                    )
+                    await self._notify_results(final_batch)
+                    if final_batch.execution_state == "queued":
+                        self._activate(sid)
+                    return
                 if env.command is not None:
                     from power_loop.runtime.host_commands import run_session
                     result = await run_session(loop, ctx, env.command)
@@ -613,6 +630,7 @@ class RuntimeWorker:
                     error=error, error_code=error_code, result_seq=result.result_seq,
                     assistant_meta=getattr(result, "result_meta", None),
                     next_seq=getattr(result, "next_seq", None),
+                    projection=getattr(result, "pending_projection", None) if status == "completed" else None,
                 )
                 if env.command is None:
                     normal_final = final_batch
@@ -735,6 +753,13 @@ class RuntimeWorker:
                 ttl_s=r.session_lease_ttl_s, can_execute=self._capable,
             )
             if reclaimed is not None:
+                if reclaimed.reclaimed_cancelled:
+                    recovered = await self.inputs.final(
+                        reclaimed, status="cancelled", final_text="",
+                        error="cancelled", error_code="cancelled",
+                    )
+                    await self._notify_results(recovered)
+                    return recovered.execution_state == "queued"
                 if not reclaimed.reclaimed_has_assistant:
                     return reclaimed
                 # Already produced an assistant message: finalize as interrupted via final()

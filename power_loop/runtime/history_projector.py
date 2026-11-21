@@ -268,6 +268,15 @@ class DefaultDeterministicProjector:
                 out.append({"role": "assistant", "content": self._render_project(r.content)})
             elif r.kind == "compact":
                 out.append({"role": "user", "content": self._render_compact(r.content)})
+            elif r.kind == "seed":
+                content = r.content if isinstance(r.content, dict) else {}
+                text = r.rendered_text or str(content.get("rendered") or content.get("text") or "")
+                out.append({"role": "user", "content": str(text)})
+            elif r.kind == "repaired":
+                content = r.content if isinstance(r.content, dict) else {}
+                text = r.rendered_text or str(content.get("text") or "[repaired]")
+                role = str(content.get("role") or "assistant")
+                out.append({"role": role if role in ("user", "assistant") else "assistant", "content": str(text)})
         return out
 
     def _render_tool(self, t: dict[str, Any]) -> str:

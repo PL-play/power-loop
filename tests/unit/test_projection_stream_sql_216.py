@@ -612,12 +612,11 @@ async def test_projection_health_and_repair_paths(registry_store, monkeypatch):
     store._db = profiled
     sid = agent.target.session_id
     try:
-        # Healthy: one tool call + final answer is projected from memory.
+        # Healthy: one tool call + final answer is projected from memory and written inline in Final (0 KV SQL).
         first = await agent.send("question one")
         assert first.status == "completed"
         await agent.drain()
-        assert saved == [(1, windows[0])]
-        assert saved[0][1] is windows[0]
+        assert len(windows) == 1 and saved == []
         project_rows = await _projection_rows(store, sid)
         assert {row["kind"] for row in project_rows} == {"user", "project"}
         assert all(int(row["projector_version"]) == 1 for row in project_rows)
@@ -634,7 +633,7 @@ async def test_projection_health_and_repair_paths(registry_store, monkeypatch):
               extra={"heal": False, "fallback": False,
                      "compact_rows": await _compact_count(store, sid, original)})
         assert second.status == "completed"
-        assert saved[-1][1] is windows[-1] and windows[-1] is not windows[0]
+        assert len(windows) == 2 and windows[-1] is not windows[0]
         assert "__pl_projection_fold" not in model.requests[-1]
         # Missing projection: delete send 1's rows; the next send must heal them.
         await store._db.execute(
@@ -661,12 +660,14 @@ async def test_projection_health_and_repair_paths(registry_store, monkeypatch):
         assert heal_records, "expected the missing projection to be healed"
         assert saved[-1] == (3, None)  # Actual heal writes invalidate the save facts.
         assert "question one" in model.requests[-1]  # Repaired rows still reach this model call.
-        # An empty historical index has nothing to heal and keeps the original window facts.
+        # An empty historical index has nothing to heal and takes the inline Final fast path (0 persist calls).
         await original.execute(
             f"UPDATE {store.t.sessions} SET send_index=4 WHERE session_id=?", (sid,))
         assert (await agent.send("after empty index")).status == "completed"
         await agent.drain()
-        assert saved[-1][0] == 5 and saved[-1][1] is windows[-1]
+        rows_5 = [row for row in await _projection_rows(store, sid, original) if int(row["send_index"]) == 5]
+        assert {row["kind"] for row in rows_5} == {"user", "project"}
+        assert saved[-1] == (3, None)
         # Repair failure: the send stops with projection_unavailable before its model call.
         await original.execute(
             f"DELETE FROM {store.t.project_messages} WHERE session_id=? AND send_index=2", (sid,))

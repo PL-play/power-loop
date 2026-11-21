@@ -96,7 +96,8 @@ MUTATE_SKIP = _NoWrite()
 
 # Conversation order WITHIN one send for projection rows: the user turn before the assistant
 # (project) summary; a compact row (keyed at its own send_index) sorts last at that index.
-_PROJECT_KIND_ORDER = {"user": 0, "project": 1, "compact": 2}
+_PROJECT_KIND_ORDER = {"seed": 0, "user": 1, "project": 2, "repaired": 3, "compact": 4}
+_UNSET = object()
 # Leave room in the 1,000-row first fetch for a lookahead, compact and statistics.
 _PROJECTION_WINDOW_PAGE_SIZE = 997
 
@@ -1072,97 +1073,154 @@ class SessionStore:
         messages.sort(key=_logical_order_key)
         return messages
 
-    async def load_projection_window(
-        self, session_id: str, *, current_send_index: int, send_limit: int | None = None,
-    ) -> ProjectionWindow:
-        """Read one model history window; the SQL page size is independent of the send cap.
+    async def load_projections(
+        self,
+        session_id: str,
+        *,
+        before_send_index: int | None = None,
+        send_limit: int = 20,
+    ) -> list[ProjectMessageRow]:
+        """Bounded O(K) projection read paginated by COMPLETE ``send_index`` intervals (1 SQL).
 
-        The first statement returns at most one compact, one raw statistics header
-        and one data page with a lookahead row. Continuations reuse the claim's
-        upper bound and the first statement's lower bound. The caller renders
-        whole sends and applies the model message cap after reassembly.
+        Never splits ``kind='user'`` and ``kind='project'`` belonging to the same ``send_index``.
+        Every SQL statement carries an explicit ``LIMIT``.
+        """
+        limit = max(1, int(send_limit))
+        table = self.t.project_messages
+        if before_send_index is not None:
+            rows = await self._db.fetchall(
+                f"SELECT p.* FROM {table} p "
+                f"JOIN (SELECT DISTINCT send_index FROM {table} "
+                "WHERE session_id=? AND send_index<? ORDER BY send_index DESC LIMIT ?) w "
+                "ON p.send_index=w.send_index "
+                "WHERE p.session_id=? ORDER BY p.send_index ASC, p.id ASC",
+                (session_id, int(before_send_index), limit, session_id),
+            )
+        else:
+            rows = await self._db.fetchall(
+                f"SELECT p.* FROM {table} p "
+                f"JOIN (SELECT DISTINCT send_index FROM {table} "
+                "WHERE session_id=? ORDER BY send_index DESC LIMIT ?) w "
+                "ON p.send_index=w.send_index "
+                "WHERE p.session_id=? ORDER BY p.send_index ASC, p.id ASC",
+                (session_id, limit, session_id),
+            )
+        return [_row_to_project_message(r) for r in rows]
+
+    async def load_projections_paged(
+        self,
+        session_id: str,
+        *,
+        before_send_index: int,
+        page_size: int = 20,
+    ) -> list[ProjectMessageRow]:
+        """Load full legal history backward in bounded ``send_index`` pages until start or compact.
+
+        Aligns with DISCOVERY.md (2026-11-19): every query uses a bounded ``LIMIT`` while
+        uncapped sessions without a compact point still read all valid history (including
+        ``send_index=0`` ``kind='seed'`` rows).
+        """
+        step = max(1, int(page_size))
+        pages: list[list[ProjectMessageRow]] = []
+        cursor = int(before_send_index)
+        while True:
+            chunk = await self.load_projections(
+                session_id, before_send_index=cursor, send_limit=step,
+            )
+            if not chunk:
+                break
+            pages.append(chunk)
+            if any(r.kind == "compact" and r.compact_to_send is not None for r in chunk):
+                break
+            distinct_sends = {int(r.send_index) for r in chunk}
+            if len(distinct_sends) < step:
+                break
+            min_si = min(distinct_sends)
+            if min_si <= 0:
+                break
+            cursor = min_si
+        combined: list[ProjectMessageRow] = []
+        for page in reversed(pages):
+            combined.extend(page)
+        return combined
+
+    async def load_projection_window(
+        self,
+        session_id: str,
+        *,
+        current_send_index: int,
+        send_limit: int | None = None,
+        include_seed: bool = False,
+        fold_stats_json: Any = _UNSET,
+    ) -> ProjectionWindow:
+        """Read one model history window by complete ``send_index`` intervals (0 KV SQL).
+
+        - Cold start (``current_send_index <= 1`` and ``not include_seed``): 0 DB reads.
+        - Uncapped (``send_limit is None``): uses :meth:`load_projections_paged` (1 business
+          SQL for sessions <= page size, bounded ``LIMIT`` pages for larger histories).
+        - Capped (``send_limit is not None``): single derived-table SQL fetching the latest
+          ``send_limit`` distinct sends plus the latest ``compact`` row (never splits a send
+          and never drops the compact summary).
         """
         current = int(current_send_index)
-        if current <= 1:
-            return ProjectionWindow(None, [], 1, ProjectionWindowStats(False, None, None))
-
-        from .projection_fold import STATE_KEY
-
-        lower = max(1, current - max(1, int(send_limit))) if send_limit is not None else 1
-        page_size = _PROJECTION_WINDOW_PAGE_SIZE
-        table, dialect = self.t.project_messages, self._db.dialect.name
-        compact_index, page_index = "idx_project_compact_order", "uq_project_send_kind"
-        if dialect == "sqlite":
-            compact_table = f"{table} INDEXED BY {self.table_prefix}{compact_index}"
-            page_table = f"{table} INDEXED BY {self.table_prefix}{page_index}"
-        else:
-            compact_table = self._access_path(table, compact_index)
-            page_table = self._access_path(table, page_index)
-        columns = (
-            "id", "session_id", "send_index", "kind", "content_json", "rendered_text",
-            "source_seq_lo", "source_seq_hi", "completed_through_send_index",
-            "compact_from_send", "compact_to_send", "projector_version", "token_estimate", "created_at",
-        )
-        projection = ",".join(columns)
-        header_kind = "__pl_stats__"
-        header_values = {
-            "kind": f"'{header_kind}'", "content_json": "stats.value_json", "rendered_text": "stats.state_key",
-        }
-        header = ",".join(header_values.get(column, "NULL") for column in columns)
-        # The compact index seeks the session/kind prefix in send order and can
-        # check the coverage end from the index. For PG, express the data bounds
-        # on the composite key so they restrict the scan as index conditions.
-        materialize = "" if dialect == "mysql" else " MATERIALIZED"
-        greatest = "MAX" if dialect == "sqlite" else "GREATEST"
-        floor = f"{greatest}(?,COALESCE((SELECT compact_to_send FROM compact),0)+1)"
-        seek = (f"AND (session_id,send_index)>=(?,{floor}) AND (session_id,send_index)<(?,?) "
-                if dialect == "postgres" else "")
-        seek_args = (session_id, lower, session_id, current) if seek else ()
-        rows = await self._db.fetchall(
-            f"WITH compact AS{materialize} (SELECT {projection} FROM {compact_table} "
-            "WHERE session_id=? AND kind='compact' AND send_index<? "
-            "AND compact_to_send>=1 AND compact_to_send<? ORDER BY send_index DESC LIMIT 1), "
-            f"page AS (SELECT {projection} FROM {page_table} "
-            f"WHERE session_id=? AND send_index>={floor} AND send_index<? "
-            f"{seek}AND kind<>'compact' ORDER BY send_index,kind LIMIT ?) "
-            f"SELECT {projection} FROM page UNION ALL SELECT {projection} FROM compact "
-            f"UNION ALL SELECT {header} FROM (SELECT ? AS session_id) AS session "
-            f"LEFT JOIN {self.t.session_runtime_state} AS stats "
-            "ON stats.session_id=session.session_id AND stats.state_key=? ORDER BY send_index,kind",
-            (session_id, current, current, session_id, lower, current, *seek_args,
-             page_size + 1, session_id, STATE_KEY),
-        )
-        stats = next(row for row in rows if row["id"] is None)
-        compact_row = next((row for row in rows if row["kind"] == "compact"), None)
-        compact = _row_to_project_message(compact_row) if compact_row is not None else None
-        cutoff = compact.compact_to_send if compact is not None else None
-        window_lo = max(lower, (cutoff or 0) + 1)
-        page = [row for row in rows if row["id"] is not None and row["kind"] != "compact"]
-        live = []
-        while True:
-            live.extend(_row_to_project_message(row) for row in page[:page_size])
-            if len(page) <= page_size:
-                break
-            last_send, last_kind = page[page_size - 1]["send_index"], page[page_size - 1]["kind"]
-            # Also include a scalar bound for MySQL, which does not reliably seek
-            # on a suffix tuple. Within the cursor's send, kind makes the seek strict.
-            if dialect == "postgres":
-                after = "(session_id,send_index,kind)>(?,?,?) AND (session_id,send_index)<(?,?)"
-                args = (session_id, last_send, last_kind, session_id, current)
-            else:
-                after = "(send_index>? OR kind>?)"
-                args = (last_send, last_kind)
-            page = await self._db.fetchall(
-                f"SELECT {projection} FROM {page_table} WHERE session_id=? "
-                f"AND send_index>=? AND send_index<? AND {after} AND kind<>'compact' "
-                "ORDER BY send_index,kind LIMIT ?",
-                (session_id, last_send, current, *args, page_size + 1),
+        if fold_stats_json is _UNSET:
+            srow = await self._db.fetchone(
+                f"SELECT fold_stats_json FROM {self.t.sessions} WHERE session_id=?",
+                (session_id,),
             )
-        live.sort(key=lambda row: (row.send_index, _PROJECT_KIND_ORDER.get(row.kind, 9)))
-        return ProjectionWindow(compact, live, window_lo, ProjectionWindowStats(
-            row_exists=stats["rendered_text"] is not None,
-            value_json=stats["content_json"], compact_to_send=cutoff,
-        ))
+            stats_raw = srow["fold_stats_json"] if srow is not None else None
+        else:
+            stats_raw = fold_stats_json
+
+        if current <= 1 and not include_seed:
+            return ProjectionWindow(
+                None, [], 1,
+                ProjectionWindowStats(stats_raw is not None, stats_raw, None),
+            )
+
+        table = self.t.project_messages
+        if send_limit is None:
+            all_rows = await self.load_projections_paged(
+                session_id, before_send_index=current, page_size=_PROJECTION_WINDOW_PAGE_SIZE,
+            )
+        else:
+            limit = max(1, int(send_limit))
+            raw_rows = await self._db.fetchall(
+                f"SELECT p.* FROM {table} p "
+                "JOIN ("
+                f"SELECT send_index FROM (SELECT DISTINCT send_index FROM {table} "
+                "WHERE session_id=? AND send_index<? ORDER BY send_index DESC LIMIT ?) recent "
+                "UNION "
+                f"SELECT send_index FROM (SELECT send_index FROM {table} "
+                "WHERE session_id=? AND kind='compact' AND send_index<? "
+                "ORDER BY send_index DESC LIMIT 1) latest_compact"
+                ") w ON p.send_index=w.send_index "
+                "WHERE p.session_id=? ORDER BY p.send_index ASC, p.id ASC",
+                (session_id, current, limit, session_id, current, session_id),
+            )
+            all_rows = [_row_to_project_message(r) for r in raw_rows]
+
+        compact: ProjectMessageRow | None = None
+        for row in all_rows:
+            if row.kind == "compact" and row.compact_to_send is not None:
+                if compact is None or int(row.send_index) >= int(compact.send_index):
+                    compact = row
+        cutoff = int(compact.compact_to_send) if (compact is not None and compact.compact_to_send is not None) else None
+        live = [
+            row for row in all_rows
+            if row.kind != "compact" and (cutoff is None or int(row.send_index) > cutoff)
+        ]
+        live.sort(key=lambda row: (row.send_index, _PROJECT_KIND_ORDER.get(row.kind, 9), row.id or 0))
+        lower = max(1, current - max(1, int(send_limit))) if send_limit is not None else 1
+        window_lo = max(lower, (cutoff or 0) + 1)
+        return ProjectionWindow(
+            compact, live, window_lo,
+            ProjectionWindowStats(
+                row_exists=stats_raw is not None,
+                value_json=stats_raw,
+                compact_to_send=cutoff,
+            ),
+        )
 
     async def load_all_messages(self, session_id: str) -> list[MessageRow]:
         rows = await self._db.fetchall(
@@ -1474,6 +1532,45 @@ class SessionStore:
             params.extend(row)
         await tx.execute(sql, tuple(params))
 
+    async def upsert_repaired_projection(
+        self,
+        session_id: str,
+        *,
+        send_index: int,
+        rendered_text: str,
+        content: dict[str, Any],
+        source_seq_lo: int | None = None,
+        source_seq_hi: int | None = None,
+        projector_version: int = 1,
+    ) -> None:
+        """Persist a ``kind='repaired'`` projection via same-tx ``DELETE + INSERT`` (Probe 7 & 10).
+
+        Deleting before inserting guarantees a strictly fresh auto-increment ``id`` for
+        same-``send_index`` arbitration and eliminates ``uq_project_send_kind`` collisions.
+        """
+        now = _now_ms()
+        tok_est = max(1, len(rendered_text) // 4) if rendered_text else 0
+        async with self._db.transaction() as tx:
+            await tx.execute(
+                f"DELETE FROM {self.t.project_messages} "
+                "WHERE session_id=? AND send_index=? AND kind='repaired'",
+                (session_id, int(send_index)),
+            )
+            await tx.execute(
+                f"INSERT INTO {self.t.project_messages} ("
+                "session_id,send_index,kind,content_json,rendered_text,"
+                "source_seq_lo,source_seq_hi,completed_through_send_index,"
+                "compact_from_send,compact_to_send,projector_version,token_estimate,created_at"
+                ") VALUES (?,?,'repaired',?,?,?,?,?,NULL,NULL,?,?,?)",
+                (
+                    session_id, int(send_index),
+                    _dumps(content if content is not None else {}),
+                    _nul_safe(rendered_text),
+                    source_seq_lo, source_seq_hi, int(send_index),
+                    int(projector_version), tok_est, now,
+                ),
+            )
+
     async def upsert_project_message(
         self,
         session_id: str,
@@ -1648,7 +1745,7 @@ class SessionStore:
             cur_to = cur.compact_to_send if cur is not None else None
             if cur_to != expected_prior_to_send:
                 return False  # a concurrent fold advanced the cursor; our snapshot/fold is stale
-            await invalidate(self, tx, session_id, state=state)
+            await invalidate(self, tx, session_id, state=state, compact_to_send=int(to_send), clear_dedup=True)
             # Delete any SUPERSEDED compact rows (send_index < the new compact): a rolled-forward
             # fold folds the prior compact's content INTO the new one, so older compacts are never
             # read again (the reader uses the latest compact + after-cursor rows). Without this they

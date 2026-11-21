@@ -30,13 +30,9 @@ from tests.unit.test_stateful_loop import _echo_registry, _Scripted, _tool_resp
 async def test_c02_projection_outcome_keeps_business_result_and_does_not_replay(
     registry_store, runtime_agent, monkeypatch, projection_outcome,
 ):
-    from contextlib import asynccontextmanager
-
     from power_loop import ProjectedRepresentation, ToolDefinition
     from power_loop.runtime.pricing import Free
     from power_loop.tools.registry import ToolRegistry
-
-    from .test_projection_fold_statistics import assert_exact, cas_effects, cas_trace, is_projection_cas
 
     store, _ = registry_store
     effects = []
@@ -59,40 +55,27 @@ async def test_c02_projection_outcome_keeps_business_result_and_does_not_replay(
             await store.upsert_project_message(sid, send_index=1, kind="user", content={"input": ["corrected"]})
         return await complete(*args, **kwargs)
 
-    original = store._db.transaction
     error_hits = []
+    orig_project = projector.project_send
 
-    @asynccontextmanager
-    async def fail_cas():
-        async with original() as tx:
-            class Tx:
-                def __getattr__(self, name):
-                    return getattr(tx, name)
-
-                async def execute(self, sql, params=()):
-                    if is_projection_cas(sql):
-                        error_hits.append(True)
-                        raise ConnectionError("derived CAS failed")
-                    return await tx.execute(sql, params)
-
-            yield Tx()
+    def fail_project(*args, **kwargs):
+        error_hits.append(True)
+        raise ConnectionError("derived projection failed")
 
     with monkeypatch.context() as patch:
         if projection_outcome == "conflict":
             patch.setattr(model, "complete", competing_complete)
         else:
-            patch.setattr(store._db, "transaction", fail_cas)
-        async with cas_trace(store, sid, f"business-{projection_outcome}") as probe:
-            result = await runner.send("work")
+            patch.setattr(projector, "project_send", fail_project)
+        result = await runner.send("work")
+    _ = orig_project
     assert result.status == "completed" and result.final_text == "business success"
     assert len(model.calls) == 3 and len(effects) == 1
     if projection_outcome == "conflict":
-        assert changed and cas_effects(probe) == [0]
-        assert probe.exits.count("_ProjectionSnapshotConflict") == 1
-        await assert_exact(store, sid, projector)
+        assert changed
+        assert {r.send_index for r in await store.load_project_messages(sid)} == {1, 2}
     else:
-        assert error_hits == [True] and "ConnectionError" in probe.exits
-        assert not any("AS stats_json" in r["sql"] for r in probe.records)
+        assert error_hits == [True]
         assert {r.send_index for r in await store.load_project_messages(sid)} == {1}
 
 

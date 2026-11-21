@@ -64,7 +64,6 @@ from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.history_sanitize import align_tool_calls
 from power_loop.runtime.store.schema import SchemaPolicy
 from power_loop.runtime.store.store import (
-    _PROJECT_KIND_ORDER,
     DEFAULT_DB_PATH,
     DEFAULT_TABLE_PREFIX,
     MAX_SPAWN_DEPTH,
@@ -132,6 +131,8 @@ class StatefulResult:
     result_meta: dict[str, Any] | None = None
     #: design 217: highest next_seq reached during this send (persisted back in Final).
     next_seq: int | None = None
+    #: design 217 M1b: deferred double-row ('user'+'project') projection + inline fold_stats_json for Final.
+    pending_projection: Any = None
 
 
 class _SyncLoopRunner:
@@ -1062,28 +1063,48 @@ class _ExecutionLoop:
         # The claim already returned the merged user row it wrote in this send's transaction
         # (content, seq, send_index, meta). Seed it instead of selecting the row back.
         claim_row = batch.user_row
-        current_raw_rows: list[Any] = [claim_row]
+        is_reclaimed_resume = bool(
+            getattr(batch, "is_reclaimed", False) and getattr(batch, "reclaimed_has_assistant", False)
+        )
+        if is_reclaimed_resume:
+            reclaimed_rows = await store.load_active_messages(sid, send_index=current_send_index)
+            current_raw_rows: list[Any] = list(reclaimed_rows) if reclaimed_rows else [claim_row]
+        else:
+            current_raw_rows = [claim_row]
+        historical_end_idx = 0
+        window = None
         if not with_history:
-            history = [_row_to_loop_message(claim_row)]
-            hist_seqs: list[int | None] = [claim_row.seq]
+            history = [_row_to_loop_message(r) for r in current_raw_rows]
+            hist_seqs: list[int | None] = [r.seq for r in current_raw_rows]
             hist_ords: list[int | None] = list(hist_seqs)
         else:
+            from power_loop.runtime.representation import resolve_send_projections
+
             version = int(getattr(projector, "version", 0) or 0)
             cap = getattr(config, "max_context_rows", None)
             send_limit = int(cap) + 1 if cap and int(cap) > 0 else None
+            include_seed = (
+                current_send_index == 1
+                and int(getattr(batch, "inbox_version", 0) or 0) > len(batch.input_refs)
+            )
             window = await store.load_projection_window(
-                sid, current_send_index=current_send_index, send_limit=send_limit)
+                sid, current_send_index=current_send_index, send_limit=send_limit,
+                include_seed=include_seed, fold_stats_json=getattr(batch, "fold_stats_json", None),
+            )
             compact = window.compact
             cutoff = compact.compact_to_send if compact is not None else 0
-            # Group the window rows ONCE by send. Rendering then walks each send's rows in
-            # order; never scan the whole projection list per send.
-            by_send: dict[int, list[Any]] = {}
-            for row in window.rows:
-                by_send.setdefault(int(row.send_index), []).append(row)
-            for rows in by_send.values():
-                rows.sort(key=lambda r: _PROJECT_KIND_ORDER.get(r.kind, 9))
-            for si in range(int(window.window_lo), current_send_index):
+            # Group window rows by send_index with 'repaired' id-based arbitration (Design 217 §5.1).
+            _res_compact, by_send = resolve_send_projections(
+                ([compact] if compact is not None else []) + list(window.rows),
+                before_send_index=current_send_index,
+            )
+            if _res_compact is not None:
+                compact = _res_compact
+                cutoff = compact.compact_to_send if compact.compact_to_send is not None else cutoff
+            for si in range(max(1, int(window.window_lo)), current_send_index):
                 rows = by_send.get(si, [])
+                if rows and all(r.kind in ("seed", "repaired") for r in rows):
+                    continue
                 current_rows = [r for r in rows if int(r.projector_version or 0) == version]
                 stale = len(current_rows) != len(rows)  # at least one stale/other-version row
                 if current_rows and not stale:
@@ -1117,18 +1138,24 @@ class _ExecutionLoop:
                 # rows for model assembly, but discard the old facts used by the later save.
                 window = None
                 by_send[si] = list(repaired)
-            flat_rows = [r for si2 in sorted(by_send) for r in by_send[si2]
-                         if cutoff < si2 < current_send_index]
+            eligible_sends = [
+                si2 for si2 in sorted(by_send)
+                if si2 < current_send_index and (si2 == 0 or si2 > cutoff)
+            ]
+            flat_rows = [r for si2 in eligible_sends for r in by_send[si2]]
             if hasattr(projector, "stamp_render_context"):
                 projector.stamp_render_context(flat_rows, current_send_index)
             compact_msgs: list[LoopMessage] = []
             if compact is not None:
                 compact_msgs.extend(projector.render([compact]))
-            send_chunks: list[list[LoopMessage]] = [
-                list(projector.render(by_send[si2]))
-                for si2 in sorted(by_send) if cutoff < si2 < current_send_index
-            ]
-            current_msgs = [_row_to_loop_message(claim_row)]
+            send_chunks: list[list[LoopMessage]] = []
+            for si2 in eligible_sends:
+                rendered_chunk = [
+                    {"_source_send_index": si2, **m} if isinstance(m, dict) else m
+                    for m in projector.render(by_send[si2])
+                ]
+                send_chunks.append(rendered_chunk)
+            current_msgs = [_row_to_loop_message(r) for r in current_raw_rows]
             if cap and int(cap) > 0:
                 # The cap counts rendered MESSAGES and drops whole sends from the oldest end;
                 # a send is never split. The entry read itself is already bounded by send.
@@ -1140,9 +1167,9 @@ class _ExecutionLoop:
                 if drop:
                     send_chunks = send_chunks[drop:]
             prefix_msgs = [m for chunk in send_chunks for m in chunk]
+            historical_end_idx = len(compact_msgs) + len(prefix_msgs)
             history = compact_msgs + prefix_msgs + current_msgs
-            hist_seqs = ([None] * (len(compact_msgs) + len(prefix_msgs))
-                         + [claim_row.seq])
+            hist_seqs = ([None] * historical_end_idx + [r.seq for r in current_raw_rows])
             hist_ords = list(hist_seqs)
 
         current_raw_rows = [_render_batch_row(r) for r in current_raw_rows]
@@ -1193,6 +1220,11 @@ class _ExecutionLoop:
                     steer_event=_session_sync(sid, owner=self).steer,
                 )
                 pipeline.send_index = current_send_index
+                pipeline._historical_end_idx = historical_end_idx
+                if is_reclaimed_resume:
+                    pipeline._initial_round_index = int(
+                        getattr(batch, "reclaimed_next_round_index", 0) or 0
+                    )
                 try:
                     result: AgentLoopResult = await pipeline.run(history)
                 except Exception as exc:
@@ -1203,14 +1235,19 @@ class _ExecutionLoop:
                 reset_effective_tools(tools_token)
                 reset_current_loop(loop_token)
 
-        # ── End-of-send projection FROM MEMORY (design 215 §P2.4): no re-read of the
-        # current send's raw rows. The derived write carries the owner fence + coverage. ──
+        # ── End-of-send projection FROM MEMORY (design 217 §5.1 / M1b):
+        # On the healthy non-fold fast path, compute double-row ('user'+'project') + inline
+        # fold_stats_json in memory and return PendingProjection so Final writes BOTH in its
+        # single atomic transaction (0 extra tx, 0 extra control SQL, 0 KV SQL!).
+        # Only when a fold is due or statistics require a cold rebuild do we write eagerly.
+        pending_projection = None
         if with_history:
             try:
-                await self._write_session_projection(
+                pending_projection = await self._prepare_or_write_session_projection(
                     store, sid, send_index=current_send_index, rows=sink.send_rows,
                     status=result.status, projector=projector, tool_registry=effective_registry,
                     ownership=ownership, stop_event=stop, window=window,
+                    existing_fold_stats_json=getattr(batch, "fold_stats_json", None),
                 )
             except CancellationRequested:
                 raise
@@ -1222,20 +1259,112 @@ class _ExecutionLoop:
             passed=result.passed, pass_reason=result.pass_reason,
             new_input_after_pass=result.new_input_after_pass, texts=result.texts,
             result_seq=sink.last_assistant_seq, result_meta=sink.last_assistant_meta,
+            pending_projection=pending_projection,
         )
 
-    async def _write_session_projection(
-        self, store, sid, *, send_index, rows, status, projector, tool_registry, ownership, stop_event,
-        window=None,
-    ) -> None:
-        """Project the finished send from its in-memory raw rows, fenced by the owner."""
+    async def _prepare_or_write_session_projection(
+        self, store, sid, *, send_index, rows, status, projector, tool_registry, ownership,
+        stop_event, window=None, existing_fold_stats_json=None,
+    ):
+        """Build double-row projection + inline fold_stats_json in memory; defer to Final unless folding."""
         if status == "pending_tools" or not rows:
-            return
+            return None
         projected = projector.project_send(rows, send_index=send_index, tool_registry=tool_registry)
         from power_loop.runtime.tool_context import active_engine
         engine = active_engine.get()
         if engine is not None:
             projected = await engine.prepare_projection(projected, rows, send_index)
+        if not projected.rows:
+            return None
+        version = int(getattr(projector, "version", 0) or 0)
+        proj_rows_to_write = tuple(
+            (pr.kind, pr.content, pr.rendered_text) for pr in projected.rows
+        )
+        strategy = self.config.fold_strategy
+        keep = int(getattr(strategy, "keep_last_sends", 0) or 0)
+        ratio = float(getattr(strategy, "trigger_ratio", 0.75) or 0.75)
+        threshold = int((self.config.effective_context_budget() or 8000) * ratio)
+        cap = self.config.max_context_rows
+        row_threshold = cap * ratio if cap and cap > 0 else None
+
+        from power_loop.agent.runtime_store import PendingProjection
+        from power_loop.runtime.fold import fold_due
+        from power_loop.runtime.store.projection_fold import (
+            _encode_state,
+            compute_inline_fold_stats,
+        )
+
+        provider = getattr(projector, "fold_statistics_policy", None)
+        policy = provider() if provider is not None else None
+        new_row_objs = [
+            ProjectMessageRow(
+                session_id=sid, send_index=int(send_index), kind=kind, content=content,
+                rendered_text=rendered_text, source_seq_lo=projected.source_seq_lo,
+                source_seq_hi=projected.source_seq_hi, compact_from_send=None,
+                compact_to_send=None, projector_version=version, token_estimate=None,
+                created_at=0, completed_through_send_index=int(send_index),
+            )
+            for kind, content, rendered_text in proj_rows_to_write
+        ]
+        # Only attempt inline deferral when status == "completed" (final() writes projection on completed).
+        if status == "completed" and window is not None:
+            if policy is not None:
+                updated_stats, needs_fallback = compute_inline_fold_stats(
+                    store, sid,
+                    existing_raw=existing_fold_stats_json,
+                    projector=projector,
+                    policy=policy,
+                    new_rows=new_row_objs,
+                    send_index=int(send_index),
+                    window=window,
+                )
+                if not needs_fallback and updated_stats is not None:
+                    will_fold = (
+                        keep > 0
+                        and updated_stats["sends"] > keep
+                        and fold_due(
+                            updated_stats["tokens"], threshold,
+                            updated_stats["rows"], row_threshold,
+                        )
+                    )
+                    if not will_fold:
+                        return PendingProjection(
+                            rows=proj_rows_to_write,
+                            source_seq_lo=projected.source_seq_lo,
+                            source_seq_hi=projected.source_seq_hi,
+                            projector_version=version,
+                            fold_stats_json=_encode_state(updated_stats),
+                        )
+            elif keep <= 0:
+                return PendingProjection(
+                    rows=proj_rows_to_write,
+                    source_seq_lo=projected.source_seq_lo,
+                    source_seq_hi=projected.source_seq_hi,
+                    projector_version=version,
+                    fold_stats_json=None,
+                )
+
+        # Fallback: write eagerly + run fold if triggered (cold rebuild / fold due / non-completed).
+        await self._write_session_projection(
+            store, sid, send_index=send_index, rows=rows, status=status,
+            projector=projector, tool_registry=tool_registry, ownership=ownership,
+            stop_event=stop_event, window=window, projected=projected,
+        )
+        return None
+
+    async def _write_session_projection(
+        self, store, sid, *, send_index, rows, status, projector, tool_registry, ownership, stop_event,
+        window=None, projected=None,
+    ) -> None:
+        """Project the finished send from its in-memory raw rows, fenced by the owner."""
+        if status == "pending_tools" or not rows:
+            return
+        if projected is None:
+            projected = projector.project_send(rows, send_index=send_index, tool_registry=tool_registry)
+            from power_loop.runtime.tool_context import active_engine
+            engine = active_engine.get()
+            if engine is not None:
+                projected = await engine.prepare_projection(projected, rows, send_index)
         version = int(getattr(projector, "version", 0) or 0)
         proj_rows_to_write = [(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows]
         strategy = self.config.fold_strategy

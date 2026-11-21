@@ -50,7 +50,93 @@ __all__ = [
     "ProjectedRow",
     "ProjectedSend",
     "ProjectionFoldPolicy",
+    "resolve_send_projections",
 ]
+
+
+def resolve_send_projections(
+    rows: list[ProjectMessageRow],
+    *,
+    before_send_index: int | None = None,
+) -> tuple[ProjectMessageRow | None, dict[int, list[ProjectMessageRow]]]:
+    """Arbitrate multi-row projections per ``send_index`` (Design 217 §7.3 / Probe 5 & 10).
+
+    Rules:
+      - Latest ``compact`` row (highest ``send_index`` with ``compact_to_send``) becomes the
+        cutoff; all non-compact rows with ``send_index <= compact_to_send`` are skipped.
+      - ``seed`` rows (including ``send_index=0``) are kept intact.
+      - Within a send, a ``repaired`` row supersedes ``project`` (or the whole turn when
+        ``content.get('replace_turn')`` is True or no ``user`` row exists) ONLY when its
+        ``id`` is strictly greater than the turn's ``user``/``project`` rows (so a mid-turn
+        takeover checkpoint never shadows a later final ``user``+``project`` pair).
+    """
+    by_send_raw: dict[int, list[ProjectMessageRow]] = {}
+    compact_row: ProjectMessageRow | None = None
+    for row in rows:
+        si = int(row.send_index)
+        if before_send_index is not None and si >= before_send_index:
+            continue
+        if row.kind == "compact":
+            if compact_row is None or si >= int(compact_row.send_index):
+                compact_row = row
+            continue
+        by_send_raw.setdefault(si, []).append(row)
+
+    cutoff = (
+        int(compact_row.compact_to_send)
+        if compact_row is not None and compact_row.compact_to_send is not None
+        else -1
+    )
+
+    resolved: dict[int, list[ProjectMessageRow]] = {}
+    for si in sorted(by_send_raw):
+        if si <= cutoff:
+            continue
+        by_kind: dict[str, ProjectMessageRow] = {}
+        for r in by_send_raw[si]:
+            prev = by_kind.get(r.kind)
+            if prev is None or int(r.id or 0) >= int(prev.id or 0):
+                by_kind[r.kind] = r
+
+        if "seed" in by_kind:
+            resolved[si] = [by_kind["seed"]]
+            continue
+
+        u_row = by_kind.get("user")
+        p_row = by_kind.get("project")
+        rep_row = by_kind.get("repaired")
+
+        max_normal_id = max(
+            int(u_row.id or 0) if u_row is not None else 0,
+            int(p_row.id or 0) if p_row is not None else 0,
+        )
+        use_rep = rep_row is not None and (
+            (u_row is None and p_row is None)
+            or (
+                rep_row.id is not None
+                and int(rep_row.id) > max_normal_id
+            )
+            or (p_row is None and u_row is not None and rep_row.id is None)
+        )
+
+        selected: list[ProjectMessageRow] = []
+        if use_rep and rep_row is not None:
+            rep_content = rep_row.content if isinstance(rep_row.content, dict) else {}
+            rep_msgs = rep_content.get("messages") if isinstance(rep_content.get("messages"), list) else []
+            replace_turn = bool(rep_content.get("replace_turn")) or any(
+                isinstance(m, dict) and m.get("role") == "user" for m in rep_msgs
+            )
+            if not replace_turn and u_row is not None:
+                selected.append(u_row)
+            selected.append(rep_row)
+        else:
+            if u_row is not None:
+                selected.append(u_row)
+            if p_row is not None:
+                selected.append(p_row)
+        if selected:
+            resolved[si] = selected
+    return compact_row, resolved
 
 
 @dataclass(frozen=True)
@@ -475,6 +561,13 @@ class ProjectedRepresentation:
     def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
         out: list[LoopMessage] = []
         for r in rows:
+            if r.kind in ("seed", "repaired") and isinstance(r.content, dict):
+                raw_msgs = r.content.get("messages")
+                if isinstance(raw_msgs, list) and raw_msgs:
+                    for m in raw_msgs:
+                        if isinstance(m, dict) and m.get("role"):
+                            out.append(dict(m))
+                    continue
             msg = self.render_row(r)
             if msg is not None:
                 out.append(msg)
@@ -489,7 +582,24 @@ class ProjectedRepresentation:
             return self.render_project_row(r)
         if r.kind == "compact":
             return self.render_compact_row(r)
+        if r.kind == "seed":
+            return self.render_seed_row(r)
+        if r.kind == "repaired":
+            return self.render_repaired_row(r)
         return None
+
+    def render_seed_row(self, r: ProjectMessageRow) -> LoopMessage:
+        content = r.content if isinstance(r.content, dict) else {}
+        text = r.rendered_text or str(content.get("rendered") or content.get("text") or "")
+        return {"role": "user", "content": str(text)}
+
+    def render_repaired_row(self, r: ProjectMessageRow) -> LoopMessage:
+        content = r.content if isinstance(r.content, dict) else {}
+        text = r.rendered_text or str(content.get("text") or "[repaired]")
+        role = str(content.get("role") or "assistant")
+        if role not in ("user", "assistant"):
+            role = "assistant"
+        return {"role": role, "content": str(text)}
 
     def render_user_row(self, r: ProjectMessageRow) -> LoopMessage:
         content = r.content or {}

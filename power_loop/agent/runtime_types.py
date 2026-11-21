@@ -298,3 +298,30 @@ class OutputItem:
     sequence: int
     kind: str
     payload: dict
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """Context window budget & current inline estimate for a target session or descriptor."""
+
+    model: str | None
+    context_budget_tokens: int
+    max_tokens: int | None
+    max_context_rows: int | None
+    used_tokens: int
+    remaining_tokens: int
+    sends: int = 0
+    compact_to_send: int | None = None
+
+
+@dataclass(frozen=True)
+class RepairResult:
+    """Result of an explicit ``RuntimeClient.repair`` / ``RuntimeInputStore.repair`` call."""
+
+    target: TargetRef
+    mode: Literal["heal_broken", "fold_tools_to_text", "compact"]
+    repaired_messages: int
+    repaired_projections: int
+    send_index: int
+    next_seq: int
+    summary: str | None = None
