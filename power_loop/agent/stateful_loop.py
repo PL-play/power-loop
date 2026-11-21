@@ -1334,6 +1334,9 @@ class _ExecutionLoop:
                             source_seq_hi=projected.source_seq_hi,
                             projector_version=version,
                             fold_stats_json=_encode_state(updated_stats),
+                            expected_fold_stats_json=existing_fold_stats_json,
+                            projector=projector,
+                            policy=policy,
                         )
             elif keep <= 0:
                 return PendingProjection(

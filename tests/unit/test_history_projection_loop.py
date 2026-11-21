@@ -32,7 +32,10 @@ async def test_c02_projection_outcome_keeps_business_result_and_does_not_replay(
 ):
     from power_loop import ProjectedRepresentation, ToolDefinition
     from power_loop.runtime.pricing import Free
+    from power_loop.runtime.store.projection_fold import read_state
     from power_loop.tools.registry import ToolRegistry
+
+    from .test_projection_fold_statistics import assert_exact
 
     store, _ = registry_store
     effects = []
@@ -48,15 +51,17 @@ async def test_c02_projection_outcome_keeps_business_result_and_does_not_replay(
     assert (await runner.send("seed")).status == "completed"
     complete = model.complete
     changed = []
+    during_invalid: list[bool | None] = []
 
     async def competing_complete(*args, **kwargs):
         if not changed:
             changed.append(True)
             await store.upsert_project_message(sid, send_index=1, kind="user", content={"input": ["corrected"]})
+            st = await read_state(store, store._db, sid)
+            during_invalid.append(st.get("invalid") if st else None)
         return await complete(*args, **kwargs)
 
     error_hits = []
-    orig_project = projector.project_send
 
     def fail_project(*args, **kwargs):
         error_hits.append(True)
@@ -68,15 +73,120 @@ async def test_c02_projection_outcome_keeps_business_result_and_does_not_replay(
         else:
             patch.setattr(projector, "project_send", fail_project)
         result = await runner.send("work")
-    _ = orig_project
     assert result.status == "completed" and result.final_text == "business success"
     assert len(model.calls) == 3 and len(effects) == 1
     if projection_outcome == "conflict":
-        assert changed
+        assert changed == [True] and during_invalid == [True]
         assert {r.send_index for r in await store.load_project_messages(sid)} == {1, 2}
+        # B1 regression: Final MUST NOT overwrite concurrent invalidation with stale Claim snapshot.
+        await assert_exact(store, sid, projector)
+        kv_rows = await store._db.fetchall(
+            f"SELECT 1 FROM {store.t.session_runtime_state} WHERE session_id=?", (sid,),
+        )
+        assert kv_rows == []
     else:
         assert error_hits == [True]
         assert {r.send_index for r in await store.load_project_messages(sid)} == {1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_state", ["null", "non_null_invalid", "non_null_other_healthy", "rebuild_deferred_to_next_send"])
+async def test_b1_final_fold_stats_cas_protects_concurrent_mutations(
+    registry_store, runtime_agent, monkeypatch, initial_state,
+):
+    """Design 217 M1b B1: Final conditional fold_stats_json write covers NULL & non-NULL snapshots,
+    never misreports SessionLeaseLost, never replays tools, and never writes stale healthy stats."""
+    from power_loop import ProjectedRepresentation, ToolDefinition
+    from power_loop.runtime.pricing import Free
+    from power_loop.runtime.store import projection_fold as pf
+    from power_loop.tools.registry import ToolRegistry
+
+    from .test_projection_fold_statistics import assert_exact
+
+    store, _ = registry_store
+    effects = []
+    registry = ToolRegistry()
+    registry.register(ToolDefinition("echo", "", pricing=Free("fixture")),
+                      lambda **kw: effects.append(kw) or "tool fact")
+    responses = (
+        [_tool_resp("c1", "echo", '{"text":"first"}'), LLMResponse(raw_text="turn1 done")]
+        if initial_state == "null"
+        else [
+            LLMResponse(raw_text="seed"),
+            _tool_resp("c2", "echo", '{"text":"once"}'),
+            LLMResponse(raw_text="turn2 done"),
+            LLMResponse(raw_text="turn3 done"),
+        ]
+    )
+    model = _Scripted(responses)
+    projector = ProjectedRepresentation()
+    runner = await runtime_agent(
+        store=store, model=model, registry=registry,
+        config=AgentLoopConfig(representation=projector, context_budget_tokens=10**9),
+    )
+    sid = runner.target.session_id
+    if initial_state != "null":
+        assert (await runner.send("seed")).status == "completed"
+        before_st = await pf.read_state(store, store._db, sid)
+        assert before_st is not None and not before_st.get("invalid")
+    else:
+        srow = await store._db.fetchone(
+            f"SELECT fold_stats_json FROM {store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        assert srow["fold_stats_json"] is None
+
+    complete = model.complete
+    mutated = []
+
+    async def competing_complete(*args, **kwargs):
+        if not mutated:
+            mutated.append(True)
+            if initial_state == "null":
+                # Concurrent projection insert during Turn 1 turns fold_stats_json NULL -> invalid=True
+                await store.upsert_project_message(
+                    sid, send_index=5, kind="user", content={"input": ["preseeded_mid_turn1"]},
+                )
+            elif initial_state in ("non_null_invalid", "rebuild_deferred_to_next_send"):
+                await store.upsert_project_message(
+                    sid, send_index=1, kind="user", content={"input": ["corrected_long " * 30]},
+                )
+            else:
+                # Concurrent non-invalid healthy rewrite (different revision) while Turn 2 is running
+                await store.upsert_project_message(
+                    sid, send_index=1, kind="user", content={"input": ["corrected_alt " * 25]},
+                )
+                snap = await pf.read_snapshot(store, sid)
+                assert snap is not None
+                rebuilt = await pf._rebuild(store, sid, projector, projector.fold_statistics_policy(), snap)
+                assert rebuilt is not None and not rebuilt.get("invalid")
+        return await complete(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model, "complete", competing_complete)
+        if initial_state == "rebuild_deferred_to_next_send":
+            async def fail_rebuild(*args, **kwargs):
+                raise RuntimeError("transient post-final rebuild error")
+
+            patch.setattr(pf, "_rebuild", fail_rebuild)
+        res = await runner.send("work")
+
+    assert mutated == [True]
+    assert res.status == "completed"
+    assert len(effects) == 1  # tool executed strictly once, no replay or SessionLeaseLost
+    if initial_state == "rebuild_deferred_to_next_send":
+        # Even if post-final rebuild fails, Final MUST leave invalid=True (never stale healthy!)
+        st_after = await pf.read_state(store, store._db, sid)
+        assert st_after is not None and st_after.get("invalid") is True
+        # Next send rebuilds to exact automatically!
+        res3 = await runner.send("follow up")
+        assert res3.status == "completed"
+        await assert_exact(store, sid, projector)
+    else:
+        await assert_exact(store, sid, projector)
+    kv_rows = await store._db.fetchall(
+        f"SELECT 1 FROM {store.t.session_runtime_state} WHERE session_id=?", (sid,),
+    )
+    assert kv_rows == []
 
 
 @pytest.fixture

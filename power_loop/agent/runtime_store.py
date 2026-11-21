@@ -121,6 +121,9 @@ class PendingProjection:
     source_seq_hi: int | None
     projector_version: int
     fold_stats_json: str | None = None
+    expected_fold_stats_json: str | None = None
+    projector: Any = None
+    policy: Any = None
 
 
 @dataclass(frozen=True)
@@ -2196,13 +2199,15 @@ class RuntimeInputStore:
                 raise RuntimeRequestError("invalid_options", "consumed input outside this session")
         if status not in {"completed", "failed", "cancelled", "interrupted"}:
             raise RuntimeRequestError("invalid_options", "terminal status")
+        fold_conflict_out = [False]
         try:
             async with self.db.transaction() as tx:
-                return await self._final_tx(
+                final_batch = await self._final_tx(
                     tx, batch, consumed, status, final_text, usage or {},
                     structured_output, error, error_code, result_seq, assistant_meta,
                     next_seq=next_seq, result_json=result_json,
                     settle_start_input=settle_start_input, projection=projection,
+                    _fold_conflict_out=fold_conflict_out,
                 )
         except (RuntimeRequestError, SessionLeaseLost):
             raise
@@ -2211,6 +2216,38 @@ class RuntimeInputStore:
             if recovered is not None:
                 return recovered
             raise StoreError(consumed[0] if consumed else batch.input_refs[0]) from exc
+
+        # Rare conflict recovery (0 SQL on normal path): Final preserved invalid=True without
+        # failing business commit or misreporting SessionLeaseLost; rebuild exact stats unlocked.
+        if (
+            fold_conflict_out[0]
+            and projection is not None
+            and projection.projector is not None
+            and projection.policy is not None
+        ):
+            await self._rebuild_fold_stats_after_conflict(
+                batch.target.session_id, projection.projector, projection.policy,
+            )
+        return final_batch
+
+    async def _rebuild_fold_stats_after_conflict(self, sid: str, projector: Any, policy: Any) -> None:
+        """Unlocked snapshot read + revision-fenced rebuild after a concurrent fold_stats_json conflict.
+
+        Never raises into the committed business result: if a second concurrent mutation races or
+        fails here, ``sessions.fold_stats_json`` remains ``invalid=True`` and the next send rebuilds.
+        """
+        from power_loop.runtime.store import projection_fold as pf
+
+        try:
+            snapshot = await pf.read_snapshot(self.store, sid)
+            if snapshot is not None:
+                await pf._rebuild(self.store, sid, projector, policy, snapshot)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "post-final fold_stats_json rebuild failed for %s (left invalid for next send)",
+                sid, exc_info=True,
+            )
 
     async def _insert_project_messages_tx(
         self, tx, sid: str, send_index: int, projection: PendingProjection, created_at: int,
@@ -2270,6 +2307,7 @@ class RuntimeInputStore:
         self, tx, batch: ClaimedBatch, consumed, status, final_text, usage, structured_output,
         error, error_code, result_seq=None, assistant_meta=None, *, next_seq=None,
         result_json=None, settle_start_input=False, projection: PendingProjection | None = None,
+        _fold_conflict_out: list[bool] | None = None,
     ) -> FinalBatch:
         sid = batch.target.session_id
         now_sql = self._now_sql()
@@ -2299,28 +2337,67 @@ class RuntimeInputStore:
             if (projection is not None and status == "completed" and projection.fold_stats_json is not None)
             else None
         )
-        fold_set_clause = (
-            "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
-            "THEN ? ELSE fold_stats_json END,"
-            if proj_fold_json is not None else ""
+        expected_fold_json = (
+            projection.expected_fold_stats_json
+            if (projection is not None and proj_fold_json is not None)
+            else None
         )
-        fold_set_params: tuple[Any, ...] = (
-            (batch.cancel_seq, proj_fold_json) if proj_fold_json is not None else ()
-        )
+        # Dialect-exact conditional write on sessions.fold_stats_json (covers both NULL and non-NULL
+        # snapshots). Never placed in WHERE so a concurrent projection mutation cannot be misreported
+        # as SessionLeaseLost or block the business commit.
+        mysql_fold_conflict_bit = ""
+        mysql_fold_conflict_params: tuple[Any, ...] = ()
+        if proj_fold_json is None:
+            fold_set_clause = ""
+            fold_set_params: tuple[Any, ...] = ()
+        elif expected_fold_json is None:
+            fold_set_clause = (
+                "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                "AND fold_stats_json IS NULL THEN ? ELSE fold_stats_json END,"
+            )
+            fold_set_params = (batch.cancel_seq, proj_fold_json)
+            if self._dialect == "mysql":
+                mysql_fold_conflict_bit = (
+                    "|(CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "AND fold_stats_json IS NOT NULL THEN 16 ELSE 0 END)"
+                )
+                mysql_fold_conflict_params = (batch.cancel_seq,)
+        else:
+            if self._dialect == "mysql":
+                fold_set_clause = (
+                    "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "AND CAST(fold_stats_json AS BINARY)=CAST(? AS BINARY) "
+                    "THEN ? ELSE fold_stats_json END,"
+                )
+                mysql_fold_conflict_bit = (
+                    "|(CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "AND (fold_stats_json IS NULL "
+                    "OR CAST(fold_stats_json AS BINARY)<>CAST(? AS BINARY)) THEN 16 ELSE 0 END)"
+                )
+                mysql_fold_conflict_params = (batch.cancel_seq, expected_fold_json)
+            else:
+                fold_set_clause = (
+                    "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "AND fold_stats_json=? THEN ? ELSE fold_stats_json END,"
+                )
+            fold_set_params = (batch.cancel_seq, expected_fold_json, proj_fold_json)
 
         # Step 1 (Deep-first lock order): Fenced UPDATE on child session FIRST (1 control SQL!).
+        post_fold_stats_json: str | None = None
         if self._dialect == "mysql":
-            # 4-bit LAST_INSERT_ID packing in 1st SET slot:
-            # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced | bit 3: closed_raced
+            # 5-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json SET):
+            # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced
+            # bit 3: closed_raced  | bit 4: fold_stats_conflict
             rc, packed = await tx.execute_packed(
                 f"UPDATE {self.s} SET "
                 "owner_epoch=(LAST_INSERT_ID("
-                "(owner_epoch<<4)"
+                "(owner_epoch<<5)"
                 "|(CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) THEN 1 ELSE 0 END)"
                 "|(CASE WHEN cancel_by='subtree' AND cancel_seq>? THEN 2 ELSE 0 END)"
                 "|(CASE WHEN cancel_seq>? THEN 4 ELSE 0 END)"
                 "|(CASE WHEN lifecycle IN ('closing','closed') THEN 8 ELSE 0 END)"
-                ")>>4),"
+                f"{mysql_fold_conflict_bit}"
+                ")>>5),"
                 "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
@@ -2335,6 +2412,7 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running'",
                 (
                     int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
+                    *mysql_fold_conflict_params,
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
@@ -2347,6 +2425,7 @@ class RuntimeInputStore:
             subtree_raced = bool(packed & 2)
             cancel_raced = bool(packed & 4)
             closed_raced = bool(packed & 8)
+            fold_conflict = bool(packed & 16)
             next_state = "queued" if has_more_wake else "idle"
             cancel_by_db = "subtree" if subtree_raced else None
             cancel_reason_db = None
@@ -2378,7 +2457,7 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} "
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
                 "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
-                "cancel_by,cancel_reason,next_seq,updated_at",
+                "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at",
                 (
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
@@ -2395,7 +2474,14 @@ class RuntimeInputStore:
             cancel_by_db = srow["cancel_by"]
             cancel_reason_db = srow["cancel_reason"]
             post_next_seq = int(srow["next_seq"])
+            post_fold_stats_json = srow["fold_stats_json"]
             database_now = int(srow["updated_at"])
+            fold_conflict = (
+                proj_fold_json is not None
+                and not closed_raced
+                and not cancel_raced
+                and post_fold_stats_json != proj_fold_json
+            )
 
         effective_status = status
         effective_cancel_by = batch.cancel_by or cancel_by_db
@@ -2539,6 +2625,18 @@ class RuntimeInputStore:
             await self._insert_project_messages_tx(
                 tx, sid, batch.send_index, projection, proj_ts,
             )
+            if fold_conflict:
+                # Rare conflict path (0 SQL on normal path): guarantee sessions.fold_stats_json
+                # is marked invalid=True (never stale healthy) while holding the session lock.
+                from power_loop.runtime.store import projection_fold as pf
+                if self._dialect == "mysql":
+                    cur_state = await pf.read_state(self.store, tx, sid)
+                else:
+                    cur_state = pf.parse_state(post_fold_stats_json)
+                if not (isinstance(cur_state, dict) and cur_state.get("invalid") is True):
+                    await pf.invalidate(self.store, tx, sid, state=cur_state)
+                if _fold_conflict_out is not None:
+                    _fold_conflict_out[0] = True
 
         # Step 4: 0 UPDATE follow_up_queue on normal completion!
         # Only update follow_up_queue on abnormal status, delivery_error, or explicit settle_start_input.
