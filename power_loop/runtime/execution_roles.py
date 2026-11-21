@@ -15,6 +15,19 @@ def finite_delegation(loop) -> bool:
     return policy == "single_level"
 
 
+def role_from_facts(parent_session_id: str | None, session_kind: str, config) -> str:
+    if session_kind == "workflow_driver":
+        return "workflow"
+    if parent_session_id is None:
+        return "main"
+    cfg = config or {}
+    if "workflow_node" in cfg:
+        return "workflow_node"
+    if "child_spec" in cfg or session_kind == "background":
+        return "subagent"
+    raise ValueError("execution_role_unavailable")
+
+
 async def session_role(store, sid: str) -> str:
     row = await store._db.fetchone(
         f"SELECT parent_session_id,session_kind,descriptor_json FROM {store.t.sessions} "
@@ -22,19 +35,9 @@ async def session_role(store, sid: str) -> str:
     )
     if row is None:
         raise ValueError("execution_role_unavailable")
-    if row["session_kind"] == "workflow_driver":
-        return "workflow"
-    if row["parent_session_id"] is None:
-        return "main"
     import json
     config = json.loads(row["descriptor_json"]).get("config") or {}
-    if "workflow_node" in config:
-        return "workflow_node"
-    if "child_spec" in config:
-        return "subagent"
-    if row["session_kind"] == "background":
-        return "subagent"
-    raise ValueError("execution_role_unavailable")
+    return role_from_facts(row["parent_session_id"], row["session_kind"], config)
 
 
 async def require_orchestration(loop, capability: str, *, sid: str | None = None) -> None:
@@ -46,7 +49,15 @@ async def require_orchestration(loop, capability: str, *, sid: str | None = None
     sid = get_session_id() or sid
     if not sid:
         raise ValueError("execution_role_unavailable")
-    role = await session_role(await loop._ensure_store(), sid)
+    ctx = getattr(loop, "_runtime_worker_context", None)
+    if (
+        ctx is not None
+        and getattr(ctx, "session_id", None) == sid
+        and getattr(ctx, "descriptor", None) is not None
+    ):
+        role = role_from_facts(ctx.parent_session_id, ctx.descriptor.kind, ctx.descriptor.config)
+    else:
+        role = await session_role(await loop._ensure_store(), sid)
     if role not in allowed_roles[capability]:
         raise ValueError("execution_role_forbids_" + capability)
 

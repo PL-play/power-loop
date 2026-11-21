@@ -1870,9 +1870,11 @@ async def test_m1c_b2_r2_mixed_batch_per_input_rebind_and_zero_extra_normal_sql(
             assert nb is not None
             profiled.records.clear()
             await port.final(nb, final_text="ok per-input")
-            assert not any("reply_to_session_id" in r["sql"] for r in profiled.records), [
-                r["sql"] for r in profiled.records
-            ]
+            assert not any(
+                "reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in profiled.records
+            ), [r["sql"] for r in profiled.records]
+            expected_pi = 7 if original.dialect.name == "mysql" else 6
+            assert len(profiled.records) == expected_pi, [r["sql"] for r in profiled.records]
             # SQLite/PG: 5 SQL (max_seq + UPDATE sessions + SELECT delivered + River UPDATE + River INSERT + INSERT msg = 6 if write_message, 5 if result_seq given)
             # Check exact MySQL/SQLite/PG counts with pre-written result_seq=2 (matches real Worker!)
             cm_norm = await port.create_many(
@@ -2356,8 +2358,13 @@ async def test_m1c_r3_runtime_state_write_no_extra_route_sql_vs_real_rebind(regi
         store._db = original
 
     assert fb_plain.result_delivery_error is None and fb_kv.result_delivery_error is None
-    assert not any("reply_to_session_id" in r["sql"] for r in kv_sql), [r["sql"] for r in kv_sql]
-    assert len(kv_sql) == len(plain_sql), ([r["sql"] for r in plain_sql], [r["sql"] for r in kv_sql])
+    assert not any(
+        "reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in kv_sql
+    ), [r["sql"] for r in kv_sql]
+    expected_pi = 7 if original.dialect.name == "mysql" else 6
+    assert len(kv_sql) == len(plain_sql) == expected_pi, (
+        [r["sql"] for r in plain_sql], [r["sql"] for r in kv_sql],
+    )
 
     # 2) Contrast: child writes runtime state AND actually rebinds (old_p -> new_p) with mixed batch!
     ch_rb = await target(port, "r3-rt-ch-rb", parent=p_old)
@@ -2381,3 +2388,305 @@ async def test_m1c_r3_runtime_state_write_no_extra_route_sql_vs_real_rebind(regi
     body = json.loads(new_rows[0]["content_json"])
     assert body["final_text"] == "rebound after kv"
     assert body["input_ref"]["message_id"] == "r1"
+
+
+# ── 10. Round-4 Rework Regressions ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("pass_consumed", [False, True])
+async def test_m1c_r4_double_rebind_aba_mixed_batch_and_kv_zero_extra_sql(
+    registry_store, pass_consumed,
+):
+    """R4-Item1: Double rebind A->B->A on cross-parent mixed batch delivers only to A; no-rebind B & KV stay exact."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        sfx = "cons" if pass_consumed else "none"
+        main_a = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"r4-a-{sfx}"})
+        main_b = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"r4-b-{sfx}"})
+        child_c = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": f"r4-c-{sfx}"},
+        )
+
+        # Public send: unrouted direct input + explicit route targeting B (cross-parent!)
+        await client.send(child_c, "direct work", message_id="direct", actor=ACTOR)
+        await client.send(
+            child_c, "routed work", message_id="routed", actor=ACTOR,
+            reply_route={"target": main_b, "result_kind": "agent_result"},
+        )
+        batch = await port.claim(child_c, node_id="n1", boot_id="b1")
+        assert batch is not None
+        assert batch.parent_session_id == main_a.session_id
+        assert batch.reply_to_session_id == main_b.session_id
+        assert batch.reply_to_item_id == "routed"
+
+        # Double rebind: A -> B, then B -> A (parent_session_id returns to A, while routed input changed B -> A!)
+        rb1 = await port.rebind_children(main_a, main_b, actor=ACTOR)
+        assert rb1.rebound_children == (child_c.session_id,)
+        rb2 = await port.rebind_children(main_b, main_a, actor=ACTOR)
+        assert rb2.rebound_children == (child_c.session_id,)
+
+        fb = await port.final(
+            batch,
+            consumed=(batch.input_refs if pass_consumed else None),
+            final_text="double rebound answer",
+        )
+        assert fb.result_delivery_error is None
+        assert fb.result_activation == main_a
+
+        a_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_a.session_id,),
+        )
+        b_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_b.session_id,),
+        )
+        assert len(a_inbox) == 1
+        assert b_inbox == []
+        a_body = json.loads(a_inbox[0]["content_json"])
+        assert a_body["final_text"] == "double rebound answer"
+        assert a_body["input_ref"]["message_id"] == "routed"
+
+        # Control (no rebind): explicit route to B still delivers to B, AND set_runtime_state() keeps 6/6/7 SQL!
+        if not pass_consumed:
+            child_ctrl = await client.create_session(
+                DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": "r4-c-ctrl"},
+            )
+            await client.send(child_ctrl, "d", message_id="d_ctrl", actor=ACTOR)
+            await client.send(
+                child_ctrl, "r", message_id="r_ctrl", actor=ACTOR,
+                reply_route={"target": main_b, "result_kind": "agent_result"},
+            )
+            b_ctrl = await port.claim(child_ctrl, node_id="n1", boot_id="b1")
+            assert b_ctrl is not None
+            await store.set_runtime_state(child_ctrl.session_id, "k", {"v": 1})
+
+            original = store._db
+            profiled = Profiled(original)
+            store._db = profiled
+            try:
+                profiled.records.clear()
+                fb_ctrl = await port.final(b_ctrl, final_text="stay on B")
+                ctrl_sql = list(profiled.records)
+            finally:
+                store._db = original
+            assert fb_ctrl.result_delivery_error is None
+            assert fb_ctrl.result_activation == main_b
+            expected_pi = 7 if original.dialect.name == "mysql" else 6
+            assert len(ctrl_sql) == expected_pi, [r["sql"] for r in ctrl_sql]
+            assert not any("reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in ctrl_sql)
+            b_rows = await store._db.fetchall(
+                f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_b.session_id,),
+            )
+            assert len(b_rows) == 1
+            assert json.loads(b_rows[0]["content_json"])["input_ref"]["message_id"] == "r_ctrl"
+    finally:
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_m1c_r4_public_runtime_client_workflow_blocks_subagent_and_leaf(registry_store):
+    """R4-Item2: Public RuntimeClient.workflow rejects subagent & workflow leaf; allows main & Driver leaf creation."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    wf_spec = {
+        "name": "nested_probe",
+        "root": {"type": "agent", "id": "step1", "spec": {"name": "s1", "system_prompt": "ok"}},
+    }
+    try:
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r4-wf-main"})
+        sub_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "child_spec": {"name": "sub"}})
+        sub = await client.create_session(
+            sub_desc, actor=ACTOR, parent=main, options={"session_id": "r4-wf-sub"},
+        )
+
+        # Positive: main agent submits workflow via public RuntimeClient.workflow -> creates & queues Driver (depth=1)
+        main_actor = TrustedActor(ACTOR.tenant_id, ACTOR.principal_id, main.session_id)
+        handle = await client.workflow(main, wf_spec, message_id="wf-main-1", actor=main_actor)
+        drv_row = await store._db.fetchone(
+            f"SELECT session_id,parent_session_id,session_kind,depth,execution_state "
+            f"FROM {store.t.sessions} WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert drv_row is not None
+        assert drv_row["parent_session_id"] == main.session_id
+        assert drv_row["session_kind"] == "workflow_driver"
+        assert int(drv_row["depth"]) == 1
+        assert drv_row["execution_state"] == "queued"
+
+        # Running Driver creates a legitimate workflow leaf (depth=2) -> ALLOWED
+        drv_batch = await port.claim(handle.target, node_id="n-wf", boot_id="b-wf")
+        assert drv_batch is not None
+        leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "step1"}})
+        cm_leaf = await port.create_many(
+            parent=handle.target, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="r4-wf-leaf", message_id="lm1", body={"text": "work"},
+                descriptor=leaf_desc, result_kind="workflow_node_result",
+            )],
+            node_id="n-wf", boot_id="b-wf", can_execute=False, free_slots=0,
+            parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+        )
+        assert cm_leaf.queued_targets == (TargetRef(store.store_id, "r4-wf-leaf"),)
+        leaf = cm_leaf.queued_targets[0]
+
+        before_sessions = await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions}")
+        before_queue = await store._db.fetchall(f"SELECT session_id,item_id FROM {store.t.follow_up_queue}")
+
+        # Negative 1: Ordinary subagent calling public RuntimeClient.workflow -> REJECTED!
+        sub_actor = TrustedActor(ACTOR.tenant_id, ACTOR.principal_id, sub.session_id)
+        with pytest.raises(RuntimeRequestError) as sub_exc:
+            await client.workflow(sub, wf_spec, message_id="wf-sub-illegal", actor=sub_actor)
+        assert sub_exc.value.code == "forbidden"
+        assert "execution_role_forbids_workflow" in str(sub_exc.value)
+
+        # Negative 2: Legitimate workflow leaf calling public RuntimeClient.workflow -> REJECTED!
+        leaf_actor = TrustedActor(ACTOR.tenant_id, ACTOR.principal_id, leaf.session_id)
+        with pytest.raises(RuntimeRequestError) as leaf_exc:
+            await client.workflow(leaf, wf_spec, message_id="wf-leaf-illegal", actor=leaf_actor)
+        assert leaf_exc.value.code == "forbidden"
+        assert "execution_role_forbids_workflow" in str(leaf_exc.value)
+
+        # Verify 0 new Driver sessions (depth=3 == 0) and 0 new start inputs were created!
+        after_sessions = await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions}")
+        after_queue = await store._db.fetchall(f"SELECT session_id,item_id FROM {store.t.follow_up_queue}")
+        assert len(after_sessions) == len(before_sessions)
+        assert len(after_queue) == len(before_queue)
+        deep = await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions} WHERE depth>=3")
+        assert deep == []
+    finally:
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_m1c_r4_main_spawn_agent_send_input_zero_role_query(registry_store, monkeypatch):
+    """R4-Item3: Real Worker main agent spawn_agent(action='send') delivers to direct child with 0 role-lookup SQL."""
+    from power_loop.runtime import child_tasks
+    from power_loop.tools.spawn_agent import register_spawn_agent
+
+    store, _ = registry_store
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+
+    send_input_slices: list[list[dict[str, Any]]] = []
+    orig_send_input = child_tasks.send_input
+
+    async def metered_send_input(loop, sid, message, *, urgent=False):
+        start_idx = len(profiled.records)
+        res = await orig_send_input(loop, sid, message, urgent=urgent)
+        send_input_slices.append(list(profiled.records[start_idx:]))
+        return res
+
+    monkeypatch.setattr(child_tasks, "send_input", metered_send_input)
+
+    child_seen_messages: list[str] = []
+    created_child_sid: list[str] = []
+    main_step = [0]
+    child_entered = asyncio.Event()
+    child_release = asyncio.Event()
+
+    class _SendInputModel:
+        async def complete(self, request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            if sid == "r4-send-main":
+                main_step[0] += 1
+                if main_step[0] == 1:
+                    return LLMResponse(
+                        raw_text="",
+                        tool_calls=[{
+                            "id": "tc-create-1",
+                            "type": "function",
+                            "function": {"name": "spawn_agent", "arguments": json.dumps({"task": "first work"})},
+                        }],
+                    )
+                if main_step[0] == 2:
+                    await asyncio.wait_for(child_entered.wait(), 5)
+                    # Extract child session_id from previous tool output
+                    tool_msg = next(m for m in reversed(request.messages) if m.get("role") == "tool")
+                    payload = json.loads(tool_msg["content"])
+                    created_child_sid.append(payload["session_id"])
+                    return LLMResponse(
+                        raw_text="",
+                        tool_calls=[{
+                            "id": "tc-send-1",
+                            "type": "function",
+                            "function": {
+                                "name": "spawn_agent",
+                                "arguments": json.dumps({
+                                    "action": "send",
+                                    "sub_session": payload["session_id"],
+                                    "message": "follow up instruction",
+                                }),
+                            },
+                        }],
+                    )
+                child_release.set()
+                return LLMResponse(raw_text="main done")
+            # Direct child session pauses during turn 1 so send_input SQL has 0 concurrent noise!
+            if not child_entered.is_set():
+                child_entered.set()
+                await asyncio.wait_for(child_release.wait(), 5)
+            for m in request.messages:
+                if m.get("role") == "user" and m.get("content"):
+                    child_seen_messages.append(str(m["content"]))
+            return LLMResponse(raw_text="child done")
+
+        async def close(self):
+            pass
+
+    model = _SendInputModel()
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        reg = ToolRegistry()
+        register_spawn_agent(reg)
+        return ExecutionEnvironment(model, reg, AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _build)
+    rt = Runtime(
+        store=store, factory=factory, node_id="r4-send-node", boot_id="r4-send-boot",
+        capacity=4, recovery_interval_s=None, timers_enabled=False,
+    )
+    await rt.worker.start()
+    try:
+        main = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r4-send-main"})
+        rcpt = await rt.client.send(main, "delegate and follow up", message_id="m1", actor=ACTOR)
+        res = await rt.client.wait(rcpt.input_ref, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert res.status == "completed"
+        assert len(created_child_sid) == 1
+        assert len(send_input_slices) == 1
+
+        # Wait for the follow-up message to arrive in child's durable inbox / execution
+        c_sid = created_child_sid[0]
+        q_rows = await original.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (c_sid,),
+        )
+        assert any("follow up instruction" in str(r["content_json"]) for r in q_rows), q_rows
+
+        # Verify ZERO role-lookup SQL in send_input (SELECT parent_session_id,session_kind,descriptor_json)
+        si_recs = send_input_slices[0]
+        role_queries = [
+            r["sql"] for r in si_recs
+            if "session_kind" in r["sql"] and "descriptor_json" in r["sql"]
+        ]
+        assert role_queries == [], f"unexpected role-lookup SQL in send_input: {role_queries}"
+        # Total send_input SQL stays at exact R2 count (3 SQLite/PG, <= 5 MySQL) with 0 role reads!
+        max_si_sql = 5 if original.dialect.name == "mysql" else 3
+        assert len(si_recs) <= max_si_sql, [r["sql"] for r in si_recs]
+    finally:
+        child_release.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+        store._db = original

@@ -701,6 +701,10 @@ class RuntimeInputStore:
                     raise RuntimeRequestError("cancelled", parent_row["cancel_reason"] or "parent_cancelled")
                 if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
                     raise RuntimeRequestError("cancelled", "parent_cancelled")
+                if any(sp.descriptor.kind == "workflow_driver" for sp in specs) and (
+                    parent_row["parent_session_id"] is not None or parent_row["session_kind"] != "agent"
+                ):
+                    raise RuntimeRequestError("forbidden", "execution_role_forbids_workflow")
 
                 database_now = await self._db_now(tx)
                 root_id = str(parent_row["root_session_id"])
@@ -890,6 +894,16 @@ class RuntimeInputStore:
                         tx, parent, actor,
                         existing_id=(target.session_id if existing is not None else None),
                     )
+                    is_driver_launch = descriptor.kind == "workflow_driver" or result_kind == "workflow_result"
+                    is_main_agent = (
+                        parent_session["parent_session_id"] is None
+                        and parent_session["session_kind"] == "agent"
+                    )
+                    if is_driver_launch:
+                        if not is_main_agent:
+                            raise RuntimeRequestError("forbidden", "execution_role_forbids_workflow")
+                    elif parent_session["session_kind"] != "workflow_driver" and not is_main_agent:
+                        raise RuntimeRequestError("forbidden", "execution_role_forbids_workflow")
                     if existing is None:
                         if attempt:
                             raise RuntimeRequestError("creation_conflict")
@@ -2733,10 +2747,14 @@ class RuntimeInputStore:
         if write_message:
             result_seq = post_next_seq - 1
 
-        # Resolve consumed inputs if caller passed consumed=None and we need exact list for abnormal settle or River
+        # Resolve consumed inputs if caller passed consumed=None and we need exact list for abnormal settle or River.
+        # Include reply_to_session_id/reply_result_kind on the same SELECT (0 extra SQL) so per-input live routes
+        # are always exact in-lock — even after A -> B -> A multi-rebinds with cross-parent routes!
+        delivered_routes: dict[str, tuple[str | None, str | None]] = {}
         if consumed is None and (effective_status != "completed" or batch.result_route is not None or batch.reply_to_session_id is not None):
             delivered = await tx.fetchall(
-                f"SELECT item_id FROM {self.q} WHERE session_id=? AND status='delivered' "
+                f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
+                "WHERE session_id=? AND status='delivered' "
                 "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id ASC",
                 (sid, batch.send_index),
             )
@@ -2744,6 +2762,11 @@ class RuntimeInputStore:
                 consumed_refs = tuple(
                     InputRef(batch.target.store_id, sid, row["item_id"]) for row in delivered
                 )
+                for row in delivered:
+                    delivered_routes[str(row["item_id"])] = (
+                        row["reply_to_session_id"],
+                        row["reply_result_kind"],
+                    )
 
         # Restore any unconsumed items back to pending (rare partial-consume path)
         if unconsumed_ids:
@@ -2811,7 +2834,19 @@ class RuntimeInputStore:
                 else:
                     if reply_item_id is None:
                         reply_item_id = consumed_refs[0].message_id
-                    if route_changed:
+                    if reply_item_id in delivered_routes:
+                        live_to, live_rk = delivered_routes[reply_item_id]
+                        if live_to is not None:
+                            effective_reply_to = str(live_to)
+                            effective_reply_rk = live_rk or effective_reply_rk
+                    elif route_changed or (
+                        batch.parent_session_id is not None
+                        and effective_reply_to != batch.parent_session_id
+                    ):
+                        # When consumed was passed explicitly (no delivered scan above):
+                        # - If reply_to == batch.parent_session_id, live route differs iff parent changed.
+                        # - If reply_to != batch.parent_session_id (cross-parent route), A->B->A can
+                        #   retarget reply_to while restoring parent_session_id, so read the live row.
                         q_live = await tx.fetchone(
                             f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
                             "WHERE session_id=? AND item_id=?",
