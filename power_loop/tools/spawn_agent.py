@@ -199,7 +199,7 @@ def register_spawn_agent(registry, *, overwrite: bool = False) -> None:
     from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
     registry.register(SPAWN_AGENT_DEFINITION, FunctionRuntimeTool(
-        _handle_spawn_agent, ToolRuntimeContract("sdk.subagent", background_allowed=False, allowed_roles=("main", "workflow_node")),
+        _handle_spawn_agent, ToolRuntimeContract("sdk.subagent", background_allowed=False, allowed_roles=("main",)),
         policy=lambda arguments: ToolDispatchPolicy(native_admitted=True), formatter=result_view,
     ), overwrite=overwrite)
 

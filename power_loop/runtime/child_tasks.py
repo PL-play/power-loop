@@ -100,6 +100,9 @@ async def create(loop, spec, task):
 
 
 async def send_input(loop, sid, message, *, urgent=False):
+    from .execution_roles import require_orchestration
+
+    await require_orchestration(loop, "subagent")
     _, actor = await tool_actor(loop)
     target = TargetRef(loop.store.store_id, sid)
     message_id = "inp_" + sha256_canonical([

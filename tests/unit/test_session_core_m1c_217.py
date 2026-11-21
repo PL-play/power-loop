@@ -1547,132 +1547,165 @@ async def test_m1c_b4_release_claim_fires_result_undeliverable_post_commit(regis
         await peer.close()
 
 
-# ── 9. Round-2 Rework B1–B3 Regressions ─────────────────────────────────────
+# ── 9. Round-2 & Round-3 Rework Regressions ─────────────────────────────────
 
 
-@pytest.mark.parametrize("interleave_point", ["after_scan2_under_root_lock", "between_scan1_and_root_lock"])
-async def test_m1c_b1_r2_3a_vs_grandchild_under_idle_middle(registry_store, interleave_point):
-    """B1-R2 Scene 1: 3A on root vs create_many under idle-middle never leaves an active grandchild."""
+@pytest.mark.parametrize("close_subtree", ["none", "all"])
+async def test_m1c_r3_running_driver_create_many_under_subtree_none_and_all(
+    registry_store, close_subtree,
+):
+    """R3-Item2: Running Driver keeps creating leaves under subtree='none' (5 SQL) and stops under subtree='all'."""
     store, connect = registry_store
     p1 = RuntimeInputStore(store)
     peer = await connect(schema="verify")
     p2 = RuntimeInputStore(peer)
     try:
-        sfx = "s2" if interleave_point == "after_scan2_under_root_lock" else "s1"
-        root = await target(p1, f"b1r2-root-{sfx}")
-        driver_desc = replace(DESCRIPTOR, kind="workflow_driver")
-        middle = await p1.create_session(
-            driver_desc, actor=ACTOR, parent=root, options={"session_id": f"b1r2-mid-{sfx}"},
+        root = await target(p1, f"r3-drv-root-{close_subtree}")
+        drv_sid = f"r3-drv-{close_subtree}"
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        cm_drv = await p1.create_many(
+            parent=root, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id=drv_sid, message_id="dm1", body={"wf": "start"},
+                descriptor=drv_desc, result_kind="workflow_result",
+            )],
+            node_id="n-drv", boot_id="b-drv", can_execute=True, free_slots=1,
         )
-        grand_sid = f"b1r2-grand-{sfx}"
-        grand_spec = ChildSpec(
-            session_id=grand_sid,
-            message_id="gm1",
-            body={"text": "leaf work"},
-            descriptor=DESCRIPTOR,
-            result_kind="workflow_node_result",
+        drv_batch = cm_drv.preclaimed[0]
+        driver = drv_batch.target
+        leaf_sid = f"r3-leaf-{close_subtree}"
+        leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "n1"}})
+        leaf_spec = ChildSpec(
+            session_id=leaf_sid, message_id="lm1", body={"text": "next wave"},
+            descriptor=leaf_desc, result_kind="workflow_node_result",
         )
-        dialect = store._db.dialect.name
-        if dialect in ("postgres", "mysql"):
-            orig_collect = p1._collect_active_descendants
-            target_scan = 2 if interleave_point == "after_scan2_under_root_lock" else 1
-            gate_reached = asyncio.Event()
-            release_close = asyncio.Event()
-            scan_count = 0
 
-            async def hooked_collect(tx, **kwargs):
-                nonlocal scan_count
-                scan_count += 1
-                rows = await orig_collect(tx, **kwargs)
-                if scan_count == target_scan:
-                    gate_reached.set()
-                    await asyncio.wait_for(release_close.wait(), 5)
-                return rows
-
-            p1._collect_active_descendants = hooked_collect  # type: ignore[method-assign]
-
-            async def run_grandchild_spawn():
-                await asyncio.wait_for(gate_reached.wait(), 5)
-                if interleave_point == "after_scan2_under_root_lock":
-                    # Under root FOR UPDATE, create_many(middle) blocks on root FOR SHARE until
-                    # close commits, then rejects with session_closed!
-                    async def _release_soon():
-                        await asyncio.sleep(0.08)
-                        release_close.set()
-
-                    rel_task = asyncio.create_task(_release_soon())
-                    try:
-                        return await p2.create_many(
-                            parent=middle, actor=ACTOR, specs=[grand_spec],
-                            node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
-                        )
-                    finally:
-                        await rel_task
-                else:
-                    try:
-                        return await p2.create_many(
-                            parent=middle, actor=ACTOR, specs=[grand_spec],
-                            node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
-                        )
-                    finally:
-                        release_close.set()
-
-            close_res, spawn_res = await asyncio.gather(
-                p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_grand"),
-                run_grandchild_spawn(),
-                return_exceptions=True,
+        if close_subtree == "none":
+            # Explicit subtree='none': running/open Driver is NOT cancelled and MUST be able
+            # to spawn its next wave of leaves with 0 ancestor-lookup SQL (exact 5 SQL)!
+            await p1.set_lifecycle(
+                root, "closed", actor=ACTOR, inflight="abort", subtree="none", reason="close_main_only",
             )
-            assert not isinstance(close_res, Exception), close_res
-        else:
-            close_res, spawn_res = await asyncio.gather(
-                p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_grand"),
-                p2.create_many(
-                    parent=middle, actor=ACTOR, specs=[grand_spec],
-                    node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
-                ),
-                return_exceptions=True,
+            drow = await store._db.fetchone(
+                f"SELECT lifecycle,execution_state,cancel_by,cancel_seq FROM {store.t.sessions} WHERE session_id=?",
+                (drv_sid,),
             )
-            assert not isinstance(close_res, Exception), close_res
+            assert drow["lifecycle"] == "open" and drow["execution_state"] == "running"
+            assert drow["cancel_by"] is None and int(drow["cancel_seq"]) == 0
 
-        if isinstance(spawn_res, Exception):
-            assert isinstance(spawn_res, RuntimeRequestError) and spawn_res.code == "session_closed"
-            assert await store.get_session(grand_sid) is None
-        else:
-            # Grandchild committed before root lock -> MUST be caught & cancelled, never executes!
-            assert grand_sid in close_res.stopped_descendant_ids
-            grow = await store._db.fetchone(
-                f"SELECT cancel_seq,cancel_by FROM {store.t.sessions} WHERE session_id=?",
-                (grand_sid,),
-            )
-            assert grow is not None and grow["cancel_by"] == "subtree" and int(grow["cancel_seq"]) >= 1
-            model_calls: list[str] = []
-            factory = RegistryRuntimeFactory()
-            model = _ScriptedModel(lambda _i, _r: (model_calls.append("ran") or LLMResponse(raw_text="NO")))
-
-            async def _chk_build(_d, _c):
-                return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
-
-            factory.register("test.agent@215", _chk_build)
-            rt = Runtime(
-                store=store, factory=factory, node_id="n-chk", boot_id="b-chk",
-                capacity=2, recovery_interval_s=None, timers_enabled=False,
-            )
-            await rt.worker.start()
+            original = store._db
+            profiled = Profiled(original)
+            store._db = profiled
             try:
-                res = await rt.client.wait(
-                    InputRef(store.store_id, grand_sid, "gm1"), actor=ACTOR, deadline_ms=now_ms() + 5000,
+                cm_leaf = await p1.create_many(
+                    parent=driver, actor=ACTOR, specs=[leaf_spec],
+                    node_id="n-drv", boot_id="b-drv", can_execute=False, free_slots=0,
+                    parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
                 )
-                assert res.status == "cancelled"
-                assert model_calls == []
-                mid_row = await store._db.fetchone(
-                    f"SELECT execution_state,wake_pending_count FROM {store.t.sessions} WHERE session_id=?",
-                    (middle.session_id,),
-                )
-                assert mid_row["execution_state"] == "idle" and int(mid_row["wake_pending_count"]) == 0
+                # Exact 5 SQL: lock_state(driver) + _db_now + INSERT sessions + INSERT queue + INSERT messages
+                assert len(profiled.records) == 5, [r["sql"] for r in profiled.records]
+                assert not any("FOR SHARE" in r["sql"] for r in profiled.records)
             finally:
-                await rt.worker.shutdown(timeout_s=2, cancel_running=True)
-                await rt.client.aclose()
-                await rt.transport.aclose()
+                store._db = original
+            assert cm_leaf.queued_targets == (TargetRef(store.store_id, leaf_sid),)
+            lrow = await store.get_session(leaf_sid)
+            assert lrow is not None and lrow.parent_session_id == drv_sid
+        else:
+            # Strategy 3A (subtree='all'): concurrent create_many from running Driver vs 3A close on main.
+            # New leaf MUST either be rejected ('cancelled') OR caught & cancelled with 0 execution!
+            if store._db.dialect.name in ("postgres", "mysql"):
+                orig_collect = p1._collect_active_descendants
+                scan1_done = asyncio.Event()
+                spawn_done = asyncio.Event()
+                calls = 0
+
+                async def hooked_collect(tx, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    rows = await orig_collect(tx, **kwargs)
+                    if calls == 1:
+                        scan1_done.set()
+                        await asyncio.wait_for(spawn_done.wait(), 5)
+                    return rows
+
+                p1._collect_active_descendants = hooked_collect  # type: ignore[method-assign]
+
+                async def run_leaf_spawn():
+                    await asyncio.wait_for(scan1_done.wait(), 5)
+                    try:
+                        return await p2.create_many(
+                            parent=driver, actor=ACTOR, specs=[leaf_spec],
+                            node_id="n-drv", boot_id="b-drv", can_execute=False, free_slots=0,
+                            parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+                        )
+                    finally:
+                        spawn_done.set()
+
+                close_res, spawn_res = await asyncio.gather(
+                    p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_drv"),
+                    run_leaf_spawn(),
+                    return_exceptions=True,
+                )
+                assert not isinstance(close_res, Exception), close_res
+            else:
+                close_res, spawn_res = await asyncio.gather(
+                    p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_drv"),
+                    p2.create_many(
+                        parent=driver, actor=ACTOR, specs=[leaf_spec],
+                        node_id="n-drv", boot_id="b-drv", can_execute=False, free_slots=0,
+                        parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+                    ),
+                    return_exceptions=True,
+                )
+                assert not isinstance(close_res, Exception), close_res
+
+            # Also verify a post-3A create_many from the now-cancelled running Driver is rejected!
+            with pytest.raises(RuntimeRequestError) as post_exc:
+                await p1.create_many(
+                    parent=driver, actor=ACTOR,
+                    specs=[ChildSpec(
+                        session_id="r3-leaf-post3a", message_id="lm2", body={"text": "too late"},
+                        descriptor=leaf_desc, result_kind="workflow_node_result",
+                    )],
+                    node_id="n-drv", boot_id="b-drv", can_execute=False, free_slots=0,
+                    parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+                )
+            assert post_exc.value.code == "cancelled"
+            assert await store.get_session("r3-leaf-post3a") is None
+
+            if isinstance(spawn_res, Exception):
+                assert isinstance(spawn_res, RuntimeRequestError) and spawn_res.code in ("cancelled", "session_closed")
+                assert await store.get_session(leaf_sid) is None
+            else:
+                assert leaf_sid in close_res.stopped_descendant_ids
+                grow = await store._db.fetchone(
+                    f"SELECT cancel_seq,cancel_by FROM {store.t.sessions} WHERE session_id=?",
+                    (leaf_sid,),
+                )
+                assert grow is not None and grow["cancel_by"] == "subtree" and int(grow["cancel_seq"]) >= 1
+                model_calls: list[str] = []
+                factory = RegistryRuntimeFactory()
+                model = _ScriptedModel(lambda _i, _r: (model_calls.append("ran") or LLMResponse(raw_text="NO")))
+
+                async def _chk_build(_d, _c):
+                    return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+                factory.register("test.agent@215", _chk_build)
+                rt = Runtime(
+                    store=store, factory=factory, node_id="n-chk", boot_id="b-chk",
+                    capacity=2, recovery_interval_s=None, timers_enabled=False,
+                )
+                await rt.worker.start()
+                try:
+                    res = await rt.client.wait(
+                        InputRef(store.store_id, leaf_sid, "lm1"), actor=ACTOR, deadline_ms=now_ms() + 5000,
+                    )
+                    assert res.status == "cancelled"
+                    assert model_calls == []
+                finally:
+                    await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+                    await rt.client.aclose()
+                    await rt.transport.aclose()
     finally:
         await peer.close()
 
@@ -2095,3 +2128,256 @@ async def test_m1c_b3_r2_post_commit_hook_no_false_execution_lost_and_real_loss_
         await rt.worker.shutdown(timeout_s=2, cancel_running=True)
         await rt.client.aclose()
         await rt.transport.aclose()
+
+
+async def test_m1c_r3_single_level_delegation_blocks_subagent_and_workflow_leaf(registry_store):
+    """R3-Item1: Only main may spawn subagents or start workflows; subagent & workflow_node are blocked at both exposure and runtime."""
+    from power_loop.core.agent_context import get_current_loop
+    from power_loop.runtime.execution_roles import require_orchestration, role_tools
+    from power_loop.runtime.tool_contracts import resolve
+    from power_loop.tools.spawn_agent import _handle_spawn_agent, register_spawn_agent
+    from power_loop.workflow.tool import register_workflow_tools
+
+    store, _ = registry_store
+    reg = ToolRegistry()
+    register_spawn_agent(reg)
+    register_workflow_tools(reg)
+
+    # 1) Tool exposure contracts: ONLY "main" sees spawn_agent and create_workflow!
+    assert resolve(reg.get("spawn_agent")).runtime_contract.allowed_roles == ("main",)
+    assert resolve(reg.get("create_workflow")).runtime_contract.allowed_roles == ("main",)
+    assert "spawn_agent" in role_tools(reg.names(), "main", registry=reg)
+    assert "create_workflow" in role_tools(reg.names(), "main", registry=reg)
+    for restricted_role in ("subagent", "workflow_node"):
+        exposed = role_tools(reg.names(), restricted_role, registry=reg)
+        assert "spawn_agent" not in exposed, (restricted_role, exposed)
+        assert "create_workflow" not in exposed, (restricted_role, exposed)
+
+    # 2) Real Worker verification: main spawns subagent (allowed), Driver creates workflow leaf (allowed),
+    #    both subagent and workflow leaf attempt spawn_agent + create_workflow (both rejected, 0 children created!)
+    seen_tools_by_sid: dict[str, list[str]] = {}
+    runtime_checks: dict[str, dict[str, str]] = {}
+    calls_per_sid: dict[str, int] = {}
+
+    class _DelegationProbeModel:
+        async def complete(self, request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            calls_per_sid[sid] = calls_per_sid.get(sid, 0) + 1
+            seen_tools_by_sid[sid] = [
+                t["function"]["name"] for t in (request.tools or []) if isinstance(t, dict) and "function" in t
+            ]
+            # Also probe runtime permission checks directly inside the live loop context!
+            if calls_per_sid[sid] == 1 and sid != "r3-perm-main":
+                loop = get_current_loop()
+                checks: dict[str, str] = {}
+                for cap in ("subagent", "workflow"):
+                    try:
+                        await require_orchestration(loop, cap)
+                        checks[cap] = "allowed"
+                    except ValueError as exc:
+                        checks[cap] = str(exc)
+                checks["direct_spawn_handler"] = await _handle_spawn_agent(task="must fail")
+                runtime_checks[sid] = checks
+                # Also force tool calls for BOTH spawn_agent and create_workflow to prove runtime rejection!
+                return LLMResponse(
+                    raw_text="",
+                    tool_calls=[
+                        {
+                            "id": f"tc-spawn-{sid}",
+                            "type": "function",
+                            "function": {"name": "spawn_agent", "arguments": json.dumps({"task": "illegal nested"})},
+                        },
+                        {
+                            "id": f"tc-wf-{sid}",
+                            "type": "function",
+                            "function": {
+                                "name": "create_workflow",
+                                "arguments": json.dumps({
+                                    "name": "nested_wf",
+                                    "root": {"type": "agent", "id": "a", "spec": {"name": "a", "system_prompt": "hi"}},
+                                }),
+                            },
+                        },
+                    ],
+                )
+            if sid == "r3-perm-main" and calls_per_sid[sid] == 1:
+                return LLMResponse(
+                    raw_text="",
+                    tool_calls=[{
+                        "id": "tc-main-spawn",
+                        "type": "function",
+                        "function": {"name": "spawn_agent", "arguments": json.dumps({"task": "sub work"})},
+                    }],
+                )
+            return LLMResponse(raw_text=f"done:{sid}")
+
+        async def close(self):
+            pass
+
+    probe_model = _DelegationProbeModel()
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        local_reg = ToolRegistry()
+        register_spawn_agent(local_reg)
+        register_workflow_tools(local_reg)
+        return ExecutionEnvironment(
+            probe_model, local_reg, AgentLoopConfig(context_budget_tokens=10**9),
+        )
+
+    factory.register("test.agent@215", _build)
+    rt = Runtime(
+        store=store, factory=factory, node_id="r3-perm-node", boot_id="r3-perm-boot",
+        capacity=4, recovery_interval_s=None, timers_enabled=False,
+    )
+    await rt.worker.start()
+    try:
+        main = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r3-perm-main"})
+        main_rcpt = await rt.client.send(main, "start sub", message_id="m1", actor=ACTOR)
+        main_res = await rt.client.wait(main_rcpt.input_ref, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert main_res.status == "completed"
+        assert "spawn_agent" in seen_tools_by_sid["r3-perm-main"]
+        assert "create_workflow" in seen_tools_by_sid["r3-perm-main"]
+
+        # Main's spawn_agent MUST have created exactly 1 subagent child (depth=1)
+        sub_rows = await store._db.fetchall(
+            f"SELECT session_id,start_input_message_id,depth FROM {store.t.sessions} WHERE parent_session_id=?",
+            ("r3-perm-main",),
+        )
+        assert len(sub_rows) == 1 and int(sub_rows[0]["depth"]) == 1
+        sub_sid = sub_rows[0]["session_id"]
+        sub_res = await rt.client.wait(
+            InputRef(store.store_id, sub_sid, sub_rows[0]["start_input_message_id"]),
+            actor=ACTOR, deadline_ms=now_ms() + 5000,
+        )
+        assert sub_res.status == "completed"
+        assert "spawn_agent" not in seen_tools_by_sid[sub_sid]
+        assert "create_workflow" not in seen_tools_by_sid[sub_sid]
+        assert runtime_checks[sub_sid]["subagent"] == "execution_role_forbids_subagent"
+        assert runtime_checks[sub_sid]["workflow"] == "execution_role_forbids_workflow"
+        assert "execution_role_forbids_subagent" in runtime_checks[sub_sid]["direct_spawn_handler"]
+        # Subagent MUST NOT have created any children!
+        sub_children = await store._db.fetchall(
+            f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=?", (sub_sid,),
+        )
+        assert sub_children == []
+
+        # Driver creates a workflow_node leaf (depth=2) -> ALLOWED; leaf trying spawn_agent/workflow -> BLOCKED!
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        cm_drv = await rt.client.inputs.create_many(
+            parent=main, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="r3-perm-drv", message_id="dm1", body={"wf": 1},
+                descriptor=drv_desc, result_kind="workflow_result",
+            )],
+            node_id="r3-perm-node", boot_id="r3-perm-boot", can_execute=True, free_slots=1,
+        )
+        drv_batch = cm_drv.preclaimed[0]
+        leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "leaf1"}})
+        cm_leaf = await rt.client.inputs.create_many(
+            parent=drv_batch.target, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="r3-perm-leaf", message_id="lm1", body={"text": "run leaf"},
+                descriptor=leaf_desc, result_kind="workflow_node_result",
+            )],
+            node_id="r3-perm-node", boot_id="r3-perm-boot", can_execute=False, free_slots=0,
+            parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+        )
+        assert cm_leaf.queued_targets == (TargetRef(store.store_id, "r3-perm-leaf"),)
+        rt.worker._activate("r3-perm-leaf")
+        leaf_res = await rt.client.wait(
+            InputRef(store.store_id, "r3-perm-leaf", "lm1"), actor=ACTOR, deadline_ms=now_ms() + 5000,
+        )
+        assert leaf_res.status == "completed"
+        assert "spawn_agent" not in seen_tools_by_sid["r3-perm-leaf"]
+        assert "create_workflow" not in seen_tools_by_sid["r3-perm-leaf"]
+        assert runtime_checks["r3-perm-leaf"]["subagent"] == "execution_role_forbids_subagent"
+        assert runtime_checks["r3-perm-leaf"]["workflow"] == "execution_role_forbids_workflow"
+        assert "execution_role_forbids_subagent" in runtime_checks["r3-perm-leaf"]["direct_spawn_handler"]
+        # Workflow leaf MUST NOT have created any depth=3 child session!
+        leaf_children = await store._db.fetchall(
+            f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? OR depth>=3",
+            ("r3-perm-leaf",),
+        )
+        assert leaf_children == []
+    finally:
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_m1c_r3_runtime_state_write_no_extra_route_sql_vs_real_rebind(registry_store):
+    """R3-Item3: Ordinary set_runtime_state() adds 0 route-lookup SQL in Final; real rebind still reroutes mixed batch."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    p_old = await target(port, "r3-rt-old")
+    p_new = await target(port, "r3-rt-new")
+
+    # 1) Control: child with per-input route writes runtime state (runtime_version 0 -> 1), NO rebind!
+    ch_kv = await target(port, "r3-rt-ch-kv", parent=p_old)
+    await port.accept(ch_kv, "direct", message_id="d0", actor=ACTOR)
+    await port.accept(
+        ch_kv, "routed", message_id="r0", actor=ACTOR,
+        reply_route={"target": p_old, "result_kind": "agent_result"},
+    )
+    b_kv = await port.claim(ch_kv, node_id="n1", boot_id="b1")
+    assert b_kv is not None and b_kv.runtime_version == 0 and b_kv.reply_to_item_id == "r0"
+
+    await store.set_runtime_state(ch_kv.session_id, "step", {"n": 1})
+    s_kv = await store._db.fetchone(
+        f"SELECT runtime_version,parent_session_id FROM {store.t.sessions} WHERE session_id=?",
+        (ch_kv.session_id,),
+    )
+    assert int(s_kv["runtime_version"]) == 1 and s_kv["parent_session_id"] == p_old.session_id
+
+    # Baseline: identical child WITHOUT set_runtime_state()
+    ch_plain = await target(port, "r3-rt-ch-plain", parent=p_old)
+    await port.accept(ch_plain, "direct", message_id="d0", actor=ACTOR)
+    await port.accept(
+        ch_plain, "routed", message_id="r0", actor=ACTOR,
+        reply_route={"target": p_old, "result_kind": "agent_result"},
+    )
+    b_plain = await port.claim(ch_plain, node_id="n1", boot_id="b1")
+    assert b_plain is not None
+
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+    try:
+        profiled.records.clear()
+        fb_plain = await port.final(b_plain, final_text="plain ok")
+        plain_sql = list(profiled.records)
+
+        profiled.records.clear()
+        fb_kv = await port.final(b_kv, final_text="kv ok")
+        kv_sql = list(profiled.records)
+    finally:
+        store._db = original
+
+    assert fb_plain.result_delivery_error is None and fb_kv.result_delivery_error is None
+    assert not any("reply_to_session_id" in r["sql"] for r in kv_sql), [r["sql"] for r in kv_sql]
+    assert len(kv_sql) == len(plain_sql), ([r["sql"] for r in plain_sql], [r["sql"] for r in kv_sql])
+
+    # 2) Contrast: child writes runtime state AND actually rebinds (old_p -> new_p) with mixed batch!
+    ch_rb = await target(port, "r3-rt-ch-rb", parent=p_old)
+    await port.accept(ch_rb, "direct", message_id="d1", actor=ACTOR)
+    await port.accept(
+        ch_rb, "routed", message_id="r1", actor=ACTOR,
+        reply_route={"target": p_old, "result_kind": "agent_result"},
+    )
+    b_rb = await port.claim(ch_rb, node_id="n1", boot_id="b1")
+    assert b_rb is not None and b_rb.reply_to_item_id == "r1"
+    await store.set_runtime_state(ch_rb.session_id, "step", {"n": 2})
+    rb = await port.rebind_children(p_old, p_new, child_targets=[ch_rb], actor=ACTOR)
+    assert rb.rebound_children == (ch_rb.session_id,)
+
+    fb_rb = await port.final(b_rb, final_text="rebound after kv")
+    assert fb_rb.result_delivery_error is None and fb_rb.result_activation == p_new
+    new_rows = await store._db.fetchall(
+        f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (p_new.session_id,),
+    )
+    assert len(new_rows) == 1
+    body = json.loads(new_rows[0]["content_json"])
+    assert body["final_text"] == "rebound after kv"
+    assert body["input_ref"]["message_id"] == "r1"

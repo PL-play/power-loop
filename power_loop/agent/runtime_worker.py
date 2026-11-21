@@ -705,6 +705,21 @@ class RuntimeWorker:
                     env_ctx.__enter__()
                 if ctx.options.tools is not None and env.tool_registry is not None:
                     env.tool_registry = env.tool_registry.subset(ctx.options.tools)
+                if (
+                    descriptor.kind == "agent"
+                    and batch.parent_session_id is not None
+                    and env.tool_registry is not None
+                ):
+                    from power_loop.runtime.execution_roles import role_tools
+
+                    leaf_role = (
+                        "workflow_node" if "workflow_node" in descriptor.config
+                        else ("subagent" if "child_spec" in descriptor.config else None)
+                    )
+                    if leaf_role is not None:
+                        env.tool_registry = env.tool_registry.subset(
+                            role_tools(env.tool_registry.names(), leaf_role, registry=env.tool_registry)
+                        )
                 config = self._config(env, descriptor)
                 if descriptor.kind == "workflow_driver":
                     from power_loop.workflow.runner import run_driver

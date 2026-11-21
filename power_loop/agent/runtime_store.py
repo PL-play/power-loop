@@ -494,35 +494,8 @@ class RuntimeInputStore:
             "staged": desc_json is not None and not applied_immediately,
         }
 
-    async def _lock_ancestors_open_tx(
-        self, tx, parent_session_id: str | None, child_session_id: str,
-    ) -> None:
-        """Walk and share-lock ancestors deep-first (depth d-1 -> 0) to serialize with root close.
-
-        0 extra SQL when ``parent_session_id is None`` (direct child of root or root session).
-        Uses ``FOR SHARE`` on PG/MySQL so sibling spawns do not block each other while mutually
-        excluding ``FOR UPDATE`` in ``set_lifecycle`` / ``cancel`` without violating deep-first order.
-        """
-        if parent_session_id is None:
-            return
-        share_suffix = " FOR SHARE" if self._dialect in ("postgres", "mysql") else ""
-        cur_pid: str | None = parent_session_id
-        visited: set[str] = {child_session_id}
-        while cur_pid is not None and cur_pid not in visited:
-            visited.add(cur_pid)
-            anc = await tx.fetchone(
-                f"SELECT session_id,parent_session_id,lifecycle FROM {self.s} "
-                f"WHERE session_id=?{share_suffix}",
-                (cur_pid,),
-            )
-            if anc is None:
-                raise RuntimeRequestError("not_found", "ancestor session")
-            if anc["lifecycle"] in ("closing", "closed"):
-                raise RuntimeRequestError("session_closed")
-            cur_pid = anc["parent_session_id"]
-
     async def _lock_creation_parent_tx(self, tx, parent, actor, *, existing_id=None):
-        """Lock deep-first (child before parent, then ancestors) consistent with Design 217 lock ordering."""
+        """Lock deep-first (child before parent) consistent with Design 217 lock ordering."""
         from power_loop.contracts.errors import CancellationRequested
 
         lock_ids = []
@@ -543,7 +516,6 @@ class RuntimeInputStore:
             raise RuntimeRequestError("session_closed")
         if parent_session["execution_state"] == "running" and parent_session["cancel_by"] is not None:
             raise CancellationRequested(parent_session["cancel_reason"] or "cancelled")
-        await self._lock_ancestors_open_tx(tx, parent_session["parent_session_id"], parent.session_id)
         return parent_session
 
     async def create_child(
@@ -729,7 +701,6 @@ class RuntimeInputStore:
                     raise RuntimeRequestError("cancelled", parent_row["cancel_reason"] or "parent_cancelled")
                 if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
                     raise RuntimeRequestError("cancelled", "parent_cancelled")
-                await self._lock_ancestors_open_tx(tx, parent_row["parent_session_id"], parent.session_id)
 
                 database_now = await self._db_now(tx)
                 root_id = str(parent_row["root_session_id"])
@@ -2636,9 +2607,9 @@ class RuntimeInputStore:
             mysql_route_changed_params: tuple[Any, ...] = ()
             if has_route:
                 mysql_route_changed_bit = (
-                    "|(CASE WHEN NOT (parent_session_id<=>?) OR runtime_version<>? THEN 32 ELSE 0 END)"
+                    "|(CASE WHEN NOT (parent_session_id<=>?) THEN 32 ELSE 0 END)"
                 )
-                mysql_route_changed_params = (batch.parent_session_id, batch.runtime_version)
+                mysql_route_changed_params = (batch.parent_session_id,)
             rc, packed = await tx.execute_packed(
                 f"UPDATE {self.s} SET "
                 "owner_epoch=(LAST_INSERT_ID("
@@ -2715,7 +2686,7 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
                 "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
                 "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,"
-                "result_route_json,parent_session_id,runtime_version",
+                "result_route_json,parent_session_id",
                 (
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
@@ -2735,10 +2706,7 @@ class RuntimeInputStore:
             post_fold_stats_json = srow["fold_stats_json"]
             database_now = int(srow["updated_at"])
             live_route_json = srow["result_route_json"]
-            route_changed = has_route and (
-                srow["parent_session_id"] != batch.parent_session_id
-                or int(srow["runtime_version"]) != batch.runtime_version
-            )
+            route_changed = has_route and (srow["parent_session_id"] != batch.parent_session_id)
             fold_conflict = (
                 proj_fold_json is not None
                 and not closed_raced
@@ -5087,8 +5055,7 @@ class RuntimeInputStore:
                                 child["result_route_json"] = new_route_json
                         child["parent_session_id"] = tp_sid
                         await tx.execute(
-                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,"
-                            f"runtime_version=runtime_version+1,updated_at={now_sql} "
+                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,updated_at={now_sql} "
                             "WHERE session_id=?",
                             (tp_sid, new_route_json, child["session_id"]),
                         )

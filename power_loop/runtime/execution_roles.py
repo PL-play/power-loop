@@ -38,7 +38,7 @@ async def session_role(store, sid: str) -> str:
 
 
 async def require_orchestration(loop, capability: str, *, sid: str | None = None) -> None:
-    allowed_roles = {"workflow": ("main",), "subagent": ("main", "workflow_node")}
+    allowed_roles = {"workflow": ("main",), "subagent": ("main",)}
     if capability not in allowed_roles:
         raise ValueError("unknown_orchestration_capability")
     if not finite_delegation(loop):
