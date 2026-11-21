@@ -2615,7 +2615,7 @@ class RuntimeInputStore:
         if self._dialect == "mysql":
             # 6-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json SET):
             # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced
-            # bit 3: closed_raced  | bit 4: fold_stats_conflict | bit 5: route_changed (rebind)
+            # bit 3: closed_raced  | bit 4: fold_stats_conflict | bit 5: route_changed (session route)
             mysql_route_changed_bit = ""
             mysql_route_changed_params: tuple[Any, ...] = ()
             if batch.result_route is not None:
@@ -2623,11 +2623,6 @@ class RuntimeInputStore:
                     "|(CASE WHEN NOT (result_route_json<=>?) THEN 32 ELSE 0 END)"
                 )
                 mysql_route_changed_params = (canonical(batch.result_route),)
-            elif batch.reply_to_session_id is not None and consumed is not None:
-                mysql_route_changed_bit = (
-                    "|(CASE WHEN inbox_version<>? THEN 32 ELSE 0 END)"
-                )
-                mysql_route_changed_params = (int(batch.inbox_version),)
             rc, packed = await tx.execute_packed(
                 f"UPDATE {self.s} SET "
                 "owner_epoch=(LAST_INSERT_ID("
@@ -2704,7 +2699,7 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
                 "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
                 "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,"
-                "result_route_json,inbox_version",
+                "result_route_json",
                 (
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
@@ -2724,12 +2719,6 @@ class RuntimeInputStore:
             post_fold_stats_json = srow["fold_stats_json"]
             database_now = int(srow["updated_at"])
             live_route_json = srow["result_route_json"]
-            route_changed = (
-                batch.result_route is None
-                and batch.reply_to_session_id is not None
-                and consumed is not None
-                and int(srow["inbox_version"]) != int(batch.inbox_version)
-            )
             fold_conflict = (
                 proj_fold_json is not None
                 and not closed_raced
@@ -2812,6 +2801,7 @@ class RuntimeInputStore:
         deliver_res_kind = None
         deliver_start_ref = None
         deliver_source_ref = consumed_refs[0] if consumed_refs else None
+        verify_source_item_id: str | None = None
         if not closed_raced and consumed_refs:
             if route is not None:
                 deliver_parent_sid = route["target"]["session_id"]
@@ -2848,19 +2838,12 @@ class RuntimeInputStore:
                         if live_to is not None:
                             effective_reply_to = str(live_to)
                             effective_reply_rk = live_rk or effective_reply_rk
-                    elif route_changed:
-                        # Only entered when consumed was passed explicitly AND rebind_children
-                        # (or concurrent inbox activity) advanced inbox_version on this running
-                        # session; 0 extra SQL on normal no-rebind path (including cross-parent
-                        # explicit reply_route and set_runtime_state() KV writes).
-                        q_live = await tx.fetchone(
-                            f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
-                            "WHERE session_id=? AND item_id=?",
-                            (sid, reply_item_id),
-                        )
-                        if q_live is not None and q_live["reply_to_session_id"] is not None:
-                            effective_reply_to = str(q_live["reply_to_session_id"])
-                            effective_reply_rk = q_live["reply_result_kind"] or effective_reply_rk
+                    else:
+                        # Explicit consumed (no delivered scan): conditionally assert the
+                        # source item's live reply_to_session_id inside _river_deliver_tx's
+                        # UPDATE (0 extra SQL on all no-rebind sends, including wake=False
+                        # notices and set_runtime_state(); re-reads live route only on mismatch).
+                        verify_source_item_id = reply_item_id
                 if effective_reply_to is not None and reply_item_id is not None:
                     deliver_parent_sid = effective_reply_to
                     deliver_res_kind = effective_reply_rk or "agent_result"
@@ -2888,11 +2871,15 @@ class RuntimeInputStore:
                 result_kind=deliver_res_kind,
                 child_wake=child_wake,
                 activations=activations,
+                verify_source_item_id=verify_source_item_id,
             )
             if delivery_error is not None and _undeliverable_out is not None:
+                actual_parent_sid = (
+                    result_ref.session_id if result_ref is not None else deliver_parent_sid
+                )
                 _undeliverable_out.append((
                     batch.target,
-                    deliver_parent_sid,
+                    actual_parent_sid,
                     replace(route_result, result_delivery_error=delivery_error),
                     deliver_res_kind,
                     delivery_error,
@@ -3026,12 +3013,16 @@ class RuntimeInputStore:
         result_kind: str,
         child_wake: int,
         activations: list[TargetRef] | None = None,
-    ) -> tuple[InputRef, str | None]:
+        verify_source_item_id: str | None = None,
+    ) -> tuple[InputRef | None, str | None]:
         """Same-tx non-cascading River delivery (parent lifecycle IN ('open','suspended')).
 
         - Parent closed / missing / over-capacity NEVER rolls back child result; returns error code.
         - Parent suspended accepts the receipt into inbox without waking (keeps execution_state='idle').
         - Uses STABLE_API ``result_message_id`` for deterministic dedupe.
+        - When ``verify_source_item_id`` is provided (explicit ``consumed`` per-input route),
+          asserts the child item's live ``reply_to_session_id`` conditionally in the same UPDATE
+          (0 extra SQL on all unchanged routes) and redirects on in-flight rebind mismatch.
         """
         parent_target = TargetRef(self.store.store_id, parent_session_id)
         effective_start = result.input_ref if result.send_index is None else start_ref
@@ -3053,6 +3044,16 @@ class RuntimeInputStore:
         content_bytes = len(content.encode()) + len(meta.encode())
         digest = self.request_hash(parent_target, body, "normal")
         now_sql = self._now_sql()
+        source_route_sql = ""
+        source_route_params: tuple[Any, ...] = ()
+        if verify_source_item_id is not None:
+            source_route_sql = (
+                f" AND EXISTS (SELECT 1 FROM {self.q} "
+                "WHERE session_id=? AND item_id=? AND reply_to_session_id=?)"
+            )
+            source_route_params = (
+                child_target.session_id, verify_source_item_id, parent_session_id,
+            )
 
         if self._dialect == "mysql":
             p_rc, p_packed = await tx.execute_packed(
@@ -3071,12 +3072,13 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND lifecycle IN ('open','suspended') "
                 "AND tenant_id=? AND principal_id=? "
                 "AND pending_count<? AND (pending_bytes+?)<=? "
-                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)",
+                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)"
+                f"{source_route_sql}",
                 (
                     child_wake, child_wake, child_wake, content_bytes, child_wake,
                     parent_session_id, child_tenant_id, child_principal_id,
                     self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
-                    parent_session_id, message_id,
+                    parent_session_id, message_id, *source_route_params,
                 ),
             )
             parent_updated = p_rc == 1
@@ -3096,13 +3098,14 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND lifecycle IN ('open','suspended') "
                 "AND tenant_id=? AND principal_id=? "
                 "AND pending_count<? AND (pending_bytes+?)<=? "
-                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?) "
+                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)"
+                f"{source_route_sql} "
                 "RETURNING inbox_version,lifecycle,execution_state,wake_pending_count",
                 (
                     child_wake, child_wake, content_bytes, child_wake,
                     parent_session_id, child_tenant_id, child_principal_id,
                     self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
-                    parent_session_id, message_id,
+                    parent_session_id, message_id, *source_route_params,
                 ),
             )
             parent_updated = prow is not None
@@ -3129,6 +3132,46 @@ class RuntimeInputStore:
             if activations is not None and parent_need_wake:
                 activations.append(parent_target)
             return ref, None
+
+        if verify_source_item_id is not None:
+            q_live = await tx.fetchone(
+                f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
+                "WHERE session_id=? AND item_id=?",
+                (child_target.session_id, verify_source_item_id),
+            )
+            if q_live is not None:
+                live_to = q_live["reply_to_session_id"]
+                if live_to is None:
+                    return None, None
+                if str(live_to) != parent_session_id:
+                    live_rk = q_live["reply_result_kind"] or result_kind
+                    return await self._river_deliver_tx(
+                        tx,
+                        child_target=child_target,
+                        child_tenant_id=child_tenant_id,
+                        child_principal_id=child_principal_id,
+                        parent_session_id=str(live_to),
+                        start_ref=start_ref,
+                        result=result,
+                        result_kind=live_rk,
+                        child_wake=child_wake,
+                        activations=activations,
+                        verify_source_item_id=None,
+                    )
+            else:
+                return await self._river_deliver_tx(
+                    tx,
+                    child_target=child_target,
+                    child_tenant_id=child_tenant_id,
+                    child_principal_id=child_principal_id,
+                    parent_session_id=parent_session_id,
+                    start_ref=start_ref,
+                    result=result,
+                    result_kind=result_kind,
+                    child_wake=child_wake,
+                    activations=activations,
+                    verify_source_item_id=None,
+                )
 
         # Non-cascading diagnosis: never roll back child's result!
         pdiag = await tx.fetchone(
@@ -5081,17 +5124,6 @@ class RuntimeInputStore:
                     all_ids = [r["session_id"] for r in all_moved]
                     a_ph = ",".join("?" for _ in all_ids)
 
-                    # Retarget active per-input reply routes on direct children first so any
-                    # running child whose follow_up_queue routes actually changed bumps
-                    # inbox_version monotonically in the existing direct-child UPDATE below
-                    # (0 extra SQL; survives A -> B -> A multi-rebinds without touching KV).
-                    retargeted = await tx.execute(
-                        f"UPDATE {self.q} SET reply_to_session_id=? "
-                        f"WHERE session_id IN ({d_ph}) AND reply_to_session_id=? "
-                        "AND status IN ('pending','delivered') AND terminal_status IS NULL",
-                        (tp_sid, *direct_ids, fp_sid),
-                    )
-
                     # Update direct children's parent_session_id and result_route_json
                     for child in direct_children:
                         new_route_json = child["result_route_json"]
@@ -5106,14 +5138,10 @@ class RuntimeInputStore:
                                 new_route_json = canonical(route_obj)
                                 child["result_route_json"] = new_route_json
                         child["parent_session_id"] = tp_sid
-                        bump_inbox = 1 if (retargeted > 0 and child["execution_state"] == "running") else 0
-                        if bump_inbox:
-                            child["inbox_version"] = int(child["inbox_version"]) + 1
                         await tx.execute(
-                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,"
-                            f"inbox_version=inbox_version+?,updated_at={now_sql} "
+                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,updated_at={now_sql} "
                             "WHERE session_id=?",
-                            (tp_sid, new_route_json, bump_inbox, child["session_id"]),
+                            (tp_sid, new_route_json, child["session_id"]),
                         )
 
                     # Recursively update root_session_id & relative depth for ALL descendants (incl. idle)
@@ -5125,6 +5153,14 @@ class RuntimeInputStore:
                     for node in all_moved:
                         node["root_session_id"] = new_root
                         node["depth"] = int(node["depth"]) + depth_delta
+
+                    # Retarget active per-input reply routes on direct children
+                    await tx.execute(
+                        f"UPDATE {self.q} SET reply_to_session_id=? "
+                        f"WHERE session_id IN ({d_ph}) AND reply_to_session_id=? "
+                        "AND status IN ('pending','delivered') AND terminal_status IS NULL",
+                        (tp_sid, *direct_ids, fp_sid),
+                    )
 
                     # Optional host context rewrite callback across every moved node
                     if rewrite_host_context is not None:

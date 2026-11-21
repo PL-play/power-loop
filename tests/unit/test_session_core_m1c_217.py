@@ -2778,9 +2778,7 @@ async def test_m1c_r5_real_worker_cross_parent_send_no_rebind_4_4_4_sql(registry
         assert len(child_consumed_args) == 1 and child_consumed_args[0] is not None
         assert len(child_final_slices) == 1
         final_sql = child_final_slices[0]
-        assert not any(
-            "reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in final_sql
-        ), [r["sql"] for r in final_sql]
+        assert not _has_independent_route_lookup(final_sql), [r["sql"] for r in final_sql]
         assert len(final_sql) == 4, [r["sql"] for r in final_sql]
     finally:
         b_release.set()
@@ -2788,6 +2786,15 @@ async def test_m1c_r5_real_worker_cross_parent_send_no_rebind_4_4_4_sql(registry
         await rt.client.aclose()
         await rt.transport.aclose()
         store._db = original
+
+
+def _has_independent_route_lookup(records: list[dict[str, Any]]) -> bool:
+    return any(
+        r["sql"].lstrip().upper().startswith("SELECT")
+        and "reply_to_session_id" in r["sql"]
+        and "item_id=?" in r["sql"]
+        for r in records
+    )
 
 
 @pytest.mark.parametrize("write_kv", [False, True])
@@ -2846,11 +2853,170 @@ async def test_m1c_r5_mixed_batch_explicit_consumed_no_rebind_5_5_6_sql(registry
         assert b_body["final_text"] == "stay on B explicit"
         assert b_body["input_ref"]["message_id"] == "r_r5"
 
-        assert not any(
-            "reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in final_sql
-        ), [r["sql"] for r in final_sql]
+        assert not _has_independent_route_lookup(final_sql), [r["sql"] for r in final_sql]
         expected_sql = 6 if original.dialect.name == "mysql" else 5
         assert len(final_sql) == expected_sql, [r["sql"] for r in final_sql]
     finally:
         await client.aclose()
         await transport.aclose()
+
+
+# ── 12. Round-6 Rework Regressions ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("route_to", ["parent_a", "other_b"])
+async def test_m1c_r6_real_worker_system_notice_wake_false_4_4_4_sql(
+    registry_store, monkeypatch, route_to,
+):
+    """R6-Item1: Real Worker + in-flight system_notice(wake=False) settles in 4/4/4 SQL with 0 route lookup."""
+    store, _ = registry_store
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+
+    c_in_model = asyncio.Event()
+    c_notice_sent = asyncio.Event()
+    parent_release = asyncio.Event()
+    child_final_slices: list[list[dict[str, Any]]] = []
+    child_consumed_args: list[Any] = []
+
+    sfx = "a" if route_to == "parent_a" else "b"
+    a_sid = f"r6-sn-a-{sfx}"
+    b_sid = f"r6-sn-b-{sfx}"
+    c_sid = f"r6-sn-c-{sfx}"
+
+    class _NoticeModel:
+        async def complete(self, request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            if sid == c_sid:
+                c_in_model.set()
+                await asyncio.wait_for(c_notice_sent.wait(), 5)
+                return LLMResponse(raw_text="c finished after notice")
+            await asyncio.wait_for(parent_release.wait(), 5)
+            return LLMResponse(raw_text="parent saw receipt")
+
+        async def close(self):
+            pass
+
+    model = _NoticeModel()
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _build)
+    rt = Runtime(
+        store=store, factory=factory, node_id=f"r6-node-{sfx}", boot_id=f"r6-boot-{sfx}",
+        capacity=4, recovery_interval_s=None, timers_enabled=False,
+    )
+
+    orig_final_tx = rt.worker.inputs._final_tx
+
+    async def metered_final_tx(tx, batch, consumed, *args, **kwargs):
+        if batch.target.session_id == c_sid:
+            child_consumed_args.append(consumed)
+            start_idx = len(profiled.records)
+            res = await orig_final_tx(tx, batch, consumed, *args, **kwargs)
+            child_final_slices.append(list(profiled.records[start_idx:]))
+            return res
+        return await orig_final_tx(tx, batch, consumed, *args, **kwargs)
+
+    monkeypatch.setattr(rt.worker.inputs, "_final_tx", metered_final_tx)
+
+    await rt.worker.start()
+    try:
+        main_a = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": a_sid})
+        main_b = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": b_sid})
+        child_c = await rt.client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": c_sid},
+        )
+        dest = main_a if route_to == "parent_a" else main_b
+        other = main_b if route_to == "parent_a" else main_a
+
+        rcpt = await rt.client.send(
+            child_c,
+            "work while notice arrives",
+            message_id="r6-work-1",
+            actor=ACTOR,
+            reply_route={"target": dest, "result_kind": "agent_result"},
+        )
+        # Wait until real Worker has claimed child_c and entered model execution
+        await asyncio.wait_for(c_in_model.wait(), 5)
+
+        # Enqueue non-waking system_notice before Final (bumps inbox_version 1 -> 2, wake_inbox_seq stays 1)
+        notice_rcpt = await rt.client.send(
+            child_c,
+            "quiet notice",
+            message_id="r6-notice-1",
+            actor=ACTOR,
+            kind="system_notice",
+            wake=False,
+        )
+        assert notice_rcpt.state == "accepted"
+        mid_row = await original.fetchone(
+            f"SELECT inbox_version,wake_inbox_seq,parent_session_id FROM {store.t.sessions} WHERE session_id=?",
+            (c_sid,),
+        )
+        assert mid_row is not None
+        assert int(mid_row["inbox_version"]) == 2
+        assert int(mid_row["wake_inbox_seq"]) == 1
+        assert mid_row["parent_session_id"] == main_a.session_id
+
+        # Release model so real Worker runs _final_tx
+        c_notice_sent.set()
+        res = await rt.client.wait(rcpt.input_ref, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert res.status == "completed"
+        assert res.final_text == "c finished after notice"
+
+        # Notice remains pending after Final; C stayed idle under A
+        notice_row = await original.fetchone(
+            f"SELECT status,kind,wake,terminal_status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id='r6-notice-1'",
+            (c_sid,),
+        )
+        assert notice_row is not None
+        assert notice_row["status"] == "pending"
+        assert notice_row["kind"] == "system_notice"
+        assert int(notice_row["wake"]) == 0
+        assert notice_row["terminal_status"] is None
+
+        post_c = await original.fetchone(
+            f"SELECT execution_state,inbox_version,wake_inbox_seq,parent_session_id "
+            f"FROM {store.t.sessions} WHERE session_id=?",
+            (c_sid,),
+        )
+        assert post_c is not None
+        assert post_c["execution_state"] == "idle"
+        assert int(post_c["inbox_version"]) == 2
+        assert int(post_c["wake_inbox_seq"]) == 1
+        assert post_c["parent_session_id"] == main_a.session_id
+
+        # Exactly 1 receipt delivered to dest; 0 receipts in other
+        dest_inbox = await original.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?",
+            (dest.session_id,),
+        )
+        other_inbox = await original.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?",
+            (other.session_id,),
+        )
+        assert len(dest_inbox) == 1
+        assert other_inbox == []
+        dest_body = json.loads(dest_inbox[0]["content_json"])
+        assert dest_body["final_text"] == "c finished after notice"
+        assert dest_body["input_ref"]["message_id"] == "r6-work-1"
+
+        # _final_tx must execute exactly 4 SQL across all 3 DBs with 0 independent route queries!
+        assert len(child_consumed_args) == 1 and child_consumed_args[0] is not None
+        assert len(child_final_slices) == 1
+        final_sql = child_final_slices[0]
+        assert not _has_independent_route_lookup(final_sql), [r["sql"] for r in final_sql]
+        assert len(final_sql) == 4, [r["sql"] for r in final_sql]
+    finally:
+        c_notice_sent.set()
+        parent_release.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+        store._db = original
