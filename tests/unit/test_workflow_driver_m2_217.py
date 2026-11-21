@@ -2014,3 +2014,388 @@ async def test_b4_2_first_takeover_with_merged_plain_input_keeps_start_chain_and
         await client.aclose()
         await rt_helper.loop.aclose()
         await rt_helper.runtime.client.aclose()
+
+
+@pytest.mark.parametrize("mode", ["normal_user", "subtree"])
+async def test_b3_1_real_capacity_exceeded_redelivery_via_urgent_preserves_original_source_and_usage(
+    registry_store, mode,
+):
+    """B3.1 (R3): Pre-staged original + urgent routed input -> real capacity_exceeded -> drain -> retry urgent keeps original ref."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store, _ = registry_store
+    # Real hard_pending_limit=1 so Leaf 2's receipt genuinely fills Driver inbox and causes capacity_exceeded
+    port = RuntimeInputStore(store, hard_pending_limit=1)
+    main = await target(port, f"b31r3-main-{mode}")
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port.create_many(
+        parent=main, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id=f"b31r3-drv-{mode}", message_id=f"b31r3-dm-{mode}", body={"wf": "go"},
+            descriptor=drv_desc, result_kind="workflow_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    drv_batch = cm_drv.preclaimed[0]
+    drv_sid = drv_batch.target.session_id
+
+    leaf1_sid = f"b31r3-leaf1-{mode}"
+    leaf2_sid = f"b31r3-leaf2-{mode}"
+    orig_id = f"b31r3-orig-{mode}"
+    urgent_id = f"b31r3-urgent-{mode}"
+    leaf1_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L1"}})
+    leaf2_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L2"}})
+
+    # Pre-stage Leaf 1's original input (queued, free_slots=0) and preclaim Leaf 2
+    cm_l1 = await port.create_many(
+        parent=drv_batch.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id=leaf1_sid, message_id=orig_id, body={"text": "original"},
+            descriptor=leaf1_desc, result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=False, free_slots=0,
+        parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+    )
+    leaf1 = cm_l1.queued_targets[0]
+    cm_l2 = await port.create_many(
+        parent=drv_batch.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id=leaf2_sid, message_id=f"b31r3-l2m-{mode}", body={"text": "filler"},
+            descriptor=leaf2_desc, result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+    )
+    leaf2_batch = cm_l2.preclaimed[0]
+
+    # Before first claim of Leaf 1, accept an URGENT input ALSO routed to Driver
+    await port.accept(
+        leaf1, {"text": "urgent"}, message_id=urgent_id, actor=ACTOR, priority="urgent",
+        reply_route={"target": drv_batch.target, "result_kind": "workflow_node_result"},
+    )
+    leaf1_batch = await port.claim(leaf1, node_id="n1", boot_id="b1")
+    assert leaf1_batch is not None and leaf1_batch.send_index == 1
+    assert [r.message_id for r in leaf1_batch.input_refs] == [orig_id, urgent_id]
+    orig_ref, urgent_ref = leaf1_batch.input_refs[0], leaf1_batch.input_refs[1]
+
+    # Fill Driver's inbox genuinely to hard_pending_limit (1) using Leaf 2's completion receipt
+    fin_l2 = await port.final(leaf2_batch, status="completed", final_text="leaf2-fills-driver")
+    assert fin_l2.result_delivery_error is None
+
+    if mode == "normal_user":
+        await port.cancel(orig_ref, actor=ACTOR, reason="user stop")
+        expected_cby, expected_wake = "user", 1
+    else:
+        await port.cancel(drv_batch.target, actor=ACTOR, scope="subtree", reason="subtree stop")
+        expected_cby, expected_wake = "subtree", 0
+
+    known_usage = {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    fin_l1 = await port.final(
+        leaf1_batch, status="cancelled", final_text="",
+        usage=known_usage, error="stopped", error_code="cancelled",
+    )
+    # First delivery genuinely rejected due to real capacity_exceeded (no DB deletion/tampering!)
+    assert fin_l1.result_delivery_error == "capacity_exceeded"
+    expected_msg_id = result_message_id(leaf1, orig_ref, 1, "workflow_node_result")
+    for mid in (orig_id, urgent_id):
+        qrow = await store._db.fetchone(
+            f"SELECT terminal_status,result_delivery_error,cancel_by FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (leaf1_sid, mid),
+        )
+        assert dict(qrow) == {
+            "terminal_status": "cancelled",
+            "result_delivery_error": "capacity_exceeded",
+            "cancel_by": expected_cby,
+        }
+
+    # Genuinely drain Driver's inbox so pending_count returns to 0
+    await port.final(
+        drv_batch, status="completed", final_text="drv-drained",
+        drain_driver_node_results=True, settle_start_input=True, write_driver_message=False,
+    )
+    drv_after_drain = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+    assert drv_after_drain["pending_count"] == 0
+
+    # Retry cancel via the URGENT input -> must redeliver with ORIGINAL source_ref, exact same receipt ID,
+    # preserved wake, cancel_by, and 7-token usage, and clear result_delivery_error on both inputs!
+    rcpt_retry = await port.cancel(urgent_ref, actor=ACTOR, reason="retry cancel via urgent")
+    assert rcpt_retry.state == "already_finished"
+
+    l1_rcpts = await store._db.fetchall(
+        f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_node_result' AND item_id=?",
+        (drv_sid, expected_msg_id),
+    )
+    assert len(l1_rcpts) == 1
+    body = json.loads(l1_rcpts[0]["content_json"])
+    assert l1_rcpts[0]["item_id"] == expected_msg_id
+    assert int(l1_rcpts[0]["wake"]) == expected_wake
+    assert body["input_ref"]["message_id"] == orig_id
+    assert body["cancel_by"] == expected_cby
+    assert body["usage"] == known_usage
+
+    for mid in (orig_id, urgent_id):
+        qrow = await store._db.fetchone(
+            f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (leaf1_sid, mid),
+        )
+        assert qrow["result_delivery_error"] is None
+
+    # Repeat retry on both urgent and original remains completely idempotent
+    assert (await port.cancel(urgent_ref, actor=ACTOR, reason="retry2")).state == "already_finished"
+    assert (await port.cancel(orig_ref, actor=ACTOR, reason="retry3")).state == "already_finished"
+    assert len(await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (drv_sid, expected_msg_id),
+    )) == 1
+
+
+async def test_b4_1a_handle_cancel_before_first_claim_then_late_input_zero_leaf_calls(registry_store):
+    """B4.1a: handle.cancel() before first claim closes run journal; subsequent plain input settles with 0 leaf calls."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    leaf_calls = 0
+
+    class B41aModel(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal leaf_calls
+            if req.system_prompt.startswith("L1"):
+                leaf_calls += 1
+                return LLMResponse(raw_text=f"leaf-unexpected-{leaf_calls}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    rt_helper = RunningAgent(
+        store, B41aModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    )
+    rt_worker = None
+    try:
+        main_target = await client.create_session(rt_helper.descriptor, actor=rt_helper.actor)
+        handle = await client.workflow(
+            main_target, {"name": "b41a-wf", "root": leaf("L1")},
+            message_id="b41a-start", actor=rt_helper.actor,
+        )
+        drv_sid = handle.target.session_id
+
+        # Public handle.cancel() BEFORE any Worker has claimed Driver
+        cancel_rcpt = await handle.cancel(reason="cancel before first claim")
+        assert cancel_rcpt.state == "voided"
+
+        wf_res_before = await handle.wait(deadline_ms=now_ms() + 5000)
+        assert wf_res_before.status == "cancelled" and wf_res_before.cancel_by == "user"
+        j_before = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert j_before is not None and j_before["status"] == "cancelled" and j_before["aggregate_delivered"] is True
+
+        # Now send a plain user input to Driver and start a real Worker to process it
+        late_rcpt = await port.accept(handle.target, "plain input after cancel", message_id="b41a-late", actor=rt_helper.actor)
+        assert late_rcpt.state == "accepted"
+
+        rt_worker = await RunningAgent(
+            store, B41aModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt_worker.runtime.worker.periodic_tick(limit=32)
+
+        late_res = await rt_worker.runtime.client.wait(late_rcpt.input_ref, actor=rt_helper.actor, deadline_ms=now_ms() + 10000)
+        assert late_res.status == "completed"
+        await rt_worker.drain()
+
+        # Zero leaf LLM calls; workflow & journal remain cancelled; Main has ONLY ONE cancelled workflow_result
+        assert leaf_calls == 0
+        wf_res_after = await handle.wait(deadline_ms=now_ms() + 5000)
+        assert wf_res_after.status == "cancelled" and wf_res_after.cancel_by == "user"
+        j_after = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert j_after is not None and j_after["status"] == "cancelled" and j_after["aggregate_delivered"] is True
+
+        main_wf_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_wf_rcpts) == 1
+        assert int(main_wf_rcpts[0]["wake"]) == 1
+        assert json.loads(main_wf_rcpts[0]["content_json"])["status"] == "cancelled"
+        assert json.loads(main_wf_rcpts[0]["content_json"])["input_ref"]["message_id"] == handle.input_ref.message_id
+    finally:
+        if rt_worker is not None:
+            await rt_worker.aclose()
+        await client.aclose()
+        await rt_helper.loop.aclose()
+        await rt_helper.runtime.client.aclose()
+
+
+async def test_b4_1b_cancel_driver_subtree_before_first_claim_with_plain_input_single_workflow_receipt(
+    registry_store,
+):
+    """B4.1b: [start_input, late_plain] queued -> cancel(driver, scope='subtree') voids both & emits ONLY 1 workflow_result."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    rt_helper = RunningAgent(
+        store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    )
+    try:
+        main_target = await client.create_session(rt_helper.descriptor, actor=rt_helper.actor)
+        handle = await client.workflow(
+            main_target, {"name": "b41b-wf", "root": leaf("L1")},
+            message_id="b41b-start", actor=rt_helper.actor,
+        )
+        drv_sid = handle.target.session_id
+        late_rcpt = await port.accept(handle.target, "queued plain input", message_id="b41b-late", actor=rt_helper.actor)
+        assert late_rcpt.state == "accepted"
+
+        # Both start_input and b41b-late are pending; cancel the whole Driver subtree
+        await port.cancel(handle.target, actor=rt_helper.actor, scope="subtree", reason="stop queued driver")
+
+        # Both inputs read cancelled terminal status
+        start_res = await port.get_result(handle.input_ref, actor=rt_helper.actor)
+        late_res = await port.get_result(late_rcpt.input_ref, actor=rt_helper.actor)
+        assert start_res is not None and start_res.status == "cancelled" and start_res.cancel_by == "user"
+        assert late_res is not None and late_res.status == "cancelled" and late_res.cancel_by == "user"
+
+        wf_res = await handle.wait(deadline_ms=now_ms() + 5000)
+        assert wf_res.status == "cancelled" and wf_res.cancel_by == "user"
+        j_row = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert j_row is not None and j_row["status"] == "cancelled" and j_row["aggregate_delivered"] is True
+
+        # Main receives EXACTLY ONE workflow_result(cancelled, wake=1) sourced from start_input (NOT b41b-late)
+        main_wf_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_wf_rcpts) == 1
+        assert int(main_wf_rcpts[0]["wake"]) == 1
+        body = json.loads(main_wf_rcpts[0]["content_json"])
+        assert body["status"] == "cancelled"
+        assert body["cancel_by"] == "user"
+        assert body["input_ref"]["message_id"] == handle.input_ref.message_id
+
+        drv_st = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+        assert drv_st["execution_state"] == "idle" and drv_st["pending_count"] == 0 and drv_st["wake_pending_count"] == 0
+    finally:
+        await client.aclose()
+        await rt_helper.loop.aclose()
+        await rt_helper.runtime.client.aclose()
+
+
+async def test_b4_2_explicit_resume_takeover_before_prepare_executes_node_and_delivers_receipt(registry_store):
+    """B4.2 (R3): Explicit handle.resume() claimed & lease expires before _prepare_explicit -> Worker 2 runs node & resolves."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    leaf_prompts: list[str] = []
+
+    class B42ResumeModel(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("L1"):
+                latest_user = next(
+                    (str(m.get("content")) for m in reversed(req.messages) if m.get("role") == "user"),
+                    "",
+                )
+                leaf_prompts.append(latest_user)
+                return LLMResponse(raw_text=f"L1-run-{len(leaf_prompts)}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, B42ResumeModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "b42-resume-wf", "root": leaf("L1")},
+            message_id="b42r-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and first.results["L1"].text == "L1-run-1"
+        await rt1.drain()
+        assert len(leaf_prompts) == 1
+
+        # Shut down Worker 1 cleanly before submitting resume so we deterministically inject crash before _prepare_explicit
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        # Submit explicit resume through public handle.resume() (attached to idle client)
+        from power_loop.workflow.runner import WorkflowRunHandle
+
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        resume_handle = await handle_on_client.resume(
+            node_id="L1", message="please recompute L1", message_id="b42r-resume-1",
+        )
+        drv_sid = handle.target.session_id
+
+        # Simulate old Worker claiming resume input and crashing BEFORE _prepare_explicit writes new definition_ref
+        claim_res = await port.claim(handle.target, node_id="worker-dead", boot_id="boot-dead")
+        assert claim_res is not None
+        assert [r.message_id for r in claim_res.input_refs] == [resume_handle.input_ref.message_id]
+        saved_pre = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert saved_pre is not None and saved_pre["aggregate_delivered"] is True
+        assert int(saved_pre.get("execution_revision", 0)) == 0
+
+        # Expire old Worker's lease and let real Worker 2 take over via periodic_tick + normal execution!
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rt2 = await RunningAgent(
+            store, B42ResumeModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        resumed = await resume_handle.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        # 1) Specified node L1 actually executed with the resume message
+        assert len(leaf_prompts) == 2
+        assert "please recompute L1" in leaf_prompts[1]
+
+        # 2) Resume handle returns the real new node result & execution_revision incremented to 1
+        assert resumed.status == "completed"
+        assert "L1" in resumed.results and resumed.results["L1"].text == "L1-run-2"
+        assert resumed.final is not None and resumed.final.text == "L1-run-2"
+        saved_post = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert saved_post is not None and int(saved_post.get("execution_revision", 0)) == 1
+
+        # 3) Main received a second workflow_result receipt for this explicit resume
+        main_wf_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_wf_rcpts) == 2
+        res_body = json.loads(main_wf_rcpts[1]["content_json"])
+        assert res_body["status"] == "completed"
+        assert res_body["input_ref"]["message_id"] == resume_handle.input_ref.message_id
+        assert res_body["final_text"] == "L1-run-2"
+
+        # 4) Original handle's stored result remains completely unchanged!
+        orig_after = await handle_on_client.wait(deadline_ms=now_ms() + 5000)
+        assert orig_after.to_dict() == first.to_dict()
+    finally:
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()

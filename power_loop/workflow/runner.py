@@ -1022,6 +1022,7 @@ async def run_driver(worker, ctx, env):
 
     origin = _fast_first_turn_origin(ctx, run_id)
     resume_options = None
+    resume_origin = origin
     if origin is None:
         origins = []
         for ref in ctx.batch.input_refs:
@@ -1046,10 +1047,23 @@ async def run_driver(worker, ctx, env):
                     break
         if origin is None and origins:
             origin = origins[-1]
+        resume_origin = origin
         if origin is not None:
             content = json.loads(origin.row["content_json"])
             if isinstance(content, dict) and "workflow_resume" in content:
                 resume_options = content["workflow_resume"]
+            elif (
+                isinstance(content, dict)
+                and isinstance(content.get("workflow_continue"), dict)
+                and isinstance(content["workflow_continue"].get("origin_input_ref"), dict)
+            ):
+                root_ref = InputRef(**content["workflow_continue"]["origin_input_ref"])
+                root_rec = await port.input(port.db, root_ref)
+                if root_rec is not None:
+                    root_content = json.loads(root_rec.row["content_json"])
+                    if isinstance(root_content, dict) and "workflow_resume" in root_content:
+                        resume_options = root_content["workflow_resume"]
+                        resume_origin = root_rec
 
     if saved.get("aggregate_delivered") and resume_options is None:
         executor = DurableExecutor(worker, ctx, env, run_id, saved)
@@ -1057,8 +1071,8 @@ async def run_driver(worker, ctx, env):
         return await _finish_late(worker, ctx, list(ctx.batch.input_refs))
     if origin is None:
         raise RuntimeRequestError("workflow_origin_missing")
-    if resume_options is not None and saved.get("definition_ref") != plain(origin.ref):
-        saved = await _prepare_explicit(worker, ctx, saved, origin, resume_options)
+    if resume_options is not None and resume_origin is not None and saved.get("definition_ref") != plain(resume_origin.ref):
+        saved = await _prepare_explicit(worker, ctx, saved, resume_origin, resume_options)
 
     resident_waiter = port.register_driver_waiter(ctx.session_id)
     try:

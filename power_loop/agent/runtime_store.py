@@ -3068,7 +3068,14 @@ class RuntimeInputStore:
         if route is not None and live_route_json:
             parsed_live = json.loads(live_route_json)
             if isinstance(parsed_live, dict) and isinstance(parsed_live.get("target"), dict):
-                route = parsed_live
+                if (
+                    is_driver
+                    and route.get("input_ref") is not None
+                    and route.get("input_ref") != parsed_live.get("input_ref")
+                ):
+                    route = {**parsed_live, "input_ref": route["input_ref"]}
+                else:
+                    route = parsed_live
         # Design 217 §5.3: human direct chat with a finished workflow leaf (reply_to_session_id IS NULL)
         # replies ONLY to human + delivers system_notice(wake=0) to root_session_id (NEVER wakes Driver!).
         is_human_direct_leaf_chat = False
@@ -3263,6 +3270,16 @@ class RuntimeInputStore:
         res_json_str = canonical(result_json) if result_json is not None else None
         usage_plain = plain(usage) if usage else {}
         persist_usage_in_meta = bool(usage_plain and result_seq is None and not write_message)
+        delivered_source_id = (
+            (deliver_source_ref or consumed_refs[0]).message_id
+            if (deliver_parent_sid is not None and deliver_res_kind is not None and consumed_refs)
+            else None
+        )
+        persist_source_in_meta = bool(
+            delivered_source_id is not None
+            and not is_driver
+            and (delivery_error is not None or len(consumed_refs) > 1)
+        )
         target_chain_ids: tuple[str, ...] | None = settle_chain_ids
         if target_chain_ids is None and settle_start_input and batch.start_input_message_id is not None:
             target_chain_ids = (batch.start_input_message_id,)
@@ -3305,7 +3322,7 @@ class RuntimeInputStore:
                 meta_clause = ""
                 meta_params: tuple[Any, ...] = ()
                 per_item_metas: list[tuple[str, str]] = []
-                if persist_usage_in_meta:
+                if persist_usage_in_meta or persist_source_in_meta:
                     mrows = await tx.fetchall(
                         f"SELECT item_id,meta_json FROM {self.q} WHERE session_id=? AND item_id IN ({c_ph})",
                         (sid, *consumed_ids),
@@ -3313,7 +3330,10 @@ class RuntimeInputStore:
                     updated_metas: dict[str, str] = {}
                     for mrow in mrows:
                         qmeta = json.loads(mrow["meta_json"] or "{}")
-                        qmeta["result_usage"] = usage_plain
+                        if persist_usage_in_meta:
+                            qmeta["result_usage"] = usage_plain
+                        if persist_source_in_meta:
+                            qmeta["result_source_item_id"] = delivered_source_id
                         updated_metas[str(mrow["item_id"])] = canonical(qmeta)
                     uniq_metas = set(updated_metas.values())
                     if len(uniq_metas) == 1:
@@ -5072,10 +5092,11 @@ class RuntimeInputStore:
                 and route.get("result_kind") == "workflow_node_result"
                 and row["reply_to_session_id"] is None
             )
+            is_driver_run = self._is_driver_run_input(state, root_rec)
             agg_void: dict[str, Any] | None = None
             if (
                 state["session_kind"] == "workflow_driver"
-                and row["kind"] in ("user", "workflow_continue")
+                and is_driver_run
                 and (
                     root_rec.ref.message_id == state["start_input_message_id"]
                     or row["continuation_of"] is not None
@@ -5086,7 +5107,12 @@ class RuntimeInputStore:
                     database_now=now_ms(),
                 )
             res_json_void = canonical(agg_void) if agg_void is not None else None
-            if route is not None and not is_human_direct_leaf and row["kind"] in ("user", "workflow_continue"):
+            if (
+                route is not None
+                and not is_human_direct_leaf
+                and is_driver_run
+                and row["kind"] in ("user", "workflow_continue")
+            ):
                 cancelled_res = Result(
                     root_rec.ref, target, "cancelled", None, None,
                     structured_output=agg_void,
@@ -5374,12 +5400,14 @@ class RuntimeInputStore:
             and route.get("result_kind") == "workflow_node_result"
             and row.get("reply_to_session_id") is None
         )
+        is_driver_run = self._is_driver_run_input(state, record)
         derived = await self._derive_input_terminal(tx, state, row)
         if derived["terminal_status"] is not None:
             if (
                 route is not None
                 and self._can_redeliver_stored_result(state, row)
                 and not is_human_direct_leaf
+                and is_driver_run
             ):
                 await self._route_stored_result_tx(
                     tx, state, route, record, activations,
@@ -5387,10 +5415,22 @@ class RuntimeInputStore:
                 )
             return self.receipt(record, state="already_finished")
         if row["status"] == "pending":
+            agg_void: dict[str, Any] | None = None
+            if (
+                state["session_kind"] == "workflow_driver"
+                and is_driver_run
+                and ref.message_id == state["start_input_message_id"]
+            ):
+                agg_void = await self._close_workflow_run_journal_tx(
+                    tx, state, primary_ref=ref, cby=cancel_by, reason=reason,
+                    database_now=now_ms(),
+                )
+            res_json_void = canonical(agg_void) if agg_void is not None else None
             delivery_error = None
-            if route is not None and not is_human_direct_leaf:
+            if route is not None and not is_human_direct_leaf and is_driver_run:
                 cancelled = Result(
                     ref, TargetRef(self.store.store_id, sid), "cancelled", None, None,
+                    structured_output=agg_void,
                     error=reason, error_code="cancelled", cancel_by=cancel_by,
                 )
                 _, delivery_error = await self._river_deliver_tx(
@@ -5416,9 +5456,9 @@ class RuntimeInputStore:
                     ))
             changed = await tx.execute(
                 f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
-                "error_code='cancelled',error_detail=?,result_delivery_error=?,"
-                f"completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
-                (cancel_by, reason, delivery_error, sid, ref.message_id),
+                "result_json=COALESCE(result_json,?),error_code='cancelled',error_detail=?,"
+                f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+                (cancel_by, res_json_void, reason, delivery_error, sid, ref.message_id),
             )
             if changed:
                 w_val = int(row["wake"])
@@ -5451,6 +5491,23 @@ class RuntimeInputStore:
             )
             return self.receipt(record, state="cancel_requested", reason=reason)
         return self.receipt(record, state="already_finished")
+
+    @staticmethod
+    def _is_driver_run_input(state, record: InputRecord) -> bool:
+        """Return True for non-driver inputs or workflow_driver run/resume inputs (excluding plain late inputs)."""
+        if state["session_kind"] != "workflow_driver":
+            return True
+        if record.row["kind"] == "workflow_continue" or record.row.get("continuation_of") is not None:
+            return True
+        if record.ref.message_id == state["start_input_message_id"]:
+            return True
+        if record.row["kind"] != "user":
+            return False
+        try:
+            parsed = json.loads(record.row["content_json"])
+        except Exception:
+            return False
+        return isinstance(parsed, dict) and "workflow_resume" in parsed
 
     @staticmethod
     def _can_redeliver_stored_result(state, row) -> bool:
@@ -5498,17 +5555,22 @@ class RuntimeInputStore:
         elif session_kind == "workflow_driver" and route is not None:
             source_ref = start_ref
         elif result_si is not None:
-            # Merged multi-input send: River receipt always used the send's canonical first routed input.
-            first_row = await tx.fetchone(
-                f"SELECT item_id,meta_json FROM {self.q} "
-                "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
-                "ORDER BY CASE WHEN reply_to_session_id IS NOT NULL THEN 0 ELSE 1 END, "
-                "CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, id ASC LIMIT 1",
-                (record.ref.session_id, result_si),
-            )
-            if first_row is not None:
-                source_ref = InputRef(self.store.store_id, record.ref.session_id, str(first_row["item_id"]))
-                first_meta_json = first_row["meta_json"]
+            stored_source_id = record.meta.get("result_source_item_id")
+            if stored_source_id:
+                source_ref = InputRef(self.store.store_id, record.ref.session_id, str(stored_source_id))
+            else:
+                # Merged multi-input send fallback: match claim()'s [prestaged, pending] routed order.
+                first_row = await tx.fetchone(
+                    f"SELECT item_id,meta_json FROM {self.q} "
+                    "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                    "ORDER BY CASE WHEN reply_to_session_id IS NOT NULL THEN 0 ELSE 1 END, "
+                    "CASE WHEN delivered_seq IS NOT NULL THEN delivered_seq ELSE 2147483647 END ASC, "
+                    "CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                    (record.ref.session_id, result_si),
+                )
+                if first_row is not None:
+                    source_ref = InputRef(self.store.store_id, record.ref.session_id, str(first_row["item_id"]))
+                    first_meta_json = first_row["meta_json"]
 
         effective_start = source_ref if result_si is None else start_ref
         message_id = result_message_id(child_target, effective_start, result_si, route["result_kind"])
