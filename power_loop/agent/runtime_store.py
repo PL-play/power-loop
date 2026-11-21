@@ -2630,6 +2630,66 @@ class RuntimeInputStore:
             tuple(params),
         )
 
+    @staticmethod
+    def _human_chat_notice_id(sid: str, send_index: int) -> str:
+        raw_notice_id = f"sys_chat_{sid}_s{send_index}"
+        if len(raw_notice_id) <= 64:
+            return raw_notice_id
+        suffix = f"_s{send_index}"
+        digest_len = max(1, 64 - len("sys_chat_") - len(suffix))
+        return f"sys_chat_{sha256_canonical([sid])[:digest_len]}{suffix}"
+
+    async def _drain_pending_driver_node_results_tx(
+        self, tx, sid: str, send_index: int,
+    ) -> tuple[int, int, int]:
+        """Drain pending workflow_node_result rows AFTER locking ``sessions(sid)``.
+
+        Caller MUST already hold the exclusive row lock on ``sessions(sid)`` so lock order
+        stays strictly ``sessions(sid) -> follow_up_queue(sid)`` (never AB-BA with ``recover``,
+        ``set_lifecycle('closed')``, or ``_river_deliver_tx``). On MySQL, updates ONLY the exact
+        locked ``id`` batch summed into ``(w_drain, p_drain, b_drain)``.
+        """
+        now_sql = self._now_sql()
+        if self._dialect == "mysql":
+            rows = await tx.fetchall(
+                f"SELECT id,wake,content_bytes FROM {self.q} "
+                "WHERE session_id=? AND status='pending' AND kind='workflow_node_result' "
+                "ORDER BY id ASC FOR UPDATE",
+                (sid,),
+            )
+            if not rows:
+                return 0, 0, 0
+            ids = [int(r["id"]) for r in rows]
+            w_drain = sum(int(r["wake"]) for r in rows)
+            p_drain = len(rows)
+            b_drain = sum(int(r["content_bytes"]) for r in rows)
+            for i in range(0, len(ids), 500):
+                chunk = ids[i : i + 500]
+                ph = ",".join("?" for _ in chunk)
+                await tx.execute(
+                    f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
+                    f"delivered_at={now_sql},terminal_status='completed',"
+                    f"result_send_index=?,completed_at={now_sql} "
+                    f"WHERE session_id=? AND status='pending' AND id IN ({ph})",
+                    (send_index, send_index, sid, *chunk),
+                )
+            return w_drain, p_drain, b_drain
+        drained_rows = await tx.fetchall(
+            f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
+            f"delivered_at={now_sql},terminal_status='completed',"
+            f"result_send_index=?,completed_at={now_sql} "
+            "WHERE session_id=? AND status='pending' AND kind='workflow_node_result' "
+            "RETURNING wake,content_bytes",
+            (send_index, send_index, sid),
+        )
+        if not drained_rows:
+            return 0, 0, 0
+        return (
+            sum(int(r["wake"]) for r in drained_rows),
+            len(drained_rows),
+            sum(int(r["content_bytes"]) for r in drained_rows),
+        )
+
     async def _final_tx(
         self, tx, batch: ClaimedBatch, consumed, status, final_text, usage, structured_output,
         error, error_code, result_seq=None, assistant_meta=None, *, next_seq=None,
@@ -2648,52 +2708,20 @@ class RuntimeInputStore:
         has_unconsumed = bool(unconsumed_ids)
         is_driver = batch.descriptor.kind == "workflow_driver"
 
-        # Plan B resident workflow_driver: drain any pending workflow_node_result rows in same tx!
-        w_drain = p_drain = b_drain = 0
-        if drain_driver_node_results:
-            if self._dialect == "mysql":
-                agg = await tx.fetchone(
-                    f"SELECT COALESCE(SUM(wake),0) AS w_sum,COUNT(*) AS p_cnt,"
-                    f"COALESCE(SUM(content_bytes),0) AS b_sum FROM {self.q} "
-                    "WHERE session_id=? AND status='pending' AND kind='workflow_node_result'",
-                    (sid,),
-                )
-                if agg and int(agg["p_cnt"]) > 0:
-                    w_drain = int(agg["w_sum"])
-                    p_drain = int(agg["p_cnt"])
-                    b_drain = int(agg["b_sum"])
-                    await tx.execute(
-                        f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
-                        f"delivered_at={now_sql},terminal_status='completed',"
-                        f"result_send_index=?,completed_at={now_sql} "
-                        "WHERE session_id=? AND status='pending' AND kind='workflow_node_result'",
-                        (batch.send_index, batch.send_index, sid),
-                    )
-            else:
-                drained_rows = await tx.fetchall(
-                    f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
-                    f"delivered_at={now_sql},terminal_status='completed',"
-                    f"result_send_index=?,completed_at={now_sql} "
-                    "WHERE session_id=? AND status='pending' AND kind='workflow_node_result' "
-                    "RETURNING wake,content_bytes",
-                    (batch.send_index, batch.send_index, sid),
-                )
-                if drained_rows:
-                    w_drain = sum(int(r["wake"]) for r in drained_rows)
-                    p_drain = len(drained_rows)
-                    b_drain = sum(int(r["content_bytes"]) for r in drained_rows)
-
         # Compute effective next_seq before releasing the session row (so 1 UPDATE suffices!).
-        # On abnormal/untracked final (exception, cancel, recovery), sync with MAX(seq)+1 so
-        # fenced appends made before the failure never cause a next_seq collision on the next send.
-        if next_seq is None or (status != "completed" and not is_driver):
+        # On abnormal/untracked final (exception, cancel, recovery) of non-driver sessions, sync
+        # with MAX(seq)+1 so fenced appends made before failure never collide on the next send.
+        # Drivers never do mid-turn fenced appends, so they advance from sessions.next_seq (0 MAX(seq)).
+        if not is_driver and (next_seq is None or status != "completed"):
             max_row = await tx.fetchone(
                 f"SELECT COALESCE(MAX(seq),0) AS max_seq FROM {self.store.t.messages} WHERE session_id=?",
                 (sid,),
             )
             if max_row is not None:
                 next_seq = max(int(next_seq or 0), int(max_row["max_seq"]) + 1)
-        write_message = (result_seq is None and status == "completed") or write_driver_message
+        write_message = (
+            bool(write_driver_message) if is_driver else (result_seq is None and status == "completed")
+        )
         effective_next_seq = max(
             int(next_seq or 0),
             (int(result_seq) + 1) if result_seq is not None else 0,
@@ -2751,23 +2779,17 @@ class RuntimeInputStore:
                 )
             fold_set_params = (batch.cancel_seq, expected_fold_json, proj_fold_json)
 
-        drain_set_clause = ""
-        drain_set_params: tuple[Any, ...] = ()
-        if w_drain or p_drain or b_drain:
-            drain_set_clause = (
-                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
-                "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
-                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
-            )
-            drain_set_params = (w_drain, w_drain, p_drain, p_drain, b_drain, b_drain)
-
-        # Step 1 (Deep-first lock order): Fenced UPDATE on child session FIRST (1 control SQL!).
+        # Step 1 (Deep-first lock order): Fenced UPDATE on child/driver session FIRST (1 control SQL!).
+        # Acquires the exclusive row lock on sessions(sid) BEFORE touching follow_up_queue(sid) or parent.
         post_fold_stats_json: str | None = None
         route_changed = False
+        has_pending = False
+        live_root_session_id = batch.root_session_id
         if self._dialect == "mysql":
-            # 6-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json/drain SET):
-            # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced
-            # bit 3: closed_raced  | bit 4: fold_stats_conflict | bit 5: route_changed (session route)
+            # 8-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json SET):
+            # bit 0 (1):   has_more_wake  | bit 1 (2):   subtree_raced | bit 2 (4):  cancel_raced
+            # bit 3 (8):   closed_raced   | bit 4 (16):  fold_conflict | bit 5 (32): route_changed
+            # bit 6 (64):  has_pending (drain_driver_node_results)     | bit 7 (128): root_changed
             mysql_route_changed_bit = ""
             mysql_route_changed_params: tuple[Any, ...] = ()
             if batch.result_route is not None:
@@ -2775,20 +2797,32 @@ class RuntimeInputStore:
                     "|(CASE WHEN NOT (result_route_json<=>?) THEN 32 ELSE 0 END)"
                 )
                 mysql_route_changed_params = (canonical(batch.result_route),)
+            mysql_has_pending_bit = (
+                "|(CASE WHEN pending_count>0 THEN 64 ELSE 0 END)"
+                if drain_driver_node_results else ""
+            )
+            mysql_root_changed_bit = ""
+            mysql_root_changed_params: tuple[Any, ...] = ()
+            if batch.root_session_id is not None and batch.root_session_id != sid:
+                mysql_root_changed_bit = (
+                    "|(CASE WHEN NOT (root_session_id<=>?) THEN 128 ELSE 0 END)"
+                )
+                mysql_root_changed_params = (batch.root_session_id,)
             rc, packed = await tx.execute_packed(
                 f"UPDATE {self.s} SET "
                 "owner_epoch=(LAST_INSERT_ID("
-                "(owner_epoch<<6)"
-                "|(CASE WHEN lifecycle='open' AND ((wake_pending_count-?)>0 OR ?=1) THEN 1 ELSE 0 END)"
+                "(owner_epoch<<8)"
+                "|(CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) THEN 1 ELSE 0 END)"
                 "|(CASE WHEN cancel_by='subtree' AND cancel_seq>? THEN 2 ELSE 0 END)"
                 "|(CASE WHEN cancel_seq>? THEN 4 ELSE 0 END)"
                 "|(CASE WHEN lifecycle IN ('closing','closed') THEN 8 ELSE 0 END)"
                 f"{mysql_fold_conflict_bit}"
                 f"{mysql_route_changed_bit}"
-                ")>>6),"
-                "execution_state=CASE WHEN lifecycle='open' AND ((wake_pending_count-?)>0 OR ?=1) "
+                f"{mysql_has_pending_bit}"
+                f"{mysql_root_changed_bit}"
+                ")>>8),"
+                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
-                f"{drain_set_clause}"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
                 "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
                 "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
@@ -2800,11 +2834,11 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} "
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running'",
                 (
-                    w_drain, int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
+                    int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
                     *mysql_fold_conflict_params,
                     *mysql_route_changed_params,
-                    w_drain, int(has_unconsumed),
-                    *drain_set_params,
+                    *mysql_root_changed_params,
+                    int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
@@ -2818,15 +2852,22 @@ class RuntimeInputStore:
             closed_raced = bool(packed & 8)
             fold_conflict = bool(packed & 16)
             route_changed = bool(packed & 32)
+            has_pending = bool(packed & 64)
+            root_changed = bool(packed & 128)
             next_state = "queued" if has_more_wake else "idle"
             cancel_by_db = "subtree" if subtree_raced else None
             cancel_reason_db = None
             post_next_seq = effective_next_seq + int(write_message)
             database_now = None
             live_route_json = None
-            if closed_raced or cancel_raced or write_message or (route_changed and batch.result_route is not None):
+            if (
+                closed_raced or cancel_raced or write_message
+                or (route_changed and batch.result_route is not None)
+                or root_changed
+            ):
                 diag = await tx.fetchone(
-                    f"SELECT next_seq,cancel_by,cancel_reason,updated_at,result_route_json "
+                    f"SELECT next_seq,cancel_by,cancel_reason,updated_at,"
+                    f"result_route_json,root_session_id "
                     f"FROM {self.s} WHERE session_id=?",
                     (sid,),
                 )
@@ -2836,12 +2877,13 @@ class RuntimeInputStore:
                     cancel_reason_db = diag["cancel_reason"]
                     database_now = int(diag["updated_at"])
                     live_route_json = diag["result_route_json"]
+                    if diag["root_session_id"]:
+                        live_root_session_id = str(diag["root_session_id"])
         else:
             srow = await tx.fetchone(
                 f"UPDATE {self.s} SET "
-                "execution_state=CASE WHEN lifecycle='open' AND ((wake_pending_count-?)>0 OR ?=1) "
+                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
-                f"{drain_set_clause}"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
                 "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
                 "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
@@ -2854,10 +2896,9 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
                 "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
                 "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,"
-                "result_route_json",
+                "result_route_json,root_session_id,pending_count",
                 (
-                    w_drain, int(has_unconsumed),
-                    *drain_set_params,
+                    int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
@@ -2875,12 +2916,62 @@ class RuntimeInputStore:
             post_fold_stats_json = srow["fold_stats_json"]
             database_now = int(srow["updated_at"])
             live_route_json = srow["result_route_json"]
+            if srow["root_session_id"]:
+                live_root_session_id = str(srow["root_session_id"])
+            has_pending = int(srow["pending_count"]) > 0
             fold_conflict = (
                 proj_fold_json is not None
                 and not closed_raced
                 and not cancel_raced
                 and post_fold_stats_json != proj_fold_json
             )
+
+        # Step 1.5 (Plan B resident workflow_driver): drain pending workflow_node_result rows AFTER
+        # acquiring the owned sessions(sid) row lock, deducting ONLY the exact drained batch.
+        if drain_driver_node_results and not closed_raced and has_pending:
+            w_drain, p_drain, b_drain = await self._drain_pending_driver_node_results_tx(
+                tx, sid, batch.send_index,
+            )
+            if p_drain > 0:
+                if self._dialect == "mysql":
+                    _, d_packed = await tx.execute_packed(
+                        f"UPDATE {self.s} SET "
+                        "owner_epoch=(LAST_INSERT_ID("
+                        "(owner_epoch<<1)"
+                        "|(CASE WHEN lifecycle='open' AND (wake_pending_count>? OR ?=1) THEN 1 ELSE 0 END)"
+                        ")>>1),"
+                        "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>? OR ?=1) "
+                        "THEN 'queued' ELSE 'idle' END,"
+                        "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                        "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                        "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END "
+                        "WHERE session_id=?",
+                        (
+                            w_drain, int(has_unconsumed),
+                            w_drain, int(has_unconsumed),
+                            w_drain, w_drain, p_drain, p_drain, b_drain, b_drain,
+                            sid,
+                        ),
+                    )
+                    next_state = "queued" if bool(d_packed & 1) else "idle"
+                else:
+                    drow = await tx.fetchone(
+                        f"UPDATE {self.s} SET "
+                        "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>? OR ?=1) "
+                        "THEN 'queued' ELSE 'idle' END,"
+                        "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                        "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                        "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END "
+                        "WHERE session_id=? "
+                        "RETURNING execution_state",
+                        (
+                            w_drain, int(has_unconsumed),
+                            w_drain, w_drain, p_drain, p_drain, b_drain, b_drain,
+                            sid,
+                        ),
+                    )
+                    if drow is not None:
+                        next_state = str(drow["execution_state"])
 
         effective_status = status
         effective_cancel_by = batch.cancel_by or cancel_by_db
@@ -3041,10 +3132,17 @@ class RuntimeInputStore:
 
         if deliver_parent_sid is not None and deliver_res_kind is not None:
             child_wake = 0 if (effective_cancel_by == "subtree" or subtree_raced) else 1
+            route_final_text = final_text
+            route_usage = usage
+            route_structured = structured_output
+            if effective_status == "cancelled" and result_seq is None and not write_message:
+                route_final_text = ""
+                route_usage = {}
+                route_structured = structured_output if result_json is not None else None
             route_result = Result(
                 deliver_source_ref or consumed_refs[0], batch.target, effective_status,
                 batch.send_index, result_seq,
-                final_text, usage, structured_output, effective_error, effective_error_code,
+                route_final_text, route_usage, route_structured, effective_error, effective_error_code,
                 cancel_by=effective_cancel_by if effective_status == "cancelled" else None,
             )
             result_ref, delivery_error = await self._river_deliver_tx(
@@ -3072,34 +3170,30 @@ class RuntimeInputStore:
                     deliver_res_kind,
                     delivery_error,
                 ))
-        elif (
-            is_human_direct_leaf_chat
-            and not closed_raced
-            and batch.root_session_id
-            and batch.root_session_id != sid
-        ):
-            raw_notice_id = f"sys_chat_{sid}_s{batch.send_index}"
-            if len(raw_notice_id) <= 64:
-                notice_id = raw_notice_id
-            else:
-                suffix = f"_s{batch.send_index}"
-                digest_len = max(16, 64 - len("sys_chat_") - len(suffix))
-                notice_id = f"sys_chat_{sha256_canonical([sid])[:digest_len]}{suffix}"
-            notice_body = {
-                "kind": "system_notice",
-                "event": "human_child_interaction",
-                "session_id": sid,
-                "send_index": batch.send_index,
-                "text": f"[system_notice · 用户直接与子会话 {sid} 进行了第 {batch.send_index} 轮对话]",
-            }
-            await self._deliver_system_notice_tx(
-                tx,
-                target_session_id=batch.root_session_id,
-                tenant_id=batch.tenant_id,
-                principal_id=batch.principal_id,
-                item_id=notice_id,
-                body=notice_body,
-            )
+        elif is_human_direct_leaf_chat and not closed_raced:
+            if live_root_session_id is None:
+                rrow = await tx.fetchone(
+                    f"SELECT root_session_id FROM {self.s} WHERE session_id=?", (sid,),
+                )
+                if rrow is not None and rrow["root_session_id"]:
+                    live_root_session_id = str(rrow["root_session_id"])
+            if live_root_session_id and live_root_session_id != sid:
+                notice_id = self._human_chat_notice_id(sid, batch.send_index)
+                notice_body = {
+                    "kind": "system_notice",
+                    "event": "human_child_interaction",
+                    "session_id": sid,
+                    "send_index": batch.send_index,
+                    "text": f"[system_notice · 用户直接与子会话 {sid} 进行了第 {batch.send_index} 轮对话]",
+                }
+                await self._deliver_system_notice_tx(
+                    tx,
+                    target_session_id=live_root_session_id,
+                    tenant_id=batch.tenant_id,
+                    principal_id=batch.principal_id,
+                    item_id=notice_id,
+                    body=notice_body,
+                )
 
         # Step 3: Assistant message write / meta stamp (skipped when already written cleanly by sink!)
         result_meta = {
@@ -3292,7 +3386,9 @@ class RuntimeInputStore:
                     "SET "
                     "_p.inbox_version=(LAST_INSERT_ID("
                     "((_p.inbox_version+1)<<1)|"
-                    "(CASE WHEN _p.lifecycle='open' AND _p.execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                    "(CASE WHEN _p.lifecycle='open' AND (_p.execution_state='idle' "
+                    "OR (_p.execution_state='running' AND _p.session_kind='workflow_driver')) "
+                    "AND ?=1 THEN 1 ELSE 0 END)"
                     ")>>1),"
                     "_p.wake_inbox_seq=_p.wake_inbox_seq+?,"
                     "_p.wake_pending_count=_p.wake_pending_count+?,"
@@ -3392,7 +3488,11 @@ class RuntimeInputStore:
             )
             if activations is not None and parent_need_wake:
                 activations.append(parent_target)
-            if result_kind == "workflow_node_result" and _driver_events_out is not None:
+            if (
+                result_kind == "workflow_node_result"
+                and child_wake == 1
+                and _driver_events_out is not None
+            ):
                 _driver_events_out.append((parent_session_id, message_id, body))
             return ref, None
 
@@ -4006,8 +4106,11 @@ class RuntimeInputStore:
             activations: list[TargetRef] = []
             settled_refs: list[InputRef] = []
             if origins:
-                origin = origins[-1]
-                root = await self._continuation_root(tx, origin)
+                primary = next(
+                    (o for o in reversed(origins) if o.row["kind"] == "workflow_continue"),
+                    origins[-1],
+                )
+                root = await self._continuation_root(tx, primary)
                 route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
                 if route is not None:
                     cancelled_res = Result(
@@ -4042,17 +4145,23 @@ class RuntimeInputStore:
                     "AND delivered_send_index=? AND terminal_status IS NULL",
                     (cby, active, reason, delivery_error, database_now, sid, active),
                 )
-                settled_refs.append(origin.ref)
-                current = origin
                 ancestors: list[str] = []
-                while current.row["continuation_of"] is not None:
-                    current = await self.input(
-                        tx, InputRef(current.ref.store_id, sid, current.row["continuation_of"]),
-                    )
-                    if current is None:
-                        break
-                    ancestors.append(current.ref.message_id)
-                    settled_refs.append(current.ref)
+                seen_anc: set[str] = set()
+                for orig in origins:
+                    settled_refs.append(orig.ref)
+                    current = orig
+                    while current.row["continuation_of"] is not None:
+                        anc_id = current.row["continuation_of"]
+                        if anc_id in seen_anc:
+                            break
+                        current = await self.input(
+                            tx, InputRef(current.ref.store_id, sid, anc_id),
+                        )
+                        if current is None:
+                            break
+                        seen_anc.add(anc_id)
+                        ancestors.append(anc_id)
+                        settled_refs.append(current.ref)
                 if ancestors:
                     await tx.execute(
                         f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
@@ -4061,19 +4170,29 @@ class RuntimeInputStore:
                         f"AND item_id IN ({','.join('?' for _ in ancestors)})",
                         (cby, active, reason, delivery_error, database_now, sid, *ancestors),
                     )
-            await tx.execute(
-                f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,delivered_at={now_sql},"
-                f"terminal_status='completed',result_send_index=?,completed_at={now_sql} "
-                "WHERE session_id=? AND status='pending' AND kind='workflow_node_result'",
-                (active, active, sid),
+            w_drain, p_drain, b_drain = await self._drain_pending_driver_node_results_tx(
+                tx, sid, active,
+            )
+            rem_wake = max(0, int(own_state["wake_pending_count"]) - w_drain)
+            next_state = (
+                "queued"
+                if own_state["lifecycle"] == "open" and rem_wake > 0
+                else "idle"
             )
             changed = await tx.execute(
-                f"UPDATE {self.s} SET execution_state='idle',wake_pending_count=0,"
-                "pending_count=0,pending_bytes=0,owner_node_id=NULL,owner_boot_id=NULL,"
+                f"UPDATE {self.s} SET execution_state=?,"
+                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+                "owner_node_id=NULL,owner_boot_id=NULL,"
                 "owner_lease_until_ms=NULL,pending_tool_seq=NULL,ready_item_json=NULL,"
                 f"cancel_by=NULL,cancel_reason=NULL,updated_at={now_sql} "
                 "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
-                (sid, epoch),
+                (
+                    next_state,
+                    w_drain, w_drain, p_drain, p_drain, b_drain, b_drain,
+                    sid, epoch,
+                ),
             )
             if changed != 1:
                 raise SessionLeaseLost(sid)
@@ -4086,7 +4205,7 @@ class RuntimeInputStore:
                 for ref in dict.fromkeys(settled_refs)
             )
             return FinalBatch(
-                "idle", results, result_ref,
+                next_state, results, result_ref,
                 activations[0] if activations else None, delivery_error,
             )
 
@@ -4116,7 +4235,10 @@ class RuntimeInputStore:
                 else "idle"
             )
         else:
-            origin = origins[-1]
+            origin = next(
+                (o for o in reversed(origins) if o.row["kind"] == "workflow_continue"),
+                origins[-1],
+            )
             root = await self._continuation_root(tx, origin)
             index = int(origin.row["continuation_index"] or 0) + 1
             message_id = "wfc_" + sha256_canonical([
@@ -4252,10 +4374,42 @@ class RuntimeInputStore:
                 result_ref = None
                 activations: list[TargetRef] = []
                 route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
-                if rows and route is not None:
-                    first = self.record(rows[0])
+                live_root_sid = str(own_state["root_session_id"]) if own_state["root_session_id"] else None
+                is_closed = own_state["lifecycle"] in ("closing", "closed")
+                is_human_direct_leaf_chat = False
+                if (
+                    rows
+                    and route is not None
+                    and route.get("result_kind") == "workflow_node_result"
+                    and not any(r["reply_to_session_id"] is not None for r in rows)
+                ):
+                    route = None
+                    is_human_direct_leaf_chat = True
+
+                deliver_parent_sid = None
+                deliver_res_kind = None
+                deliver_start_ref = None
+                deliver_source_ref = None
+                if rows:
+                    if route is not None:
+                        deliver_parent_sid = route["target"]["session_id"]
+                        deliver_res_kind = route["result_kind"]
+                        deliver_start_ref = InputRef(**route["input_ref"])
+                        deliver_source_ref = self.record(rows[0]).ref
+                    elif not is_human_direct_leaf_chat:
+                        reply_row = next((r for r in rows if r["reply_to_session_id"] is not None), None)
+                        if reply_row is not None:
+                            deliver_parent_sid = str(reply_row["reply_to_session_id"])
+                            deliver_res_kind = reply_row["reply_result_kind"] or "agent_result"
+                            deliver_source_ref = InputRef(self.store.store_id, sid, reply_row["item_id"])
+                            deliver_start_ref = (
+                                InputRef(self.store.store_id, sid, own_state["start_input_message_id"])
+                                if own_state["start_input_message_id"] else deliver_source_ref
+                            )
+
+                if deliver_parent_sid is not None and deliver_res_kind is not None and deliver_source_ref is not None:
                     route_result = Result(
-                        first.ref, target, terminal, active, None,
+                        deliver_source_ref, target, terminal, active, None,
                         error=detail, error_code=terminal, cancel_by=cby,
                     )
                     result_ref, delivery_error = await self._river_deliver_tx(
@@ -4263,10 +4417,10 @@ class RuntimeInputStore:
                         child_target=target,
                         child_tenant_id=own_state["tenant_id"],
                         child_principal_id=own_state["principal_id"],
-                        parent_session_id=route["target"]["session_id"],
-                        start_ref=InputRef(**route["input_ref"]),
+                        parent_session_id=deliver_parent_sid,
+                        start_ref=deliver_start_ref or deliver_source_ref,
                         result=route_result,
-                        result_kind=route["result_kind"],
+                        result_kind=deliver_res_kind,
                         child_wake=0 if own_state["cancel_by"] == "subtree" else 1,
                         activations=activations,
                         _driver_events_out=driver_events_out,
@@ -4274,11 +4428,33 @@ class RuntimeInputStore:
                     if delivery_error is not None:
                         undeliverables.append((
                             target,
-                            route["target"]["session_id"],
+                            deliver_parent_sid,
                             replace(route_result, result_delivery_error=delivery_error),
-                            route["result_kind"],
+                            deliver_res_kind,
                             delivery_error,
                         ))
+                elif (
+                    is_human_direct_leaf_chat
+                    and not is_closed
+                    and live_root_sid
+                    and live_root_sid != sid
+                ):
+                    notice_id = self._human_chat_notice_id(sid, active)
+                    notice_body = {
+                        "kind": "system_notice",
+                        "event": "human_child_interaction",
+                        "session_id": sid,
+                        "send_index": active,
+                        "text": f"[system_notice · 用户直接与子会话 {sid} 进行了第 {active} 轮对话]",
+                    }
+                    await self._deliver_system_notice_tx(
+                        tx,
+                        target_session_id=live_root_sid,
+                        tenant_id=own_state["tenant_id"],
+                        principal_id=own_state["principal_id"],
+                        item_id=notice_id,
+                        body=notice_body,
+                    )
                 if rows:
                     await tx.execute(
                         f"UPDATE {self.q} SET terminal_status=?,cancel_by=?,result_send_index=?,"
@@ -4363,7 +4539,7 @@ class RuntimeInputStore:
 
     async def _collect_active_descendants(
         self, tx, *, session_id: str, root_session_id: str, target_depth: int,
-        only_linked: bool = True,
+        only_linked: bool = True, include_independent_drivers: bool = False,
     ) -> list[tuple[str, int, bool]]:
         """Bounded active-only subtree scan using ``idx_sessions_root`` (0 idle rows scanned!)."""
         active_rows = await tx.fetchall(
@@ -4391,7 +4567,9 @@ class RuntimeInputStore:
             matched = False
             visited: set[str] = set()
             while cur_parent is not None and cur_parent not in visited:
-                if only_linked and cur_prop != "linked" and cur_kind != "workflow_driver":
+                if only_linked and cur_prop != "linked" and not (
+                    include_independent_drivers and cur_kind == "workflow_driver"
+                ):
                     break
                 if cur_parent == session_id:
                     matched = True
@@ -4460,6 +4638,7 @@ class RuntimeInputStore:
                             root_session_id=str(session["root_session_id"]),
                             target_depth=int(session["depth"]),
                             only_linked=only_linked,
+                            include_independent_drivers=True,
                         )
                         for d_sid, d_val, _d_pre in active_desc:
                             expected_depth[d_sid] = d_val
@@ -4521,6 +4700,7 @@ class RuntimeInputStore:
                             root_session_id=str(state["root_session_id"]),
                             target_depth=int(state["depth"]),
                             only_linked=only_linked,
+                            include_independent_drivers=True,
                         )
                         recheck_ids = {d_sid for d_sid, _, _ in recheck}
                         if recheck_ids != set(locked_desc.keys()):
@@ -4762,7 +4942,12 @@ class RuntimeInputStore:
             rec = self.record(row)
             root_rec = await self._continuation_root(tx, rec) if row["continuation_of"] is not None else rec
             delivery_error = None
-            if route is not None and row["kind"] in ("user", "workflow_continue"):
+            is_human_direct_leaf = (
+                route is not None
+                and route.get("result_kind") == "workflow_node_result"
+                and row["reply_to_session_id"] is None
+            )
+            if route is not None and not is_human_direct_leaf and row["kind"] in ("user", "workflow_continue"):
                 cancelled_res = Result(
                     root_rec.ref, target, "cancelled", None, None,
                     error=reason, error_code="cancelled", cancel_by=cancel_by,
@@ -4866,8 +5051,15 @@ class RuntimeInputStore:
 
         if not pending_rows and not is_prestaged and route is not None:
             start = await self.input(tx, InputRef(**route["input_ref"]))
-            if start is not None and start.row["terminal_status"] is not None:
-                await self._route_stored_result_tx(tx, state, route, start, activations)
+            if (
+                start is not None
+                and start.row["terminal_status"] is not None
+                and start.row.get("error_code") != "session_closed"
+            ):
+                await self._route_stored_result_tx(
+                    tx, state, route, start, activations,
+                    _driver_events_out=_driver_events_out,
+                )
 
         if state["execution_state"] == "queued" or changed > 0:
             rem_count = max(0, int(state["pending_count"]) - (changed - (1 if is_prestaged and changed else 0)))
@@ -4916,6 +5108,18 @@ class RuntimeInputStore:
         )
         derived_latest = await self._derive_input_terminal(tx, dict(state), latest.row)
         if derived_latest["terminal_status"] is not None:
+            route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
+            if (
+                route is not None
+                and latest.row["terminal_status"] is not None
+                and latest.row.get("error_code") != "session_closed"
+            ):
+                latest_full = await self.input(tx, latest.ref)
+                if latest_full is not None:
+                    await self._route_stored_result_tx(
+                        tx, state, route, latest_full, activations,
+                        _driver_events_out=_driver_events_out,
+                    )
             return self.receipt(record, state="already_finished")
         if (
             latest.row["status"] == "delivered"
@@ -4953,7 +5157,7 @@ class RuntimeInputStore:
                 start_ref=InputRef(**route["input_ref"]),
                 result=cancelled,
                 result_kind=route["result_kind"],
-                child_wake=1,
+                child_wake=0 if cancel_by == "subtree" else 1,
                 activations=activations,
                 _driver_events_out=_driver_events_out,
             )
@@ -5025,14 +5229,27 @@ class RuntimeInputStore:
         now_sql = self._now_sql()
         route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
         # Check derived terminal status for normal completed rows (no final_settle_inbox)
+        is_human_direct_leaf = (
+            route is not None
+            and route.get("result_kind") == "workflow_node_result"
+            and row.get("reply_to_session_id") is None
+        )
         derived = await self._derive_input_terminal(tx, state, row)
         if derived["terminal_status"] is not None:
-            if route is not None and row["terminal_status"] is not None:
-                await self._route_stored_result_tx(tx, state, route, record, activations)
+            if (
+                route is not None
+                and row["terminal_status"] is not None
+                and row.get("error_code") != "session_closed"
+                and not is_human_direct_leaf
+            ):
+                await self._route_stored_result_tx(
+                    tx, state, route, record, activations,
+                    _driver_events_out=_driver_events_out,
+                )
             return self.receipt(record, state="already_finished")
         if row["status"] == "pending":
             delivery_error = None
-            if route is not None:
+            if route is not None and not is_human_direct_leaf:
                 cancelled = Result(
                     ref, TargetRef(self.store.store_id, sid), "cancelled", None, None,
                     error=reason, error_code="cancelled", cancel_by=cancel_by,
@@ -5046,7 +5263,7 @@ class RuntimeInputStore:
                     start_ref=InputRef(**route["input_ref"]),
                     result=cancelled,
                     result_kind=route["result_kind"],
-                    child_wake=1,
+                    child_wake=0 if cancel_by == "subtree" else 1,
                     activations=activations,
                     _driver_events_out=_driver_events_out,
                 )
@@ -5098,7 +5315,24 @@ class RuntimeInputStore:
 
     async def _route_stored_result_tx(
         self, tx, session, route, record, activations=None, *, parent_state=None,
+        _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
     ):
+        session_kind = dict(session).get("session_kind")
+        if session_kind == "workflow_driver":
+            # Follow any continuation chain (orig -> wfc_1 -> ...) to its terminal head so
+            # repeat cancel(orig_ref) or cancel(driver_target) reuses the exact final send_index
+            # (e.g. NULL when voided while pending) and never emits a second receipt.
+            head = record
+            for _ in range(10000):
+                child = await tx.fetchone(
+                    f"SELECT * FROM {self.q} WHERE session_id=? AND continuation_of=? "
+                    "ORDER BY continuation_index DESC LIMIT 1",
+                    (head.ref.session_id, head.ref.message_id),
+                )
+                if child is None or child["terminal_status"] is None:
+                    break
+                head = self.record(child)
+            record = head
         row = record.row
         final_text, usage, structured = "", {}, None
         if row["result_seq"] is not None:
@@ -5112,12 +5346,22 @@ class RuntimeInputStore:
                 meta = json.loads(message["meta_json"] or "{}")
                 usage = meta.get("usage") or {}
                 structured = meta.get("structured_output")
+        if structured is None and row.get("result_json"):
+            structured = json.loads(row["result_json"])
+        stored_cancel_by = row.get("cancel_by") if row["terminal_status"] == "cancelled" else None
+        source_ref = record.ref
+        if row.get("continuation_of") is not None:
+            source_ref = (await self._continuation_root(tx, record)).ref
+        elif session_kind == "workflow_driver" and route is not None:
+            source_ref = InputRef(**route["input_ref"])
         existing = Result(
-            record.ref, TargetRef(self.store.store_id, record.ref.session_id),
+            source_ref, TargetRef(self.store.store_id, record.ref.session_id),
             row["terminal_status"], row["result_send_index"], row["result_seq"],
             final_text, usage, structured, row["error_detail"], row["error_code"],
             row["result_delivery_error"],
+            cancel_by=stored_cancel_by,
         )
+        child_wake = 0 if (row["terminal_status"] == "cancelled" and stored_cancel_by == "subtree") else 1
         result_ref, delivery_error = await self._river_deliver_tx(
             tx,
             child_target=TargetRef(self.store.store_id, record.ref.session_id),
@@ -5127,8 +5371,9 @@ class RuntimeInputStore:
             start_ref=InputRef(**route["input_ref"]),
             result=existing,
             result_kind=route["result_kind"],
-            child_wake=1,
+            child_wake=child_wake,
             activations=activations,
+            _driver_events_out=_driver_events_out,
         )
         if delivery_error != row["result_delivery_error"]:
             await tx.execute(
