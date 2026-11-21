@@ -1028,7 +1028,24 @@ async def run_driver(worker, ctx, env):
             record = await port.input(port.db, ref)
             if record is not None and record.row["kind"] in {"user", "workflow_continue"}:
                 origins.append(record)
-        origin = origins[-1] if origins else None
+        def_ref = saved.get("definition_ref") if isinstance(saved, dict) else None
+        def_msg_id = def_ref.get("message_id") if isinstance(def_ref, dict) else None
+        origin = next(
+            (o for o in reversed(origins) if o.row["kind"] == "workflow_continue"),
+            None,
+        )
+        if origin is None:
+            origin = next((o for o in origins if o.ref.message_id == run_id), None)
+        if origin is None and def_msg_id:
+            origin = next((o for o in origins if o.ref.message_id == def_msg_id), None)
+        if origin is None:
+            for o in reversed(origins):
+                parsed = json.loads(o.row["content_json"])
+                if isinstance(parsed, dict) and "workflow_resume" in parsed:
+                    origin = o
+                    break
+        if origin is None and origins:
+            origin = origins[-1]
         if origin is not None:
             content = json.loads(origin.row["content_json"])
             if isinstance(content, dict) and "workflow_resume" in content:

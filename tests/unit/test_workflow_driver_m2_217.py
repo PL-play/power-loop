@@ -1594,3 +1594,423 @@ async def test_m1a6_create_many_5_leaves_exact_1_tx_4_sql_multi_value_inserts(re
     assert f"INSERT INTO {store.t.sessions}" in sqls[1] and sqls[1].count("),(") == 4
     assert f"INSERT INTO {store.t.follow_up_queue}" in sqls[2] and sqls[2].count("),(") == 4
     assert f"INSERT INTO {store.t.messages}" in sqls[3] and sqls[3].count("),(") == 4
+
+
+@pytest.mark.parametrize("mode", ["normal_user", "subtree"])
+async def test_b3_1_merged_inputs_cancel_retry_preserves_delivery_and_usage(registry_store, mode):
+    """B3.1: Merged 2-input leaf cancelled & finalized preserves usage (7 tokens) and idempotent retry on 2nd input."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    main = await target(port, f"b31-main-{mode}")
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port.create_many(
+        parent=main, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id=f"b31-drv-{mode}", message_id=f"b31-dm-{mode}", body={"wf": "go"},
+            descriptor=drv_desc, result_kind="workflow_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    drv_batch = cm_drv.preclaimed[0]
+    drv_sid = drv_batch.target.session_id
+    leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L1"}})
+    leaf_sid = f"b31-leaf-{mode}"
+    first_id = f"b31-first-{mode}"
+    second_id = f"b31-second-{mode}"
+    # Create leaf queued (free_slots=0) so we can accept a second routed input and merge both in send_index=1
+    cm_leaf = await port.create_many(
+        parent=drv_batch.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id=leaf_sid, message_id=first_id, body={"text": "first"},
+            descriptor=leaf_desc, result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=False, free_slots=0,
+        parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+    )
+    leaf = cm_leaf.queued_targets[0]
+    await port.accept(
+        leaf, {"text": "second"}, message_id=second_id, actor=ACTOR,
+        reply_route={"target": drv_batch.target, "result_kind": "workflow_node_result"},
+    )
+    leaf_batch = await port.claim(leaf, node_id="n1", boot_id="b1")
+    assert leaf_batch is not None and [r.message_id for r in leaf_batch.input_refs] == [first_id, second_id]
+    first_ref, second_ref = leaf_batch.input_refs[0], leaf_batch.input_refs[1]
+
+    if mode == "normal_user":
+        await port.cancel(first_ref, actor=ACTOR, reason="user stop")
+        expected_cby, expected_wake = "user", 1
+    else:
+        await port.cancel(drv_batch.target, actor=ACTOR, scope="subtree", reason="subtree stop")
+        expected_cby, expected_wake = "subtree", 0
+
+    known_usage = {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    fin = await port.final(
+        leaf_batch, status="cancelled", final_text="",
+        usage=known_usage, error="stopped", error_code="cancelled",
+    )
+    assert fin.result_delivery_error is None
+    assert fin.results[0].usage == known_usage
+
+    # Verify initial River receipt carries canonical source=first_ref, known usage=7, and expected cancel_by/wake
+    receipts_before = await store._db.fetchall(
+        f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_node_result' ORDER BY id ASC",
+        (drv_sid,),
+    )
+    assert len(receipts_before) == 1
+    body_before = json.loads(receipts_before[0]["content_json"])
+    assert int(receipts_before[0]["wake"]) == expected_wake
+    assert body_before["cancel_by"] == expected_cby
+    assert body_before["input_ref"]["message_id"] == first_id
+    assert body_before["usage"] == known_usage
+
+    for mid in (first_id, second_id):
+        qrow = await store._db.fetchone(
+            f"SELECT terminal_status,result_delivery_error,cancel_by FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (leaf_sid, mid),
+        )
+        assert dict(qrow) == {
+            "terminal_status": "cancelled",
+            "result_delivery_error": None,
+            "cancel_by": expected_cby,
+        }
+
+    # Retry cancel on the SECOND input (merged in the same send_index=1) -> must stay idempotent with NO request_conflict
+    rcpt_second = await port.cancel(second_ref, actor=ACTOR, reason="retry cancel second")
+    assert rcpt_second.state == "already_finished"
+    rcpt_first = await port.cancel(first_ref, actor=ACTOR, reason="retry cancel first")
+    assert rcpt_first.state == "already_finished"
+
+    receipts_after = await store._db.fetchall(
+        f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_node_result' ORDER BY id ASC",
+        (drv_sid,),
+    )
+    assert len(receipts_after) == 1
+    assert receipts_after[0]["item_id"] == receipts_before[0]["item_id"]
+    assert int(receipts_after[0]["wake"]) == expected_wake
+    assert json.loads(receipts_after[0]["content_json"]) == body_before
+
+    for mid in (first_id, second_id):
+        qrow = await store._db.fetchone(
+            f"SELECT terminal_status,result_delivery_error,cancel_by FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (leaf_sid, mid),
+        )
+        assert qrow["result_delivery_error"] is None, f"unexpected delivery error for {mid}: {dict(qrow)}"
+        res_loaded = await port.get_result(InputRef(store.store_id, leaf_sid, mid), actor=ACTOR)
+        assert res_loaded is not None and res_loaded.status == "cancelled"
+        assert res_loaded.usage == known_usage and res_loaded.cancel_by == expected_cby
+
+    # Also verify redelivery path via second_ref (if receipt had been missing) reconstructs canonical first_ref + usage=7
+    await store._db.execute(
+        f"DELETE FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (drv_sid, receipts_before[0]["item_id"]),
+    )
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET pending_count=0, wake_pending_count=0 WHERE session_id=?",
+        (drv_sid,),
+    )
+    rcpt_redeliver = await port.cancel(second_ref, actor=ACTOR, reason="redeliver via second")
+    assert rcpt_redeliver.state == "already_finished"
+    receipts_redel = await store._db.fetchall(
+        f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_node_result' ORDER BY id ASC",
+        (drv_sid,),
+    )
+    assert len(receipts_redel) == 1
+    body_redel = json.loads(receipts_redel[0]["content_json"])
+    assert receipts_redel[0]["item_id"] == receipts_before[0]["item_id"]
+    assert int(receipts_redel[0]["wake"]) == expected_wake
+    assert body_redel["input_ref"]["message_id"] == first_id
+    assert body_redel["cancel_by"] == expected_cby
+    assert body_redel["usage"] == known_usage
+
+
+async def test_b3_2_closed_inflight_leaf_repeat_cancel_keeps_driver_unchanged(registry_store):
+    """B3.2: Running leaf closed (cancelled/removed) + Final -> repeat cancel(InputRef) keeps Driver receipts=0 & wake=0."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    main = await target(port, "b32-main")
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port.create_many(
+        parent=main, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="b32-drv", message_id="b32-dm1", body={"wf": "go"},
+            descriptor=drv_desc, result_kind="workflow_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    drv_batch = cm_drv.preclaimed[0]
+    drv_sid = drv_batch.target.session_id
+
+    leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L1"}})
+    cm_leaf = await port.create_many(
+        parent=drv_batch.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="b32-leaf", message_id="b32-lm1", body={"text": "work"},
+            descriptor=leaf_desc, result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
+    )
+    leaf_batch = cm_leaf.preclaimed[0]
+    leaf = leaf_batch.target
+    leaf_orig_ref = leaf_batch.input_refs[0]
+
+    # Put Driver to idle so any spurious wake=1 receipt would visibly flip Driver to queued and bump wake_pending_count
+    await port.final(
+        drv_batch, status="completed", final_text="drv-idle",
+        drain_driver_node_results=True, settle_start_input=True, write_driver_message=False,
+    )
+    drv_before = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+    assert drv_before["execution_state"] == "idle" and drv_before["wake_pending_count"] == 0
+
+    # Close the running leaf with inflight='abort', subtree='none', then let original executor call Final
+    await port.set_lifecycle(leaf, "closed", actor=ACTOR, inflight="abort", subtree="none")
+    fin = await port.final(leaf_batch, status="completed", final_text="late leaf answer")
+    assert fin.results[0].status == "cancelled"
+    assert fin.results[0].cancel_by == "removed"
+    assert fin.result_delivery_error is None
+
+    # Verify Driver has 0 receipts and wake_pending_count == 0 after closed Final
+    drv_rcpts_0 = await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_node_result'",
+        (drv_sid,),
+    )
+    assert drv_rcpts_0 == []
+    drv_mid = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+    assert drv_mid["execution_state"] == "idle" and drv_mid["wake_pending_count"] == 0
+
+    # Repeat cancel on the original leaf InputRef (and on the closed leaf target)
+    rcpt_ref = await port.cancel(leaf_orig_ref, actor=ACTOR, reason="repeat cancel closed leaf")
+    assert rcpt_ref.state == "already_finished"
+    rcpt_ref2 = await port.cancel(leaf_orig_ref, actor=ACTOR, reason="repeat cancel closed leaf 2")
+    assert rcpt_ref2.state == "already_finished"
+    rcpt_target = await port.cancel(leaf, actor=ACTOR, reason="repeat cancel target")
+    assert rcpt_target.state in {"already_finished", "idle"}
+
+    # Driver's receipt count, wake_pending_count, and execution_state MUST remain completely unchanged!
+    drv_rcpts_after = await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_node_result'",
+        (drv_sid,),
+    )
+    assert drv_rcpts_after == []
+    drv_after = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+    assert drv_after["execution_state"] == "idle"
+    assert drv_after["wake_pending_count"] == 0
+    assert drv_after["pending_count"] == 0
+
+    leaf_q = await store._db.fetchone(
+        f"SELECT terminal_status,cancel_by,result_delivery_error FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND item_id=?",
+        (leaf.session_id, leaf_orig_ref.message_id),
+    )
+    assert dict(leaf_q) == {
+        "terminal_status": "cancelled",
+        "cancel_by": "removed",
+        "result_delivery_error": None,
+    }
+
+
+async def test_b4_1_cancelled_driver_takeover_late_input_handled_by_new_worker_without_restart(registry_store):
+    """B4.1: Cancelled Driver lease-takeover closes run journal; real Worker 2 settles late input with 0 new leaf calls."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    leaf_calls = 0
+
+    class B41Model(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal leaf_calls
+            if req.system_prompt.startswith("L1"):
+                leaf_calls += 1
+                return LLMResponse(raw_text=f"leaf-call-{leaf_calls}")
+            return LLMResponse(raw_text="main-ack")
+
+    # Submit a real workflow through RuntimeClient (no worker claiming yet) so we can deterministically
+    # simulate Worker 1 owning Driver (running, send_index=1), receiving a late plain input, getting
+    # subtree-cancelled, and crashing before Final (lease expiry).
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    rt_helper = RunningAgent(
+        store, B41Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    )
+    rt2 = None
+    try:
+        main_target = await client.create_session(rt_helper.descriptor, actor=rt_helper.actor)
+        handle = await client.workflow(
+            main_target, {"name": "b41-wf", "root": leaf("L1")},
+            message_id="b41-start", actor=rt_helper.actor,
+        )
+        drv_target = handle.target
+        drv_sid = drv_target.session_id
+
+        # Confirm client.workflow created the real open run journal
+        init_journal = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert init_journal is not None and init_journal["aggregate_delivered"] is False
+
+        # Simulate Worker 1 claiming Driver Turn 1
+        drv_batch = await port.claim(drv_target, node_id="worker-1", boot_id="boot-1")
+        assert drv_batch is not None and drv_batch.send_index == 1
+
+        # While Driver is running, accept a plain wake=1 input, then cancel(driver, scope='subtree')
+        late_rcpt = await port.accept(drv_target, "late plain input", message_id="b41-late", actor=rt_helper.actor)
+        assert late_rcpt.state == "accepted"
+        await port.cancel(drv_target, actor=rt_helper.actor, scope="subtree", reason="user cancelled workflow")
+
+        # Expire Worker 1's lease and let a brand-new Worker 2 take over via periodic_tick + normal execution!
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        assert leaf_calls == 0
+
+        rt2 = await RunningAgent(
+            store, B41Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        # Worker 2 sweeps expired lease -> recovers Driver (closes run journal + settles start input + delivers
+        # cancelled workflow_result to Main + keeps Driver queued for b41-late), then executes b41-late!
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        late_res = await rt2.runtime.client.wait(late_rcpt.input_ref, actor=rt_helper.actor, deadline_ms=now_ms() + 10000)
+        assert late_res.status == "completed"
+        await rt2.drain()
+
+        # 1) Zero new leaf model invocations (workflow was NEVER restarted!)
+        assert leaf_calls == 0
+
+        # 2) Original workflow handle and stored start input remain cancelled
+        wf_res = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert wf_res.status == "cancelled"
+        assert wf_res.cancel_by == "user"
+        orig_stored = await port.get_result(handle.input_ref, actor=rt_helper.actor)
+        assert orig_stored is not None and orig_stored.status == "cancelled" and orig_stored.cancel_by == "user"
+
+        # 3) Run journal stays closed & cancelled
+        saved_journal = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert saved_journal is not None
+        assert saved_journal["status"] == "cancelled"
+        assert saved_journal["aggregate_delivered"] is True
+
+        # 4) Main received ONLY ONE workflow_result receipt (cancelled, wake=1)
+        main_wf_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_wf_rcpts) == 1
+        assert int(main_wf_rcpts[0]["wake"]) == 1
+        assert json.loads(main_wf_rcpts[0]["content_json"])["status"] == "cancelled"
+
+        # 5) Driver counts match pending (idle, 0 pending)
+        drv_st = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+        assert drv_st["execution_state"] == "idle" and drv_st["wake_pending_count"] == 0
+    finally:
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt_helper.loop.aclose()
+        await rt_helper.runtime.client.aclose()
+
+
+async def test_b4_2_first_takeover_with_merged_plain_input_keeps_start_chain_and_wait_resolves(registry_store):
+    """B4.2: Turn 1 merges [start_input, late_plain] -> uncancelled takeover attaches wfc_* to start_input & wait() completes."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+
+    class B42Model(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("L1"):
+                return LLMResponse(raw_text="L1-completed-after-takeover")
+            return LLMResponse(raw_text="main-ack")
+
+    # Submit workflow through RuntimeClient (before Worker starts) so we can queue a plain input before Turn 1 claim
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    rt_helper = RunningAgent(
+        store, B42Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    )
+    rt_worker = None
+    try:
+        main_target = await client.create_session(rt_helper.descriptor, actor=rt_helper.actor)
+        handle = await client.workflow(
+            main_target, {"name": "b42-wf", "root": leaf("L1")},
+            message_id="b42-start", actor=rt_helper.actor,
+        )
+        drv_target = handle.target
+        drv_sid = drv_target.session_id
+        start_id = handle.input_ref.message_id
+
+        # Queue a plain user input BEFORE Driver's first claim so Turn 1 merges [start_id, b42-late]
+        await port.accept(drv_target, "plain input before first claim", message_id="b42-late", actor=rt_helper.actor)
+        batch1 = await port.claim(drv_target, node_id="worker-dead", boot_id="boot-dead")
+        assert batch1 is not None and batch1.send_index == 1
+        assert [r.message_id for r in batch1.input_refs] == [start_id, "b42-late"]
+
+        # Lease expires WITHOUT cancel -> recover() must attach continuation chain to start_id (NOT b42-late)!
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec = await port.recover(drv_target, node_id="worker-2", boot_id="boot-2")
+        assert rec is not None
+
+        start_row = await store._db.fetchone(
+            f"SELECT status,terminal_status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (drv_sid, start_id),
+        )
+        assert start_row["status"] == "waiting_continuation" and start_row["terminal_status"] is None
+        wfc_rows = await store._db.fetchall(
+            f"SELECT item_id,continuation_of,continuation_index,status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_continue' ORDER BY id ASC",
+            (drv_sid,),
+        )
+        assert len(wfc_rows) == 1
+        assert wfc_rows[0]["continuation_of"] == start_id
+        assert int(wfc_rows[0]["continuation_index"]) == 1
+        assert wfc_rows[0]["status"] == "pending"
+
+        # Start a real Worker to execute the recovered workflow to completion and verify handle.wait() resolves!
+        rt_worker = await RunningAgent(
+            store, B42Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt_worker.runtime.worker.periodic_tick(limit=32)
+
+        wf_res = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert wf_res.status == "completed"
+        assert wf_res.final is not None and wf_res.final.text == "L1-completed-after-takeover"
+
+        stored_start = await port.get_result(handle.input_ref, actor=rt_helper.actor)
+        assert stored_start is not None and stored_start.status == "completed"
+        await rt_worker.drain()
+    finally:
+        if rt_worker is not None:
+            await rt_worker.aclose()
+        await client.aclose()
+        await rt_helper.loop.aclose()
+        await rt_helper.runtime.client.aclose()

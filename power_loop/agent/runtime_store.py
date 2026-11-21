@@ -77,7 +77,7 @@ _RESULT_INPUT_COLUMNS = (
     "session_id", "item_id", "kind", "status", "terminal_status",
     "result_seq", "result_send_index", "error_code", "error_detail",
     "result_delivery_error", "delivered_send_index", "continuation_of",
-    "result_json", "cancel_by",
+    "result_json", "cancel_by", "meta_json",
 )
 
 
@@ -1904,6 +1904,7 @@ class RuntimeInputStore:
                             )
 
                 # Rare path: extra inputs arrived on a pre-staged child before first claim
+                prestaged_ids: set[int] = set()
                 if srow["ready_item_json"] == "":
                     await tx.execute(
                         f"UPDATE {self.s} SET ready_item_json=NULL WHERE session_id=?",
@@ -1919,6 +1920,7 @@ class RuntimeInputStore:
                     row_ids = {int(r["id"]) for r in rows}
                     extra_pre = [r for r in prestaged if int(r["id"]) not in row_ids]
                     if extra_pre:
+                        prestaged_ids = {int(r["id"]) for r in extra_pre}
                         rows = [*extra_pre, *rows]
 
                 # Probe 4B/4C: filter pending items that already carry cancel_by (returned by release_claim)
@@ -1946,15 +1948,16 @@ class RuntimeInputStore:
                 context["refs"] = refs
                 deliv_seq = None if is_driver else seq
                 if not pending_already_delivered:
-                    ids = [int(r["id"]) for r in rows]
-                    delivered = await tx.execute(
-                        f"UPDATE {self.q} SET status='delivered',delivered_at={now_sql},"
-                        "delivered_seq=?,delivered_send_index=? "
-                        f"WHERE session_id=? AND status='pending' AND id IN ({','.join('?' for _ in ids)})",
-                        (deliv_seq, send_index, target.session_id, *ids),
-                    )
-                    if delivered != len(ids):
-                        raise SessionLeaseLost(target.session_id)
+                    ids = [int(r["id"]) for r in rows if int(r["id"]) not in prestaged_ids]
+                    if ids:
+                        delivered = await tx.execute(
+                            f"UPDATE {self.q} SET status='delivered',delivered_at={now_sql},"
+                            "delivered_seq=?,delivered_send_index=? "
+                            f"WHERE session_id=? AND status='pending' AND id IN ({','.join('?' for _ in ids)})",
+                            (deliv_seq, send_index, target.session_id, *ids),
+                        )
+                        if delivered != len(ids):
+                            raise SessionLeaseLost(target.session_id)
 
                 merged = self.merge_batch(rows)
                 merged_json = canonical(merged)
@@ -3133,16 +3136,14 @@ class RuntimeInputStore:
         if deliver_parent_sid is not None and deliver_res_kind is not None:
             child_wake = 0 if (effective_cancel_by == "subtree" or subtree_raced) else 1
             route_final_text = final_text
-            route_usage = usage
             route_structured = structured_output
             if effective_status == "cancelled" and result_seq is None and not write_message:
                 route_final_text = ""
-                route_usage = {}
                 route_structured = structured_output if result_json is not None else None
             route_result = Result(
                 deliver_source_ref or consumed_refs[0], batch.target, effective_status,
                 batch.send_index, result_seq,
-                route_final_text, route_usage, route_structured, effective_error, effective_error_code,
+                route_final_text, usage, route_structured, effective_error, effective_error_code,
                 cancel_by=effective_cancel_by if effective_status == "cancelled" else None,
             )
             result_ref, delivery_error = await self._river_deliver_tx(
@@ -3260,6 +3261,8 @@ class RuntimeInputStore:
         # Step 4: 0 UPDATE follow_up_queue on normal completion!
         # Only update follow_up_queue on abnormal status, delivery_error, or explicit settle_start_input.
         res_json_str = canonical(result_json) if result_json is not None else None
+        usage_plain = plain(usage) if usage else {}
+        persist_usage_in_meta = bool(usage_plain and result_seq is None and not write_message)
         target_chain_ids: tuple[str, ...] | None = settle_chain_ids
         if target_chain_ids is None and settle_start_input and batch.start_input_message_id is not None:
             target_chain_ids = (batch.start_input_message_id,)
@@ -3278,6 +3281,18 @@ class RuntimeInputStore:
                     sid, *target_chain_ids,
                 ),
             )
+            if persist_usage_in_meta:
+                mrows = await tx.fetchall(
+                    f"SELECT item_id,meta_json FROM {self.q} WHERE session_id=? AND item_id IN ({ph})",
+                    (sid, *target_chain_ids),
+                )
+                for mrow in mrows:
+                    qmeta = json.loads(mrow["meta_json"] or "{}")
+                    qmeta["result_usage"] = usage_plain
+                    await tx.execute(
+                        f"UPDATE {self.q} SET meta_json=? WHERE session_id=? AND item_id=?",
+                        (canonical(qmeta), sid, mrow["item_id"]),
+                    )
         elif (
             effective_status != "completed"
             or delivery_error is not None
@@ -3286,22 +3301,48 @@ class RuntimeInputStore:
         ):
             consumed_ids = [ref.message_id for ref in consumed_refs]
             if consumed_ids:
+                c_ph = ",".join("?" for _ in consumed_ids)
+                meta_clause = ""
+                meta_params: tuple[Any, ...] = ()
+                per_item_metas: list[tuple[str, str]] = []
+                if persist_usage_in_meta:
+                    mrows = await tx.fetchall(
+                        f"SELECT item_id,meta_json FROM {self.q} WHERE session_id=? AND item_id IN ({c_ph})",
+                        (sid, *consumed_ids),
+                    )
+                    updated_metas: dict[str, str] = {}
+                    for mrow in mrows:
+                        qmeta = json.loads(mrow["meta_json"] or "{}")
+                        qmeta["result_usage"] = usage_plain
+                        updated_metas[str(mrow["item_id"])] = canonical(qmeta)
+                    uniq_metas = set(updated_metas.values())
+                    if len(uniq_metas) == 1:
+                        meta_clause = ",meta_json=?"
+                        meta_params = (next(iter(uniq_metas)),)
+                    else:
+                        per_item_metas = list(updated_metas.items())
                 changed = await tx.execute(
                     f"UPDATE {self.q} SET terminal_status=?,cancel_by=?,result_seq=?,"
                     "result_send_index=?,result_json=?,error_code=?,error_detail=?,"
-                    f"result_delivery_error=?,completed_at={now_sql} "
+                    f"result_delivery_error=?,completed_at={now_sql}{meta_clause} "
                     "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
-                    f"AND item_id IN ({','.join('?' for _ in consumed_ids)})",
+                    f"AND item_id IN ({c_ph})",
                     (
                         effective_status,
                         effective_cancel_by if effective_status == "cancelled" else None,
                         result_seq, batch.send_index,
                         res_json_str, effective_error_code, effective_error, delivery_error,
+                        *meta_params,
                         sid, batch.send_index, *consumed_ids,
                     ),
                 )
                 if changed != len(consumed_ids):
                     raise SessionLeaseLost(sid)
+                for mid, mjson in per_item_metas:
+                    await tx.execute(
+                        f"UPDATE {self.q} SET meta_json=? WHERE session_id=? AND item_id=?",
+                        (mjson, sid, mid),
+                    )
 
         settle_refs = (
             tuple(InputRef(batch.target.store_id, sid, mid) for mid in target_chain_ids)
@@ -4083,6 +4124,88 @@ class RuntimeInputStore:
             ttl_s=ttl_s, can_execute=can_execute,
         )
 
+    async def _select_workflow_origin_tx(
+        self, tx, own_state, origins: list[InputRecord],
+    ) -> InputRecord:
+        """Select the true workflow run origin when a Driver send merged multiple inputs.
+
+        Priority:
+        1. Existing ``workflow_continue`` continuation chain item.
+        2. The session's ``start_input_message_id`` (initial workflow start input).
+        3. Explicit ``resume_run`` input matching saved journal ``definition_ref`` or
+           carrying ``{"workflow_resume": ...}``.
+        4. Fallback to ``origins[-1]`` (late inputs after completion).
+        """
+        for o in reversed(origins):
+            if o.row["kind"] == "workflow_continue":
+                return o
+        start_id = own_state["start_input_message_id"]
+        if start_id is not None:
+            for o in origins:
+                if o.ref.message_id == start_id:
+                    return o
+            from power_loop.workflow import journal
+            saved = await journal.get(
+                self.store, tx, own_state["session_id"], journal.run_key(start_id),
+            )
+            def_ref = (saved or {}).get("definition_ref") if isinstance(saved, dict) else None
+            def_msg_id = def_ref.get("message_id") if isinstance(def_ref, dict) else None
+            if def_msg_id:
+                for o in origins:
+                    if o.ref.message_id == def_msg_id:
+                        return o
+        for o in reversed(origins):
+            try:
+                parsed = json.loads(o.row["content_json"])
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and "workflow_resume" in parsed:
+                return o
+        return origins[-1]
+
+    async def _close_workflow_run_journal_tx(
+        self, tx, state, *, primary_ref: InputRef, cby: str, reason: str, database_now: int,
+    ) -> dict[str, Any] | None:
+        """Atomically close an open workflow run journal on cancelled takeover/void."""
+        if state["session_kind"] != "workflow_driver":
+            return None
+        run_id = state["start_input_message_id"]
+        if not run_id:
+            return None
+        from power_loop.workflow import journal
+
+        sid = state["session_id"]
+        saved = await journal.get(self.store, tx, sid, journal.run_key(run_id))
+        if saved is None or saved.get("aggregate_delivered"):
+            return None
+        desc_obj = json.loads(state["descriptor_json"])
+        wf_name = (
+            ((desc_obj.get("config") or {}).get("workflow") or {}).get("spec", {}).get("name")
+            or run_id
+        )
+        agg_final = {
+            "name": wf_name,
+            "status": "cancelled",
+            "results": {},
+            "final": None,
+            "usage": {},
+            "errors": [reason] if reason and reason != "cancelled" else [],
+            "tolerated": [],
+            "cancel_by": cby,
+        }
+        saved.update(
+            status="cancelled",
+            cancel_by=cby,
+            result=agg_final,
+            result_seq=None,
+            aggregate_delivered=True,
+            aggregate_delivered_at=database_now,
+            continuation={},
+            last_input_ref=plain(primary_ref),
+        )
+        await journal.put(self.store, tx, sid, journal.run_key(run_id), saved)
+        return agg_final
+
     async def _recover_workflow_tx(
         self, tx, own_state, target: TargetRef, active: int, epoch: int, database_now: int,
         undeliverable_out: list[tuple[TargetRef, str, Result, str, str]],
@@ -4105,16 +4228,20 @@ class RuntimeInputStore:
             result_ref = None
             activations: list[TargetRef] = []
             settled_refs: list[InputRef] = []
+            agg_final: dict[str, Any] | None = None
             if origins:
-                primary = next(
-                    (o for o in reversed(origins) if o.row["kind"] == "workflow_continue"),
-                    origins[-1],
-                )
+                primary = await self._select_workflow_origin_tx(tx, own_state, origins)
                 root = await self._continuation_root(tx, primary)
+                agg_final = await self._close_workflow_run_journal_tx(
+                    tx, own_state, primary_ref=primary.ref, cby=cby, reason=reason,
+                    database_now=database_now,
+                )
+                res_json_str = canonical(agg_final) if agg_final is not None else None
                 route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
                 if route is not None:
                     cancelled_res = Result(
                         root.ref, target, "cancelled", active, None,
+                        structured_output=agg_final,
                         error=reason, error_code="cancelled", cancel_by=cby,
                     )
                     result_ref, delivery_error = await self._river_deliver_tx(
@@ -4140,10 +4267,10 @@ class RuntimeInputStore:
                         ))
                 await tx.execute(
                     f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
-                    "result_send_index=?,error_code='cancelled',error_detail=?,"
+                    "result_send_index=?,result_json=?,error_code='cancelled',error_detail=?,"
                     "result_delivery_error=?,completed_at=? WHERE session_id=? "
                     "AND delivered_send_index=? AND terminal_status IS NULL",
-                    (cby, active, reason, delivery_error, database_now, sid, active),
+                    (cby, active, res_json_str, reason, delivery_error, database_now, sid, active),
                 )
                 ancestors: list[str] = []
                 seen_anc: set[str] = set()
@@ -4165,10 +4292,10 @@ class RuntimeInputStore:
                 if ancestors:
                     await tx.execute(
                         f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
-                        "result_send_index=?,error_code='cancelled',error_detail=?,"
+                        "result_send_index=?,result_json=?,error_code='cancelled',error_detail=?,"
                         "result_delivery_error=?,completed_at=? WHERE session_id=? "
                         f"AND item_id IN ({','.join('?' for _ in ancestors)})",
-                        (cby, active, reason, delivery_error, database_now, sid, *ancestors),
+                        (cby, active, res_json_str, reason, delivery_error, database_now, sid, *ancestors),
                     )
             w_drain, p_drain, b_drain = await self._drain_pending_driver_node_results_tx(
                 tx, sid, active,
@@ -4199,6 +4326,7 @@ class RuntimeInputStore:
             results = tuple(
                 Result(
                     ref, target, "cancelled", active, None,
+                    structured_output=agg_final,
                     error=reason, error_code="cancelled", result_delivery_error=delivery_error,
                     cancel_by=cby,
                 )
@@ -4235,10 +4363,7 @@ class RuntimeInputStore:
                 else "idle"
             )
         else:
-            origin = next(
-                (o for o in reversed(origins) if o.row["kind"] == "workflow_continue"),
-                origins[-1],
-            )
+            origin = await self._select_workflow_origin_tx(tx, own_state, origins)
             root = await self._continuation_root(tx, origin)
             index = int(origin.row["continuation_index"] or 0) + 1
             message_id = "wfc_" + sha256_canonical([
@@ -4947,9 +5072,24 @@ class RuntimeInputStore:
                 and route.get("result_kind") == "workflow_node_result"
                 and row["reply_to_session_id"] is None
             )
+            agg_void: dict[str, Any] | None = None
+            if (
+                state["session_kind"] == "workflow_driver"
+                and row["kind"] in ("user", "workflow_continue")
+                and (
+                    root_rec.ref.message_id == state["start_input_message_id"]
+                    or row["continuation_of"] is not None
+                )
+            ):
+                agg_void = await self._close_workflow_run_journal_tx(
+                    tx, state, primary_ref=rec.ref, cby=cancel_by, reason=reason,
+                    database_now=now_ms(),
+                )
+            res_json_void = canonical(agg_void) if agg_void is not None else None
             if route is not None and not is_human_direct_leaf and row["kind"] in ("user", "workflow_continue"):
                 cancelled_res = Result(
                     root_rec.ref, target, "cancelled", None, None,
+                    structured_output=agg_void,
                     error=reason, error_code="cancelled", cancel_by=cancel_by,
                 )
                 parent_ref, delivery_error = await self._river_deliver_tx(
@@ -4977,9 +5117,9 @@ class RuntimeInputStore:
                     ))
             affected = await tx.execute(
                 f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
-                "error_code='cancelled',error_detail=?,result_delivery_error=?,"
-                f"completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
-                (cancel_by, reason, delivery_error, sid, rec.ref.message_id),
+                "result_json=COALESCE(result_json,?),error_code='cancelled',error_detail=?,"
+                f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+                (cancel_by, res_json_void, reason, delivery_error, sid, rec.ref.message_id),
             )
             changed += affected
             if affected:
@@ -4996,11 +5136,12 @@ class RuntimeInputStore:
                 if ancestors_to_close:
                     await tx.execute(
                         f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
-                        "result_send_index=delivered_send_index,error_code='cancelled',error_detail=?,"
+                        "result_send_index=delivered_send_index,result_json=COALESCE(result_json,?),"
+                        "error_code='cancelled',error_detail=?,"
                         f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? "
                         f"AND item_id IN ({','.join('?' for _ in ancestors_to_close)}) "
                         "AND status='waiting_continuation' AND terminal_status IS NULL",
-                        (cancel_by, reason, delivery_error, sid, *ancestors_to_close),
+                        (cancel_by, res_json_void, reason, delivery_error, sid, *ancestors_to_close),
                     )
 
         # Handle queued pre-staged child (send_index=0 and ready_item_json IS NOT NULL)
@@ -5051,11 +5192,7 @@ class RuntimeInputStore:
 
         if not pending_rows and not is_prestaged and route is not None:
             start = await self.input(tx, InputRef(**route["input_ref"]))
-            if (
-                start is not None
-                and start.row["terminal_status"] is not None
-                and start.row.get("error_code") != "session_closed"
-            ):
+            if start is not None and self._can_redeliver_stored_result(state, start.row):
                 await self._route_stored_result_tx(
                     tx, state, route, start, activations,
                     _driver_events_out=_driver_events_out,
@@ -5109,11 +5246,7 @@ class RuntimeInputStore:
         derived_latest = await self._derive_input_terminal(tx, dict(state), latest.row)
         if derived_latest["terminal_status"] is not None:
             route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
-            if (
-                route is not None
-                and latest.row["terminal_status"] is not None
-                and latest.row.get("error_code") != "session_closed"
-            ):
+            if route is not None and self._can_redeliver_stored_result(state, latest.row):
                 latest_full = await self.input(tx, latest.ref)
                 if latest_full is not None:
                     await self._route_stored_result_tx(
@@ -5142,10 +5275,16 @@ class RuntimeInputStore:
         w_val = int(latest_full.row["wake"]) if latest_full is not None else 1
         b_val = int(latest_full.row["content_bytes"]) if latest_full is not None else 0
         route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
+        agg_void = await self._close_workflow_run_journal_tx(
+            tx, state, primary_ref=latest.ref, cby=cancel_by, reason=reason,
+            database_now=now_ms(),
+        )
+        res_json_void = canonical(agg_void) if agg_void is not None else None
         delivery_error = None
         if route is not None:
             cancelled = Result(
                 root.ref, target, "cancelled", None, None,
+                structured_output=agg_void,
                 error=reason, error_code="cancelled", cancel_by=cancel_by,
             )
             _, delivery_error = await self._river_deliver_tx(
@@ -5171,9 +5310,9 @@ class RuntimeInputStore:
                 ))
         changed = await tx.execute(
             f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
-            "error_code='cancelled',error_detail=?,result_delivery_error=?,"
-            f"completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
-            (cancel_by, reason, delivery_error, sid, latest.ref.message_id),
+            "result_json=COALESCE(result_json,?),error_code='cancelled',error_detail=?,"
+            f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+            (cancel_by, res_json_void, reason, delivery_error, sid, latest.ref.message_id),
         )
         if changed != 1:
             raise SessionLeaseLost(sid)
@@ -5197,11 +5336,12 @@ class RuntimeInputStore:
         if ancestors:
             await tx.execute(
                 f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
-                "result_send_index=delivered_send_index,error_code='cancelled',error_detail=?,"
+                "result_send_index=delivered_send_index,result_json=COALESCE(result_json,?),"
+                "error_code='cancelled',error_detail=?,"
                 f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? "
                 f"AND item_id IN ({','.join('?' for _ in ancestors)}) "
                 "AND status='waiting_continuation' AND terminal_status IS NULL",
-                (cancel_by, reason, delivery_error, sid, *ancestors),
+                (cancel_by, res_json_void, reason, delivery_error, sid, *ancestors),
             )
             completed_refs.extend(closed_refs)
 
@@ -5238,8 +5378,7 @@ class RuntimeInputStore:
         if derived["terminal_status"] is not None:
             if (
                 route is not None
-                and row["terminal_status"] is not None
-                and row.get("error_code") != "session_closed"
+                and self._can_redeliver_stored_result(state, row)
                 and not is_human_direct_leaf
             ):
                 await self._route_stored_result_tx(
@@ -5313,6 +5452,19 @@ class RuntimeInputStore:
             return self.receipt(record, state="cancel_requested", reason=reason)
         return self.receipt(record, state="already_finished")
 
+    @staticmethod
+    def _can_redeliver_stored_result(state, row) -> bool:
+        """Return False for locally-terminated closed-session inputs that never had delivery eligibility."""
+        if row["terminal_status"] is None:
+            return False
+        if row.get("error_code") == "session_closed":
+            return False
+        if row.get("cancel_by") == "removed":
+            return False
+        if state["lifecycle"] in ("closing", "closed") and row.get("result_delivery_error") is None:
+            return False
+        return True
+
     async def _route_stored_result_tx(
         self, tx, session, route, record, activations=None, *, parent_state=None,
         _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
@@ -5334,29 +5486,64 @@ class RuntimeInputStore:
                 head = self.record(child)
             record = head
         row = record.row
+        child_target = TargetRef(self.store.store_id, record.ref.session_id)
+        parent_sid = route["target"]["session_id"]
+        start_ref = InputRef(**route["input_ref"])
+        result_si = row["result_send_index"]
+
+        source_ref = record.ref
+        first_meta_json: str | None = None
+        if row.get("continuation_of") is not None:
+            source_ref = (await self._continuation_root(tx, record)).ref
+        elif session_kind == "workflow_driver" and route is not None:
+            source_ref = start_ref
+        elif result_si is not None:
+            # Merged multi-input send: River receipt always used the send's canonical first routed input.
+            first_row = await tx.fetchone(
+                f"SELECT item_id,meta_json FROM {self.q} "
+                "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                "ORDER BY CASE WHEN reply_to_session_id IS NOT NULL THEN 0 ELSE 1 END, "
+                "CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                (record.ref.session_id, result_si),
+            )
+            if first_row is not None:
+                source_ref = InputRef(self.store.store_id, record.ref.session_id, str(first_row["item_id"]))
+                first_meta_json = first_row["meta_json"]
+
+        effective_start = source_ref if result_si is None else start_ref
+        message_id = result_message_id(child_target, effective_start, result_si, route["result_kind"])
+        if row["result_delivery_error"] is None:
+            existing_parent = await tx.fetchone(
+                f"SELECT id FROM {self.q} WHERE session_id=? AND item_id=? LIMIT 1",
+                (parent_sid, message_id),
+            )
+            if existing_parent is not None:
+                return InputRef(self.store.store_id, parent_sid, message_id), None
+
         final_text, usage, structured = "", {}, None
         if row["result_seq"] is not None:
             message = await tx.fetchone(
                 f"SELECT content,meta_json FROM {self.store.t.messages} "
                 "WHERE session_id=? AND seq=? AND send_index=?",
-                (record.ref.session_id, row["result_seq"], row["result_send_index"]),
+                (record.ref.session_id, row["result_seq"], result_si),
             )
             if message is not None:
                 final_text = message["content"] or ""
                 meta = json.loads(message["meta_json"] or "{}")
                 usage = meta.get("usage") or {}
                 structured = meta.get("structured_output")
+        else:
+            stored_usage = record.meta.get("result_usage")
+            if not stored_usage and first_meta_json:
+                stored_usage = (json.loads(first_meta_json) or {}).get("result_usage")
+            if stored_usage:
+                usage = dict(stored_usage)
         if structured is None and row.get("result_json"):
             structured = json.loads(row["result_json"])
         stored_cancel_by = row.get("cancel_by") if row["terminal_status"] == "cancelled" else None
-        source_ref = record.ref
-        if row.get("continuation_of") is not None:
-            source_ref = (await self._continuation_root(tx, record)).ref
-        elif session_kind == "workflow_driver" and route is not None:
-            source_ref = InputRef(**route["input_ref"])
         existing = Result(
-            source_ref, TargetRef(self.store.store_id, record.ref.session_id),
-            row["terminal_status"], row["result_send_index"], row["result_seq"],
+            source_ref, child_target,
+            row["terminal_status"], result_si, row["result_seq"],
             final_text, usage, structured, row["error_detail"], row["error_code"],
             row["result_delivery_error"],
             cancel_by=stored_cancel_by,
@@ -5364,11 +5551,11 @@ class RuntimeInputStore:
         child_wake = 0 if (row["terminal_status"] == "cancelled" and stored_cancel_by == "subtree") else 1
         result_ref, delivery_error = await self._river_deliver_tx(
             tx,
-            child_target=TargetRef(self.store.store_id, record.ref.session_id),
+            child_target=child_target,
             child_tenant_id=session["tenant_id"],
             child_principal_id=session["principal_id"],
-            parent_session_id=route["target"]["session_id"],
-            start_ref=InputRef(**route["input_ref"]),
+            parent_session_id=parent_sid,
+            start_ref=start_ref,
             result=existing,
             result_kind=route["result_kind"],
             child_wake=child_wake,
@@ -5376,10 +5563,17 @@ class RuntimeInputStore:
             _driver_events_out=_driver_events_out,
         )
         if delivery_error != row["result_delivery_error"]:
-            await tx.execute(
-                f"UPDATE {self.q} SET result_delivery_error=? WHERE session_id=? AND item_id=?",
-                (delivery_error, record.ref.session_id, record.ref.message_id),
-            )
+            if result_si is not None and delivery_error is None:
+                await tx.execute(
+                    f"UPDATE {self.q} SET result_delivery_error=NULL "
+                    "WHERE session_id=? AND status='delivered' AND delivered_send_index=?",
+                    (record.ref.session_id, result_si),
+                )
+            else:
+                await tx.execute(
+                    f"UPDATE {self.q} SET result_delivery_error=? WHERE session_id=? AND item_id=?",
+                    (delivery_error, record.ref.session_id, record.ref.message_id),
+                )
             if row["result_seq"] is not None:
                 message = await tx.fetchone(
                     f"SELECT meta_json FROM {self.store.t.messages} WHERE session_id=? AND seq=?",
@@ -6964,7 +7158,7 @@ class RuntimeInputStore:
         row = await reader.fetchone(
             f"SELECT session_id,item_id,kind,status,terminal_status,result_seq,"
             "result_send_index,error_code,error_detail,result_delivery_error,"
-            "delivered_send_index,continuation_of,result_json,cancel_by "
+            "delivered_send_index,continuation_of,result_json,cancel_by,meta_json "
             f"FROM {self.q} WHERE session_id=? AND continuation_of=? "
             "ORDER BY continuation_index DESC LIMIT 1",
             (record.ref.session_id, record.ref.message_id),
@@ -6997,6 +7191,7 @@ class RuntimeInputStore:
             "q.error_detail AS input_error_detail,q.result_delivery_error AS input_result_delivery_error,"
             "q.delivered_send_index AS input_delivered_send_index,q.continuation_of AS input_continuation_of,"
             "q.result_json AS input_result_json,q.cancel_by AS input_cancel_by,"
+            "q.meta_json AS input_meta_json,"
             "m.seq AS message_seq,m.content AS message_content,m.meta_json AS message_meta_json "
             f"FROM {self.s} s LEFT JOIN {self.q} q "
             "ON q.session_id=s.session_id AND q.item_id=? "
@@ -7039,6 +7234,7 @@ class RuntimeInputStore:
             "continuation_of": row["input_continuation_of"],
             "result_json": row["input_result_json"],
             "cancel_by": row["input_cancel_by"],
+            "meta_json": row["input_meta_json"],
         }
         record = ResultInput(ref, input_dict)
         continuation = (
@@ -7099,6 +7295,10 @@ class RuntimeInputStore:
                 meta = json.loads(message["meta_json"] or "{}")
                 usage = meta.get("usage") or {}
                 structured = meta.get("structured_output")
+        if not usage and resolved.row.get("meta_json"):
+            qmeta = json.loads(resolved.row["meta_json"] or "{}")
+            if qmeta.get("result_usage"):
+                usage = dict(qmeta["result_usage"])
         if structured is None and resolved.row.get("result_json"):
             structured = json.loads(resolved.row["result_json"])
         return Result(
