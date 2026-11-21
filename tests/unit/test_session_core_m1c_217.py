@@ -3020,3 +3020,219 @@ async def test_m1c_r6_real_worker_system_notice_wake_false_4_4_4_sql(
         await rt.client.aclose()
         await rt.transport.aclose()
         store._db = original
+
+
+# ── 13. Round-7 Rework Regressions ──────────────────────────────────────────
+
+
+async def test_m1c_r7_concurrent_rebound_child_and_old_parent_final_no_deadlock(registry_store):
+    """R7-B2: Rebound child C settles to B while old parent A's row lock is held & A->C settles (0 deadlocks)."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, connect = registry_store
+    peer = await connect(schema="verify")
+    tr1 = MemoryMessageTransport()
+    tr2 = MemoryMessageTransport()
+    c1 = RuntimeClient(store=store, transport=tr1)
+    c2 = RuntimeClient(store=peer, transport=tr2)
+    p1 = c1.inputs
+    p2 = c2.inputs
+    try:
+        main_a = await c1.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "overlap-a"})
+        main_b = await c1.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "overlap-b"})
+        child_c = await c1.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": "overlap-c"},
+        )
+
+        # 1. Public send to C explicitly routing receipt to A; C claims
+        await c1.send(
+            child_c,
+            "work for c",
+            message_id="c-msg-1",
+            actor=ACTOR,
+            reply_route={"target": main_a, "result_kind": "agent_result"},
+        )
+        batch_c = await p1.claim(child_c, node_id="n-c", boot_id="b-c")
+        assert batch_c is not None
+        assert batch_c.reply_to_session_id == main_a.session_id
+
+        # 2. Rebind C from A to B and commit; confirm DB route on C's claimed item is now B
+        rb = await p1.rebind_children(main_a, main_b, actor=ACTOR)
+        assert rb.rebound_children == (child_c.session_id,)
+        q_c = await store._db.fetchone(
+            f"SELECT reply_to_session_id FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id='c-msg-1'",
+            (child_c.session_id,),
+        )
+        assert q_c is not None and q_c["reply_to_session_id"] == main_b.session_id
+
+        # 3. Public send to A explicitly routing receipt to C; A claims
+        await c2.send(
+            main_a,
+            "work for a",
+            message_id="a-msg-1",
+            actor=ACTOR,
+            reply_route={"target": child_c, "result_kind": "agent_result"},
+        )
+        batch_a = await p2.claim(main_a, node_id="n-a", boot_id="b-a")
+        assert batch_a is not None
+        assert batch_a.reply_to_session_id == child_c.session_id
+
+        # 4. Concurrent Final with explicit consumed on two DB connections:
+        #    Hold BOTH row locks (C on conn 1, A on conn 2), then require C -> B to complete AND
+        #    COMMIT while conn 2 STILL holds A's row lock, before releasing A -> C!
+        dialect = store._db.dialect.name
+        if dialect in ("postgres", "mysql"):
+            c_locked = asyncio.Event()
+            a_locked = asyncio.Event()
+            c_committed = asyncio.Event()
+
+            orig_river_c = p1._river_deliver_tx
+            orig_river_a = p2._river_deliver_tx
+            c_entered_once = False
+            a_entered_once = False
+
+            async def hooked_river_c(tx, **kwargs):
+                nonlocal c_entered_once
+                if not c_entered_once:
+                    c_entered_once = True
+                    c_locked.set()
+                    await asyncio.wait_for(a_locked.wait(), 5)
+                return await orig_river_c(tx, **kwargs)
+
+            async def hooked_river_a(tx, **kwargs):
+                nonlocal a_entered_once
+                if not a_entered_once:
+                    a_entered_once = True
+                    a_locked.set()
+                    await asyncio.wait_for(c_locked.wait(), 5)
+                    # Prove C redirects to B and commits WITHOUT waiting for A's row lock!
+                    await asyncio.wait_for(c_committed.wait(), 5)
+                return await orig_river_a(tx, **kwargs)
+
+            p1._river_deliver_tx = hooked_river_c  # type: ignore[method-assign]
+            p2._river_deliver_tx = hooked_river_a  # type: ignore[method-assign]
+
+            async def settle_c():
+                res = await p1.final(batch_c, consumed=batch_c.input_refs, final_text="c done to b")
+                c_committed.set()
+                return res
+
+            async def settle_a():
+                return await p2.final(batch_a, consumed=batch_a.input_refs, final_text="a done to c")
+
+            fb_c, fb_a = await asyncio.gather(settle_c(), settle_a())
+        else:
+            fb_c, fb_a = await asyncio.gather(
+                p1.final(batch_c, consumed=batch_c.input_refs, final_text="c done to b"),
+                p2.final(batch_a, consumed=batch_a.input_refs, final_text="a done to c"),
+            )
+
+        assert fb_c.result_delivery_error is None
+        assert fb_c.result_activation == main_b
+        assert fb_a.result_delivery_error is None
+
+        # Verify both sessions settled cleanly (neither rolled back to 'running')
+        s_a = await store._db.fetchone(
+            f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?", (main_a.session_id,),
+        )
+        s_b = await store._db.fetchone(
+            f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?", (main_b.session_id,),
+        )
+        s_c = await store._db.fetchone(
+            f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?", (child_c.session_id,),
+        )
+        assert s_a is not None and s_a["execution_state"] == "idle"
+        assert s_b is not None and s_b["execution_state"] == "queued"
+        assert s_c is not None and s_c["execution_state"] == "queued"
+
+        # B received exactly 1 receipt from C; C received exactly 1 receipt from A; A received 0 receipts
+        b_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=? AND status='pending'",
+            (main_b.session_id,),
+        )
+        c_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=? AND status='pending'",
+            (child_c.session_id,),
+        )
+        a_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=? AND status='pending'",
+            (main_a.session_id,),
+        )
+        assert len(b_inbox) == 1
+        assert len(c_inbox) == 1
+        assert a_inbox == []
+        b_body = json.loads(b_inbox[0]["content_json"])
+        c_body = json.loads(c_inbox[0]["content_json"])
+        assert b_body["final_text"] == "c done to b"
+        assert b_body["input_ref"]["message_id"] == "c-msg-1"
+        assert c_body["final_text"] == "a done to c"
+        assert c_body["input_ref"]["message_id"] == "a-msg-1"
+
+        # 5. Simultaneous release after both hold row locks: zero deadlocks (MySQL 1213 == 0)
+        if dialect in ("postgres", "mysql"):
+            main_a2 = await c1.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "overlap2-a"})
+            main_b2 = await c1.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "overlap2-b"})
+            child_c2 = await c1.create_session(
+                DESCRIPTOR, actor=ACTOR, parent=main_a2, options={"session_id": "overlap2-c"},
+            )
+            await c1.send(
+                child_c2, "c2 work", message_id="c2-msg", actor=ACTOR,
+                reply_route={"target": main_a2, "result_kind": "agent_result"},
+            )
+            bc2 = await p1.claim(child_c2, node_id="n-c2", boot_id="b-c2")
+            assert bc2 is not None
+            await p1.rebind_children(main_a2, main_b2, actor=ACTOR)
+
+            await c2.send(
+                main_a2, "a2 work", message_id="a2-msg", actor=ACTOR,
+                reply_route={"target": child_c2, "result_kind": "agent_result"},
+            )
+            ba2 = await p2.claim(main_a2, node_id="n-a2", boot_id="b-a2")
+            assert ba2 is not None
+
+            ev_c2 = asyncio.Event()
+            ev_a2 = asyncio.Event()
+            once_c2 = False
+            once_a2 = False
+
+            async def sim_river_c(tx, **kwargs):
+                nonlocal once_c2
+                if not once_c2:
+                    once_c2 = True
+                    ev_c2.set()
+                    await asyncio.wait_for(ev_a2.wait(), 5)
+                return await orig_river_c(tx, **kwargs)
+
+            async def sim_river_a(tx, **kwargs):
+                nonlocal once_a2
+                if not once_a2:
+                    once_a2 = True
+                    ev_a2.set()
+                    await asyncio.wait_for(ev_c2.wait(), 5)
+                return await orig_river_a(tx, **kwargs)
+
+            p1._river_deliver_tx = sim_river_c  # type: ignore[method-assign]
+            p2._river_deliver_tx = sim_river_a  # type: ignore[method-assign]
+
+            fb_c2, fb_a2 = await asyncio.gather(
+                p1.final(bc2, consumed=bc2.input_refs, final_text="c2 done"),
+                p2.final(ba2, consumed=ba2.input_refs, final_text="a2 done"),
+            )
+            assert fb_c2.result_delivery_error is None and fb_c2.result_activation == main_b2
+            assert fb_a2.result_delivery_error is None
+            b2_in = await store._db.fetchall(
+                f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND status='pending'",
+                (main_b2.session_id,),
+            )
+            c2_in = await store._db.fetchall(
+                f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND status='pending'",
+                (child_c2.session_id,),
+            )
+            assert len(b2_in) == 1 and len(c2_in) == 1
+    finally:
+        await c1.aclose()
+        await c2.aclose()
+        await tr1.aclose()
+        await tr2.aclose()
+        await peer.close()

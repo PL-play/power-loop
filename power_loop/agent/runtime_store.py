@@ -3056,31 +3056,66 @@ class RuntimeInputStore:
             )
 
         if self._dialect == "mysql":
-            p_rc, p_packed = await tx.execute_packed(
-                f"UPDATE {self.s} SET "
-                "inbox_version=(LAST_INSERT_ID("
-                "((inbox_version+1)<<1)|"
-                "(CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
-                ")>>1),"
-                "wake_inbox_seq=wake_inbox_seq+?,"
-                "wake_pending_count=wake_pending_count+?,"
-                "pending_count=pending_count+1,"
-                "pending_bytes=pending_bytes+?,"
-                "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 "
-                "THEN 'queued' ELSE execution_state END,"
-                f"updated_at={now_sql} "
-                "WHERE session_id=? AND lifecycle IN ('open','suspended') "
-                "AND tenant_id=? AND principal_id=? "
-                "AND pending_count<? AND (pending_bytes+?)<=? "
-                f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)"
-                f"{source_route_sql}",
-                (
-                    child_wake, child_wake, child_wake, content_bytes, child_wake,
-                    parent_session_id, child_tenant_id, child_principal_id,
-                    self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
-                    parent_session_id, message_id, *source_route_params,
-                ),
-            )
+            if verify_source_item_id is not None:
+                # Materialize the 1-row source-route check via uq_inbox_item FIRST (LIMIT 1
+                # disables derived_merge constant propagation onto _p.session_id, keeping _p
+                # eq_ref instead of const). When an in-flight rebind retargeted the child's
+                # route away from parent_session_id, _src yields 0 rows and MySQL never
+                # probes or locks the stale old parent row (0 AB-BA deadlocks!).
+                p_rc, p_packed = await tx.execute_packed(
+                    "UPDATE ("
+                    f"SELECT reply_to_session_id AS _target_sid FROM {self.q} "
+                    "WHERE session_id=? AND item_id=? AND reply_to_session_id=? LIMIT 1"
+                    f") AS _src STRAIGHT_JOIN {self.s} AS _p ON _p.session_id=_src._target_sid "
+                    "SET "
+                    "_p.inbox_version=(LAST_INSERT_ID("
+                    "((_p.inbox_version+1)<<1)|"
+                    "(CASE WHEN _p.lifecycle='open' AND _p.execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                    ")>>1),"
+                    "_p.wake_inbox_seq=_p.wake_inbox_seq+?,"
+                    "_p.wake_pending_count=_p.wake_pending_count+?,"
+                    "_p.pending_count=_p.pending_count+1,"
+                    "_p.pending_bytes=_p.pending_bytes+?,"
+                    "_p.execution_state=CASE WHEN _p.lifecycle='open' AND _p.execution_state='idle' AND ?=1 "
+                    "THEN 'queued' ELSE _p.execution_state END,"
+                    f"_p.updated_at={now_sql} "
+                    "WHERE _p.lifecycle IN ('open','suspended') "
+                    "AND _p.tenant_id=? AND _p.principal_id=? "
+                    "AND _p.pending_count<? AND (_p.pending_bytes+?)<=? "
+                    f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=_p.session_id AND item_id=?)",
+                    (
+                        child_target.session_id, verify_source_item_id, parent_session_id,
+                        child_wake, child_wake, child_wake, content_bytes, child_wake,
+                        child_tenant_id, child_principal_id,
+                        self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
+                        message_id,
+                    ),
+                )
+            else:
+                p_rc, p_packed = await tx.execute_packed(
+                    f"UPDATE {self.s} SET "
+                    "inbox_version=(LAST_INSERT_ID("
+                    "((inbox_version+1)<<1)|"
+                    "(CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                    ")>>1),"
+                    "wake_inbox_seq=wake_inbox_seq+?,"
+                    "wake_pending_count=wake_pending_count+?,"
+                    "pending_count=pending_count+1,"
+                    "pending_bytes=pending_bytes+?,"
+                    "execution_state=CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 "
+                    "THEN 'queued' ELSE execution_state END,"
+                    f"updated_at={now_sql} "
+                    "WHERE session_id=? AND lifecycle IN ('open','suspended') "
+                    "AND tenant_id=? AND principal_id=? "
+                    "AND pending_count<? AND (pending_bytes+?)<=? "
+                    f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)",
+                    (
+                        child_wake, child_wake, child_wake, content_bytes, child_wake,
+                        parent_session_id, child_tenant_id, child_principal_id,
+                        self.hard_pending_limit, content_bytes, self.inbox_byte_limit,
+                        parent_session_id, message_id,
+                    ),
+                )
             parent_updated = p_rc == 1
             parent_need_wake = bool(p_packed & 1) if parent_updated else False
             parent_inbox_ver = (p_packed >> 1) if parent_updated else 0
