@@ -399,7 +399,7 @@ async def _read_logs(loop, target, actor, options):
 
 
 async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
-    from power_loop.agent.runtime_types import InputRef, RuntimeRequestError, plain, sha256_canonical
+    from power_loop.agent.runtime_types import RuntimeRequestError, plain, sha256_canonical
     from power_loop.runtime.child_tasks import tool_actor
 
     from . import journal
@@ -446,9 +446,9 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                     value = await _read_logs(loop, selected, actor, options)
                 elif action == "cancel":
                     if entry is None:
-                        ref = InputRef(**saved["start_input_ref"])
                         value = plain(await client.cancel(
-                            ref, actor=actor, reason=options.get("reason", "cancelled"),
+                            selected, actor=actor, scope="subtree",
+                            reason=options.get("reason", "cancelled"),
                         ))
                     else:
                         value = plain(await client.cancel(

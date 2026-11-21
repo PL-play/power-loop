@@ -157,25 +157,30 @@ class RuntimeClient:
         return replace(receipt, notification="published" if published else "failed",
                        reason=None if published else "wake_pending")
 
-    async def cancel(self, ref, *, actor, scope="self", reason="cancelled") -> Receipt:
+    async def cancel(
+        self, ref, *, actor, scope="self", reason="cancelled", cancel_by: str | None = None,
+    ) -> Receipt:
         self._require_open()
         receipt, activations, completed_refs, stopped_descendants = await self.inputs.cancel(
-            ref, actor=actor, scope=scope, reason=reason, _with_activation=True, _with_stopped=True,
+            ref, actor=actor, scope=scope, reason=reason, cancel_by=cancel_by,
+            _with_activation=True, _with_stopped=True,
         )
         target = receipt.target
-        cancel_by = "agent" if actor.session_id is not None else "user"
+        eff_cancel_by = cancel_by or ("agent" if actor.session_id is not None else "user")
         if self._local_worker is not None:
             self._local_worker._activate(
                 target.session_id, receipt.input_ref,
                 cancelled=True, cancel_reason=reason, cancel_verified=True,
+                cancel_by=eff_cancel_by,
             )
             for d_sid in stopped_descendants:
                 self._local_worker._activate(
                     d_sid, None, cancelled=True, cancel_reason=reason, cancel_verified=True,
+                    cancel_by="subtree",
                 )
         if self.wake_transport is not None:
             try:
-                await self.wake_transport.publish_cancel(target.session_id, cancel_by=cancel_by)
+                await self.wake_transport.publish_cancel(target.session_id, cancel_by=eff_cancel_by)
             except Exception:
                 log.warning("wake_transport publish_cancel failed for %s", target.session_id, exc_info=True)
             for d_sid in stopped_descendants:

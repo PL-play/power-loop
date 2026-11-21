@@ -182,11 +182,11 @@ async def test_late_child_result_retention_cost(registry_store, monkeypatch):
         assert counts.get('unfinished_transactions', 0) == 0
         assert sum(counts[name] for name in _CATEGORIES) == len(records)
         assert sum(counts[name + '_tx'] for name in _CATEGORIES) == transactions
-        assert any('workflow.journal:put' in r['chain'] and 'session_runtime_state' in r['sql']
-                   and 'workflow.runner:_consume_results_locked' in r['chain'] for r in records)
-        assert any(r['sql'].startswith('UPDATE') and 'follow_up_queue' in r['sql']
-                   and 'workflow.runner:_consume_results_locked' in r['chain'] for r in records)
-        assert any('workflow.runner:_finish_late' in r['chain'] for r in records)
+        assert any('agent.runtime_store:_river_deliver_tx' in r['chain'] and 'follow_up_queue' in r['sql']
+                   for r in records)
+        assert any('agent.runtime_store:_river_deliver_tx' in r['chain'] and 'sessions' in r['sql']
+                   for r in records)
+        assert not any('workflow.runner:' in r['chain'] for r in records)
         writes = await meter.report()
         data.update(db=original.dialect.name, operation='workflow_halt_late_result', samples=1,
             sql={**counts, 'total': len(records)}, transactions=transactions, records=records,

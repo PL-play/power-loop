@@ -236,6 +236,64 @@ class RuntimeInputStore:
         self.on_repair_interrupted_turn = on_repair_interrupted_turn
         self.on_session_takeover = on_session_takeover
         self.on_result_undeliverable = on_result_undeliverable
+        waiters = getattr(store, "_driver_waiters", None)
+        if waiters is None:
+            waiters = {}
+            store._driver_waiters = waiters
+        self._driver_waiters: dict[str, tuple[asyncio.Queue, asyncio.Event, list[bool]]] = waiters
+
+    def register_driver_waiter(self, sid: str) -> tuple[asyncio.Queue, asyncio.Event, list[bool]]:
+        q: asyncio.Queue = asyncio.Queue()
+        sig = asyncio.Event()
+        subtree_flag = [False]
+        self._driver_waiters[sid] = (q, sig, subtree_flag)
+        return q, sig, subtree_flag
+
+    def unregister_driver_waiter(self, sid: str) -> None:
+        self._driver_waiters.pop(sid, None)
+
+    def notify_driver_wake(self, sid: str) -> None:
+        entry = self._driver_waiters.get(sid)
+        if entry is not None:
+            entry[1].set()
+
+    def notify_driver_cancel(
+        self, sid: str, *, cancel_by: str | None = None, reason: str = "cancelled",
+        subtree_stopped: bool = False,
+    ) -> None:
+        entry = self._driver_waiters.get(sid)
+        if entry is not None:
+            q, sig, subtree_flag = entry
+            if subtree_stopped:
+                subtree_flag[0] = True
+            q.put_nowait({"type": "cancel", "cancel_by": cancel_by, "reason": reason})
+            sig.set()
+
+    def _push_driver_leaf_result(self, driver_sid: str, item_id: str, payload: dict[str, Any]) -> None:
+        entry = self._driver_waiters.get(driver_sid)
+        if entry is not None:
+            q, sig, _ = entry
+            q.put_nowait({"type": "leaf_result", "item_id": item_id, "payload": payload})
+            sig.set()
+
+    async def poll_pending_driver_results(self, sid: str, *, after_id: int = 0):
+        """Single indexed SELECT on ``idx_inbox_session_status`` for cross-process leaf results."""
+        return await self.db.fetchall(
+            f"SELECT id,item_id,content_json FROM {self.q} "
+            "WHERE session_id=? AND status='pending' AND kind='workflow_node_result' AND id>? "
+            "ORDER BY id ASC LIMIT 1000",
+            (sid, int(after_id)),
+        )
+
+    async def poll_driver_results_for_send(self, sid: str, send_index: int, *, after_id: int = 0):
+        """Crash-replay poll: includes pending AND node results already claimed into ``send_index``."""
+        return await self.db.fetchall(
+            f"SELECT id,item_id,content_json FROM {self.q} "
+            "WHERE session_id=? AND kind='workflow_node_result' AND terminal_status IS NULL "
+            "AND (status='pending' OR (status='delivered' AND delivered_send_index=?)) AND id>? "
+            "ORDER BY id ASC LIMIT 1000",
+            (sid, int(send_index), int(after_id)),
+        )
 
     def _effective_hooks(self):
         if self.hooks is not None:
@@ -687,8 +745,15 @@ class RuntimeInputStore:
             ])
 
         try:
+            now_sql = self._now_sql()
+            lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
             async with self.db.transaction() as tx:
-                parent_row = await self.db.dialect.lock_state(tx, self.s, parent.session_id)
+                parent_row = await tx.fetchone(
+                    f"SELECT *,{now_sql} AS _db_now FROM {self.s} WHERE session_id=?{lock_suffix}",
+                    (parent.session_id,),
+                )
+                if parent_row is None:
+                    raise ValueError(f"unknown session: {parent.session_id}")
                 await self._authorize_known(tx, parent, actor, parent_row)
                 if parent_owner_epoch is not None and (
                     int(parent_row["owner_epoch"]) != int(parent_owner_epoch)
@@ -706,7 +771,7 @@ class RuntimeInputStore:
                 ):
                     raise RuntimeRequestError("forbidden", "execution_role_forbids_workflow")
 
-                database_now = await self._db_now(tx)
+                database_now = int(parent_row["_db_now"])
                 root_id = str(parent_row["root_session_id"])
                 child_depth = int(parent_row["depth"]) + 1
                 if child_depth > self.store.max_spawn_depth:
@@ -718,6 +783,12 @@ class RuntimeInputStore:
 
                 preclaimed: list[ClaimedBatch] = []
                 queued: list[TargetRef] = []
+                sess_rows_sql: list[str] = []
+                sess_params: list[Any] = []
+                queue_rows_sql: list[str] = []
+                queue_params: list[Any] = []
+                msg_rows_sql: list[str] = []
+                msg_params: list[Any] = []
 
                 for idx, sp in enumerate(specs):
                     is_preclaimed = idx < k
@@ -766,49 +837,37 @@ class RuntimeInputStore:
                     lease_col = lease_until if is_preclaimed else None
                     wake_pending_col = 0 if is_preclaimed else 1
 
-                    await tx.execute(
-                        f"INSERT INTO {self.s} ("
-                        "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
-                        "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
-                        "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
-                        "tenant_id,principal_id,result_route_json,cancel_propagation,"
-                        "next_seq,send_index,execution_state,owner_epoch,owner_node_id,"
-                        "owner_boot_id,owner_lease_until_ms,inbox_version,wake_inbox_seq,"
-                        "wake_pending_count,pending_count,pending_bytes,ready_item_json,"
-                        "created_at,updated_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            sp.session_id, parent.session_id, actor.session_id, root_id, child_depth,
-                            sp.descriptor.kind, canonical(sp.descriptor), sha256_canonical(sp.descriptor),
-                            spec_hashes[sp.session_id],
-                            canonical(sp.creation_call_ref) if sp.creation_call_ref else None,
-                            sp.creation_tool_call_id, sp.message_id,
-                            parent_row["tenant_id"], parent_row["principal_id"],
-                            canonical(route), sp.cancel_propagation,
-                            next_seq_col, send_idx_col, execution_state_val, owner_epoch_col,
-                            owner_node_col, owner_boot_col, lease_col,
-                            1, 1, wake_pending_col, 0, 0, ready_item,
-                            database_now, database_now,
-                        ),
+                    sess_rows_sql.append(
+                        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                     )
+                    sess_params.extend((
+                        sp.session_id, parent.session_id, actor.session_id, root_id, child_depth,
+                        sp.descriptor.kind, canonical(sp.descriptor), sha256_canonical(sp.descriptor),
+                        spec_hashes[sp.session_id],
+                        canonical(sp.creation_call_ref) if sp.creation_call_ref else None,
+                        sp.creation_tool_call_id, sp.message_id,
+                        parent_row["tenant_id"], parent_row["principal_id"],
+                        canonical(route), sp.cancel_propagation,
+                        next_seq_col, send_idx_col, execution_state_val, owner_epoch_col,
+                        owner_node_col, owner_boot_col, lease_col,
+                        1, 1, wake_pending_col, 0, 0, ready_item,
+                        database_now, database_now,
+                    ))
                     deliv_seq = None if is_driver else 1
-                    await tx.execute(
-                        f"INSERT INTO {self.q} ("
-                        "session_id,item_id,inbox_version,kind,priority,wake,status,"
-                        "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
-                        "meta_json,request_hash,result_kind,created_at,delivered_at,"
-                        "delivered_seq,delivered_send_index) "
-                        "VALUES (?,?,1,'user','normal',1,'delivered',?,?,?,?,?,?,NULL,?,?,?,1)",
-                        (
-                            sp.session_id, sp.message_id, reply_to, sp.result_kind,
-                            content, content_bytes, meta, req_hash, database_now,
-                            database_now, deliv_seq,
-                        ),
+                    queue_rows_sql.append(
+                        "(?,?,1,'user','normal',1,'delivered',?,?,?,?,?,?,NULL,?,?,?,1)"
                     )
+                    queue_params.extend((
+                        sp.session_id, sp.message_id, reply_to, sp.result_kind,
+                        content, content_bytes, meta, req_hash, database_now,
+                        database_now, deliv_seq,
+                    ))
                     if not is_driver:
-                        await self._insert_message(
-                            tx, sp.session_id, 1, "user", merged_json, msg_meta, 1, database_now,
-                        )
+                        msg_rows_sql.append("(?,?,?,?,?,?,?)")
+                        msg_params.extend((
+                            sp.session_id, 1, "user", merged_json,
+                            canonical(msg_meta), 1, database_now,
+                        ))
                     if is_preclaimed:
                         user_row = StoredMessageRow(
                             session_id=sp.session_id, seq=1, role="user", name=None,
@@ -843,6 +902,34 @@ class RuntimeInputStore:
                         ))
                     else:
                         queued.append(child_target)
+
+                await tx.execute(
+                    f"INSERT INTO {self.s} ("
+                    "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
+                    "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
+                    "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
+                    "tenant_id,principal_id,result_route_json,cancel_propagation,"
+                    "next_seq,send_index,execution_state,owner_epoch,owner_node_id,"
+                    "owner_boot_id,owner_lease_until_ms,inbox_version,wake_inbox_seq,"
+                    "wake_pending_count,pending_count,pending_bytes,ready_item_json,"
+                    "created_at,updated_at) VALUES " + ",".join(sess_rows_sql),
+                    tuple(sess_params),
+                )
+                await tx.execute(
+                    f"INSERT INTO {self.q} ("
+                    "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                    "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                    "meta_json,request_hash,result_kind,created_at,delivered_at,"
+                    "delivered_seq,delivered_send_index) VALUES " + ",".join(queue_rows_sql),
+                    tuple(queue_params),
+                )
+                if msg_rows_sql:
+                    await tx.execute(
+                        f"INSERT INTO {self.store.t.messages} ("
+                        "session_id,seq,role,content,meta_json,send_index,created_at) VALUES "
+                        + ",".join(msg_rows_sql),
+                        tuple(msg_params),
+                    )
                 return CreateManyResult(preclaimed=tuple(preclaimed), queued_targets=tuple(queued))
         except Exception as exc:
             if not is_duplicate_key_error(exc):
@@ -2399,7 +2486,10 @@ class RuntimeInputStore:
         self, batch: ClaimedBatch, *, consumed=None, status="completed", final_text="",
         usage=None, structured_output=None, error=None, error_code=None, result_seq=None,
         assistant_meta=None, next_seq: int | None = None, result_json: dict | None = None,
-        settle_start_input: bool = False, projection: PendingProjection | None = None,
+        settle_start_input: bool = False, settle_chain_ids: tuple[str, ...] | None = None,
+        drain_driver_node_results: bool = False, deliver_to_parent: bool = True,
+        write_driver_message: bool = False, tx_hook=None,
+        projection: PendingProjection | None = None,
         _on_committed=None,
     ) -> FinalBatch:
         if consumed is not None:
@@ -2410,15 +2500,23 @@ class RuntimeInputStore:
             raise RuntimeRequestError("invalid_options", "terminal status")
         fold_conflict_out = [False]
         undeliverable_out: list[tuple[TargetRef, str, Result, str, str]] = []
+        driver_events_out: list[tuple[str, str, dict[str, Any]]] = []
         try:
             async with self.db.transaction() as tx:
                 final_batch = await self._final_tx(
                     tx, batch, consumed, status, final_text, usage or {},
                     structured_output, error, error_code, result_seq, assistant_meta,
                     next_seq=next_seq, result_json=result_json,
-                    settle_start_input=settle_start_input, projection=projection,
+                    settle_start_input=settle_start_input,
+                    settle_chain_ids=settle_chain_ids,
+                    drain_driver_node_results=drain_driver_node_results,
+                    deliver_to_parent=deliver_to_parent,
+                    write_driver_message=write_driver_message,
+                    tx_hook=tx_hook,
+                    projection=projection,
                     _fold_conflict_out=fold_conflict_out,
                     _undeliverable_out=undeliverable_out,
+                    _driver_events_out=driver_events_out,
                 )
         except (RuntimeRequestError, SessionLeaseLost):
             raise
@@ -2432,6 +2530,9 @@ class RuntimeInputStore:
 
         if _on_committed is not None:
             _on_committed()
+
+        for drv_sid, item_id, payload in driver_events_out:
+            self._push_driver_leaf_result(drv_sid, item_id, payload)
 
         # Post-commit RESULT_UNDELIVERABLE hook (Design 217 §4.4 / §5.4)
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverable_out:
@@ -2532,31 +2633,72 @@ class RuntimeInputStore:
     async def _final_tx(
         self, tx, batch: ClaimedBatch, consumed, status, final_text, usage, structured_output,
         error, error_code, result_seq=None, assistant_meta=None, *, next_seq=None,
-        result_json=None, settle_start_input=False, projection: PendingProjection | None = None,
+        result_json=None, settle_start_input=False, settle_chain_ids: tuple[str, ...] | None = None,
+        drain_driver_node_results: bool = False, deliver_to_parent: bool = True,
+        write_driver_message: bool = False, tx_hook=None,
+        projection: PendingProjection | None = None,
         _fold_conflict_out: list[bool] | None = None,
         _undeliverable_out: list[tuple[TargetRef, str, Result, str, str]] | None = None,
+        _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> FinalBatch:
         sid = batch.target.session_id
         now_sql = self._now_sql()
         consumed_refs = tuple(batch.input_refs) if consumed is None else tuple(consumed)
         unconsumed_ids = [ref.message_id for ref in batch.input_refs if ref not in consumed_refs]
         has_unconsumed = bool(unconsumed_ids)
+        is_driver = batch.descriptor.kind == "workflow_driver"
+
+        # Plan B resident workflow_driver: drain any pending workflow_node_result rows in same tx!
+        w_drain = p_drain = b_drain = 0
+        if drain_driver_node_results:
+            if self._dialect == "mysql":
+                agg = await tx.fetchone(
+                    f"SELECT COALESCE(SUM(wake),0) AS w_sum,COUNT(*) AS p_cnt,"
+                    f"COALESCE(SUM(content_bytes),0) AS b_sum FROM {self.q} "
+                    "WHERE session_id=? AND status='pending' AND kind='workflow_node_result'",
+                    (sid,),
+                )
+                if agg and int(agg["p_cnt"]) > 0:
+                    w_drain = int(agg["w_sum"])
+                    p_drain = int(agg["p_cnt"])
+                    b_drain = int(agg["b_sum"])
+                    await tx.execute(
+                        f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
+                        f"delivered_at={now_sql},terminal_status='completed',"
+                        f"result_send_index=?,completed_at={now_sql} "
+                        "WHERE session_id=? AND status='pending' AND kind='workflow_node_result'",
+                        (batch.send_index, batch.send_index, sid),
+                    )
+            else:
+                drained_rows = await tx.fetchall(
+                    f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,"
+                    f"delivered_at={now_sql},terminal_status='completed',"
+                    f"result_send_index=?,completed_at={now_sql} "
+                    "WHERE session_id=? AND status='pending' AND kind='workflow_node_result' "
+                    "RETURNING wake,content_bytes",
+                    (batch.send_index, batch.send_index, sid),
+                )
+                if drained_rows:
+                    w_drain = sum(int(r["wake"]) for r in drained_rows)
+                    p_drain = len(drained_rows)
+                    b_drain = sum(int(r["content_bytes"]) for r in drained_rows)
 
         # Compute effective next_seq before releasing the session row (so 1 UPDATE suffices!).
         # On abnormal/untracked final (exception, cancel, recovery), sync with MAX(seq)+1 so
         # fenced appends made before the failure never cause a next_seq collision on the next send.
-        if next_seq is None or status != "completed":
+        if next_seq is None or (status != "completed" and not is_driver):
             max_row = await tx.fetchone(
                 f"SELECT COALESCE(MAX(seq),0) AS max_seq FROM {self.store.t.messages} WHERE session_id=?",
                 (sid,),
             )
             if max_row is not None:
                 next_seq = max(int(next_seq or 0), int(max_row["max_seq"]) + 1)
-        write_message = result_seq is None and status == "completed"
+        write_message = (result_seq is None and status == "completed") or write_driver_message
         effective_next_seq = max(
             int(next_seq or 0),
             (int(result_seq) + 1) if result_seq is not None else 0,
-            batch.message_seq + 1,
+            batch.message_seq + (0 if is_driver else 1),
+            1,
         )
         keep_pending_tool = status == "interrupted"
         proj_fold_json = (
@@ -2609,11 +2751,21 @@ class RuntimeInputStore:
                 )
             fold_set_params = (batch.cancel_seq, expected_fold_json, proj_fold_json)
 
+        drain_set_clause = ""
+        drain_set_params: tuple[Any, ...] = ()
+        if w_drain or p_drain or b_drain:
+            drain_set_clause = (
+                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+            )
+            drain_set_params = (w_drain, w_drain, p_drain, p_drain, b_drain, b_drain)
+
         # Step 1 (Deep-first lock order): Fenced UPDATE on child session FIRST (1 control SQL!).
         post_fold_stats_json: str | None = None
         route_changed = False
         if self._dialect == "mysql":
-            # 6-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json SET):
+            # 6-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json/drain SET):
             # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced
             # bit 3: closed_raced  | bit 4: fold_stats_conflict | bit 5: route_changed (session route)
             mysql_route_changed_bit = ""
@@ -2627,15 +2779,16 @@ class RuntimeInputStore:
                 f"UPDATE {self.s} SET "
                 "owner_epoch=(LAST_INSERT_ID("
                 "(owner_epoch<<6)"
-                "|(CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) THEN 1 ELSE 0 END)"
+                "|(CASE WHEN lifecycle='open' AND ((wake_pending_count-?)>0 OR ?=1) THEN 1 ELSE 0 END)"
                 "|(CASE WHEN cancel_by='subtree' AND cancel_seq>? THEN 2 ELSE 0 END)"
                 "|(CASE WHEN cancel_seq>? THEN 4 ELSE 0 END)"
                 "|(CASE WHEN lifecycle IN ('closing','closed') THEN 8 ELSE 0 END)"
                 f"{mysql_fold_conflict_bit}"
                 f"{mysql_route_changed_bit}"
                 ")>>6),"
-                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
+                "execution_state=CASE WHEN lifecycle='open' AND ((wake_pending_count-?)>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
+                f"{drain_set_clause}"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
                 "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
                 "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
@@ -2647,10 +2800,11 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} "
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running'",
                 (
-                    int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
+                    w_drain, int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
                     *mysql_fold_conflict_params,
                     *mysql_route_changed_params,
-                    int(has_unconsumed),
+                    w_drain, int(has_unconsumed),
+                    *drain_set_params,
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
@@ -2685,8 +2839,9 @@ class RuntimeInputStore:
         else:
             srow = await tx.fetchone(
                 f"UPDATE {self.s} SET "
-                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
+                "execution_state=CASE WHEN lifecycle='open' AND ((wake_pending_count-?)>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
+                f"{drain_set_clause}"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
                 "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
                 "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
@@ -2701,7 +2856,8 @@ class RuntimeInputStore:
                 "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,"
                 "result_route_json",
                 (
-                    int(has_unconsumed),
+                    w_drain, int(has_unconsumed),
+                    *drain_set_params,
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
@@ -2728,6 +2884,8 @@ class RuntimeInputStore:
 
         effective_status = status
         effective_cancel_by = batch.cancel_by or cancel_by_db
+        if subtree_raced:
+            effective_cancel_by = "subtree"
         effective_error = error
         effective_error_code = error_code
         if closed_raced:
@@ -2738,16 +2896,38 @@ class RuntimeInputStore:
             write_message = False
         elif cancel_raced and effective_status == "completed":
             effective_status = "cancelled"
+            effective_cancel_by = effective_cancel_by or "user"
             effective_error = cancel_reason_db or "cancelled"
             effective_error_code = "cancelled"
-            write_message = False
+            if not write_driver_message:
+                write_message = False
+        if effective_status == "cancelled" and effective_cancel_by is None:
+            effective_cancel_by = "user"
 
         if write_message:
             result_seq = post_next_seq - 1
 
+        if tx_hook is not None:
+            hook_override = await tx_hook(
+                tx,
+                {
+                    "effective_status": effective_status,
+                    "effective_cancel_by": effective_cancel_by,
+                    "effective_error": effective_error,
+                    "effective_error_code": effective_error_code,
+                    "result_seq": result_seq,
+                    "database_now": database_now,
+                },
+            )
+            if isinstance(hook_override, dict):
+                if "structured_output" in hook_override:
+                    structured_output = hook_override["structured_output"]
+                if "result_json" in hook_override:
+                    result_json = hook_override["result_json"]
+                if "final_text" in hook_override:
+                    final_text = hook_override["final_text"]
+
         # Resolve consumed inputs if caller passed consumed=None and we need exact list for abnormal settle or River.
-        # Include reply_to_session_id/reply_result_kind on the same SELECT (0 extra SQL) so per-input live routes
-        # are always exact in-lock — even after A -> B -> A multi-rebinds with cross-parent routes!
         delivered_routes: dict[str, tuple[str | None, str | None]] = {}
         if consumed is None and (effective_status != "completed" or batch.result_route is not None or batch.reply_to_session_id is not None):
             delivered = await tx.fetchall(
@@ -2788,8 +2968,6 @@ class RuntimeInputStore:
             )
 
         # Step 2 (Deep-first lock order): River delivery to parent AFTER child UPDATE (0 final_lock_asc!).
-        # Use the live route read under the locked child row so in-flight rebind_children is honored
-        # atomically (0 extra SQL on root sends).
         result_ref, delivery_error = None, None
         activations: list[TargetRef] = []
         route = batch.result_route
@@ -2797,24 +2975,36 @@ class RuntimeInputStore:
             parsed_live = json.loads(live_route_json)
             if isinstance(parsed_live, dict) and isinstance(parsed_live.get("target"), dict):
                 route = parsed_live
+        # Design 217 §5.3: human direct chat with a finished workflow leaf (reply_to_session_id IS NULL)
+        # replies ONLY to human + delivers system_notice(wake=0) to root_session_id (NEVER wakes Driver!).
+        is_human_direct_leaf_chat = False
+        if (
+            route is not None
+            and route.get("result_kind") == "workflow_node_result"
+            and batch.reply_to_session_id is None
+            and not any(to for to, _ in delivered_routes.values())
+        ):
+            route = None
+            is_human_direct_leaf_chat = True
+
         deliver_parent_sid = None
         deliver_res_kind = None
         deliver_start_ref = None
         deliver_source_ref = consumed_refs[0] if consumed_refs else None
         verify_source_item_id: str | None = None
-        if not closed_raced and consumed_refs:
+        if deliver_to_parent and not closed_raced and consumed_refs:
             if route is not None:
                 deliver_parent_sid = route["target"]["session_id"]
                 deliver_res_kind = route["result_kind"]
                 deliver_start_ref = InputRef(**route["input_ref"])
+                if is_driver:
+                    deliver_source_ref = deliver_start_ref
             elif batch.reply_to_session_id is not None:
                 consumed_id_set = {ref.message_id for ref in consumed_refs}
                 reply_item_id = batch.reply_to_item_id
                 effective_reply_to: str | None = batch.reply_to_session_id
                 effective_reply_rk: str | None = batch.reply_result_kind
                 if reply_item_id is not None and reply_item_id not in consumed_id_set:
-                    # Partial consume excluded the batch's originally selected routed item;
-                    # check if another consumed item carries a live reply route.
                     c_ids = [ref.message_id for ref in consumed_refs]
                     c_ph = ",".join("?" for _ in c_ids)
                     q_alt = await tx.fetchone(
@@ -2839,10 +3029,6 @@ class RuntimeInputStore:
                             effective_reply_to = str(live_to)
                             effective_reply_rk = live_rk or effective_reply_rk
                     else:
-                        # Explicit consumed (no delivered scan): conditionally assert the
-                        # source item's live reply_to_session_id inside _river_deliver_tx's
-                        # UPDATE (0 extra SQL on all no-rebind sends, including wake=False
-                        # notices and set_runtime_state(); re-reads live route only on mismatch).
                         verify_source_item_id = reply_item_id
                 if effective_reply_to is not None and reply_item_id is not None:
                     deliver_parent_sid = effective_reply_to
@@ -2859,6 +3045,7 @@ class RuntimeInputStore:
                 deliver_source_ref or consumed_refs[0], batch.target, effective_status,
                 batch.send_index, result_seq,
                 final_text, usage, structured_output, effective_error, effective_error_code,
+                cancel_by=effective_cancel_by if effective_status == "cancelled" else None,
             )
             result_ref, delivery_error = await self._river_deliver_tx(
                 tx,
@@ -2872,6 +3059,7 @@ class RuntimeInputStore:
                 child_wake=child_wake,
                 activations=activations,
                 verify_source_item_id=verify_source_item_id,
+                _driver_events_out=_driver_events_out,
             )
             if delivery_error is not None and _undeliverable_out is not None:
                 actual_parent_sid = (
@@ -2884,6 +3072,34 @@ class RuntimeInputStore:
                     deliver_res_kind,
                     delivery_error,
                 ))
+        elif (
+            is_human_direct_leaf_chat
+            and not closed_raced
+            and batch.root_session_id
+            and batch.root_session_id != sid
+        ):
+            raw_notice_id = f"sys_chat_{sid}_s{batch.send_index}"
+            if len(raw_notice_id) <= 64:
+                notice_id = raw_notice_id
+            else:
+                suffix = f"_s{batch.send_index}"
+                digest_len = max(16, 64 - len("sys_chat_") - len(suffix))
+                notice_id = f"sys_chat_{sha256_canonical([sid])[:digest_len]}{suffix}"
+            notice_body = {
+                "kind": "system_notice",
+                "event": "human_child_interaction",
+                "session_id": sid,
+                "send_index": batch.send_index,
+                "text": f"[system_notice · 用户直接与子会话 {sid} 进行了第 {batch.send_index} 轮对话]",
+            }
+            await self._deliver_system_notice_tx(
+                tx,
+                target_session_id=batch.root_session_id,
+                tenant_id=batch.tenant_id,
+                principal_id=batch.principal_id,
+                item_id=notice_id,
+                body=notice_body,
+            )
 
         # Step 3: Assistant message write / meta stamp (skipped when already written cleanly by sink!)
         result_meta = {
@@ -2937,8 +3153,6 @@ class RuntimeInputStore:
                 tx, sid, batch.send_index, projection, proj_ts,
             )
             if fold_conflict:
-                # Rare conflict path (0 SQL on normal path): guarantee sessions.fold_stats_json
-                # is marked invalid=True (never stale healthy) while holding the session lock.
                 from power_loop.runtime.store import projection_fold as pf
                 if self._dialect == "mysql":
                     cur_state = await pf.read_state(self.store, tx, sid)
@@ -2952,16 +3166,22 @@ class RuntimeInputStore:
         # Step 4: 0 UPDATE follow_up_queue on normal completion!
         # Only update follow_up_queue on abnormal status, delivery_error, or explicit settle_start_input.
         res_json_str = canonical(result_json) if result_json is not None else None
-        if settle_start_input and batch.start_input_message_id is not None:
+        target_chain_ids: tuple[str, ...] | None = settle_chain_ids
+        if target_chain_ids is None and settle_start_input and batch.start_input_message_id is not None:
+            target_chain_ids = (batch.start_input_message_id,)
+        if target_chain_ids:
+            ph = ",".join("?" for _ in target_chain_ids)
             await tx.execute(
-                f"UPDATE {self.q} SET terminal_status=?,cancel_by=?,result_seq=?,"
+                f"UPDATE {self.q} SET status='delivered',terminal_status=?,cancel_by=?,result_seq=?,"
                 "result_send_index=?,result_json=?,error_code=?,error_detail=?,"
                 f"result_delivery_error=?,completed_at={now_sql} "
-                "WHERE session_id=? AND item_id=?",
+                f"WHERE session_id=? AND item_id IN ({ph})",
                 (
-                    effective_status, effective_cancel_by, result_seq, batch.send_index,
+                    effective_status,
+                    effective_cancel_by if effective_status == "cancelled" else None,
+                    result_seq, batch.send_index,
                     res_json_str, effective_error_code, effective_error, delivery_error,
-                    sid, batch.start_input_message_id,
+                    sid, *target_chain_ids,
                 ),
             )
         elif (
@@ -2979,7 +3199,9 @@ class RuntimeInputStore:
                     "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
                     f"AND item_id IN ({','.join('?' for _ in consumed_ids)})",
                     (
-                        effective_status, effective_cancel_by, result_seq, batch.send_index,
+                        effective_status,
+                        effective_cancel_by if effective_status == "cancelled" else None,
+                        result_seq, batch.send_index,
                         res_json_str, effective_error_code, effective_error, delivery_error,
                         sid, batch.send_index, *consumed_ids,
                     ),
@@ -2987,12 +3209,17 @@ class RuntimeInputStore:
                 if changed != len(consumed_ids):
                     raise SessionLeaseLost(sid)
 
+        settle_refs = (
+            tuple(InputRef(batch.target.store_id, sid, mid) for mid in target_chain_ids)
+            if target_chain_ids else consumed_refs
+        )
         results = tuple(
             Result(
                 ref, batch.target, effective_status, batch.send_index, result_seq, final_text,
                 usage, structured_output, effective_error, effective_error_code, delivery_error,
+                cancel_by=effective_cancel_by if effective_status == "cancelled" else None,
             )
-            for ref in consumed_refs
+            for ref in settle_refs
         )
         return FinalBatch(
             next_state, results, result_ref,
@@ -3014,16 +3241,9 @@ class RuntimeInputStore:
         child_wake: int,
         activations: list[TargetRef] | None = None,
         verify_source_item_id: str | None = None,
+        _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> tuple[InputRef | None, str | None]:
-        """Same-tx non-cascading River delivery (parent lifecycle IN ('open','suspended')).
-
-        - Parent closed / missing / over-capacity NEVER rolls back child result; returns error code.
-        - Parent suspended accepts the receipt into inbox without waking (keeps execution_state='idle').
-        - Uses STABLE_API ``result_message_id`` for deterministic dedupe.
-        - When ``verify_source_item_id`` is provided (explicit ``consumed`` per-input route),
-          asserts the child item's live ``reply_to_session_id`` conditionally in the same UPDATE
-          (0 extra SQL on all unchanged routes) and redirects on in-flight rebind mismatch.
-        """
+        """Same-tx non-cascading River delivery (parent lifecycle IN ('open','suspended'))."""
         parent_target = TargetRef(self.store.store_id, parent_session_id)
         effective_start = result.input_ref if result.send_index is None else start_ref
         message_id = result_message_id(child_target, effective_start, result.send_index, result_kind)
@@ -3038,6 +3258,8 @@ class RuntimeInputStore:
             "error": result.error,
             "error_code": result.error_code,
             "result_seq": result.result_seq,
+            "send_index": result.send_index,
+            "cancel_by": result.cancel_by,
         }
         content = canonical(body)
         meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
@@ -3096,7 +3318,9 @@ class RuntimeInputStore:
                     f"UPDATE {self.s} SET "
                     "inbox_version=(LAST_INSERT_ID("
                     "((inbox_version+1)<<1)|"
-                    "(CASE WHEN lifecycle='open' AND execution_state='idle' AND ?=1 THEN 1 ELSE 0 END)"
+                    "(CASE WHEN lifecycle='open' AND (execution_state='idle' "
+                    "OR (execution_state='running' AND session_kind='workflow_driver')) "
+                    "AND ?=1 THEN 1 ELSE 0 END)"
                     ")>>1),"
                     "wake_inbox_seq=wake_inbox_seq+?,"
                     "wake_pending_count=wake_pending_count+?,"
@@ -3135,7 +3359,7 @@ class RuntimeInputStore:
                 "AND pending_count<? AND (pending_bytes+?)<=? "
                 f"AND NOT EXISTS (SELECT 1 FROM {self.q} WHERE session_id=? AND item_id=?)"
                 f"{source_route_sql} "
-                "RETURNING inbox_version,lifecycle,execution_state,wake_pending_count",
+                "RETURNING inbox_version,lifecycle,execution_state,wake_pending_count,session_kind",
                 (
                     child_wake, child_wake, content_bytes, child_wake,
                     parent_session_id, child_tenant_id, child_principal_id,
@@ -3149,8 +3373,10 @@ class RuntimeInputStore:
                 parent_updated
                 and prow["lifecycle"] == "open"
                 and child_wake == 1
-                and prow["execution_state"] == "queued"
-                and int(prow["wake_pending_count"]) == 1
+                and (
+                    (prow["execution_state"] == "queued" and int(prow["wake_pending_count"]) == 1)
+                    or (prow["execution_state"] == "running" and prow["session_kind"] == "workflow_driver")
+                )
             )
 
         if parent_updated:
@@ -3166,6 +3392,8 @@ class RuntimeInputStore:
             )
             if activations is not None and parent_need_wake:
                 activations.append(parent_target)
+            if result_kind == "workflow_node_result" and _driver_events_out is not None:
+                _driver_events_out.append((parent_session_id, message_id, body))
             return ref, None
 
         if verify_source_item_id is not None:
@@ -3192,6 +3420,7 @@ class RuntimeInputStore:
                         child_wake=child_wake,
                         activations=activations,
                         verify_source_item_id=None,
+                        _driver_events_out=_driver_events_out,
                     )
             else:
                 return await self._river_deliver_tx(
@@ -3206,6 +3435,7 @@ class RuntimeInputStore:
                     child_wake=child_wake,
                     activations=activations,
                     verify_source_item_id=None,
+                    _driver_events_out=_driver_events_out,
                 )
 
         # Non-cascading diagnosis: never roll back child's result!
@@ -3753,6 +3983,202 @@ class RuntimeInputStore:
             ttl_s=ttl_s, can_execute=can_execute,
         )
 
+    async def _recover_workflow_tx(
+        self, tx, own_state, target: TargetRef, active: int, epoch: int, database_now: int,
+        undeliverable_out: list[tuple[TargetRef, str, Result, str, str]],
+        driver_events_out: list[tuple[str, str, dict[str, Any]]],
+    ) -> FinalBatch:
+        """Continue an interrupted non-LLM workflow_driver via deterministic continuation."""
+        sid = target.session_id
+        now_sql = self._now_sql()
+        rows = await tx.fetchall(
+            f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
+            "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id ASC",
+            (sid, active),
+        )
+        cancelled = own_state["cancel_by"] is not None or own_state["lifecycle"] in ("closing", "closed")
+        if cancelled:
+            cby = own_state["cancel_by"] or ("removed" if own_state["lifecycle"] in ("closing", "closed") else "user")
+            reason = own_state["cancel_reason"] or "cancelled"
+            origins = [self.record(row) for row in rows if row["kind"] in {"user", "workflow_continue"}]
+            delivery_error = None
+            result_ref = None
+            activations: list[TargetRef] = []
+            settled_refs: list[InputRef] = []
+            if origins:
+                origin = origins[-1]
+                root = await self._continuation_root(tx, origin)
+                route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
+                if route is not None:
+                    cancelled_res = Result(
+                        root.ref, target, "cancelled", active, None,
+                        error=reason, error_code="cancelled", cancel_by=cby,
+                    )
+                    result_ref, delivery_error = await self._river_deliver_tx(
+                        tx,
+                        child_target=target,
+                        child_tenant_id=own_state["tenant_id"],
+                        child_principal_id=own_state["principal_id"],
+                        parent_session_id=route["target"]["session_id"],
+                        start_ref=InputRef(**route["input_ref"]),
+                        result=cancelled_res,
+                        result_kind=route["result_kind"],
+                        child_wake=0 if cby == "subtree" else 1,
+                        activations=activations,
+                        _driver_events_out=driver_events_out,
+                    )
+                    if delivery_error is not None:
+                        undeliverable_out.append((
+                            target,
+                            route["target"]["session_id"],
+                            replace(cancelled_res, result_delivery_error=delivery_error),
+                            route["result_kind"],
+                            delivery_error,
+                        ))
+                await tx.execute(
+                    f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
+                    "result_send_index=?,error_code='cancelled',error_detail=?,"
+                    "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                    "AND delivered_send_index=? AND terminal_status IS NULL",
+                    (cby, active, reason, delivery_error, database_now, sid, active),
+                )
+                settled_refs.append(origin.ref)
+                current = origin
+                ancestors: list[str] = []
+                while current.row["continuation_of"] is not None:
+                    current = await self.input(
+                        tx, InputRef(current.ref.store_id, sid, current.row["continuation_of"]),
+                    )
+                    if current is None:
+                        break
+                    ancestors.append(current.ref.message_id)
+                    settled_refs.append(current.ref)
+                if ancestors:
+                    await tx.execute(
+                        f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
+                        "result_send_index=?,error_code='cancelled',error_detail=?,"
+                        "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                        f"AND item_id IN ({','.join('?' for _ in ancestors)})",
+                        (cby, active, reason, delivery_error, database_now, sid, *ancestors),
+                    )
+            await tx.execute(
+                f"UPDATE {self.q} SET status='delivered',delivered_send_index=?,delivered_at={now_sql},"
+                f"terminal_status='completed',result_send_index=?,completed_at={now_sql} "
+                "WHERE session_id=? AND status='pending' AND kind='workflow_node_result'",
+                (active, active, sid),
+            )
+            changed = await tx.execute(
+                f"UPDATE {self.s} SET execution_state='idle',wake_pending_count=0,"
+                "pending_count=0,pending_bytes=0,owner_node_id=NULL,owner_boot_id=NULL,"
+                "owner_lease_until_ms=NULL,pending_tool_seq=NULL,ready_item_json=NULL,"
+                f"cancel_by=NULL,cancel_reason=NULL,updated_at={now_sql} "
+                "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+                (sid, epoch),
+            )
+            if changed != 1:
+                raise SessionLeaseLost(sid)
+            results = tuple(
+                Result(
+                    ref, target, "cancelled", active, None,
+                    error=reason, error_code="cancelled", result_delivery_error=delivery_error,
+                    cancel_by=cby,
+                )
+                for ref in dict.fromkeys(settled_refs)
+            )
+            return FinalBatch(
+                "idle", results, result_ref,
+                activations[0] if activations else None, delivery_error,
+            )
+
+        # Uncancelled crash: return unconsumed delivered workflow_node_result rows back to pending
+        unconsumed_nodes = [
+            r for r in rows
+            if r["kind"] == "workflow_node_result" and r["terminal_status"] is None
+        ]
+        restored_wake = sum(int(r["wake"]) for r in unconsumed_nodes)
+        restored_count = len(unconsumed_nodes)
+        restored_bytes = sum(int(r["content_bytes"]) for r in unconsumed_nodes)
+        if unconsumed_nodes:
+            await tx.execute(
+                f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+                "delivered_send_index=NULL WHERE session_id=? AND kind='workflow_node_result' "
+                "AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL",
+                (sid, active),
+            )
+
+        origins = [self.record(row) for row in rows if row["kind"] in {"user", "workflow_continue"}]
+        ver_bump = 0
+        wake_seq_bump = 0
+        if not origins:
+            next_state = (
+                "queued"
+                if own_state["lifecycle"] == "open" and (int(own_state["wake_pending_count"]) + restored_wake) > 0
+                else "idle"
+            )
+        else:
+            origin = origins[-1]
+            root = await self._continuation_root(tx, origin)
+            index = int(origin.row["continuation_index"] or 0) + 1
+            message_id = "wfc_" + sha256_canonical([
+                "workflow_continue", self.store.store_id, sid, root.ref.message_id, index,
+            ])[:56]
+            continuation = InputRef(self.store.store_id, sid, message_id)
+            body = {
+                "workflow_continue": {
+                    "origin_input_ref": plain(root.ref),
+                    "previous_input_ref": plain(origin.ref),
+                    "continuation_index": index,
+                },
+            }
+            content = canonical(body)
+            meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+            cbytes = len(content.encode()) + len(meta.encode())
+            req_hash = self.request_hash(target, body, "normal")
+            existing = await self.input(tx, continuation)
+            if existing is None:
+                ver_bump = 1
+                wake_seq_bump = 1
+                new_ver = int(own_state["inbox_version"]) + 1
+                await tx.execute(
+                    f"INSERT INTO {self.q} ("
+                    "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                    "content_json,content_bytes,meta_json,request_hash,created_at,"
+                    "continuation_of,continuation_index) "
+                    "VALUES (?,?,?,'workflow_continue','normal',1,'pending',?,?,?,?,?,?,?)",
+                    (
+                        sid, message_id, new_ver, content, cbytes, meta, req_hash,
+                        database_now, origin.ref.message_id, index,
+                    ),
+                )
+                restored_wake += 1
+                restored_count += 1
+                restored_bytes += cbytes
+            elif existing.row["request_hash"] != req_hash:
+                raise RuntimeRequestError("request_conflict")
+            await tx.execute(
+                f"UPDATE {self.q} SET status='waiting_continuation' WHERE session_id=? "
+                "AND item_id=? AND status='delivered' AND delivered_send_index=? "
+                "AND terminal_status IS NULL",
+                (sid, origin.ref.message_id, active),
+            )
+            next_state = "queued" if own_state["lifecycle"] == "open" else "idle"
+
+        changed = await tx.execute(
+            f"UPDATE {self.s} SET execution_state=?,inbox_version=inbox_version+?,"
+            "wake_inbox_seq=wake_inbox_seq+?,wake_pending_count=wake_pending_count+?,"
+            "pending_count=pending_count+?,pending_bytes=pending_bytes+?,"
+            "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
+            f"pending_tool_seq=NULL,ready_item_json=NULL,cancel_by=NULL,cancel_reason=NULL,updated_at={now_sql} "
+            "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+            (
+                next_state, ver_bump, wake_seq_bump, restored_wake, restored_count, restored_bytes,
+                sid, epoch,
+            ),
+        )
+        if changed != 1:
+            raise SessionLeaseLost(sid)
+        return FinalBatch(next_state, ())
+
     async def recover(self, target, *, node_id: str, boot_id: str, ttl_s: float = 30.0, ownership=None) -> FinalBatch | None:
         """Atomically take over an expired running session without any 'recovering' state."""
         self.check_store(target)
@@ -3762,7 +4188,8 @@ class RuntimeInputStore:
         prev_boot_id: str | None = None
         new_epoch = 0
         active = 0
-        undeliverable: tuple[TargetRef, str, Result, str, str] | None = None
+        undeliverables: list[tuple[TargetRef, str, Result, str, str]] = []
+        driver_events_out: list[tuple[str, str, dict[str, Any]]] = []
         async with self.db.transaction() as tx:
             try:
                 own_state = await self.db.dialect.lock_state(tx, self.s, sid)
@@ -3801,79 +4228,94 @@ class RuntimeInputStore:
                     return None
             new_epoch = epoch
 
-            await self._repair_pending_tx(tx, sid, active, own_state)
+            if own_state["session_kind"] == "workflow_driver":
+                final_batch = await self._recover_workflow_tx(
+                    tx, own_state, target, active, epoch, database_now,
+                    undeliverables, driver_events_out,
+                )
+            else:
+                await self._repair_pending_tx(tx, sid, active, own_state)
 
-            rows = await tx.fetchall(
-                f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
-                "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id ASC",
-                (sid, active),
-            )
-            cancelled = own_state["cancel_by"] is not None or own_state["lifecycle"] in ("closing", "closed")
-            terminal = "cancelled" if cancelled else "interrupted"
-            detail = own_state["cancel_reason"] if cancelled else "execution owner lost"
-            delivery_error = None
-            result_ref = None
-            activations: list[TargetRef] = []
-            route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
-            if rows and route is not None:
-                first = self.record(rows[0])
-                route_result = Result(
-                    first.ref, target, terminal, active, None,
-                    error=detail, error_code=terminal,
+                rows = await tx.fetchall(
+                    f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
+                    "AND delivered_send_index=? AND terminal_status IS NULL ORDER BY id ASC",
+                    (sid, active),
                 )
-                result_ref, delivery_error = await self._river_deliver_tx(
-                    tx,
-                    child_target=target,
-                    child_tenant_id=own_state["tenant_id"],
-                    child_principal_id=own_state["principal_id"],
-                    parent_session_id=route["target"]["session_id"],
-                    start_ref=InputRef(**route["input_ref"]),
-                    result=route_result,
-                    result_kind=route["result_kind"],
-                    child_wake=0 if own_state["cancel_by"] == "subtree" else 1,
-                    activations=activations,
+                cancelled = own_state["cancel_by"] is not None or own_state["lifecycle"] in ("closing", "closed")
+                terminal = "cancelled" if cancelled else "interrupted"
+                cby = (
+                    (own_state["cancel_by"] or ("removed" if own_state["lifecycle"] in ("closing", "closed") else "user"))
+                    if cancelled else None
                 )
-                if delivery_error is not None:
-                    undeliverable = (
-                        target,
-                        route["target"]["session_id"],
-                        replace(route_result, result_delivery_error=delivery_error),
-                        route["result_kind"],
-                        delivery_error,
+                detail = own_state["cancel_reason"] if cancelled else "execution owner lost"
+                delivery_error = None
+                result_ref = None
+                activations: list[TargetRef] = []
+                route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
+                if rows and route is not None:
+                    first = self.record(rows[0])
+                    route_result = Result(
+                        first.ref, target, terminal, active, None,
+                        error=detail, error_code=terminal, cancel_by=cby,
                     )
-            if rows:
-                await tx.execute(
-                    f"UPDATE {self.q} SET terminal_status=?,result_send_index=?,"
-                    "error_code=?,error_detail=?,result_delivery_error=?,completed_at=? "
-                    "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
-                    "AND terminal_status IS NULL",
-                    (terminal, active, terminal, detail, delivery_error, database_now, sid, active),
+                    result_ref, delivery_error = await self._river_deliver_tx(
+                        tx,
+                        child_target=target,
+                        child_tenant_id=own_state["tenant_id"],
+                        child_principal_id=own_state["principal_id"],
+                        parent_session_id=route["target"]["session_id"],
+                        start_ref=InputRef(**route["input_ref"]),
+                        result=route_result,
+                        result_kind=route["result_kind"],
+                        child_wake=0 if own_state["cancel_by"] == "subtree" else 1,
+                        activations=activations,
+                        _driver_events_out=driver_events_out,
+                    )
+                    if delivery_error is not None:
+                        undeliverables.append((
+                            target,
+                            route["target"]["session_id"],
+                            replace(route_result, result_delivery_error=delivery_error),
+                            route["result_kind"],
+                            delivery_error,
+                        ))
+                if rows:
+                    await tx.execute(
+                        f"UPDATE {self.q} SET terminal_status=?,cancel_by=?,result_send_index=?,"
+                        "error_code=?,error_detail=?,result_delivery_error=?,completed_at=? "
+                        "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                        "AND terminal_status IS NULL",
+                        (terminal, cby, active, terminal, detail, delivery_error, database_now, sid, active),
+                    )
+                next_state = (
+                    "queued"
+                    if own_state["lifecycle"] == "open" and int(own_state["wake_pending_count"]) > 0
+                    else "idle"
                 )
-            next_state = (
-                "queued"
-                if own_state["lifecycle"] == "open" and int(own_state["wake_pending_count"]) > 0
-                else "idle"
-            )
-            changed = await tx.execute(
-                f"UPDATE {self.s} SET execution_state=?,owner_node_id=NULL,owner_boot_id=NULL,"
-                "owner_lease_until_ms=NULL,pending_tool_seq=NULL,ready_item_json=NULL,"
-                f"cancel_by=NULL,cancel_reason=NULL,updated_at={now_sql} "
-                "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
-                (next_state, sid, epoch),
-            )
-            if changed != 1:
-                raise SessionLeaseLost(sid)
-            results = tuple(
-                Result(
-                    self.record(row).ref, target, terminal, active, None,
-                    error=detail, error_code=terminal, result_delivery_error=delivery_error,
+                changed = await tx.execute(
+                    f"UPDATE {self.s} SET execution_state=?,owner_node_id=NULL,owner_boot_id=NULL,"
+                    "owner_lease_until_ms=NULL,pending_tool_seq=NULL,ready_item_json=NULL,"
+                    f"cancel_by=NULL,cancel_reason=NULL,updated_at={now_sql} "
+                    "WHERE session_id=? AND execution_state='running' AND owner_epoch=?",
+                    (next_state, sid, epoch),
                 )
-                for row in rows
-            )
-            final_batch = FinalBatch(
-                next_state, results, result_ref,
-                activations[0] if activations else None, delivery_error,
-            )
+                if changed != 1:
+                    raise SessionLeaseLost(sid)
+                results = tuple(
+                    Result(
+                        self.record(row).ref, target, terminal, active, None,
+                        error=detail, error_code=terminal, result_delivery_error=delivery_error,
+                        cancel_by=cby,
+                    )
+                    for row in rows
+                )
+                final_batch = FinalBatch(
+                    next_state, results, result_ref,
+                    activations[0] if activations else None, delivery_error,
+                )
+
+        for drv_sid, item_id, payload in driver_events_out:
+            self._push_driver_leaf_result(drv_sid, item_id, payload)
 
         await self._fire_session_takeover(
             session_id=sid,
@@ -3885,13 +4327,13 @@ class RuntimeInputStore:
             owner_epoch=new_epoch,
             send_index=active,
         )
-        if undeliverable is not None:
+        for c_target, p_sid, r_res, r_kind, r_reason in undeliverables:
             await self._fire_result_undeliverable(
-                child_target=undeliverable[0],
-                parent_session_id=undeliverable[1],
-                result=undeliverable[2],
-                result_kind=undeliverable[3],
-                reason=undeliverable[4],
+                child_target=c_target,
+                parent_session_id=p_sid,
+                result=r_res,
+                result_kind=r_kind,
+                reason=r_reason,
             )
         return final_batch
 
@@ -3925,8 +4367,9 @@ class RuntimeInputStore:
     ) -> list[tuple[str, int, bool]]:
         """Bounded active-only subtree scan using ``idx_sessions_root`` (0 idle rows scanned!)."""
         active_rows = await tx.fetchall(
-            "SELECT session_id,parent_session_id,depth,send_index,ready_item_json,cancel_propagation "
-            f"FROM {self.s} WHERE root_session_id=? AND execution_state IN ('queued','running')",
+            "SELECT session_id,parent_session_id,depth,send_index,ready_item_json,"
+            f"cancel_propagation,session_kind FROM {self.s} "
+            "WHERE root_session_id=? AND execution_state IN ('queued','running')",
             (root_session_id,),
         )
         if session_id == root_session_id and not only_linked:
@@ -3944,10 +4387,11 @@ class RuntimeInputStore:
             cur_id = r["session_id"]
             cur_parent = r["parent_session_id"]
             cur_prop = r["cancel_propagation"]
+            cur_kind = r["session_kind"]
             matched = False
             visited: set[str] = set()
             while cur_parent is not None and cur_parent not in visited:
-                if only_linked and cur_prop != "linked":
+                if only_linked and cur_prop != "linked" and cur_kind != "workflow_driver":
                     break
                 if cur_parent == session_id:
                     matched = True
@@ -3956,16 +4400,19 @@ class RuntimeInputStore:
                 if cur_parent in by_id:
                     cur_id = cur_parent
                     cur_prop = by_id[cur_parent]["cancel_propagation"]
+                    cur_kind = by_id[cur_parent]["session_kind"]
                     cur_parent = by_id[cur_parent]["parent_session_id"]
                 else:
                     prow = await tx.fetchone(
-                        f"SELECT parent_session_id,cancel_propagation FROM {self.s} WHERE session_id=?",
+                        f"SELECT parent_session_id,cancel_propagation,session_kind "
+                        f"FROM {self.s} WHERE session_id=?",
                         (cur_parent,),
                     )
                     if prow is None:
                         break
                     cur_id = cur_parent
                     cur_prop = prow["cancel_propagation"]
+                    cur_kind = prow["session_kind"]
                     cur_parent = prow["parent_session_id"]
             if matched:
                 result.append((
@@ -3999,6 +4446,8 @@ class RuntimeInputStore:
             completed_refs: list[InputRef] = []
             stopped_descendants: list[str] = []
             undeliverables: list[tuple[TargetRef, str, Result, str, str]] = []
+            driver_events_out: list[tuple[str, str, dict[str, Any]]] = []
+            target_is_driver = False
             try:
                 async with self.db.transaction() as tx:
                     session = await self.authorize(tx, target, actor)
@@ -4054,6 +4503,7 @@ class RuntimeInputStore:
 
                     # Now lock target itself (strictly shallower than all descendants & intermediate parents)
                     state = await self.db.dialect.lock_state(tx, self.s, target.session_id)
+                    target_is_driver = state["session_kind"] == "workflow_driver"
 
                     # Step C (Verify under locks): confirm target & every locked candidate still match
                     # the live subtree topology and active state; retry cleanly with 0 writes if changed!
@@ -4099,16 +4549,26 @@ class RuntimeInputStore:
                                 skip_item_ids=cascaded_delivered.get(d_sid),
                                 cascaded_delivered=cascaded_delivered,
                                 undeliverables=undeliverables,
+                                _driver_events_out=driver_events_out,
                             )
                     if isinstance(ref, InputRef):
                         record = await self.input(tx, ref)
                         if record is None:
                             raise RuntimeRequestError("not_found")
-                        receipt = await self._cancel_input_tx(
-                            tx, state, record, reason=reason, cancel_by=eff_cancel_by,
-                            activations=activations, completed_refs=completed_refs,
-                            undeliverables=undeliverables,
-                        )
+                        if record.row["kind"] == "workflow_continue" or record.row["status"] == "waiting_continuation":
+                            receipt = await self._cancel_workflow_input_tx(
+                                tx, state, record, reason=reason, cancel_by=eff_cancel_by,
+                                activations=activations, completed_refs=completed_refs,
+                                undeliverables=undeliverables,
+                                _driver_events_out=driver_events_out,
+                            )
+                        else:
+                            receipt = await self._cancel_input_tx(
+                                tx, state, record, reason=reason, cancel_by=eff_cancel_by,
+                                activations=activations, completed_refs=completed_refs,
+                                undeliverables=undeliverables,
+                                _driver_events_out=driver_events_out,
+                            )
                     else:
                         receipt = await self._cancel_single_session_tx(
                             tx, state, reason=reason, cancel_by=eff_cancel_by,
@@ -4116,6 +4576,7 @@ class RuntimeInputStore:
                             completed_refs=completed_refs,
                             skip_item_ids=cascaded_delivered.get(target.session_id),
                             undeliverables=undeliverables,
+                            _driver_events_out=driver_events_out,
                         )
 
                     if prestaged_desc:
@@ -4127,12 +4588,11 @@ class RuntimeInputStore:
                             tuple(prestaged_desc),
                         )
 
-                    # Probe 4A: human single-target stop on a child session notifies root_session_id
+                    # Design 217 §5.3: human stop on a child/driver notifies root_session_id
                     # with wake=0 system_notice keyed by sys_stop_{session_id}_c{new_cancel_seq}.
                     root_sid = str(state["root_session_id"])
                     if (
                         not isinstance(ref, InputRef)
-                        and scope == "self"
                         and actor.session_id is None
                         and eff_cancel_by == "user"
                         and root_sid != target.session_id
@@ -4168,6 +4628,21 @@ class RuntimeInputStore:
                 continue
         else:
             raise RuntimeRequestError("request_conflict", "concurrent subtree mutation")
+
+        for drv_sid, item_id, payload in driver_events_out:
+            self._push_driver_leaf_result(drv_sid, item_id, payload)
+        if receipt.state == "cancel_requested":
+            if target_is_driver:
+                self.notify_driver_cancel(
+                    target.session_id,
+                    cancel_by=eff_cancel_by,
+                    reason=reason,
+                    subtree_stopped=(scope == "subtree"),
+                )
+            for d_sid in stopped_descendants:
+                self.notify_driver_cancel(
+                    d_sid, cancel_by="subtree", reason=reason, subtree_stopped=True,
+                )
 
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverables:
             await self._fire_result_undeliverable(
@@ -4255,12 +4730,13 @@ class RuntimeInputStore:
         skip_item_ids: set[str] | None = None,
         cascaded_delivered: dict[str, set[str]] | None = None,
         undeliverables: list[tuple[TargetRef, str, Result, str, str]] | None = None,
+        _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> Receipt:
         sid = state["session_id"]
         target = TargetRef(self.store.store_id, sid)
         now_sql = self._now_sql()
         route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
-        child_wake = 0 if is_subtree_cascade else 1
+        child_wake = 0 if (is_subtree_cascade or cancel_by == "subtree") else 1
 
         if state["execution_state"] == "running":
             await tx.execute(
@@ -4284,11 +4760,12 @@ class RuntimeInputStore:
         voided_wake = 0
         for row in pending_rows:
             rec = self.record(row)
+            root_rec = await self._continuation_root(tx, rec) if row["continuation_of"] is not None else rec
             delivery_error = None
-            if route is not None:
+            if route is not None and row["kind"] in ("user", "workflow_continue"):
                 cancelled_res = Result(
-                    rec.ref, target, "cancelled", None, None,
-                    error=reason, error_code="cancelled",
+                    root_rec.ref, target, "cancelled", None, None,
+                    error=reason, error_code="cancelled", cancel_by=cancel_by,
                 )
                 parent_ref, delivery_error = await self._river_deliver_tx(
                     tx,
@@ -4301,6 +4778,7 @@ class RuntimeInputStore:
                     result_kind=route["result_kind"],
                     child_wake=child_wake,
                     activations=activations,
+                    _driver_events_out=_driver_events_out,
                 )
                 if delivery_error is None and cascaded_delivered is not None:
                     cascaded_delivered.setdefault(parent_ref.session_id, set()).add(parent_ref.message_id)
@@ -4324,10 +4802,21 @@ class RuntimeInputStore:
                 voided_wake += int(row["wake"])
                 completed_refs.append(rec.ref)
                 parent_id = row["continuation_of"]
+                ancestors_to_close: list[str] = []
                 while parent_id in waiting_by_item:
                     parent_row = waiting_by_item.pop(parent_id)
+                    ancestors_to_close.append(parent_id)
                     completed_refs.append(InputRef(self.store.store_id, sid, parent_id))
                     parent_id = parent_row["continuation_of"]
+                if ancestors_to_close:
+                    await tx.execute(
+                        f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
+                        "result_send_index=delivered_send_index,error_code='cancelled',error_detail=?,"
+                        f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? "
+                        f"AND item_id IN ({','.join('?' for _ in ancestors_to_close)}) "
+                        "AND status='waiting_continuation' AND terminal_status IS NULL",
+                        (cancel_by, reason, delivery_error, sid, *ancestors_to_close),
+                    )
 
         # Handle queued pre-staged child (send_index=0 and ready_item_json IS NOT NULL)
         is_prestaged = int(state["send_index"]) == 0 and bool(state["ready_item_json"])
@@ -4338,7 +4827,7 @@ class RuntimeInputStore:
             if route is not None:
                 cancelled_res = Result(
                     pre_ref, target, "cancelled", None, None,
-                    error=reason, error_code="cancelled",
+                    error=reason, error_code="cancelled", cancel_by=cancel_by,
                 )
                 parent_ref, delivery_error = await self._river_deliver_tx(
                     tx,
@@ -4351,6 +4840,7 @@ class RuntimeInputStore:
                     result_kind=route["result_kind"],
                     child_wake=child_wake,
                     activations=activations,
+                    _driver_events_out=_driver_events_out,
                 )
                 if delivery_error is None and cascaded_delivered is not None:
                     cascaded_delivered.setdefault(parent_ref.session_id, set()).add(parent_ref.message_id)
@@ -4396,10 +4886,138 @@ class RuntimeInputStore:
             None, "not_needed", reason if changed else None,
         )
 
+    async def _continuation_root(self, reader, record: InputRecord) -> InputRecord:
+        current = record
+        for _ in range(10000):
+            parent_id = current.row["continuation_of"]
+            if parent_id is None:
+                return current
+            parent = await self.input(
+                reader, InputRef(current.ref.store_id, current.ref.session_id, parent_id),
+            )
+            if parent is None:
+                raise RuntimeRequestError("workflow_continuation_broken")
+            current = parent
+        raise CapacityError()
+
+    async def _cancel_workflow_input_tx(
+        self, tx, state, record: InputRecord, *, reason: str, cancel_by: str,
+        activations: list[TargetRef], completed_refs: list[InputRef],
+        undeliverables: list[tuple[TargetRef, str, Result, str, str]] | None = None,
+        _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
+    ) -> Receipt:
+        """Resolve cancel(original/continuation) to the newest continuation and close its chain."""
+        sid = record.ref.session_id
+        target = TargetRef(self.store.store_id, sid)
+        now_sql = self._now_sql()
+        root = await self._continuation_root(tx, record)
+        latest = await self._latest_continuation(
+            tx, ResultInput(record.ref, {name: record.row[name] for name in _RESULT_INPUT_COLUMNS}),
+        )
+        derived_latest = await self._derive_input_terminal(tx, dict(state), latest.row)
+        if derived_latest["terminal_status"] is not None:
+            return self.receipt(record, state="already_finished")
+        if (
+            latest.row["status"] == "delivered"
+            and state["execution_state"] == "running"
+            and latest.row["delivered_send_index"] == int(state["send_index"])
+        ):
+            await tx.execute(
+                f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
+                f"updated_at={now_sql} WHERE session_id=? AND execution_state='running'",
+                (cancel_by, reason, sid),
+            )
+            return Receipt(
+                record.ref, target, record.ref.message_id, False, "cancel_requested",
+                int(state["send_index"]), "not_needed", reason,
+            )
+        if latest.row["status"] != "pending":
+            return self.receipt(record, state="already_finished")
+
+        latest_full = await self.input(tx, latest.ref)
+        w_val = int(latest_full.row["wake"]) if latest_full is not None else 1
+        b_val = int(latest_full.row["content_bytes"]) if latest_full is not None else 0
+        route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
+        delivery_error = None
+        if route is not None:
+            cancelled = Result(
+                root.ref, target, "cancelled", None, None,
+                error=reason, error_code="cancelled", cancel_by=cancel_by,
+            )
+            _, delivery_error = await self._river_deliver_tx(
+                tx,
+                child_target=target,
+                child_tenant_id=state["tenant_id"],
+                child_principal_id=state["principal_id"],
+                parent_session_id=route["target"]["session_id"],
+                start_ref=InputRef(**route["input_ref"]),
+                result=cancelled,
+                result_kind=route["result_kind"],
+                child_wake=1,
+                activations=activations,
+                _driver_events_out=_driver_events_out,
+            )
+            if delivery_error is not None and undeliverables is not None:
+                undeliverables.append((
+                    target,
+                    route["target"]["session_id"],
+                    replace(cancelled, result_delivery_error=delivery_error),
+                    route["result_kind"],
+                    delivery_error,
+                ))
+        changed = await tx.execute(
+            f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
+            "error_code='cancelled',error_detail=?,result_delivery_error=?,"
+            f"completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+            (cancel_by, reason, delivery_error, sid, latest.ref.message_id),
+        )
+        if changed != 1:
+            raise SessionLeaseLost(sid)
+        completed_refs.append(latest.ref)
+
+        ancestors: list[str] = []
+        closed_refs: list[InputRef] = []
+        cur_id = latest.row["continuation_of"]
+        while cur_id is not None:
+            anc = await self.input(tx, InputRef(self.store.store_id, sid, cur_id))
+            if anc is None:
+                break
+            ancestors.append(anc.ref.message_id)
+            if anc.row["status"] == "waiting_continuation" and anc.row["terminal_status"] is None:
+                closed_refs.append(anc.ref)
+            cur_id = anc.row["continuation_of"]
+        if record.ref.message_id not in ancestors:
+            ancestors.append(record.ref.message_id)
+            if record.row["status"] == "waiting_continuation" and record.row["terminal_status"] is None:
+                closed_refs.append(record.ref)
+        if ancestors:
+            await tx.execute(
+                f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
+                "result_send_index=delivered_send_index,error_code='cancelled',error_detail=?,"
+                f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? "
+                f"AND item_id IN ({','.join('?' for _ in ancestors)}) "
+                "AND status='waiting_continuation' AND terminal_status IS NULL",
+                (cancel_by, reason, delivery_error, sid, *ancestors),
+            )
+            completed_refs.extend(closed_refs)
+
+        await tx.execute(
+            f"UPDATE {self.s} SET "
+            "execution_state=CASE WHEN execution_state='queued' AND (wake_pending_count-?)<=0 "
+            "THEN 'idle' ELSE execution_state END,"
+            "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+            "pending_count=CASE WHEN pending_count>=1 THEN pending_count-1 ELSE 0 END,"
+            "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+            f"updated_at={now_sql} WHERE session_id=?",
+            (w_val, w_val, w_val, b_val, b_val, sid),
+        )
+        return self.receipt(record, state="voided", reason=reason)
+
     async def _cancel_input_tx(
         self, tx, state, record: InputRecord, *, reason: str, cancel_by: str,
         activations: list[TargetRef], completed_refs: list[InputRef],
         undeliverables: list[tuple[TargetRef, str, Result, str, str]] | None = None,
+        _driver_events_out: list[tuple[str, str, dict[str, Any]]] | None = None,
     ) -> Receipt:
         row = record.row
         ref = record.ref
@@ -4417,7 +5035,7 @@ class RuntimeInputStore:
             if route is not None:
                 cancelled = Result(
                     ref, TargetRef(self.store.store_id, sid), "cancelled", None, None,
-                    error=reason, error_code="cancelled",
+                    error=reason, error_code="cancelled", cancel_by=cancel_by,
                 )
                 _, delivery_error = await self._river_deliver_tx(
                     tx,
@@ -4430,6 +5048,7 @@ class RuntimeInputStore:
                     result_kind=route["result_kind"],
                     child_wake=1,
                     activations=activations,
+                    _driver_events_out=_driver_events_out,
                 )
                 if delivery_error is not None and undeliverables is not None:
                     undeliverables.append((
@@ -4460,8 +5079,8 @@ class RuntimeInputStore:
                 )
                 completed_refs.append(ref)
                 new_row = dict(
-                    row, status="void", terminal_status="cancelled", error_detail=reason,
-                    result_delivery_error=delivery_error,
+                    row, status="void", terminal_status="cancelled", cancel_by=cancel_by,
+                    error_detail=reason, result_delivery_error=delivery_error,
                 )
                 return self.receipt(InputRecord(ref, new_row, record.meta), state="voided", reason=reason)
         if (
@@ -6241,6 +6860,7 @@ class RuntimeInputStore:
             ref, target, terminal, result_si, result_seq,
             final_text, usage, structured, resolved.row["error_detail"],
             resolved.row["error_code"], resolved.row["result_delivery_error"],
+            cancel_by=resolved.row.get("cancel_by"),
         )
 
     async def read_result_state(self, ref: InputRef, *, actor) -> ResultRead:

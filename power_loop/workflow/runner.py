@@ -1,19 +1,25 @@
-"""Session-native workflow admission, execution and recovery.
+"""Session-Core Plan B resident lightweight workflow_driver (design 217 §4.5).
 
-The driver is a non-LLM session. Leaves are ordinary agent sessions created with
-one atomic session+start transaction; their journal entries commit afterwards.
-A replacement driver replays the frozen graph from those entries and ordinary
-node result inputs, never from a Python call stack or a job generation.
+The driver is a non-LLM session that occupies 0 model concurrency slots and piggybacks
+its lease onto node-level ``batch_renew``. Same-wave leaves are created in one atomic
+``create_many`` transaction; original-leaf continuations (``ContinuationPolicy`` and
+``LoopNode.continue_nodes``) use standard ``accept(kind='workflow_continue')``.
+Same-process leaf results arrive via an in-memory waiter queue (0 DB reads); cross-process
+leaf results arrive via ``WakeTransport`` / transport wake followed by a single indexed
+``follow_up_queue`` read. The driver executes 1 Claim + 1 Final per run, writing back
+``start_input_message_id``'s ``terminal_status``/``result_json``/``completed_at`` and
+delivering ``workflow_result`` to the parent in the same ``Final`` transaction.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from typing import Any
 
-from power_loop.agent.runtime_store import FinalBatch, now_ms
+from power_loop.agent.runtime_store import ChildSpec, InputRecord, now_ms
 from power_loop.agent.runtime_types import (
     CapacityError,
     InputRef,
@@ -34,9 +40,30 @@ from .engine import WorkflowEngine
 from .spec import WorkflowSpec
 
 
+@dataclass
+class _PendingLeafCreate:
+    key: str
+    request: Any
+    target: TargetRef
+    start: InputRef
+    request_hash: str
+    descriptor: RuntimeDescriptor
+    spec: ChildSpec
+    future: asyncio.Future
+
+
+def _normalize_node_status(raw: dict[str, Any]) -> dict[str, Any]:
+    out = dict(raw)
+    if out.get("error_code") in {"hit_round_limit", "context_checkpoint"}:
+        out["status"] = out["error_code"]
+    elif out.get("error_code") in {"unknown", "store_commit_unknown"}:
+        out["status"] = "unknown"
+    return out
+
+
 async def submit(client, target, spec, *, message_id, actor, descriptor=None, options=None, parent=None):
     """Create only the independent driver and its frozen start input."""
-    del parent  # Parent authority is the direct caller session, never a job lease.
+    del parent
     client._require_open()
     spec = WorkflowSpec.from_json(spec.to_dict() if isinstance(spec, WorkflowSpec) else spec)
     port = client.inputs
@@ -55,18 +82,19 @@ async def submit(client, target, spec, *, message_id, actor, descriptor=None, op
         target.store_id, sid,
         "inp_" + sha256_canonical(["workflow_start", target.store_id, sid])[:56],
     )
-    existing = await port.db.fetchone(
-        f"SELECT descriptor_json FROM {port.store.t.sessions} WHERE session_id=?", (sid,),
-    )
-    if existing is not None and supplied_descriptor is None and supplied_options is None:
-        descriptor = RuntimeDescriptor(**json.loads(existing["descriptor_json"]))
-        frozen_spec = WorkflowSpec.from_json(plain(descriptor.config["workflow"]["spec"]))
-        if canonical(frozen_spec.to_dict()) != canonical(spec.to_dict()):
-            raise RuntimeRequestError("creation_conflict")
-        options = RequestOptions(**{
-            key: value for key, value in descriptor.config["workflow"].get("options", {}).items()
-            if key in RequestOptions.__dataclass_fields__
-        })
+    if supplied_descriptor is None and supplied_options is None:
+        existing = await port.db.fetchone(
+            f"SELECT descriptor_json FROM {port.store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        if existing is not None:
+            descriptor = RuntimeDescriptor(**json.loads(existing["descriptor_json"]))
+            frozen_spec = WorkflowSpec.from_json(plain(descriptor.config["workflow"]["spec"]))
+            if canonical(frozen_spec.to_dict()) != canonical(spec.to_dict()):
+                raise RuntimeRequestError("creation_conflict")
+            options = RequestOptions(**{
+                key: value for key, value in descriptor.config["workflow"].get("options", {}).items()
+                if key in RequestOptions.__dataclass_fields__
+            })
     descriptor = replace(
         descriptor,
         kind="workflow_driver",
@@ -88,6 +116,7 @@ async def submit(client, target, spec, *, message_id, actor, descriptor=None, op
         "definition_ref": plain(start),
         "created_at_ms": now_ms(),
         "status": "running",
+        "cancel_by": None,
         "result": None,
         "result_seq": None,
         "aggregate_delivered": False,
@@ -103,9 +132,14 @@ async def submit(client, target, spec, *, message_id, actor, descriptor=None, op
         body=spec.input,
         result_kind="workflow_result",
         cancel_propagation="independent",
-        run_journal=saved if existing is None else None,
+        run_journal=saved,
     )
     await client._notify(driver, start.message_id, start, ["work", "activation"])
+    if client.wake_transport is not None:
+        try:
+            await client.wake_transport.publish_wake(driver.session_id)
+        except Exception:
+            pass
     return WorkflowRunHandle(client, actor, driver, start)
 
 
@@ -128,12 +162,17 @@ class WorkflowRunHandle:
         data = plain(result.structured_output)
         if data is None:
             return WorkflowResult(
-                self.run_id, result.status, errors=[result.error] if result.error else [],
+                self.run_id,
+                result.status,
+                errors=[result.error] if result.error else [],
+                cancel_by=result.cancel_by,
             )
         data["results"] = {
             key: AgentResult(**value) for key, value in data.get("results", {}).items()
         }
         data["final"] = AgentResult(**data["final"]) if data.get("final") else None
+        if data.get("cancel_by") is None and result.cancel_by is not None:
+            data["cancel_by"] = result.cancel_by
         return WorkflowResult(**data)
 
     async def resume(self, *, node_id, message, message_id):
@@ -147,9 +186,9 @@ class WorkflowRunHandle:
 
 
 class DurableExecutor:
-    """Narrow Executor adapter over the unified session Client."""
+    """Session-Core Executor adapter over ``create_many``, ``workflow_continue``, and local/remote River."""
 
-    def __init__(self, worker, ctx, env, run_id, saved):
+    def __init__(self, worker, ctx, env, run_id, saved, *, resident_waiter=None):
         self.worker, self.ctx, self.env = worker, ctx, env
         self.client = worker.runtime.client
         self.port = worker.inputs
@@ -157,16 +196,31 @@ class DurableExecutor:
         self.plan = saved.get("continuation") or {}
         self.driver = TargetRef(ctx.store_id, ctx.session_id)
         self.actor = TrustedActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id)
-        self._nodes = None
-        self._by_input = {}
+        # Turn 1 of a fresh resident run has 0 prior node-journal rows: initialize in memory
+        # so parallel branches coalesce in one tick and skip an empty KV scan.
+        self._nodes: dict[str, dict[str, Any]] | None = (
+            {} if (resident_waiter is not None and ctx.send_index == 1 and not self.plan) else None
+        )
+        self._by_input: dict[InputRef, str] = {}
         self._journal_lock = asyncio.Lock()
+        self._pending_creates: list[_PendingLeafCreate] = []
+        self._flush_scheduled = False
+        if resident_waiter is not None:
+            self._waiter_q, self._waiter_sig, self._subtree_stopped_flag = resident_waiter
+        else:
+            self._waiter_q = None
+            self._waiter_sig = None
+            self._subtree_stopped_flag = [False]
+        self._in_memory_results: dict[InputRef, tuple[str, dict[str, Any]]] = {}
+        self._last_polled_id = 0
 
     async def _load_nodes(self, reader=None):
         """Called under the local journal lock; facts belong only to this executor."""
         if self._nodes is not None:
             return
         entries = await journal.nodes(
-            self.port.store, self.port.db if reader is None else reader, self.ctx.session_id)
+            self.port.store, self.port.db if reader is None else reader, self.ctx.session_id,
+        )
         self._nodes = {}
         for entry in entries:
             key = journal.node_key(
@@ -175,12 +229,14 @@ class DurableExecutor:
             )
             self._publish_node(key, entry)
 
-    def _publish_node(self, key, entry):
+    def _publish_node(self, key: str, entry: dict[str, Any]) -> None:
+        assert self._nodes is not None
         self._nodes[key] = entry
         self._by_input[InputRef(**entry["input_ref"])] = key
 
-    def _check_capacity(self, key):
-        if key not in self._nodes and len(self._nodes) + 1 > journal.NODE_LIMIT:
+    def _check_capacity(self, key: str, extra: int = 0) -> None:
+        assert self._nodes is not None
+        if key not in self._nodes and len(self._nodes) + extra + 1 > journal.NODE_LIMIT:
             raise CapacityError()
 
     def _coordinates(self, request):
@@ -253,21 +309,316 @@ class DurableExecutor:
         )
 
     async def _check_owner(self, tx):
-        state = await self.port.store._db.dialect.lock_state(tx, self.port.state, self.ctx.session_id)
+        state = await self.port.store._db.dialect.lock_state(tx, self.port.s, self.ctx.session_id)
         batch = self.ctx.batch
         if (
             state["execution_state"] != "running"
-            or state["active_send_index"] != batch.send_index
-            or state["owner_epoch"] != batch.owner_epoch
-            or state["owner_token"] != batch.owner_token
+            or int(state["send_index"]) != int(batch.send_index)
+            or int(state["owner_epoch"]) != int(batch.owner_epoch)
         ):
             raise SessionLeaseLost(self.ctx.session_id)
         return state
+
+    def _build_node_entry(self, request, target: TargetRef, start: InputRef, request_hash: str) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "driver_target": plain(self.driver),
+            "run_id": self.run_id,
+            "path": request.node_path,
+            "iteration": request.iteration_path,
+            "attempt": request.attempt,
+            "continuation_index": request.continuation,
+            "target_ref": plain(target),
+            "session_id": target.session_id,
+            "input_ref": plain(start),
+            "request_hash": request_hash,
+            "revision": int(self.plan.get("revision", 0)),
+            "superseded": False,
+            "result": None,
+            "result_seq": None,
+            "result_input_ref": None,
+            "late_results": [],
+        }
+
+    async def _enqueue_leaf_create(
+        self, key: str, request, target: TargetRef, start: InputRef,
+        request_hash: str, descriptor: RuntimeDescriptor,
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        identity = sha256_canonical([
+            "workflow_session", self.driver.store_id, self.driver.session_id,
+            target.session_id, descriptor, start,
+        ])
+        child_spec = ChildSpec(
+            session_id=target.session_id,
+            message_id=start.message_id,
+            body=request.body,
+            descriptor=descriptor,
+            result_kind="workflow_node_result",
+            reply_to_session_id=self.driver.session_id,
+            cancel_propagation="linked",
+            creation_identity_hash=identity,
+        )
+        self._pending_creates.append(_PendingLeafCreate(
+            key=key, request=request, target=target, start=start,
+            request_hash=request_hash, descriptor=descriptor, spec=child_spec, future=fut,
+        ))
+        if not self._flush_scheduled:
+            self._flush_scheduled = True
+            asyncio.create_task(self._flush_pending_creates())
+        return await fut
+
+    async def _flush_pending_creates(self) -> None:
+        # Yield once so all parallel/foreach branches scheduled in this event-loop tick coalesce
+        # into ONE single atomic create_many transaction + ONE batched node-journal transaction!
+        await asyncio.sleep(0)
+        while self._journal_lock.locked():
+            await asyncio.sleep(0)
+        batch_items = list(self._pending_creates)
+        self._pending_creates.clear()
+        self._flush_scheduled = False
+        if not batch_items:
+            return
+
+        r = self.worker.runtime
+        can_preclaim = (
+            self.worker._started
+            and not self.worker._closing
+            and getattr(r, "fuse_local_send", True)
+            and getattr(r.coordinator, "installs_session_fence", False)
+            and all(self.worker._capable(item.descriptor) for item in batch_items)
+        )
+        free_slots = max(0, r.capacity - self.worker._active_llm_count()) if can_preclaim else 0
+
+        try:
+            cm = await self.port.create_many(
+                parent=self.driver,
+                actor=self.actor,
+                specs=[item.spec for item in batch_items],
+                node_id=r.node_id,
+                boot_id=r.boot_id,
+                ttl_s=r.session_lease_ttl_s,
+                can_execute=can_preclaim,
+                free_slots=free_slots,
+                parent_owner_epoch=self.ctx.batch.owner_epoch,
+                parent_cancel_seq=self.ctx.batch.cancel_seq,
+            )
+            for b in cm.preclaimed:
+                self.worker.dispatch_claimed(b)
+            spec_by_sid = {item.target.session_id: item for item in batch_items}
+            for qt in cm.queued_targets:
+                it = spec_by_sid[qt.session_id]
+                await self.client._notify(qt, it.start.message_id, it.start, ["work", "activation"])
+                if self.client.wake_transport is not None:
+                    try:
+                        await self.client.wake_transport.publish_wake(qt.session_id)
+                    except Exception:
+                        pass
+            if cm.already_created:
+                for item in batch_items:
+                    await self.client._notify(
+                        item.target, item.start.message_id, item.start, ["work", "activation"],
+                    )
+                    if self.client.wake_transport is not None:
+                        try:
+                            await self.client.wake_transport.publish_wake(item.target.session_id)
+                        except Exception:
+                            pass
+        except BaseException as exc:
+            for item in batch_items:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            return
+
+        # Fixed order: session+start committed above, journal committed below.
+        accepted_items: list[tuple[_PendingLeafCreate, dict[str, Any]]] = []
+        async with self._journal_lock:
+            assert self._nodes is not None
+            extra = 0
+            for item in batch_items:
+                existing = self._nodes.get(item.key)
+                if existing is not None:
+                    if existing["request_hash"] != item.request_hash:
+                        if not item.future.done():
+                            item.future.set_exception(
+                                RuntimeRequestError("request_conflict", "workflow dispatch input changed")
+                            )
+                    else:
+                        if not item.future.done():
+                            item.future.set_result(existing)
+                    continue
+                try:
+                    self._check_capacity(item.key, extra=extra)
+                except BaseException as cap_exc:
+                    if not item.future.done():
+                        item.future.set_exception(cap_exc)
+                    continue
+                entry = self._build_node_entry(item.request, item.target, item.start, item.request_hash)
+                accepted_items.append((item, entry))
+                extra += 1
+
+            if accepted_items:
+                try:
+                    async with self.port.db.transaction() as tx:
+                        await self._check_owner(tx)
+                        await journal.put_many(
+                            self.port.store,
+                            tx,
+                            self.ctx.session_id,
+                            [(it.key, ent) for it, ent in accepted_items],
+                        )
+                except BaseException as j_exc:
+                    for it, _ in accepted_items:
+                        if not it.future.done():
+                            it.future.set_exception(j_exc)
+                    return
+                for it, ent in accepted_items:
+                    self._publish_node(it.key, ent)
+                    if not it.future.done():
+                        it.future.set_result(ent)
+
+    async def _send_leaf_continuation(self, target: TargetRef, start: InputRef, body: Any) -> None:
+        """Original-leaf continuation via standard accept/accept_and_claim(kind='workflow_continue')."""
+        r = self.worker.runtime
+        reply_route = {"target": self.driver, "result_kind": "workflow_node_result"}
+        can_fuse = (
+            self.worker._started
+            and not self.worker._closing
+            and getattr(r, "fuse_local_send", True)
+            and getattr(r.coordinator, "installs_session_fence", False)
+            and self.worker.can_fuse_locally(target.session_id)
+        )
+        batch = None
+        if can_fuse:
+            receipt, batch, activate = await self.port.accept_and_claim(
+                target, body, message_id=start.message_id, actor=self.actor,
+                node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
+                kind="workflow_continue", reply_route=reply_route, public=False,
+                can_execute=self.worker._capable,
+            )
+        else:
+            receipt, activate = await self.port.accept(
+                target, body, message_id=start.message_id, actor=self.actor,
+                kind="workflow_continue", reply_route=reply_route, public=False,
+                _with_activation=True,
+            )
+        if batch is not None:
+            self.worker.dispatch_claimed(batch)
+            return
+        if receipt.state == "accepted" and activate:
+            await self.client._notify(target, start.message_id, start, ["work", "activation"])
+            if self.client.wake_transport is not None:
+                try:
+                    await self.client.wake_transport.publish_wake(target.session_id)
+                except Exception:
+                    pass
+
+    def _drain_local_waiter(self) -> None:
+        if self._waiter_q is None:
+            return
+        while True:
+            try:
+                ev = self._waiter_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if ev.get("type") == "leaf_result":
+                payload = ev["payload"]
+                src = InputRef(**payload["input_ref"])
+                self._in_memory_results[src] = (str(ev["item_id"]), _normalize_node_status(payload))
+            elif ev.get("type") == "cancel":
+                if ev.get("cancel_by") is not None:
+                    self.ctx.cancel_by = ev["cancel_by"]
+
+    async def _pull_remote_pending_results(self, *, include_claimed_send: bool = False) -> int:
+        if include_claimed_send:
+            rows = await self.port.poll_driver_results_for_send(
+                self.ctx.session_id, self.ctx.send_index, after_id=self._last_polled_id,
+            )
+        else:
+            rows = await self.port.poll_pending_driver_results(
+                self.ctx.session_id, after_id=self._last_polled_id,
+            )
+        for row in rows:
+            self._last_polled_id = max(self._last_polled_id, int(row["id"]))
+            payload = json.loads(row["content_json"])
+            src = InputRef(**payload["input_ref"])
+            self._in_memory_results[src] = (str(row["item_id"]), _normalize_node_status(payload))
+        return len(rows)
+
+    async def _redeliver_missing_node_result(self, leaf_target: TargetRef, start: InputRef, res: Result) -> None:
+        driver_events: list[tuple[str, str, dict[str, Any]]] = []
+        async with self.port.db.transaction() as tx:
+            leaf_row = await self.port._session(tx, leaf_target.session_id)
+            await self.port._river_deliver_tx(
+                tx,
+                child_target=leaf_target,
+                child_tenant_id=leaf_row["tenant_id"],
+                child_principal_id=leaf_row["principal_id"],
+                parent_session_id=self.driver.session_id,
+                start_ref=start,
+                result=res,
+                result_kind="workflow_node_result",
+                child_wake=1,
+                _driver_events_out=driver_events,
+            )
+        for drv_sid, item_id, payload in driver_events:
+            self.port._push_driver_leaf_result(drv_sid, item_id, payload)
+
+    async def _wait_resident_node_result(self, key: str, start: InputRef, target: TargetRef) -> dict[str, Any]:
+        """Wait for a leaf result: 0 DB reads in-process; 1 indexed SELECT on cross-process wake."""
+        assert self._waiter_sig is not None and self._nodes is not None
+        polled_initial = False
+        idle_polls = 0
+        while True:
+            self._drain_local_waiter()
+            existing_res = self._nodes[key].get("result")
+            if existing_res is not None:
+                return existing_res
+            hit = self._in_memory_results.get(start)
+            if hit is not None:
+                item_id, raw = hit
+                entry = self._nodes[key]
+                entry["result"] = raw
+                entry["result_seq"] = raw.get("result_seq")
+                entry["result_input_ref"] = plain(InputRef(self.ctx.store_id, self.ctx.session_id, item_id))
+                return raw
+
+            # If woken by cross-process WakeTransport/transport (or on crash replay), run 1 indexed SELECT
+            if self._waiter_sig.is_set() or (self.ctx.send_index > 1 and not polled_initial):
+                is_recovery_init = self.ctx.send_index > 1 and not polled_initial
+                self._waiter_sig.clear()
+                polled_initial = True
+                self._drain_local_waiter()
+                if start in self._in_memory_results:
+                    continue
+                await self._pull_remote_pending_results(include_claimed_send=is_recovery_init)
+                if start in self._in_memory_results:
+                    continue
+
+            try:
+                await asyncio.wait_for(self._waiter_sig.wait(), timeout=0.25)
+            except TimeoutError:
+                idle_polls += 1
+                # Fallback for cross-process DatabasePollingTransport / lost hints or full inbox
+                found = await self._pull_remote_pending_results(
+                    include_claimed_send=(self.ctx.send_index > 1),
+                )
+                if found or start in self._in_memory_results:
+                    continue
+                if idle_polls >= 2:
+                    res = await self.port.get_result(start, actor=self.actor)
+                    if res is not None:
+                        await self._consume_results(for_key=key)
+                        if self._nodes[key].get("result") is not None:
+                            return self._nodes[key]["result"]
+                        await self._redeliver_missing_node_result(target, start, res)
 
     async def run_agent(self, request, *, allow_start=True):
         request, target, start, key, request_hash = self._coordinates(request)
         async with self._journal_lock:
             await self._load_nodes()
+            assert self._nodes is not None
             saved = self._nodes.get(key)
             if saved is not None and saved["request_hash"] != request_hash:
                 raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
@@ -275,81 +626,66 @@ class DurableExecutor:
                 if not allow_start:
                     return {"status": "budget_exceeded", "usage": {}, "session_id": target.session_id}
                 self._check_capacity(key)
+
         if saved is None:
             descriptor = self._descriptor(request)
             if request.session_id is None and request.attempt == 1 and request.continuation == 0:
-                await self.port.create_workflow_session(
-                    descriptor,
-                    parent=self.driver,
-                    actor=self.actor,
-                    target=target,
-                    start=start,
-                    body=request.body,
-                    result_kind="workflow_node_result",
-                    cancel_propagation="linked",
+                saved = await self._enqueue_leaf_create(
+                    key, request, target, start, request_hash, descriptor,
                 )
-                await self.client._notify(target, start.message_id, start, ["work", "activation"])
             else:
-                await self.client.send(
-                    target, request.body, message_id=start.message_id, actor=self.actor,
-                )
-            # Fixed order: session+start committed above, journal committed below.
-            async with self._journal_lock:
-                saved = self._nodes.get(key)
-                if saved is not None and saved["request_hash"] != request_hash:
-                    raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
-                if saved is None:
-                    self._check_capacity(key)
-                    saved = {
-                        "version": 1,
-                        "driver_target": plain(self.driver),
-                        "run_id": self.run_id,
-                        "path": request.node_path,
-                        "iteration": request.iteration_path,
-                        "attempt": request.attempt,
-                        "continuation_index": request.continuation,
-                        "target_ref": plain(target),
-                        "session_id": target.session_id,
-                        "input_ref": plain(start),
-                        "request_hash": request_hash,
-                        "revision": int(self.plan.get("revision", 0)),
-                        "superseded": False,
-                        "result": None,
-                        "result_seq": None,
-                        "result_input_ref": None,
-                        "late_results": [],
-                    }
-                    async with self.port.db.transaction() as tx:
-                        await self._check_owner(tx)
-                        await journal.put(self.port.store, tx, self.ctx.session_id, key, saved)
-                    self._publish_node(key, saved)
+                await self._send_leaf_continuation(target, start, request.body)
+                async with self._journal_lock:
+                    saved = self._nodes.get(key)
+                    if saved is not None and saved["request_hash"] != request_hash:
+                        raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
+                    if saved is None:
+                        self._check_capacity(key)
+                        saved = self._build_node_entry(request, target, start, request_hash)
+                        async with self.port.db.transaction() as tx:
+                            await self._check_owner(tx)
+                            await journal.put(self.port.store, tx, self.ctx.session_id, key, saved)
+                        self._publish_node(key, saved)
 
         if saved.get("result") is None:
+            use_resident_waiter = self._waiter_q is not None and "wait" not in vars(self.client)
             try:
-                result = await self.client.wait(start, actor=self.actor, deadline_ms=None)
+                if use_resident_waiter:
+                    raw_res = await self._wait_resident_node_result(key, start, target)
+                    saved = self._nodes[key]
+                    _ = raw_res
+                else:
+                    result = await self.client.wait(start, actor=self.actor, deadline_ms=None)
+                    consumed = await self._consume_results(for_key=key)
+                    saved = consumed.get(key, self._nodes[key])
+                    if saved.get("result") is None:
+                        await self._redeliver_missing_node_result(target, start, result)
+                        consumed = await self._consume_results(for_key=key)
+                        saved = consumed.get(key, self._nodes[key])
+                    if saved.get("result") is None:
+                        raise RuntimeRequestError("result_delivery_failed", start.message_id)
             except asyncio.CancelledError:
-                # Graph halt and explicit cancellation stop outstanding leaves. Driver
-                # shutdown/ownership replacement leaves healthy independent sessions alone.
+                # Graph halt, workflow timeout, or single-InputRef cancel stops sibling/active leaves
+                # with cancel_by='subtree' (child_wake=0 -> NEVER ghost-rewakes finished Driver!).
+                # If the Driver itself was already cancelled with scope='subtree', RuntimeInputStore.cancel
+                # already stopped all active leaves in 1 atomic DB transaction (0 redundant SQL!).
                 if (
                     not self.ctx.shutdown_interrupted
-                    and not self.ctx.ownership.lost
+                    and not (self.ctx.ownership is not None and self.ctx.ownership.lost)
                     and self.ctx.stop.reason != "worker shutdown"
+                    and not self._subtree_stopped_flag[0]
+                    and self.ctx.cancel_by != "subtree"
                 ):
                     await self.client.cancel(
-                        target, actor=self.actor, scope="subtree", reason="workflow branch stopped",
+                        target,
+                        actor=self.actor,
+                        scope="subtree",
+                        reason="workflow branch stopped",
+                        cancel_by="subtree",
                     )
                 raise
-            consumed = await self._consume_results(for_key=key)
-            saved = consumed.get(key, self._nodes[key])
-            if saved.get("result") is None:
-                # A full driver inbox can be drained and the ordinary result re-reported
-                # without re-executing the node. Unknown external actions are not replayed.
-                await self.port.accept_result(target, result, result_kind="workflow_node_result")
-                consumed = await self._consume_results(for_key=key)
-                saved = consumed.get(key, self._nodes[key])
-            if saved.get("result") is None:
-                raise RuntimeRequestError("result_delivery_failed", start.message_id)
 
+        assert self._nodes is not None
         raw = dict(saved["result"])
         next_key = journal.node_key(
             self.driver, self.run_id, request.node_path, request.iteration_path,
@@ -366,14 +702,18 @@ class DurableExecutor:
 
     async def _consume_results(self, *, for_key=None):
         async with self._journal_lock:
-            if for_key is not None and self._nodes[for_key].get("result") is not None:
+            if (
+                for_key is not None
+                and self._nodes is not None
+                and for_key in self._nodes
+                and self._nodes[for_key].get("result") is not None
+            ):
                 return {for_key: self._nodes[for_key]}
             return await self._consume_results_locked()
 
     async def _consume_results_locked(self):
-        """Consume every ready node result and journal it in one fenced transaction."""
+        """Consume ready node results and journal them in one conditionally-fenced transaction."""
         async with self.port.db.transaction() as tx:
-            await self._check_owner(tx)
             rows = await tx.fetchall(
                 f"SELECT * FROM {self.port.q} WHERE session_id=? "
                 "AND kind='workflow_node_result' AND terminal_status IS NULL AND completed_at IS NULL "
@@ -382,32 +722,65 @@ class DurableExecutor:
                 (self.ctx.session_id, self.ctx.send_index),
             )
             if not rows:
+                # Verify ownership even when empty if called explicitly
+                state = await tx.fetchone(
+                    f"SELECT execution_state,send_index,owner_epoch FROM {self.port.s} WHERE session_id=?",
+                    (self.ctx.session_id,),
+                )
+                if (
+                    state is None
+                    or state["execution_state"] != "running"
+                    or int(state["send_index"]) != int(self.ctx.send_index)
+                    or int(state["owner_epoch"]) != int(self.ctx.batch.owner_epoch)
+                ):
+                    raise SessionLeaseLost(self.ctx.session_id)
                 return {}
+
             await self._load_nodes(tx)
-            updates = {}
+            assert self._nodes is not None
+            updates: dict[str, dict[str, Any]] = {}
+            consumed_row_ids: list[int] = []
+            w_sub = p_sub = b_sub = 0
             database_now = now_ms()
+
             for row in rows:
                 body = json.loads(row["content_json"])
                 source = InputRef(**body["input_ref"])
                 key = self._by_input.get(source)
                 if key is None:
-                    # The node may have committed before its journal. Recovery aligns
-                    # that journal first; only then can this result advance the graph.
                     continue
                 if key not in updates:
                     prior = self._nodes[key]
                     updates[key] = {**prior, "late_results": list(prior["late_results"])}
                 entry = updates[key]
-                raw = dict(body)
-                source_record = await self.port.input(tx, source)
-                if source_record is None or source_record.row["terminal_status"] is None:
-                    raise RuntimeRequestError("workflow_result_source_not_terminal")
-                raw["send_index"] = source_record.row["result_send_index"]
-                if raw.get("error_code") in {"hit_round_limit", "context_checkpoint"}:
-                    raw["status"] = raw["error_code"]
-                elif raw.get("error_code") in {"unknown", "store_commit_unknown"}:
-                    raw["status"] = "unknown"
-                if self.saved.get("aggregate_delivered") or entry.get("superseded") or entry.get("result") is not None:
+                raw = _normalize_node_status(body)
+                if "send_index" not in body:
+                    source_record = await self.port.input(tx, source)
+                    if source_record is None:
+                        raise RuntimeRequestError("workflow_result_source_not_terminal")
+                    source_sess = await self.port._session(tx, source.session_id)
+                    derived_src = await self.port._derive_input_terminal(
+                        tx, dict(source_sess), source_record.row,
+                    )
+                    if derived_src["terminal_status"] is None:
+                        raise RuntimeRequestError("workflow_result_source_not_terminal")
+                    raw["send_index"] = derived_src["result_send_index"]
+                    if raw.get("cancel_by") is None and derived_src.get("cancel_by") is not None:
+                        raw["cancel_by"] = derived_src["cancel_by"]
+
+                is_same_primary = (
+                    entry.get("result") is not None
+                    and entry["result"].get("input_ref") == body["input_ref"]
+                    and not self.saved.get("aggregate_delivered")
+                    and not entry.get("superseded")
+                )
+                if is_same_primary:
+                    entry["result"] = raw
+                    entry["result_seq"] = body.get("result_seq")
+                    entry["result_input_ref"] = plain(
+                        InputRef(self.ctx.store_id, self.ctx.session_id, row["item_id"])
+                    )
+                elif self.saved.get("aggregate_delivered") or entry.get("superseded") or entry.get("result") is not None:
                     if not any(item.get("input_ref") == body["input_ref"] for item in entry["late_results"]):
                         entry["late_results"].append(raw)
                 else:
@@ -416,21 +789,49 @@ class DurableExecutor:
                     entry["result_input_ref"] = plain(
                         InputRef(self.ctx.store_id, self.ctx.session_id, row["item_id"])
                     )
-                await journal.put(self.port.store, tx, self.ctx.session_id, key, entry)
+
+                consumed_row_ids.append(int(row["id"]))
+                if row["status"] == "pending":
+                    w_sub += int(row["wake"])
+                    p_sub += 1
+                    b_sub += int(row["content_bytes"])
+
+            # Conditional owner fence + pending counter drain in 1 UPDATE sessions statement!
+            fenced = await tx.execute(
+                f"UPDATE {self.port.s} SET "
+                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END "
+                "WHERE session_id=? AND execution_state='running' AND send_index=? AND owner_epoch=?",
+                (
+                    w_sub, w_sub, p_sub, p_sub, b_sub, b_sub,
+                    self.ctx.session_id, self.ctx.send_index, self.ctx.batch.owner_epoch,
+                ),
+            )
+            if fenced != 1:
+                raise SessionLeaseLost(self.ctx.session_id)
+
+            if updates:
+                await journal.put_many(
+                    self.port.store, tx, self.ctx.session_id, list(updates.items()),
+                )
+            if consumed_row_ids:
+                ph = ",".join("?" for _ in consumed_row_ids)
                 changed = await tx.execute(
                     f"UPDATE {self.port.q} SET status='delivered',delivered_at=?,"
                     "delivered_seq=NULL,delivered_send_index=?,terminal_status='completed',"
-                    "result_send_index=?,completed_at=? WHERE session_id=? AND item_id=? "
+                    "result_send_index=?,completed_at=? "
+                    f"WHERE session_id=? AND id IN ({ph}) "
                     "AND (status='pending' OR (status='delivered' AND delivered_send_index=? "
                     "AND terminal_status IS NULL))",
                     (
                         database_now, self.ctx.send_index, self.ctx.send_index, database_now,
-                        self.ctx.session_id, row["item_id"], self.ctx.send_index,
+                        self.ctx.session_id, *consumed_row_ids, self.ctx.send_index,
                     ),
                 )
-                if changed != 1:
+                if changed != len(consumed_row_ids):
                     raise SessionLeaseLost(self.ctx.session_id)
-        # No await between a successful commit and publishing the transaction copies.
+
         for key, entry in updates.items():
             self._publish_node(key, entry)
         return updates
@@ -447,7 +848,7 @@ async def _prepare_explicit(worker, ctx, saved, origin, options):
     spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
     plan = plan_continuation(spec, options["node_id"])
     entries = await journal.nodes(port.store, port.db, ctx.session_id)
-    offsets = {}
+    offsets: dict[str, int] = {}
     for entry in entries:
         if entry["path"] in plan.invalidated:
             offsets[entry["path"]] = max(offsets.get(entry["path"], 0), int(entry["attempt"]))
@@ -460,14 +861,14 @@ async def _prepare_explicit(worker, ctx, saved, origin, options):
         "revision": revision,
     }
     async with port.db.transaction() as tx:
-        state = await port.store._db.dialect.lock_state(tx, port.state, ctx.session_id)
+        state = await port.store._db.dialect.lock_state(tx, port.s, ctx.session_id)
         if (
             state["execution_state"] != "running"
-            or state["active_send_index"] != ctx.send_index
-            or state["owner_epoch"] != ctx.batch.owner_epoch
-            or state["owner_token"] != ctx.batch.owner_token
+            or int(state["send_index"]) != int(ctx.send_index)
+            or int(state["owner_epoch"]) != int(ctx.batch.owner_epoch)
         ):
             raise SessionLeaseLost(ctx.session_id)
+        to_write: list[tuple[str, dict[str, Any]]] = []
         for entry in entries:
             if entry["path"] in plan.invalidated:
                 entry["superseded"] = True
@@ -475,210 +876,164 @@ async def _prepare_explicit(worker, ctx, saved, origin, options):
                     TargetRef(ctx.store_id, ctx.session_id), saved["run_id"],
                     entry["path"], entry["iteration"], entry["attempt"], entry["continuation_index"],
                 )
-                await journal.put(port.store, tx, ctx.session_id, key, entry)
+                to_write.append((key, entry))
         saved.update(
             continuation=continuation,
             execution_revision=revision,
             definition_ref=plain(origin.ref),
             status="running",
+            cancel_by=None,
             aggregate_delivered=False,
         )
-        await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
+        to_write.append((journal.run_key(saved["run_id"]), saved))
+        await journal.put_many(port.store, tx, ctx.session_id, to_write)
     return saved
 
 
-async def _complete_driver(worker, ctx, saved, origin, aggregate):
-    """Bind/finalize the driver chain and route one aggregate in the same transaction."""
+async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_results: bool = False):
+    """Finalize the resident driver in 1 Final transaction (0 final_lock_asc!)."""
     port = worker.inputs
-    target = TargetRef(ctx.store_id, ctx.session_id)
-    async with port.db.transaction() as tx:
-        # The claim supplied the same frozen identity/route used by ordinary final.
-        session = {
-            "session_id": ctx.session_id,
-            "tenant_id": ctx.batch.tenant_id,
-            "principal_id": ctx.batch.principal_id,
-            "parent_session_id": ctx.batch.parent_session_id,
-        }
-        route = ctx.batch.result_route
-        lock_ids = {ctx.session_id}
-        if route is not None:
-            lock_ids.add(route["target"]["session_id"])
-        states = {}
-        for sid in sorted(lock_ids):
-            states[sid] = await port.store._db.dialect.lock_state(tx, port.state, sid)
-        own_state = states[ctx.session_id]
-        if (
-            own_state["execution_state"] != "running"
-            or own_state["active_send_index"] != ctx.send_index
-            or own_state["owner_epoch"] != ctx.batch.owner_epoch
-            or own_state["owner_token"] != ctx.batch.owner_token
-        ):
-            raise SessionLeaseLost(ctx.session_id)
-        root = await port._continuation_root(tx, origin)
-        status = aggregate["status"]
-        if status == "budget_exceeded":
-            status = "failed"
-        if own_state["cancel_send_index"] == ctx.send_index:
-            status = "cancelled"
-            aggregate = {**aggregate, "status": "cancelled"}
-        error = None if status == "completed" else (
-            own_state["cancel_reason"] if status == "cancelled" else status
-        )
-        database_now = now_ms()
-        result_seq = int(own_state["next_seq"])
-        final_text = (aggregate.get("final") or {}).get("text") or ""
-        result_meta = {
-            "usage": aggregate.get("usage") or {},
-            "structured_output": aggregate,
-            "error": error,
-            "error_code": None if status == "completed" else status,
-        }
-        await port._insert_message(
-            tx, ctx.session_id, result_seq, "assistant", final_text,
-            result_meta, ctx.send_index, database_now,
-        )
-        chain = [origin]
+    status = aggregate["status"]
+    if status == "budget_exceeded":
+        status = "failed"
+    if ctx.stop.is_cancelled():
+        status = "cancelled"
+    final_text = (aggregate.get("final") or {}).get("text") or ""
+    error_list = list(aggregate.get("errors") or [])
+    error = (
+        None if status == "completed"
+        else ((ctx.stop.reason or "cancelled") if status == "cancelled" else (error_list[0] if error_list else status))
+    )
+    error_code = None if status == "completed" else status
+
+    chain_ids: list[str] = [origin.ref.message_id]
+    if origin.row.get("continuation_of") is not None:
         current = origin
-        while current.row["continuation_of"] is not None:
-            current = await port.input(tx, InputRef(
-                current.ref.store_id, current.ref.session_id, current.row["continuation_of"],
-            ))
-            chain.append(current)
-        result_ref = delivery_error = None
-        activations = []
-        if route is not None:
-            result_ref, delivery_error = await port._route_result_tx(
-                tx, session, route,
-                Result(
-                    root.ref, target, status, ctx.send_index, result_seq, final_text,
-                    aggregate.get("usage") or {}, aggregate, error,
-                    None if status == "completed" else status,
-                ),
-                route["result_kind"], database_now, activations,
-                parent_state=states[route["target"]["session_id"]],
+        while current.row.get("continuation_of") is not None:
+            parent_rec = await port.input(
+                port.db, InputRef(ctx.store_id, ctx.session_id, current.row["continuation_of"]),
             )
-        ids = [record.ref.message_id for record in chain]
-        await tx.execute(
-            f"UPDATE {port.q} SET status='delivered',terminal_status=?,result_seq=?,"
-            "result_send_index=?,error_code=?,error_detail=?,result_delivery_error=?,completed_at=? "
-            f"WHERE session_id=? AND item_id IN ({','.join('?' for _ in ids)}) "
-            "AND terminal_status IS NULL",
-            (
-                status, result_seq, ctx.send_index, None if status == "completed" else status,
-                error, delivery_error, database_now, ctx.session_id, *ids,
-            ),
-        )
-        other = [ref for ref in ctx.batch.input_refs if ref not in {record.ref for record in chain}]
-        if other:
-            await tx.execute(
-                f"UPDATE {port.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
-                f"delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
-                "AND delivered_send_index=? AND terminal_status IS NULL "
-                f"AND item_id IN ({','.join('?' for _ in other)})",
-                (ctx.session_id, ctx.send_index, *[ref.message_id for ref in other]),
-            )
-        pending = await tx.fetchone(
-            f"SELECT COUNT(*) AS n FROM {port.q} WHERE session_id=? AND status='pending'",
-            (ctx.session_id,),
-        )
-        next_state = "queued" if int(pending["n"]) else "idle"
-        changed = await tx.execute(
-            f"UPDATE {port.state} SET execution_state=?,active_send_index=NULL,"
-            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-            "cancel_send_index=NULL,cancel_reason=NULL,next_seq=? WHERE session_id=? "
-            "AND execution_state='running' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
-            (
-                next_state, result_seq + 1, ctx.session_id, ctx.send_index,
-                ctx.batch.owner_epoch, ctx.batch.owner_token,
-            ),
-        )
-        if changed != 1:
-            raise SessionLeaseLost(ctx.session_id)
+            if parent_rec is None:
+                break
+            chain_ids.append(parent_rec.ref.message_id)
+            current = parent_rec
+
+    root_id = chain_ids[-1]
+    batch_for_final = ctx.batch
+    if ctx.cancel_by is not None and batch_for_final.cancel_by is None:
+        batch_for_final = replace(batch_for_final, cancel_by=ctx.cancel_by)
+    if batch_for_final.result_route is not None and root_id != batch_for_final.start_input_message_id:
+        # Explicit resume_run on a new user input: route with that resume input's ref
+        new_route = {
+            **batch_for_final.result_route,
+            "input_ref": plain(InputRef(ctx.store_id, ctx.session_id, root_id)),
+        }
+        batch_for_final = replace(batch_for_final, result_route=new_route)
+
+    async def _driver_tx_hook(tx, info):
+        eff_status = info["effective_status"]
+        eff_cby = info["effective_cancel_by"] if eff_status == "cancelled" else None
+        agg_final = dict(aggregate)
+        if eff_status == "cancelled":
+            agg_final["status"] = "cancelled"
+            agg_final["cancel_by"] = eff_cby
+        elif agg_final.get("cancel_by") != eff_cby:
+            agg_final["cancel_by"] = eff_cby
         saved.update(
-            status=aggregate["status"], result=aggregate, result_seq=result_seq,
-            aggregate_delivered=True, aggregate_delivered_at=database_now,
-            continuation={}, last_input_ref=plain(origin.ref),
+            status=agg_final["status"],
+            cancel_by=eff_cby,
+            result=agg_final,
+            result_seq=info["result_seq"],
+            aggregate_delivered=True,
+            aggregate_delivered_at=info["database_now"] or now_ms(),
+            continuation={},
+            last_input_ref=plain(origin.ref),
         )
         await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
-        results = tuple(
-            Result(
-                record.ref, target, status, ctx.send_index, result_seq, final_text,
-                aggregate.get("usage") or {}, aggregate, error,
-                None if status == "completed" else status, delivery_error,
-            )
-            for record in chain
-        )
-        return FinalBatch(
-            next_state, results, result_ref,
-            activations[0] if activations else None,
-        )
+        return {"structured_output": agg_final, "result_json": agg_final}
+
+    return await port.final(
+        batch_for_final,
+        consumed=ctx.batch.input_refs,
+        status=status,
+        final_text=final_text,
+        usage=aggregate.get("usage") or {},
+        structured_output=aggregate,
+        error=error,
+        error_code=error_code,
+        next_seq=ctx.batch.message_seq + 1,
+        result_json=aggregate,
+        settle_start_input=(root_id == ctx.batch.start_input_message_id),
+        settle_chain_ids=tuple(dict.fromkeys(chain_ids)),
+        drain_driver_node_results=drain_node_results,
+        deliver_to_parent=True,
+        write_driver_message=True,
+        tx_hook=_driver_tx_hook,
+    )
 
 
 async def _finish_late(worker, ctx, refs):
     """Terminalize late result inputs without another graph run or parent result."""
     port = worker.inputs
-    async with port.db.transaction() as tx:
-        state = await port.store._db.dialect.lock_state(tx, port.state, ctx.session_id)
-        if (
-            state["execution_state"] != "running"
-            or state["active_send_index"] != ctx.send_index
-            or state["owner_epoch"] != ctx.batch.owner_epoch
-            or state["owner_token"] != ctx.batch.owner_token
-        ):
-            raise SessionLeaseLost(ctx.session_id)
-        database_now = now_ms()
-        ids = [ref.message_id for ref in refs]
-        if ids:
-            await tx.execute(
-                f"UPDATE {port.q} SET terminal_status='completed',result_send_index=?,completed_at=? "
-                f"WHERE session_id=? AND item_id IN ({','.join('?' for _ in ids)}) "
-                "AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL",
-                (ctx.send_index, database_now, ctx.session_id, *ids, ctx.send_index),
-            )
-        pending = await tx.fetchone(
-            f"SELECT COUNT(*) AS n FROM {port.q} WHERE session_id=? AND status='pending'",
-            (ctx.session_id,),
+    return await port.final(
+        ctx.batch,
+        consumed=tuple(refs),
+        status="completed",
+        final_text="",
+        next_seq=max(1, ctx.batch.message_seq),
+        settle_chain_ids=tuple(ref.message_id for ref in refs),
+        drain_driver_node_results=True,
+        deliver_to_parent=False,
+        write_driver_message=False,
+    )
+
+
+def _fast_first_turn_origin(ctx, run_id: str) -> InputRecord | None:
+    """Construct Turn-1 origin in memory with 0 DB reads when input_refs == (start_input_ref,)."""
+    refs = ctx.batch.input_refs
+    if ctx.send_index == 1 and len(refs) == 1 and refs[0].message_id == run_id:
+        ref = refs[0]
+        return InputRecord(
+            ref,
+            {
+                "session_id": ctx.session_id,
+                "item_id": run_id,
+                "kind": "user",
+                "status": "delivered",
+                "content_json": "null",
+                "continuation_of": None,
+                "continuation_index": None,
+            },
+            {},
         )
-        next_state = "queued" if int(pending["n"]) else "idle"
-        await tx.execute(
-            f"UPDATE {port.state} SET execution_state=?,active_send_index=NULL,"
-            "owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-            "cancel_send_index=NULL,cancel_reason=NULL WHERE session_id=? "
-            "AND execution_state='running' AND active_send_index=? AND owner_epoch=? AND owner_token=?",
-            (
-                next_state, ctx.session_id, ctx.send_index,
-                ctx.batch.owner_epoch, ctx.batch.owner_token,
-            ),
-        )
-        target = TargetRef(ctx.store_id, ctx.session_id)
-        return FinalBatch(next_state, tuple(
-            Result(ref, target, "completed", ctx.send_index, None) for ref in refs
-        ))
+    return None
 
 
 async def run_driver(worker, ctx, env):
-    """Rebuild the graph at each send; healthy nodes are never adopted or cancelled.
-
-    RuntimeWorker's dispatcher excludes non-LLM drivers from model capacity, so a
-    driver can run (and recover) while all its healthy leaves still own the slots.
-    """
+    """Execute the Plan B resident workflow_driver coroutine (0 LLM slots, 1 Claim + 1 Final)."""
     port = worker.inputs
-    session = await port._session(port.db, ctx.session_id)
-    run_id = session["start_input_message_id"]
+    run_id = ctx.batch.start_input_message_id
+    if not run_id:
+        session = await port._session(port.db, ctx.session_id)
+        run_id = session["start_input_message_id"]
     saved = await journal.get(port.store, port.db, ctx.session_id, journal.run_key(run_id))
     if saved is None:
         raise RuntimeRequestError("workflow_journal_missing")
-    origins = []
-    for ref in ctx.batch.input_refs:
-        record = await port.input(port.db, ref)
-        if record is not None and record.row["kind"] in {"user", "workflow_continue"}:
-            origins.append(record)
-    origin = origins[-1] if origins else None
+
+    origin = _fast_first_turn_origin(ctx, run_id)
     resume_options = None
-    if origin is not None:
-        content = json.loads(origin.row["content_json"])
-        if isinstance(content, dict) and "workflow_resume" in content:
-            resume_options = content["workflow_resume"]
+    if origin is None:
+        origins = []
+        for ref in ctx.batch.input_refs:
+            record = await port.input(port.db, ref)
+            if record is not None and record.row["kind"] in {"user", "workflow_continue"}:
+                origins.append(record)
+        origin = origins[-1] if origins else None
+        if origin is not None:
+            content = json.loads(origin.row["content_json"])
+            if isinstance(content, dict) and "workflow_resume" in content:
+                resume_options = content["workflow_resume"]
+
     if saved.get("aggregate_delivered") and resume_options is None:
         executor = DurableExecutor(worker, ctx, env, run_id, saved)
         await executor._consume_results()
@@ -687,46 +1042,82 @@ async def run_driver(worker, ctx, env):
         raise RuntimeRequestError("workflow_origin_missing")
     if resume_options is not None and saved.get("definition_ref") != plain(origin.ref):
         saved = await _prepare_explicit(worker, ctx, saved, origin, resume_options)
-    executor = DurableExecutor(worker, ctx, env, run_id, saved)
-    spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
-    engine = WorkflowEngine(
-        executor,
-        run_id=run_id,
-        driver_sid=ctx.session_id,
-        allowed_tools=ctx.descriptor.config["workflow"]["allowed_tools"],
-        stop_event=ctx.stop,
-        file_io=env.workflow_file_io,
-    )
-    if executor.plan:
-        engine._usage_acc = dict(executor.plan.get("prior_usage") or {})
-    graph = asyncio.create_task(engine.run(spec))
-    stopped = asyncio.create_task(ctx.stop.wait())
-    timed_out = False
+
+    resident_waiter = port.register_driver_waiter(ctx.session_id)
     try:
-        remaining = (
-            max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000)
-            if spec.timeout_s else None
+        if ctx.batch.reclaimed_cancelled or ctx.batch.cancel_by is not None:
+            ctx.cancel_by = ctx.batch.cancel_by or "user"
+            ctx.stop.cancel("cancelled")
+
+        executor = DurableExecutor(
+            worker, ctx, env, run_id, saved, resident_waiter=resident_waiter,
         )
-        done, _ = await asyncio.wait(
-            (graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+        spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
+        engine = WorkflowEngine(
+            executor,
+            run_id=run_id,
+            driver_sid=ctx.session_id,
+            allowed_tools=ctx.descriptor.config["workflow"]["allowed_tools"],
+            stop_event=ctx.stop,
+            file_io=env.workflow_file_io,
         )
-        if graph in done:
-            result = graph.result()
-        else:
-            timed_out = stopped not in done
-            if timed_out:
-                await worker.inputs.cancel_active(ctx.batch, reason="workflow timeout")
+        if executor.plan:
+            engine._usage_acc = dict(executor.plan.get("prior_usage") or {})
+
+        if ctx.stop.is_cancelled():
+            cby = ctx.cancel_by or "user"
+            result = engine._build_result(spec, "cancelled", cancel_by=cby)
+            return await _complete_driver(
+                worker, ctx, saved, origin, result.to_dict(), drain_node_results=True,
+            )
+
+        graph = asyncio.create_task(engine.run(spec))
+        stopped = asyncio.create_task(ctx.stop.wait())
+        timed_out = False
+        aborted_early = False
+        try:
+            remaining = (
+                max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000)
+                if spec.timeout_s else None
+            )
+            done, _ = await asyncio.wait(
+                (graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if graph in done:
+                result = graph.result()
+                if result.status == "cancelled" and result.cancel_by is None:
+                    executor._drain_local_waiter()
+                    result.cancel_by = ctx.cancel_by or "user"
+            else:
+                aborted_early = True
+                timed_out = stopped not in done
+                if timed_out:
+                    ctx.cancel_by = "timeout"
+                    await worker.inputs.cancel_active(
+                        ctx.batch, reason="workflow timeout", cancel_by="timeout",
+                    )
+                else:
+                    executor._drain_local_waiter()
+                graph.cancel()
+                await asyncio.gather(graph, return_exceptions=True)
+                if timed_out:
+                    result = engine._build_result(spec, "failed")
+                    result.errors.append("workflow timeout")
+                else:
+                    cby = ctx.cancel_by or "user"
+                    result = engine._build_result(spec, "cancelled", cancel_by=cby)
+        finally:
+            stopped.cancel()
             graph.cancel()
-            await asyncio.gather(graph, return_exceptions=True)
-            result = engine._build_result(spec, "failed" if timed_out else "cancelled")
-            if timed_out:
-                result.errors.append("workflow timeout")
+            await asyncio.gather(stopped, graph, return_exceptions=True)
+
+        if not aborted_early:
+            await executor._consume_results()
+        return await _complete_driver(
+            worker, ctx, saved, origin, result.to_dict(), drain_node_results=aborted_early,
+        )
     finally:
-        stopped.cancel()
-        graph.cancel()
-        await asyncio.gather(stopped, graph, return_exceptions=True)
-    await executor._consume_results()
-    return await _complete_driver(worker, ctx, saved, origin, result.to_dict())
+        port.unregister_driver_waiter(ctx.session_id)
 
 
 async def resume_run(client, target, *, node_id, message, message_id, actor):

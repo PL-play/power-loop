@@ -42,6 +42,31 @@ async def put(store, tx, sid, key, value):
     )
 
 
+async def put_many(store, tx, sid, entries):
+    """Persist 1..N journal entries; single-entry calls delegate to ``put``."""
+    if not entries:
+        return
+    if len(entries) == 1:
+        key, value = entries[0]
+        await put(store, tx, sid, key, value)
+        return
+    from power_loop.agent.runtime_store import now_ms
+
+    ts = now_ms()
+    params = []
+    for key, value in entries:
+        params.extend((sid, key, canonical(value), ts))
+    await tx.execute(
+        store._db.dialect.upsert_many(
+            store.t.session_runtime_state,
+            ("session_id", "state_key"),
+            ("value_json", "updated_at"),
+            rows=len(entries),
+        ),
+        tuple(params),
+    )
+
+
 async def get(store, reader, sid, key):
     row = await reader.fetchone(
         f"SELECT value_json FROM {store.t.session_runtime_state} "

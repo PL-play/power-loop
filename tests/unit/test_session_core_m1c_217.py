@@ -1602,8 +1602,8 @@ async def test_m1c_r3_running_driver_create_many_under_subtree_none_and_all(
                     node_id="n-drv", boot_id="b-drv", can_execute=False, free_slots=0,
                     parent_owner_epoch=drv_batch.owner_epoch, parent_cancel_seq=drv_batch.cancel_seq,
                 )
-                # Exact 5 SQL: lock_state(driver) + _db_now + INSERT sessions + INSERT queue + INSERT messages
-                assert len(profiled.records) == 5, [r["sql"] for r in profiled.records]
+                # Exact 4 SQL: merged lock_state+_db_now(driver) + INSERT sessions + INSERT queue + INSERT messages
+                assert len(profiled.records) == 4, [r["sql"] for r in profiled.records]
                 assert not any("FOR SHARE" in r["sql"] for r in profiled.records)
             finally:
                 store._db = original

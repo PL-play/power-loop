@@ -67,6 +67,7 @@ class _SessionExecution:
         self.actor = actor
         self.stop = _NotifyingCancellationToken()
         self.stop_event = self.stop.event
+        self.cancel_by: str | None = batch.cancel_by
         self.task = None
         self.loop = None
         self.closing = False
@@ -178,8 +179,8 @@ class RuntimeWorker:
             async def _on_wake(sid: str, _reason: str) -> None:
                 self._activate(sid)
 
-            async def _on_cancel(sid: str, _cancel_by: str) -> None:
-                self._activate(sid, cancelled=True, cancel_verified=True)
+            async def _on_cancel(sid: str, cby: str) -> None:
+                self._activate(sid, cancelled=True, cancel_verified=True, cancel_by=cby)
 
             await r.wake_transport.subscribe(on_wake=_on_wake, on_cancel=_on_cancel)
         self._listeners = [asyncio.create_task(self._listen(s), context=contextvars.Context()) for s in self._subscriptions]
@@ -246,17 +247,27 @@ class RuntimeWorker:
                 return
 
     def _activate(
-        self, sid, input_ref=None, *, cancelled=False, cancel_reason=None, cancel_verified=False,
+        self, sid, input_ref=None, *, cancelled=False, cancel_reason=None,
+        cancel_verified=False, cancel_by=None,
     ):
         if self._closing:
             return
         if sid in self._active:
             ctx = self._active[sid]
             if ctx is not None and cancelled:
+                if cancel_by is not None:
+                    ctx.cancel_by = cancel_by
                 if cancel_verified:
+                    if ctx.descriptor.kind == "workflow_driver":
+                        self.inputs.notify_driver_cancel(
+                            sid, cancel_by=ctx.cancel_by, reason=cancel_reason or "cancelled",
+                        )
                     ctx.stop.cancel(cancel_reason or "cancelled")
                 else:
                     ctx.cancel_hint = True
+                return
+            if ctx is not None and ctx.descriptor.kind == "workflow_driver" and not cancelled:
+                self.inputs.notify_driver_wake(sid)
                 return
             if ctx is not None and ctx.consumed is None \
                     and input_ref is not None and not cancelled:
@@ -312,6 +323,12 @@ class RuntimeWorker:
             if ctx.ownership is not None:
                 ctx.ownership.expires_at = now_mono
             if row["lifecycle"] in ("closing", "closed") or int(row["cancel_seq"]) > ctx.batch.cancel_seq:
+                cby = row.get("cancel_by") or ("removed" if row["lifecycle"] in ("closing", "closed") else "user")
+                ctx.cancel_by = cby
+                if ctx.descriptor.kind == "workflow_driver":
+                    self.inputs.notify_driver_cancel(
+                        sid, cancel_by=cby, reason=row.get("cancel_reason") or "cancelled",
+                    )
                 ctx.stop.cancel(row.get("cancel_reason") or "cancelled")
         return rows
 
@@ -362,7 +379,7 @@ class RuntimeWorker:
                         await self._notify_results(recovered)
                         if recovered.execution_state == "queued":
                             self._activate(sid)
-                    elif not batch.reclaimed_has_assistant:
+                    elif not batch.reclaimed_has_assistant and "workflow_node" not in batch.descriptor.config:
                         self.dispatch_claimed(batch)
                         dispatched = True
                     else:
@@ -377,6 +394,18 @@ class RuntimeWorker:
                     if not dispatched:
                         self._active.pop(sid, None)
                         self._wake.set()
+            elif row["session_kind"] == "workflow_driver":
+                self._drivers.add(sid)
+                recovered = await self.inputs.recover(
+                    TargetRef(r.store.store_id, sid),
+                    node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
+                )
+                if recovered is None:
+                    continue
+                reclaimed.append(recovered)
+                await self._notify_results(recovered)
+                if recovered.execution_state == "queued":
+                    self._activate(sid)
             else:
                 batch = await self.inputs.reclaim_running(
                     TargetRef(r.store.store_id, sid),
@@ -728,6 +757,7 @@ class RuntimeWorker:
                     await self._notify_results(final_batch)
                     if final_batch.execution_state == "queued":
                         self._activate(sid)
+                    batch = None
                     return
                 if descriptor.kind == "background":
                     managed = "managed_effect" in descriptor.config
@@ -971,7 +1001,11 @@ class RuntimeWorker:
                     )
                     await self._notify_results(recovered)
                     return recovered.execution_state == "queued"
-                if entry["lifecycle"] == "open" and not reclaimed.reclaimed_has_assistant:
+                if (
+                    entry["lifecycle"] == "open"
+                    and not reclaimed.reclaimed_has_assistant
+                    and "workflow_node" not in descriptor.config
+                ):
                     return reclaimed
                 # Already produced an assistant message or non-open lifecycle: finalize as interrupted
                 recovered = await self.inputs.final(
@@ -1231,6 +1265,19 @@ class RuntimeWorker:
             await self.runtime.client._notify(
                 target, ref.message_id, ref, ["work", "activation"]
             )
+            if (
+                self.runtime.wake_transport is not None
+                and target.session_id not in self.inputs._driver_waiters
+            ):
+                try:
+                    await self.runtime.wake_transport.publish_wake(
+                        target.session_id, reason="river",
+                    )
+                except Exception:
+                    log.warning(
+                        "wake_transport publish_wake failed for %s",
+                        target.session_id, exc_info=True,
+                    )
 
     async def _has_pending(self, sid):
         row = await self.runtime.store._db.fetchone(

@@ -193,13 +193,13 @@ async def test_takeover_rejects_old_map_and_new_executor_loads(registry_store, m
         try:
             await terminalize(old, refs[0])
             await store._db.execute(
-                f"UPDATE {old.port.state} SET owner_epoch=owner_epoch+1,owner_token='replacement' WHERE session_id=?",
+                f"UPDATE {old.port.s} SET owner_epoch=owner_epoch+1 WHERE session_id=?",
                 (old.ctx.session_id,))
             with pytest.raises(SessionLeaseLost):
                 await old._consume_results()
             assert all(entry["result"] is None for entry in old._nodes.values())
             from dataclasses import replace
-            new_batch = replace(old.ctx.batch, owner_epoch=old.ctx.batch.owner_epoch + 1, owner_token="replacement")
+            new_batch = replace(old.ctx.batch, owner_epoch=old.ctx.batch.owner_epoch + 1)
             ctx = _SessionExecution(agent.runtime, old.ctx.session_id, new_batch.descriptor, new_batch, old.ctx.actor)
             fresh = DurableExecutor(old.worker, ctx, old.env, old.run_id, old.saved)
             assert fresh._nodes is None
@@ -217,20 +217,21 @@ async def test_capacity_last_slot_leaves_loser_public_and_cancellable(registry_s
     store, _ = registry_store
     async with executor_fixture(store) as (executor, agent):
         monkeypatch.setattr(journal, "NODE_LIMIT", 1)
-        create = executor.port.create_workflow_session
+        create = executor.port.create_many
         created, release_create = asyncio.Event(), asyncio.Event()
         created_count = 0
 
         async def gated_create(*args, **kwargs):
             nonlocal created_count
             result = await create(*args, **kwargs)
-            created_count += 1
-            if created_count == 2:
+            specs = kwargs.get("specs") if "specs" in kwargs else (args[2] if len(args) > 2 else ())
+            created_count += len(specs)
+            if created_count >= 2:
                 created.set()
             await release_create.wait()
             return result
 
-        monkeypatch.setattr(executor.port, "create_workflow_session", gated_create)
+        monkeypatch.setattr(executor.port, "create_many", gated_create)
         waiting = asyncio.Event()
 
         async def wait(ref, **kwargs):
@@ -561,7 +562,7 @@ async def test_recovered_pending_result_keeps_null_completion_and_is_consumed(re
             await terminalize(old, refs[0])
             assert await old.port.claim_follow_up(old.ctx.batch) is not None
             await store._db.execute(
-                f"UPDATE {old.port.state} SET owner_lease_until_ms=0 WHERE session_id=?", (old.ctx.session_id,))
+                f"UPDATE {old.port.s} SET owner_lease_until_ms=0 WHERE session_id=?", (old.ctx.session_id,))
             recovered = await old.port.recover(old.driver, node_id="new", boot_id="new", ttl_s=300)
             assert recovered.execution_state == "queued"
             row = await store._db.fetchone(

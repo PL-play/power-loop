@@ -175,6 +175,7 @@ class WorkflowEngine:
         self._executor, self._run_id, self._driver_sid = executor, run_id, driver_sid
         self._allowed_tools, self._file_io = allowed_tools, file_io
         self._cancel = stop_event or CancellationToken()
+        self._cancel_by: str | None = None
         self._results = _ScopedResults()
         self._errors, self._iter_broken, self._tolerated = [], [], set()
         self._last = None
@@ -205,9 +206,9 @@ class WorkflowEngine:
             r.status not in ("completed", "skipped") and nid not in self._tolerated for nid, r in self._results.items()
         ):
             status = "failed"
-        return self._build_result(spec, status)
+        return self._build_result(spec, status, cancel_by=self._cancel_by if status == "cancelled" else None)
 
-    def _build_result(self, spec: WorkflowSpec, status: str) -> WorkflowResult:
+    def _build_result(self, spec: WorkflowSpec, status: str, *, cancel_by: str | None = None) -> WorkflowResult:
         return WorkflowResult(
             name=spec.name,
             status=status,
@@ -216,6 +217,7 @@ class WorkflowEngine:
             usage=self._total_usage(),
             errors=list(self._errors),
             tolerated=sorted(self._tolerated),
+            cancel_by=cancel_by if status == "cancelled" else None,
         )
 
     # ── node dispatch ──────────────────────────────────────────────────────
@@ -315,6 +317,7 @@ class WorkflowEngine:
             text=f"循环 {node.id}：{'满足' if converged else '没满足'}（{iteration} 轮）：{why}",
             payload=payload,
             error=err,
+            cancel_by=self._cancel_by if self._cancel.is_cancelled() else None,
         )
         self._results[node.id] = res
         await self._emit_step(res)
@@ -337,7 +340,7 @@ class WorkflowEngine:
 
         if self._cancel.is_cancelled():
             self._cancelled = True
-            return AgentResult(node.id, "cancelled", "")
+            return AgentResult(node.id, "cancelled", "", cancel_by=self._cancel_by)
         if node.when and not self._eval_when(node.when)[0]:
             result = AgentResult(node.id, "skipped", "")
             self._results[node.id] = result
@@ -452,6 +455,7 @@ class WorkflowEngine:
             usage=node_usage,
             session_id=raw.get("session_id"),
             error=error,
+            cancel_by=raw.get("cancel_by") if raw.get("status") == "cancelled" else None,
         )
         self._results[node.id] = self._last = result
         if (

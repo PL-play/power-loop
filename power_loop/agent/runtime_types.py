@@ -188,6 +188,7 @@ class Result:
     error: str | None = None
     error_code: str | None = None
     result_delivery_error: str | None = None
+    cancel_by: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "usage", freeze(self.usage or {}))

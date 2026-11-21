@@ -8,6 +8,7 @@ the SDK (the 214 charge event lives in the agent host, P6).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -148,7 +149,7 @@ def _category(chain, sql=""):
         return "session_control"
     if sql:
         raise AssertionError(("unclassified SQL", sql, chain))
-    if any(c.startswith(("agent.", "runtime.session_ownership", "runtime.store_session_ownership"))
+    if any(c.startswith(("agent.", "workflow.", "runtime.session_ownership", "runtime.store_session_ownership"))
            for c in chain):
         return "session_control"
     if any(c.startswith(("runtime.store.", "runtime.runtime_state", "core.")) for c in chain):
@@ -609,3 +610,477 @@ async def test_m1a_periodic_node_sql_profile(registry_store):
     finally:
         await agent.aclose()
         store._db = original
+
+
+# ── Design 217 M2: Genuine Cross-Process 5-Leaf Workflow SQL Ledgers ──────────
+
+
+class _ShardedWakeBus:
+    """Signal-only cross-node WakeTransport (carries ONLY (session_id, reason/cancel_by), 0 payload!).
+
+    Routes Main + Driver signals to Node A and Leaf signals to Node B (matching sharded/routed
+    pub-sub without sharing SessionStore, RuntimeInputStore, or in-memory result queues).
+    """
+
+    def __init__(self):
+        self.node_a_sids: set[str] = {"000_main"}
+        self._a_wake = None
+        self._a_cancel = None
+        self._b_wake = None
+        self._b_cancel = None
+
+    def endpoint(self, role: str):
+        bus = self
+
+        class _Ep:
+            async def subscribe(self, *, on_wake, on_cancel=None) -> None:
+                if role == "a":
+                    bus._a_wake, bus._a_cancel = on_wake, on_cancel
+                else:
+                    bus._b_wake, bus._b_cancel = on_wake, on_cancel
+
+            async def publish_wake(self, session_id: str, *, reason: str = "accept") -> None:
+                # submit() runs on Node A for the workflow_driver session before leaves exist
+                if role == "a" and reason == "accept" and len(bus.node_a_sids) == 1:
+                    bus.node_a_sids.add(session_id)
+                cb = bus._a_wake if session_id in bus.node_a_sids else bus._b_wake
+                if cb is not None:
+                    await cb(session_id, reason)
+
+            async def publish_cancel(self, session_id: str, *, cancel_by: str = "user") -> None:
+                cb = bus._a_cancel if session_id in bus.node_a_sids else bus._b_cancel
+                if cb is not None:
+                    await cb(session_id, cancel_by)
+
+            async def poll_once(self, *, limit: int = 32) -> list[str]:
+                return []
+
+            async def aclose(self) -> None:
+                return None
+
+        return _Ep()
+class _SharedLedgerProfiled(Profiled):
+    """Wraps a second independent SessionStore._db so both processes append to ONE SQL ledger."""
+
+    def __init__(self, db, master: Profiled):
+        super().__init__(db, master.meter)
+        self.master = master
+        self.records = master.records
+        self.tx_sites = master.tx_sites
+        self.tx_categories = master.tx_categories
+
+    def _reserve_transaction(self, site):
+        self.master.transactions += 1
+        self.transactions = self.master.transactions
+        index = len(self.tx_sites)
+        self.tx_sites.append(site)
+        self.tx_categories[index:] = [None]
+        return index
+
+
+@asynccontextmanager
+async def _cross_process_workflow_cluster(store_a, connect, model_a, model_b, *, leaf_capacity=5):
+    """Two independent SessionStore connections + two independent Runtimes (Node A: Main+Driver, Node B: Leaves)."""
+    from power_loop import (
+        DatabasePollingTransport,
+        ExecutionEnvironment,
+        ProjectedRepresentation,
+        RegistryRuntimeFactory,
+        Runtime,
+    )
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import RuntimeDescriptor, TrustedActor
+    from power_loop.workflow import register_workflow_tool
+
+    store_b = await connect()
+    orig_a, orig_b = store_a._db, store_b._db
+    master = Profiled(orig_a)
+    peer = _SharedLedgerProfiled(orig_b, master)
+    wake_bus = _ShardedWakeBus()
+
+    reg_a = ToolRegistry()
+    register_workflow_tool(reg_a)
+    reg_b = ToolRegistry()
+
+    cfg_a = AgentLoopConfig(context_budget_tokens=10**9, representation=ProjectedRepresentation())
+    cfg_b = AgentLoopConfig(context_budget_tokens=10**9, representation=ProjectedRepresentation())
+
+    fac_a = RegistryRuntimeFactory()
+    fac_b = RegistryRuntimeFactory()
+
+    def can_exec_a(desc):
+        if desc.kind == "workflow_driver":
+            return True
+        return desc.kind == "agent" and "workflow_node" not in (desc.config or {})
+
+    def can_exec_b(desc):
+        return desc.kind == "agent" and "workflow_node" in (desc.config or {})
+
+    async def build_a(desc, ctx):
+        return ExecutionEnvironment(model_a, reg_a, cfg_a)
+
+    async def build_b(desc, ctx):
+        return ExecutionEnvironment(model_b, reg_b, cfg_b)
+
+    fac_a.register("m2.agent@215", build_a, can_execute=can_exec_a)
+    fac_b.register("m2.agent@215", build_b, can_execute=can_exec_b)
+
+    # Separate DatabasePollingTransport per node (interval=3600s so 0 background poll SQL);
+    # cross-node wakes/cancels travel strictly over signal-only WakeTransport.
+    tp_a = DatabasePollingTransport(RuntimeInputStore(store_a), interval_s=3600.0)
+    tp_b = DatabasePollingTransport(RuntimeInputStore(store_b), interval_s=3600.0)
+    rt_a = Runtime(
+        store=store_a, factory=fac_a, node_id="node-a", boot_id="boot-a",
+        capacity=2, transport=tp_a, wake_transport=wake_bus.endpoint("a"),
+        session_lease_ttl_s=300.0, recovery_interval_s=3600.0,
+        shared_execution=True, timers_enabled=False,
+    )
+    rt_b = Runtime(
+        store=store_b, factory=fac_b, node_id="node-b", boot_id="boot-b",
+        capacity=leaf_capacity, transport=tp_b, wake_transport=wake_bus.endpoint("b"),
+        session_lease_ttl_s=300.0, recovery_interval_s=3600.0,
+        shared_execution=True, timers_enabled=False,
+    )
+    await rt_a.worker.start()
+    await rt_b.worker.start()
+
+    actor = TrustedActor("tenant-m2", "user-m2", None)
+    desc = RuntimeDescriptor(
+        2, "agent", "m2.agent@215", None, "m2.tools@215", "m2.hooks@215", "m2.res@215", {}, {},
+    )
+    # Create Main session with '000_main' < 'ses_...' so Main < Driver < Leaf IDs (verifies 0 final_lock_asc!).
+    main_target = await rt_a.client.create_session(desc, actor=actor, options={"session_id": "000_main"})
+
+    # Attach profiler AFTER startup & session seed so we measure exact workflow + leaf + parent ingestion SQL!
+    store_a._db = master
+    store_b._db = peer
+    master.records.clear()
+    master.tx_sites.clear()
+    master.tx_categories.clear()
+    master.transactions = 0
+    try:
+        yield rt_a, rt_b, main_target, actor, desc, master
+    finally:
+        store_a._db = orig_a
+        store_b._db = orig_b
+        await rt_b.worker.shutdown(timeout_s=5, cancel_running=True)
+        await rt_b.client.aclose()
+        await tp_b.aclose()
+        await rt_a.worker.shutdown(timeout_s=5, cancel_running=True)
+        await rt_a.client.aclose()
+        await tp_a.aclose()
+
+
+async def test_m2_cross_process_5_leaf_workflow_sql_profile(registry_store):
+    """Real 2-store / 2-worker cross-process 5-leaf parallel Workflow SQL ledger across all 3 DBs."""
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.agent.runtime_types import InputRef, result_message_id
+
+    store_a, connect = registry_store
+    db = store_a._db.dialect.name
+    leaf_started = [asyncio.Event() for _ in range(5)]
+    release_leaves = asyncio.Event()
+
+    class _MainModel(LLMService):
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, req, **kwargs):
+            self.calls += 1
+            return LLMResponse(
+                raw_text="main handled workflow",
+                token_usage=LLMTokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            )
+
+        async def close(self):
+            pass
+
+    class _LeafModel(LLMService):
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, req, **kwargs):
+            idx = int(req.system_prompt.splitlines()[0].split("-")[1])
+            self.calls += 1
+            leaf_started[idx].set()
+            await release_leaves.wait()
+            return LLMResponse(
+                raw_text=f"leaf-{idx}-ok",
+                token_usage=LLMTokenUsage(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+            )
+
+        async def close(self):
+            pass
+
+    model_a, model_b = _MainModel(), _LeafModel()
+    branches = [
+        {
+            "type": "agent", "id": f"L{i}", "input": f"work-{i}",
+            "spec": {"name": f"L{i}", "system_prompt": f"LEAF-{i}", "tools": []},
+        }
+        for i in range(5)
+    ]
+    spec = {
+        "name": "five-leaf-xproc",
+        "root": {"type": "parallel", "max_concurrency": 5, "branches": branches},
+    }
+
+    async with _cross_process_workflow_cluster(store_a, connect, model_a, model_b) as (
+        rt_a, rt_b, main_target, actor, desc, master,
+    ):
+        # Verify Node A and Node B do NOT share local waiter maps!
+        assert rt_a.worker.inputs is not rt_b.worker.inputs
+        assert rt_a.worker.inputs._driver_waiters is not rt_b.worker.inputs._driver_waiters
+
+        handle = await rt_a.client.workflow(
+            main_target, spec, message_id="wf-5leaf", actor=actor, descriptor=desc,
+        )
+        await asyncio.wait_for(asyncio.gather(*(ev.wait() for ev in leaf_started)), 10)
+        # Release all 5 remote leaves together so they commit River results on Node B and wake Driver on Node A
+        release_leaves.set()
+        wf_res = await handle.wait(deadline_ms=now_ms() + 15000)
+        assert wf_res.status == "completed" and len(wf_res.results) == 5
+        parent_ref = InputRef(
+            store_a.store_id, main_target.session_id,
+            result_message_id(handle.target, handle.input_ref, 1, "workflow_result"),
+        )
+        main_res = await rt_a.client.wait(parent_ref, actor=actor, deadline_ms=now_ms() + 15000)
+        assert main_res.status == "completed" and main_res.final_text == "main handled workflow"
+        # Wait for both workers to settle all tasks
+        async with asyncio.timeout(5):
+            while rt_a.worker._active or rt_b.worker._active:
+                await asyncio.sleep(0.01)
+
+        records = [r for r in master.records if _category(r["chain"], r["sql"]) != "periodic"]
+        counts = _counts(records, master.tx_sites, master.tx_categories)
+        assert counts["legacy_job_control"] == 0, counts
+        assert counts["billing"] == 0, counts
+        assert counts.get("unfinished_transactions", 0) == 0, counts
+        assert model_b.calls == 5 and model_a.calls == 1
+        # Verify 0 ascending parent+child FOR UPDATE lock SQL (deep-first River!)
+        assert not any("_lock_result_sessions" in c for r in records for c in r["chain"])
+        # Verify start_input_message_id settled with non-null result_json
+        start_info = await rt_a.worker.inputs.db.fetchone(
+            f"SELECT terminal_status,result_json,completed_at FROM {store_a.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (handle.target.session_id, handle.input_ref.message_id),
+        )
+        assert start_info["terminal_status"] == "completed"
+        assert start_info["result_json"] is not None and start_info["completed_at"] is not None
+
+        # Exact cross-process 5-leaf Workflow + Main ingestion turn:
+        # 18 explicit txs = 14 (M0 baseline: 1 submit + 1 driver claim + 1 create_many + 5*(leaf claim + leaf final)
+        #                     + 1 driver final) + 2 (workflow node/run journal txs: put_many + _consume_results)
+        #                     + 2 (Main ingestion turn: claim + final)
+        assert master.transactions == 18, (db, master.transactions, master.tx_sites)
+        ctrl_limit = 63 if db == "mysql" else 55
+        total_limit = 78 if db == "mysql" else 70
+        assert counts["session_control"] <= ctrl_limit, (db, counts, [r["sql"] for r in records])
+        assert len(records) <= total_limit, (db, len(records), counts)
+        if out := os.environ.get("M2_WORKFLOW_LEDGER_OUT"):
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "case": "5_leaf_xproc_normal",
+                    "db": db,
+                    "transactions": master.transactions,
+                    "session_control": counts["session_control"],
+                    "message": counts["message"],
+                    "total": len(records),
+                }) + "\n")
+
+
+async def test_m2_cross_process_5_leaf_mid_stop_one_leaf_sql_profile(registry_store):
+    """Cross-process 5-leaf Workflow where user stops 1 leaf mid-run (scope='self', cancel_by='user')."""
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.agent.runtime_types import InputRef, TargetRef, result_message_id
+
+    store_a, connect = registry_store
+    db = store_a._db.dialect.name
+    leaf_started = [asyncio.Event() for _ in range(5)]
+    release_leaf_0 = asyncio.Event()
+    release_others = asyncio.Event()
+
+    class _MainModel(LLMService):
+        async def complete(self, req, **kwargs):
+            return LLMResponse(raw_text="main handled partial workflow")
+
+        async def close(self):
+            pass
+
+    class _LeafModel(LLMService):
+        async def complete(self, req, **kwargs):
+            idx = int(req.system_prompt.splitlines()[0].split("-")[1])
+            leaf_started[idx].set()
+            if idx == 0:
+                await release_leaf_0.wait()
+            else:
+                await release_others.wait()
+            return LLMResponse(raw_text=f"leaf-{idx}-ok")
+
+        async def close(self):
+            pass
+
+    branches = [
+        {
+            "type": "agent", "id": f"L{i}", "input": f"work-{i}",
+            "spec": {"name": f"L{i}", "system_prompt": f"LEAF-{i}", "tools": []},
+        }
+        for i in range(5)
+    ]
+    spec = {
+        "name": "five-leaf-mid-stop",
+        "root": {"type": "parallel", "max_concurrency": 5, "on_error": "continue", "branches": branches},
+    }
+
+    async with _cross_process_workflow_cluster(store_a, connect, _MainModel(), _LeafModel()) as (
+        rt_a, rt_b, main_target, actor, desc, master,
+    ):
+        handle = await rt_a.client.workflow(
+            main_target, spec, message_id="wf-midstop", actor=actor, descriptor=desc,
+        )
+        await asyncio.wait_for(asyncio.gather(*(ev.wait() for ev in leaf_started)), 10)
+        children = await rt_a.client.list_children(handle.target, actor=actor)
+        assert len(children.items) == 5
+        l0_row = await rt_a.worker.inputs.db.fetchone(
+            f"SELECT session_id FROM {store_a.t.sessions} "
+            "WHERE parent_session_id=? AND descriptor_json LIKE '%\"node_id\":\"L0\"%'",
+            (handle.target.session_id,),
+        )
+        l0_target = TargetRef(store_a.store_id, l0_row["session_id"])
+        stop_rcpt = await rt_a.client.cancel(l0_target, actor=actor, scope="self", reason="user stopped L0")
+        assert stop_rcpt.state == "cancel_requested"
+        release_leaf_0.set()
+        release_others.set()
+        wf_res = await handle.wait(deadline_ms=now_ms() + 15000)
+        assert wf_res.results["L0"].status == "cancelled"
+        assert wf_res.results["L0"].cancel_by == "user"
+        for i in range(1, 5):
+            assert wf_res.results[f"L{i}"].status == "completed"
+        parent_ref = InputRef(
+            store_a.store_id, main_target.session_id,
+            result_message_id(handle.target, handle.input_ref, 1, "workflow_result"),
+        )
+        await rt_a.client.wait(parent_ref, actor=actor, deadline_ms=now_ms() + 15000)
+        async with asyncio.timeout(5):
+            while rt_a.worker._active or rt_b.worker._active:
+                await asyncio.sleep(0.01)
+
+        records = [r for r in master.records if _category(r["chain"], r["sql"]) != "periodic"]
+        counts = _counts(records, master.tx_sites, master.tx_categories)
+        assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+        assert counts.get("unfinished_transactions", 0) == 0
+        notice = await rt_a.worker.inputs.db.fetchone(
+            f"SELECT wake,kind FROM {store_a.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='system_notice'",
+            (main_target.session_id,),
+        )
+        assert notice is not None and int(notice["wake"]) == 0
+        if out := os.environ.get("M2_WORKFLOW_LEDGER_OUT"):
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "case": "5_leaf_xproc_mid_stop_1_leaf",
+                    "db": db,
+                    "transactions": master.transactions,
+                    "session_control": counts["session_control"],
+                    "message": counts["message"],
+                    "total": len(records),
+                }) + "\n")
+
+
+async def test_m2_cross_process_5_leaf_subtree_stop_and_halt_sql_profile(registry_store):
+    """Cross-process stop(driver, scope='subtree') (0 dead-wait, wake=1 to Main) + halt (wake=0)."""
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.agent.runtime_types import InputRef, result_message_id
+
+    store_a, connect = registry_store
+    db = store_a._db.dialect.name
+    leaf_started = [asyncio.Event() for _ in range(5)]
+    release_leaves = asyncio.Event()
+
+    class _MainModel(LLMService):
+        async def complete(self, req, **kwargs):
+            return LLMResponse(raw_text="main handled cancelled workflow")
+
+        async def close(self):
+            pass
+
+    class _LeafModel(LLMService):
+        async def complete(self, req, **kwargs):
+            idx = int(req.system_prompt.splitlines()[0].split("-")[1])
+            leaf_started[idx].set()
+            await release_leaves.wait()
+            return LLMResponse(raw_text=f"leaf-{idx}-late")
+
+        async def close(self):
+            pass
+
+    branches = [
+        {
+            "type": "agent", "id": f"L{i}", "input": f"work-{i}",
+            "spec": {"name": f"L{i}", "system_prompt": f"LEAF-{i}", "tools": []},
+        }
+        for i in range(5)
+    ]
+    spec = {
+        "name": "five-leaf-subtree-stop",
+        "root": {"type": "parallel", "max_concurrency": 5, "branches": branches},
+    }
+
+    async with _cross_process_workflow_cluster(store_a, connect, _MainModel(), _LeafModel()) as (
+        rt_a, rt_b, main_target, actor, desc, master,
+    ):
+        handle = await rt_a.client.workflow(
+            main_target, spec, message_id="wf-substop", actor=actor, descriptor=desc,
+        )
+        await asyncio.wait_for(asyncio.gather(*(ev.wait() for ev in leaf_started)), 10)
+        # Do NOT release leaves yet! Verify stop(driver, scope='subtree') finishes with 0 dead-wait!
+        rcpt = await rt_a.client.cancel(
+            handle.target, actor=actor, scope="subtree", reason="abort workflow subtree",
+        )
+        assert rcpt.state == "cancel_requested"
+        wf_res = await handle.wait(deadline_ms=now_ms() + 5000)
+        assert wf_res.status == "cancelled" and wf_res.cancel_by == "user"
+        parent_ref = InputRef(
+            store_a.store_id, main_target.session_id,
+            result_message_id(handle.target, handle.input_ref, 1, "workflow_result"),
+        )
+        main_res = await rt_a.client.wait(parent_ref, actor=actor, deadline_ms=now_ms() + 10000)
+        assert main_res.status == "completed"
+
+        # Now let all 5 remote leaves finish and confirm 0 ghost re-wake of finished Driver!
+        release_leaves.set()
+        async with asyncio.timeout(10):
+            while rt_a.worker._active or rt_b.worker._active:
+                await asyncio.sleep(0.01)
+
+        drv_row = await rt_a.worker.inputs.db.fetchone(
+            f"SELECT execution_state,send_index,wake_pending_count FROM {store_a.t.sessions} "
+            "WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert dict(drv_row) == {
+            "execution_state": "idle", "send_index": 1, "wake_pending_count": 0,
+        }
+        late_rows = await rt_a.worker.inputs.db.fetchall(
+            f"SELECT wake,content_json FROM {store_a.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_node_result'",
+            (handle.target.session_id,),
+        )
+        assert len(late_rows) == 5
+        assert all(int(r["wake"]) == 0 for r in late_rows)
+        assert all(json.loads(r["content_json"])["cancel_by"] == "subtree" for r in late_rows)
+
+        records = [r for r in master.records if _category(r["chain"], r["sql"]) != "periodic"]
+        counts = _counts(records, master.tx_sites, master.tx_categories)
+        assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+        assert counts.get("unfinished_transactions", 0) == 0
+        if out := os.environ.get("M2_WORKFLOW_LEDGER_OUT"):
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "case": "5_leaf_xproc_stop_driver_subtree",
+                    "db": db,
+                    "transactions": master.transactions,
+                    "session_control": counts["session_control"],
+                    "message": counts["message"],
+                    "total": len(records),
+                }) + "\n")

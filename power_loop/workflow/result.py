@@ -29,6 +29,7 @@ class AgentResult:
     usage: dict[str, int] = field(default_factory=dict)
     session_id: str | None = None
     error: str | None = None
+    cancel_by: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -43,6 +44,7 @@ class AgentResult:
             "usage": self.usage,
             "session_id": self.session_id,
             "error": self.error,
+            "cancel_by": self.cancel_by,
         }
 
 
@@ -64,6 +66,7 @@ class WorkflowResult:
     #: 失败但明确放行（continue_on_error）的节点 id（6.45）：宿主自己再判一遍 run 终态时要跳过它们，
     #: 否则 continue_on_error 在宿主侧等于没开（DeepTalk design/170 §6）。
     tolerated: list[str] = field(default_factory=list)
+    cancel_by: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -94,6 +97,7 @@ class WorkflowResult:
             "usage": self.usage,
             "errors": self.errors,
             "tolerated": self.tolerated,
+            "cancel_by": self.cancel_by,
         }
 
 

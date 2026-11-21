@@ -92,10 +92,13 @@ async def test_model_submission_returns_receipt_and_delivers_to_parent(registry_
     register_workflow_tool(registry)
 
     class Parent(Model):
+        created = False
+
         async def complete(self, request, **kwargs):
             if request.system_prompt.startswith("A"):
                 return LLMResponse(raw_text="leaf done")
-            if not any(m.get("role") == "tool" for m in request.messages):
+            if not self.created:
+                self.created = True
                 return LLMResponse(
                     raw_text="",
                     tool_calls=[
@@ -129,18 +132,23 @@ async def test_model_submission_returns_receipt_and_delivers_to_parent(registry_
         await runner.runtime.worker.recover()
         await runner.drain()
         notices = await store._db.fetchall(
-            f"SELECT kind,terminal_status FROM {store.t.follow_up_queue} "
+            f"SELECT item_id,kind,status FROM {store.t.follow_up_queue} "
             "WHERE session_id=? AND kind='workflow_result'",
             (runner.target.session_id,),
         )
-        assert len(notices) == 1 and notices[0]["terminal_status"] == "completed"
+        assert len(notices) == 1 and notices[0]["status"] == "delivered"
+        inspected = await runner.runtime.client.inspect(
+            InputRef(store.store_id, runner.target.session_id, notices[0]["item_id"]),
+            actor=runner.actor,
+        )
+        assert inspected.terminal_status == "completed"
     finally:
         await runner.aclose()
 
 
 async def test_required_child_finishes_before_downstream(registry_store, tmp_path):
-    import json
-
+    from power_loop.contracts.tools import ToolDefinition
+    from power_loop.runtime.pricing import Free
     from power_loop.tools import create_default_tool_registry
     from power_loop.tools.spawn_agent import register_spawn_agent
 
@@ -149,35 +157,48 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
     register_spawn_agent(registry)
 
     class Delegating(Model):
-        child_done = False
+        tool_done = False
+        a_called_tool = False
+        saw_tools_on_a: tuple[str, ...] = ()
 
         async def complete(self, request, **kwargs):
-            if request.system_prompt.startswith("CHILD"):
-                self.child_done = True
-                return LLMResponse(raw_text="child result")
             if request.system_prompt.startswith("A"):
-                if not any(m.get("role") == "tool" for m in request.messages):
+                self.saw_tools_on_a = tuple(
+                    (t.get("function", {}) or {}).get("name") or t.get("name")
+                    for t in (request.tools or ())
+                )
+                if not self.a_called_tool:
+                    self.a_called_tool = True
                     return LLMResponse(
                         raw_text="",
                         tool_calls=[
                             {
-                                "id": "spawn",
+                                "id": "prep",
                                 "type": "function",
-                                "function": {
-                                    "name": "spawn_agent",
-                                    "arguments": json.dumps({"task": "work", "system_prompt": "CHILD", "tools": []}),
-                                },
+                                "function": {"name": "step_work", "arguments": "{}"},
                             }
                         ],
                     )
                 return LLMResponse(raw_text="A done")
-            assert self.child_done
-            return LLMResponse(raw_text="B done")
+            if request.system_prompt.startswith("B"):
+                assert self.tool_done
+                return LLMResponse(raw_text="B done")
+            return LLMResponse(raw_text="parent ack")
 
     model = Delegating()
+
+    async def step_work():
+        model.tool_done = True
+        return "step complete"
+
+    registry.register(
+        ToolDefinition("step_work", "leaf work", input_schema={"type": "object"}, pricing=Free("test")),
+        step_work,
+    )
     runner = await RunningAgent(store, model, registry, AgentLoopConfig(context_budget_tokens=10**9)).start()
     a = leaf("A")
-    a["spec"].update(tools=["spawn_agent"], max_rounds=5)
+    # Design 217 §5.3 / M1c single-level delegation: spawn_agent is stripped on workflow_node (depth=2)
+    a["spec"].update(tools=["spawn_agent", "step_work"], max_rounds=5)
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
@@ -186,17 +207,13 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
             actor=runner.actor,
         )
         result = await handle.wait(deadline_ms=now_ms() + 15000)
-        assert result.status == "completed" and model.child_done, result
+        assert result.status == "completed" and model.tool_done, result
+        assert "spawn_agent" not in model.saw_tools_on_a and "step_work" in model.saw_tools_on_a
         children = await store._db.fetchall(
-            f"SELECT session_id,parent_session_id FROM {store.t.sessions} WHERE parent_session_id=?",
+            f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? OR depth>=3",
             (result.results["A"].session_id,),
         )
-        assert len(children) == 1
-        child_result = await store._db.fetchone(
-            f"SELECT terminal_status FROM {store.t.follow_up_queue} WHERE session_id=?",
-            (children[0]["session_id"],),
-        )
-        assert child_result["terminal_status"] == "completed"
+        assert children == []
     finally:
         await runner.aclose()
 
@@ -206,13 +223,14 @@ async def test_failure_policy_uses_new_attempt_and_keeps_usage(registry_store, p
     store, _ = registry_store
 
     class Failing(Model):
-        calls = 0
+        leaf_calls = 0
 
         async def complete(self, request, **kwargs):
-            self.calls += 1
-            # A failed declared JSON output exhausts its bounded repair.
-            text = "invalid" if request.system_prompt.startswith("A") and self.calls <= 2 else '{"ok":true}'
-            return LLMResponse(raw_text=text)
+            if request.system_prompt.startswith(("A", "B")):
+                self.leaf_calls += 1
+                text = "invalid" if request.system_prompt.startswith("A") and self.leaf_calls == 1 else '{"ok":true}'
+                return LLMResponse(raw_text=text)
+            return LLMResponse(raw_text="parent ack")
 
     model = Failing()
     runner = await RunningAgent(store, model, config=AgentLoopConfig(context_budget_tokens=10**9)).start()
@@ -233,7 +251,7 @@ async def test_failure_policy_uses_new_attempt_and_keeps_usage(registry_store, p
         )
         result = await handle.wait(deadline_ms=now_ms() + 10000)
         assert result.status == "completed", result
-        assert result.usage["calls"] == model.calls
+        assert result.usage["calls"] == model.leaf_calls
         nodes = await store._db.fetchall(
             f"SELECT session_id FROM {store.t.sessions} WHERE descriptor_json LIKE '%workflow_node%'",
         )

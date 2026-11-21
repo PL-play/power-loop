@@ -59,8 +59,8 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
         lease = current_ownership(store, execution.session_id)
         assert lease is runner.runtime.worker._active[execution.session_id].ownership
         lease.require_owned()
-        assert (lease.key, lease.epoch, lease.token) == (
-            (execution.store_id, execution.session_id), execution.owner_epoch, execution.owner_token)
+        assert (lease.key, lease.epoch) == (
+            (execution.store_id, execution.session_id), execution.owner_epoch)
         built.append((descriptor.kind, lease))
         return await original_build(descriptor, execution)
 
@@ -83,8 +83,8 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
             await asyncio.wait_for(runner.drain(), 10)
         except TimeoutError:
             states = await store._db.fetchall(
-                f"SELECT session_id,execution_state,active_send_index,send_index,owner_token "
-                f"FROM {store.t.session_state}",
+                f"SELECT session_id,execution_state,send_index,owner_epoch "
+                f"FROM {store.t.sessions}",
             )
             inbox = await store._db.fetchall(
                 f"SELECT session_id,item_id,kind,status,terminal_status,delivered_send_index "
@@ -109,7 +109,7 @@ async def test_model_tool_creates_and_finishes_workflow_without_job_authority(re
 
 async def _expire(store, session_id):
     await store._db.execute(
-        f"UPDATE {store.t.session_state} SET owner_lease_until_ms=0 WHERE session_id=?",
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?",
         (session_id,),
     )
 
@@ -373,15 +373,15 @@ async def test_original_cancel_running_continuation_cancels_current_send(registr
             async with asyncio.timeout(5):
                 while True:
                     state = await store._db.fetchone(
-                        f"SELECT active_send_index FROM {store.t.session_state} WHERE session_id=?",
+                        f"SELECT execution_state,send_index FROM {store.t.sessions} WHERE session_id=?",
                         (handle.target.session_id,),
                     )
-                    if state["active_send_index"] == 2:
+                    if state["execution_state"] == "running" and int(state["send_index"]) == 2:
                         break
                     await asyncio.sleep(0.01)
         except TimeoutError:
             rows = await store._db.fetchall(
-                f"SELECT session_id,execution_state,active_send_index,cancel_send_index FROM {store.t.session_state}",
+                f"SELECT session_id,execution_state,send_index,cancel_seq,cancel_by FROM {store.t.sessions}",
             )
             inbox = await store._db.fetchall(
                 f"SELECT session_id,kind,status,terminal_status,delivered_send_index FROM {store.t.follow_up_queue}",
@@ -414,7 +414,6 @@ async def test_halt_late_result_is_journaled_without_advancing_finished_graph(re
 
 async def _exercise_halt_late_result(store, raw_db, monkeypatch, *, measure=nullcontext):
     from power_loop.workflow import journal
-    from power_loop.workflow import runner as workflow_runner
 
     started, release = asyncio.Event(), asyncio.Event()
 
@@ -425,7 +424,10 @@ async def _exercise_halt_late_result(store, raw_db, monkeypatch, *, measure=null
                 raise RuntimeError("business failure")
             if request.system_prompt.startswith("B"):
                 started.set()
-                await release.wait()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()
                 return LLMResponse(raw_text="late B")
             return LLMResponse(raw_text="parent acknowledged")
 
@@ -443,7 +445,7 @@ async def _exercise_halt_late_result(store, raw_db, monkeypatch, *, measure=null
             result = await handle.wait(deadline_ms=now_ms() + 10000)
         except TimeoutError:
             states = await raw_db.fetchall(
-                f"SELECT session_id,execution_state,active_send_index,cancel_send_index FROM {store.t.session_state}",
+                f"SELECT session_id,execution_state,send_index,cancel_seq,cancel_by FROM {store.t.sessions}",
             )
             raise AssertionError(states)
         assert result.name == "late halt" and result.status == "failed"
@@ -476,42 +478,47 @@ async def _exercise_halt_late_result(store, raw_db, monkeypatch, *, measure=null
         assert parent.status == "completed" and parent.input_ref == aggregate_ref
         await runner.finish(aggregate_ref)
         await runner.finish(InputRef(**a["input_ref"]))
-        committed = asyncio.Event()
-        commits = []
-        finish_late = workflow_runner._finish_late
+        a_res_id = a["result_input_ref"]["message_id"]
 
-        async def observe_finish(worker, context, refs):
-            final = await finish_late(worker, context, refs)
-            if worker is runner.runtime.worker and context.session_id == driver_sid:
-                commits.append(tuple(refs))
-                committed.set()
-            return final
+        async with measure():
+            release.set()
+            async with asyncio.timeout(10):
+                b_result = await runner.runtime.client.wait(
+                    b_ref, actor=runner.actor, deadline_ms=now_ms() + 10000,
+                )
+                await runner.finish(b_ref)
+                await runner.drain()
 
-        with monkeypatch.context() as patch:
-            patch.setattr(workflow_runner, "_finish_late", observe_finish)
-            async with measure():
-                release.set()
-                async with asyncio.timeout(10):
-                    await committed.wait()
-                    await runner.drain()
-
-        [(late_ref,)] = commits
-        late_row = await raw_db.fetchone(
-            f"SELECT kind,terminal_status,content_json FROM {store.t.follow_up_queue} "
-            "WHERE session_id=? AND item_id=?",
-            (driver_sid, late_ref.message_id),
+        # Design 217 §4.5 / §5.3: halt stops sibling B with cancel_by='subtree' (wake=0),
+        # so B's River delivery NEVER ghost-rewakes the finished workflow_driver!
+        driver_state = await raw_db.fetchone(
+            f"SELECT execution_state,send_index,wake_pending_count FROM {store.t.sessions} "
+            "WHERE session_id=?",
+            (driver_sid,),
         )
-        assert late_ref.session_id == driver_sid
-        assert late_row["kind"] == "workflow_node_result" and late_row["terminal_status"] == "completed"
+        assert dict(driver_state) == {
+            "execution_state": "idle", "send_index": 1, "wake_pending_count": 0,
+        }
+        late_row = await raw_db.fetchone(
+            f"SELECT item_id,kind,wake,status,terminal_status,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_node_result' AND item_id<>?",
+            (driver_sid, a_res_id),
+        )
+        assert late_row is not None
+        late_ref = InputRef(store.store_id, driver_sid, late_row["item_id"])
+        assert late_row["kind"] == "workflow_node_result"
+        assert int(late_row["wake"]) == 0
+        assert late_row["status"] == "pending" and late_row["terminal_status"] is None
         routed = json.loads(late_row["content_json"])
-        assert routed["status"] == "cancelled" and routed["input_ref"] == plain(b_ref)
+        assert (
+            routed["status"] == "cancelled"
+            and routed["cancel_by"] == "subtree"
+            and routed["input_ref"] == plain(b_ref)
+        )
         [b] = [entry for entry in await read_nodes() if entry["path"] == "B"]
-        [late] = b["late_results"]
-        assert b["input_ref"] == late["input_ref"] == plain(b_ref)
-        assert b["result"] is None and late["status"] == "cancelled"
+        assert b["input_ref"] == plain(b_ref) and b["result"] is None
         inputs = runner.runtime.client.inputs
-        b_result = await inputs.get_result(b_ref, actor=runner.actor)
-        assert b_result.input_ref == b_ref and b_result.status == "cancelled"
+        assert b_result.input_ref == b_ref and b_result.status == "cancelled" and b_result.cancel_by == "subtree"
         persisted = await inputs.get_result(handle.input_ref, actor=runner.actor)
         assert persisted.input_ref == handle.input_ref and persisted.target == handle.target
         assert persisted.status == result.status and persisted.result_seq == saved_before["result_seq"]
@@ -525,6 +532,7 @@ async def _exercise_halt_late_result(store, raw_db, monkeypatch, *, measure=null
             "b_input_ref_before_release": plain(b_ref), "b_late_before_release": len(before_b["late_results"]),
             "b_result": b["result"], "b_late_results": b["late_results"],
             "b_persisted_status": b_result.status, "driver_late_input_ref": plain(late_ref),
+            "driver_late_wake": int(late_row["wake"]),
             "driver_late_terminal_status": late_row["terminal_status"],
             "driver_original_input_ref": plain(persisted.input_ref), "driver_original_status": persisted.status,
             "driver_original_result_seq": persisted.result_seq, "parent_aggregate_count": len(aggregates),
