@@ -2690,3 +2690,167 @@ async def test_m1c_r4_main_spawn_agent_send_input_zero_role_query(registry_store
         await rt.client.aclose()
         await rt.transport.aclose()
         store._db = original
+
+
+# ── 11. Round-5 Rework Regressions ──────────────────────────────────────────
+
+
+async def test_m1c_r5_real_worker_cross_parent_send_no_rebind_4_4_4_sql(registry_store, monkeypatch):
+    """R5-Item1: Real Worker public send with cross-parent reply_route=B (no rebind) settles in 4/4/4 SQL."""
+    store, _ = registry_store
+    original = store._db
+    profiled = Profiled(original)
+    store._db = profiled
+
+    b_release = asyncio.Event()
+    child_final_slices: list[list[dict[str, Any]]] = []
+    child_consumed_args: list[Any] = []
+
+    class _CrossParentModel:
+        async def complete(self, request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            if sid == "r5-wk-b":
+                await asyncio.wait_for(b_release.wait(), 5)
+                return LLMResponse(raw_text="b saw receipt")
+            return LLMResponse(raw_text="worker cross-parent answer")
+
+        async def close(self):
+            pass
+
+    model = _CrossParentModel()
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _build)
+    rt = Runtime(
+        store=store, factory=factory, node_id="r5-wk-node", boot_id="r5-wk-boot",
+        capacity=4, recovery_interval_s=None, timers_enabled=False,
+    )
+
+    orig_final_tx = rt.worker.inputs._final_tx
+
+    async def metered_final_tx(tx, batch, consumed, *args, **kwargs):
+        if batch.target.session_id == "r5-wk-c":
+            child_consumed_args.append(consumed)
+            start_idx = len(profiled.records)
+            res = await orig_final_tx(tx, batch, consumed, *args, **kwargs)
+            child_final_slices.append(list(profiled.records[start_idx:]))
+            return res
+        return await orig_final_tx(tx, batch, consumed, *args, **kwargs)
+
+    monkeypatch.setattr(rt.worker.inputs, "_final_tx", metered_final_tx)
+
+    await rt.worker.start()
+    try:
+        main_a = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r5-wk-a"})
+        main_b = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r5-wk-b"})
+        child_c = await rt.client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": "r5-wk-c"},
+        )
+
+        rcpt = await rt.client.send(
+            child_c,
+            "cross parent worker work",
+            message_id="r5-wk-msg",
+            actor=ACTOR,
+            reply_route={"target": main_b, "result_kind": "agent_result"},
+        )
+        res = await rt.client.wait(rcpt.input_ref, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert res.status == "completed"
+        assert res.final_text == "worker cross-parent answer"
+
+        a_inbox = await original.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_a.session_id,),
+        )
+        b_inbox = await original.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_b.session_id,),
+        )
+        assert a_inbox == []
+        assert len(b_inbox) == 1
+        b_body = json.loads(b_inbox[0]["content_json"])
+        assert b_body["final_text"] == "worker cross-parent answer"
+        assert b_body["input_ref"]["message_id"] == "r5-wk-msg"
+
+        # Real Worker passed explicit consumed list; _final_tx must restore 4/4/4 SQL with 0 route lookup!
+        assert len(child_consumed_args) == 1 and child_consumed_args[0] is not None
+        assert len(child_final_slices) == 1
+        final_sql = child_final_slices[0]
+        assert not any(
+            "reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in final_sql
+        ), [r["sql"] for r in final_sql]
+        assert len(final_sql) == 4, [r["sql"] for r in final_sql]
+    finally:
+        b_release.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+        store._db = original
+
+
+@pytest.mark.parametrize("write_kv", [False, True])
+async def test_m1c_r5_mixed_batch_explicit_consumed_no_rebind_5_5_6_sql(registry_store, write_kv):
+    """R5-Item2: Mixed batch (direct + explicit route->B), no rebind, explicit consumed stays 5/5/6 with or without KV."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        sfx = "kv" if write_kv else "plain"
+        main_a = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"r5-mx-a-{sfx}"})
+        main_b = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"r5-mx-b-{sfx}"})
+        child_c = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": f"r5-mx-c-{sfx}"},
+        )
+
+        await client.send(child_c, "direct work", message_id="d_r5", actor=ACTOR)
+        await client.send(
+            child_c, "routed work", message_id="r_r5", actor=ACTOR,
+            reply_route={"target": main_b, "result_kind": "agent_result"},
+        )
+        batch = await port.claim(child_c, node_id="n1", boot_id="b1")
+        assert batch is not None
+        assert batch.parent_session_id == main_a.session_id
+        assert batch.reply_to_session_id == main_b.session_id
+        assert batch.reply_to_item_id == "r_r5"
+
+        if write_kv:
+            await store.set_runtime_state(child_c.session_id, "step", {"n": 1})
+
+        original = store._db
+        profiled = Profiled(original)
+        store._db = profiled
+        try:
+            profiled.records.clear()
+            fb = await port.final(batch, consumed=batch.input_refs, final_text="stay on B explicit")
+            final_sql = list(profiled.records)
+        finally:
+            store._db = original
+
+        assert fb.result_delivery_error is None
+        assert fb.result_activation == main_b
+        a_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_a.session_id,),
+        )
+        b_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (main_b.session_id,),
+        )
+        assert a_inbox == []
+        assert len(b_inbox) == 1
+        b_body = json.loads(b_inbox[0]["content_json"])
+        assert b_body["final_text"] == "stay on B explicit"
+        assert b_body["input_ref"]["message_id"] == "r_r5"
+
+        assert not any(
+            "reply_to_session_id" in r["sql"] and "item_id=?" in r["sql"] for r in final_sql
+        ), [r["sql"] for r in final_sql]
+        expected_sql = 6 if original.dialect.name == "mysql" else 5
+        assert len(final_sql) == expected_sql, [r["sql"] for r in final_sql]
+    finally:
+        await client.aclose()
+        await transport.aclose()
