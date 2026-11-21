@@ -1545,3 +1545,553 @@ async def test_m1c_b4_release_claim_fires_result_undeliverable_post_commit(regis
         await rt.transport.aclose()
         await observer.close()
         await peer.close()
+
+
+# ── 9. Round-2 Rework B1–B3 Regressions ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("interleave_point", ["after_scan2_under_root_lock", "between_scan1_and_root_lock"])
+async def test_m1c_b1_r2_3a_vs_grandchild_under_idle_middle(registry_store, interleave_point):
+    """B1-R2 Scene 1: 3A on root vs create_many under idle-middle never leaves an active grandchild."""
+    store, connect = registry_store
+    p1 = RuntimeInputStore(store)
+    peer = await connect(schema="verify")
+    p2 = RuntimeInputStore(peer)
+    try:
+        sfx = "s2" if interleave_point == "after_scan2_under_root_lock" else "s1"
+        root = await target(p1, f"b1r2-root-{sfx}")
+        driver_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        middle = await p1.create_session(
+            driver_desc, actor=ACTOR, parent=root, options={"session_id": f"b1r2-mid-{sfx}"},
+        )
+        grand_sid = f"b1r2-grand-{sfx}"
+        grand_spec = ChildSpec(
+            session_id=grand_sid,
+            message_id="gm1",
+            body={"text": "leaf work"},
+            descriptor=DESCRIPTOR,
+            result_kind="workflow_node_result",
+        )
+        dialect = store._db.dialect.name
+        if dialect in ("postgres", "mysql"):
+            orig_collect = p1._collect_active_descendants
+            target_scan = 2 if interleave_point == "after_scan2_under_root_lock" else 1
+            gate_reached = asyncio.Event()
+            release_close = asyncio.Event()
+            scan_count = 0
+
+            async def hooked_collect(tx, **kwargs):
+                nonlocal scan_count
+                scan_count += 1
+                rows = await orig_collect(tx, **kwargs)
+                if scan_count == target_scan:
+                    gate_reached.set()
+                    await asyncio.wait_for(release_close.wait(), 5)
+                return rows
+
+            p1._collect_active_descendants = hooked_collect  # type: ignore[method-assign]
+
+            async def run_grandchild_spawn():
+                await asyncio.wait_for(gate_reached.wait(), 5)
+                if interleave_point == "after_scan2_under_root_lock":
+                    # Under root FOR UPDATE, create_many(middle) blocks on root FOR SHARE until
+                    # close commits, then rejects with session_closed!
+                    async def _release_soon():
+                        await asyncio.sleep(0.08)
+                        release_close.set()
+
+                    rel_task = asyncio.create_task(_release_soon())
+                    try:
+                        return await p2.create_many(
+                            parent=middle, actor=ACTOR, specs=[grand_spec],
+                            node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
+                        )
+                    finally:
+                        await rel_task
+                else:
+                    try:
+                        return await p2.create_many(
+                            parent=middle, actor=ACTOR, specs=[grand_spec],
+                            node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
+                        )
+                    finally:
+                        release_close.set()
+
+            close_res, spawn_res = await asyncio.gather(
+                p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_grand"),
+                run_grandchild_spawn(),
+                return_exceptions=True,
+            )
+            assert not isinstance(close_res, Exception), close_res
+        else:
+            close_res, spawn_res = await asyncio.gather(
+                p1.set_lifecycle(root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_grand"),
+                p2.create_many(
+                    parent=middle, actor=ACTOR, specs=[grand_spec],
+                    node_id="n2", boot_id="b2", can_execute=False, free_slots=0,
+                ),
+                return_exceptions=True,
+            )
+            assert not isinstance(close_res, Exception), close_res
+
+        if isinstance(spawn_res, Exception):
+            assert isinstance(spawn_res, RuntimeRequestError) and spawn_res.code == "session_closed"
+            assert await store.get_session(grand_sid) is None
+        else:
+            # Grandchild committed before root lock -> MUST be caught & cancelled, never executes!
+            assert grand_sid in close_res.stopped_descendant_ids
+            grow = await store._db.fetchone(
+                f"SELECT cancel_seq,cancel_by FROM {store.t.sessions} WHERE session_id=?",
+                (grand_sid,),
+            )
+            assert grow is not None and grow["cancel_by"] == "subtree" and int(grow["cancel_seq"]) >= 1
+            model_calls: list[str] = []
+            factory = RegistryRuntimeFactory()
+            model = _ScriptedModel(lambda _i, _r: (model_calls.append("ran") or LLMResponse(raw_text="NO")))
+
+            async def _chk_build(_d, _c):
+                return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+            factory.register("test.agent@215", _chk_build)
+            rt = Runtime(
+                store=store, factory=factory, node_id="n-chk", boot_id="b-chk",
+                capacity=2, recovery_interval_s=None, timers_enabled=False,
+            )
+            await rt.worker.start()
+            try:
+                res = await rt.client.wait(
+                    InputRef(store.store_id, grand_sid, "gm1"), actor=ACTOR, deadline_ms=now_ms() + 5000,
+                )
+                assert res.status == "cancelled"
+                assert model_calls == []
+                mid_row = await store._db.fetchone(
+                    f"SELECT execution_state,wake_pending_count FROM {store.t.sessions} WHERE session_id=?",
+                    (middle.session_id,),
+                )
+                assert mid_row["execution_state"] == "idle" and int(mid_row["wake_pending_count"]) == 0
+            finally:
+                await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+                await rt.client.aclose()
+                await rt.transport.aclose()
+    finally:
+        await peer.close()
+
+
+async def test_m1c_b1_r2_3a_does_not_cancel_rebound_child(registry_store):
+    """B1-R2 Scene 2: Child rebound to another tree after 3A scan 1 is NOT cancelled and completes cleanly."""
+    store, connect = registry_store
+    p1 = RuntimeInputStore(store)
+    peer = await connect(schema="verify")
+    p2 = RuntimeInputStore(peer)
+    try:
+        old_root = await target(p1, "b1r2-old-root")
+        new_parent = await target(p1, "b1r2-new-parent")
+        cm = await p1.create_many(
+            parent=old_root, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="b1r2-moved-ch", message_id="m1", body={"text": "survive"},
+                descriptor=DESCRIPTOR, result_kind="agent_result",
+            )],
+            node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        )
+        batch = cm.preclaimed[0]
+        child = batch.target
+
+        if store._db.dialect.name in ("postgres", "mysql"):
+            orig_collect = p1._collect_active_descendants
+            scan1_done = asyncio.Event()
+            rebind_done = asyncio.Event()
+            calls = 0
+
+            async def hooked_collect(tx, **kwargs):
+                nonlocal calls
+                calls += 1
+                rows = await orig_collect(tx, **kwargs)
+                if calls == 1:
+                    scan1_done.set()
+                    await asyncio.wait_for(rebind_done.wait(), 5)
+                return rows
+
+            p1._collect_active_descendants = hooked_collect  # type: ignore[method-assign]
+
+            async def run_rebind():
+                await asyncio.wait_for(scan1_done.wait(), 5)
+                try:
+                    return await p2.rebind_children(old_root, new_parent, actor=ACTOR)
+                finally:
+                    rebind_done.set()
+
+            close_res, rb_res = await asyncio.gather(
+                p1.set_lifecycle(old_root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_old"),
+                run_rebind(),
+            )
+            assert calls >= 2
+        else:
+            # On SQLite (single writer lock), first commit rebind_children, then inject stale scan-1
+            # output containing the moved child so Step B/C verifies locked ownership and retries cleanly!
+            rb_res = await p2.rebind_children(old_root, new_parent, actor=ACTOR)
+            orig_collect = p1._collect_active_descendants
+            stale_injected = False
+
+            async def sqlite_hook(tx, **kwargs):
+                nonlocal stale_injected
+                if not stale_injected:
+                    stale_injected = True
+                    return [(child.session_id, 1, False)]
+                return await orig_collect(tx, **kwargs)
+
+            p1._collect_active_descendants = sqlite_hook  # type: ignore[method-assign]
+            close_res = await p1.set_lifecycle(
+                old_root, "closed", actor=ACTOR, inflight="abort", subtree="all", reason="3a_old",
+            )
+
+        assert child.session_id not in close_res.stopped_descendant_ids
+        ch_row = await store._db.fetchone(
+            f"SELECT parent_session_id,root_session_id,cancel_seq,cancel_by "
+            f"FROM {store.t.sessions} WHERE session_id=?",
+            (child.session_id,),
+        )
+        assert ch_row["parent_session_id"] == new_parent.session_id
+        assert ch_row["root_session_id"] == new_parent.session_id
+        assert int(ch_row["cancel_seq"]) == 0 and ch_row["cancel_by"] is None
+
+        # Moved child MUST complete normally and deliver ONLY to new_parent!
+        fb = await p1.final(batch, final_text="moved child survived")
+        assert fb.results[0].status == "completed"
+        assert fb.result_delivery_error is None
+        new_inbox = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?",
+            (new_parent.session_id,),
+        )
+        assert len(new_inbox) == 1 and "moved child survived" in new_inbox[0]["content_json"]
+        _ = rb_res
+    finally:
+        await peer.close()
+
+
+@pytest.mark.parametrize("old_parent_state", ["open", "closed"])
+async def test_m1c_b2_r2_mixed_batch_per_input_rebind_and_zero_extra_normal_sql(
+    registry_store, old_parent_state,
+):
+    """B2-R2: Mixed batch (unrouted first, routed second) honors in-flight rebind; normal Final adds 0 SQL."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    old_p = await target(port, f"b2r2-old-{old_parent_state}")
+    new_p = await target(port, f"b2r2-new-{old_parent_state}")
+    # Child with NO session-level default result_route
+    child = await target(port, f"b2r2-ch-{old_parent_state}", parent=old_p)
+
+    # First input has NO reply_route; second input explicitly routes back to old_p
+    await port.accept(child, "direct msg", message_id="direct", actor=ACTOR)
+    await port.accept(
+        child,
+        "routed msg",
+        message_id="routed",
+        actor=ACTOR,
+        reply_route={"target": old_p, "result_kind": "agent_result"},
+    )
+    batch = await port.claim(child, node_id="n1", boot_id="b1")
+    assert batch is not None
+    assert batch.result_route is None
+    assert [r.message_id for r in batch.input_refs] == ["direct", "routed"]
+    assert batch.reply_to_session_id == old_p.session_id
+    assert batch.reply_to_item_id == "routed"
+
+    if old_parent_state == "closed":
+        await port.set_lifecycle(old_p, "closed", actor=ACTOR, inflight="abort", subtree="none")
+
+    rb = await port.rebind_children(old_p, new_p, actor=ACTOR)
+    assert rb.rebound_children == (child.session_id,)
+
+    # Finalize using the ORIGINAL pre-rebind batch
+    fb = await port.final(batch, final_text="mixed routed answer")
+    assert fb.result_delivery_error is None
+    assert fb.result_activation == new_p
+
+    old_inbox = await store._db.fetchall(
+        f"SELECT * FROM {store.t.follow_up_queue} WHERE session_id=?", (old_p.session_id,),
+    )
+    new_inbox = await store._db.fetchall(
+        f"SELECT content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (new_p.session_id,),
+    )
+    assert old_inbox == []
+    assert len(new_inbox) == 1
+    body = json.loads(new_inbox[0]["content_json"])
+    assert body["final_text"] == "mixed routed answer"
+    assert body["input_ref"]["message_id"] == "routed"
+
+    # Also assert 0 extra route-lookup SQL on NORMAL (non-rebound) per-input & session-route Finals!
+    if old_parent_state == "open":
+        original = store._db
+        profiled = Profiled(original)
+        store._db = profiled
+        try:
+            # 1) Normal per-input routed Final (no rebind): must NOT query follow_up_queue for reply_to_session_id
+            ch_norm = await target(port, "b2r2-norm-perinput", parent=new_p)
+            await port.accept(ch_norm, "d1", message_id="d1", actor=ACTOR)
+            await port.accept(
+                ch_norm, "r1", message_id="r1", actor=ACTOR,
+                reply_route={"target": new_p, "result_kind": "agent_result"},
+            )
+            nb = await port.claim(ch_norm, node_id="n1", boot_id="b1")
+            assert nb is not None
+            profiled.records.clear()
+            await port.final(nb, final_text="ok per-input")
+            assert not any("reply_to_session_id" in r["sql"] for r in profiled.records), [
+                r["sql"] for r in profiled.records
+            ]
+            # SQLite/PG: 5 SQL (max_seq + UPDATE sessions + SELECT delivered + River UPDATE + River INSERT + INSERT msg = 6 if write_message, 5 if result_seq given)
+            # Check exact MySQL/SQLite/PG counts with pre-written result_seq=2 (matches real Worker!)
+            cm_norm = await port.create_many(
+                parent=new_p, actor=ACTOR,
+                specs=[ChildSpec(
+                    session_id="b2r2-norm-route", message_id="m1", body={"text": "go"},
+                    descriptor=DESCRIPTOR, result_kind="agent_result",
+                )],
+                node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+            )
+            cb = cm_norm.preclaimed[0]
+            await store.append_message_fenced(
+                cb.target.session_id, owner_epoch=cb.owner_epoch, seq=2, send_index=1,
+                round_index=0, role="assistant", content="done",
+                meta={"usage": {}, "structured_output": None, "error": None, "error_code": None, "result_delivery_error": None},
+            )
+            profiled.records.clear()
+            await port.final(
+                cb, consumed=cb.input_refs, status="completed", final_text="done",
+                usage={}, result_seq=2, next_seq=3,
+                assistant_meta={"usage": {}, "structured_output": None, "error": None, "error_code": None, "result_delivery_error": None},
+            )
+            # Normal child Final with session-level result_route: 0 diag SELECT on MySQL (3 SQL on all 3 DBs: UPDATE child + River UPDATE parent + River INSERT parent!)
+            assert not any("SELECT next_seq,cancel_by" in r["sql"] for r in profiled.records), [
+                r["sql"] for r in profiled.records
+            ]
+            assert len(profiled.records) == 3, [r["sql"] for r in profiled.records]
+        finally:
+            store._db = original
+
+
+async def test_m1c_b3_r2_automatic_takeover_respects_capacity_limit(registry_store):
+    """B3-R2: With capacity=1 and 3 expired 0-assistant tasks, automatic periodic takeover keeps concurrency == 1."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    in_flight = 0
+    max_in_flight = 0
+    started_order: list[str] = []
+    gates = {f"b3r2-cap-{i}": asyncio.Event() for i in range(1, 4)}
+    entered = {f"b3r2-cap-{i}": asyncio.Event() for i in range(1, 4)}
+
+    class _CountingBlockingModel:
+        async def complete(self, request, **_kwargs):
+            nonlocal in_flight, max_in_flight
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            started_order.append(sid)
+            entered[sid].set()
+            try:
+                await asyncio.wait_for(gates[sid].wait(), 5)
+            finally:
+                in_flight -= 1
+            return LLMResponse(raw_text=f"done:{sid}")
+
+        async def close(self):
+            pass
+
+    model = _CountingBlockingModel()
+    factory = RegistryRuntimeFactory()
+
+    async def _cap_build(_d, _c):
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _cap_build)
+
+    refs: list[InputRef] = []
+    for i in range(1, 4):
+        sid = f"b3r2-cap-{i}"
+        t = await target(port, sid)
+        r = await port.accept(t, f"task-{i}", message_id=f"m{i}", actor=ACTOR)
+        b = await port.claim(t, node_id="dead-node", boot_id="dead-boot", ttl_s=1.0)
+        assert b is not None
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
+            (sid,),
+        )
+        refs.append(r.input_ref)
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="b3r2-node", boot_id="b3r2-boot",
+        capacity=1, session_lease_ttl_s=1.5, recovery_interval_s=0.1, timers_enabled=False,
+    )
+    await rt.worker.start()
+    try:
+        # Wait for the 1st task to enter model execution, then let multiple automatic ticks run
+        await asyncio.wait_for(
+            asyncio.wait(
+                [asyncio.create_task(ev.wait()) for ev in entered.values()],
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            5,
+        )
+        await asyncio.sleep(0.35)
+        assert in_flight == 1, f"expected 1 in-flight model call, got {in_flight}"
+        assert max_in_flight == 1, f"concurrency exceeded capacity=1: {max_in_flight}"
+        assert len(started_order) == 1
+
+        # Release tasks one by one and assert concurrency NEVER exceeds 1 across all 3 takeovers!
+        first_sid = started_order[0]
+        gates[first_sid].set()
+        for expected_started in (2, 3):
+            for _ in range(100):
+                if len(started_order) >= expected_started:
+                    break
+                await asyncio.sleep(0.03)
+            assert len(started_order) == expected_started
+            await asyncio.sleep(0.25)
+            assert max_in_flight == 1, f"concurrency exceeded capacity=1: {max_in_flight}"
+            gates[started_order[-1]].set()
+
+        results = await asyncio.gather(*(
+            rt.client.wait(ref, actor=ACTOR, deadline_ms=now_ms() + 5000) for ref in refs
+        ))
+        assert [r.status for r in results] == ["completed", "completed", "completed"]
+        assert max_in_flight == 1
+        assert len(started_order) == 3
+    finally:
+        for ev in gates.values():
+            ev.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_m1c_b3_r2_post_commit_hook_no_false_execution_lost_and_real_loss_fires(registry_store):
+    """B3-R2: Committed Final awaiting post-commit RESULT_UNDELIVERABLE never fires EXECUTION_LOST; real loss does."""
+    store, connect = registry_store
+    hooks = AgentHooks()
+    undeliv_entered = asyncio.Event()
+    undeliv_release = asyncio.Event()
+    undeliv_events: list[dict[str, Any]] = []
+    lost_events: list[dict[str, Any]] = []
+
+    async def on_undeliv(ctx):
+        undeliv_events.append(dict(ctx.values))
+        undeliv_entered.set()
+        await asyncio.wait_for(undeliv_release.wait(), 5)
+
+    async def on_lost(ctx):
+        lost_events.append(dict(ctx.values))
+
+    hooks.register(HookPoint.RESULT_UNDELIVERABLE, on_undeliv)
+    hooks.register(HookPoint.EXECUTION_LOST, on_lost)
+
+    # Part 1: Child finishes after parent closed; RESULT_UNDELIVERABLE spans >=2 automatic maintenance ticks!
+    real_loss_entered = asyncio.Event()
+    real_loss_release = asyncio.Event()
+
+    class _ModeModel:
+        async def complete(self, request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            if sid == "b3r2-loss-sess":
+                real_loss_entered.set()
+                await asyncio.wait_for(real_loss_release.wait(), 5)
+            return LLMResponse(raw_text="child finished ok")
+
+        async def close(self):
+            pass
+
+    factory = RegistryRuntimeFactory()
+    mode_model = _ModeModel()
+
+    async def _mode_build(_d, _c):
+        return ExecutionEnvironment(mode_model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _mode_build)
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="b3r2-hnode", boot_id="b3r2-hboot",
+        capacity=2, session_lease_ttl_s=0.6, recovery_interval_s=0.1,
+        hook_timeout_s=2.0, timers_enabled=False, hooks=hooks,
+    )
+    tick_count = 0
+    orig_tick = rt.worker.periodic_tick
+
+    async def counting_tick(*, limit: int = 32):
+        nonlocal tick_count
+        res = await orig_tick(limit=limit)
+        tick_count += 1
+        return res
+
+    rt.worker.periodic_tick = counting_tick  # type: ignore[method-assign]
+    await rt.worker.start()
+    peer = await connect(schema="verify")
+    try:
+        parent_t = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "b3r2-parent"})
+        cm = await rt.client.inputs.create_many(
+            parent=parent_t, actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="b3r2-child", message_id="cm1", body={"text": "work"},
+                descriptor=DESCRIPTOR, result_kind="agent_result",
+            )],
+            node_id="b3r2-hnode", boot_id="b3r2-hboot", can_execute=False, free_slots=0,
+        )
+        # Soft-close parent without cancelling child -> child commits completed / session_closed!
+        await rt.client.inputs.set_lifecycle(parent_t, "closed", actor=ACTOR, inflight="abort", subtree="none")
+        rt.worker._activate(cm.queued_targets[0].session_id)
+
+        await asyncio.wait_for(undeliv_entered.wait(), 5)
+        # Confirm child result is already durably committed while RESULT_UNDELIVERABLE is running
+        row = await peer._db.fetchone(
+            f"SELECT execution_state FROM {peer.t.sessions} WHERE session_id=?", ("b3r2-child",),
+        )
+        assert row["execution_state"] == "idle"
+        qrow = await peer._db.fetchone(
+            f"SELECT terminal_status,result_delivery_error FROM {peer.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id='cm1'",
+            ("b3r2-child",),
+        )
+        assert (qrow["terminal_status"], qrow["result_delivery_error"]) == ("completed", "session_closed")
+
+        # Let >= 2 automatic maintenance ticks run while RESULT_UNDELIVERABLE is still awaiting!
+        ticks_before = tick_count
+        for _ in range(100):
+            if tick_count >= ticks_before + 2:
+                break
+            await asyncio.sleep(0.03)
+        assert tick_count >= ticks_before + 2
+        assert lost_events == [], f"false EXECUTION_LOST during post-commit hook: {lost_events}"
+        undeliv_release.set()
+
+        res = await rt.client.wait(
+            InputRef(store.store_id, "b3r2-child", "cm1"), actor=ACTOR, deadline_ms=now_ms() + 5000,
+        )
+        assert res.status == "completed" and res.result_delivery_error == "session_closed"
+        assert len(undeliv_events) == 1
+        assert lost_events == []
+
+        # Part 2: Genuine ownership loss MUST still fire EXECUTION_LOST immediately on next tick!
+        loss_t = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "b3r2-loss-sess"})
+        await rt.client.send(loss_t, "block", message_id="lm1", actor=ACTOR)
+        await asyncio.wait_for(real_loss_entered.wait(), 5)
+
+        # Simulate another node taking over the lease (bumps owner_epoch & changes owner_node_id)
+        await peer._db.execute(
+            f"UPDATE {peer.t.sessions} SET owner_node_id='other-node',owner_boot_id='other-boot',"
+            "owner_epoch=owner_epoch+1 WHERE session_id=?",
+            ("b3r2-loss-sess",),
+        )
+        for _ in range(100):
+            if lost_events:
+                break
+            await asyncio.sleep(0.03)
+        assert len(lost_events) == 1
+        assert lost_events[0]["session_id"] == "b3r2-loss-sess"
+    finally:
+        undeliv_release.set()
+        real_loss_release.set()
+        await peer.close()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()

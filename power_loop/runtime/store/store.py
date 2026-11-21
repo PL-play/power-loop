@@ -435,6 +435,25 @@ class SessionStore:
                 ):
                     from power_loop.agent.runtime_types import RuntimeRequestError
                     raise RuntimeRequestError("forbidden")
+                # Coordinate deep-first with ancestor lifecycle (0 extra SQL when parent is root)
+                cur_anc_id = parent["parent_session_id"]
+                if cur_anc_id is not None:
+                    share_suffix = " FOR SHARE" if self._db.dialect.name in ("postgres", "mysql") else ""
+                    visited_anc = {parent_session_id}
+                    while cur_anc_id is not None and cur_anc_id not in visited_anc:
+                        visited_anc.add(cur_anc_id)
+                        anc = await tx.fetchone(
+                            f"SELECT session_id,parent_session_id,lifecycle FROM {self.t.sessions} "
+                            f"WHERE session_id=?{share_suffix}",
+                            (cur_anc_id,),
+                        )
+                        if anc is None:
+                            from power_loop.agent.runtime_types import RuntimeRequestError
+                            raise RuntimeRequestError("not_found", "ancestor session")
+                        if anc["lifecycle"] in ("closing", "closed"):
+                            from power_loop.agent.runtime_types import RuntimeRequestError
+                            raise RuntimeRequestError("session_closed")
+                        cur_anc_id = anc["parent_session_id"]
                 depth = int(parent["depth"]) + 1
                 if depth > self.max_spawn_depth:
                     from power_loop.agent.runtime_types import RuntimeRequestError

@@ -70,6 +70,7 @@ class _SessionExecution:
         self.task = None
         self.loop = None
         self.closing = False
+        self.finalizing = False
         self.finalized = False
         self.shutdown_interrupted = False
         self._lost_notified = False
@@ -294,6 +295,7 @@ class RuntimeWorker:
             if (
                 ctx is None
                 or ctx.closing
+                or ctx.finalizing
                 or ctx.finalized
                 or (ctx.ownership is not None and ctx.ownership.released)
             ):
@@ -314,38 +316,91 @@ class RuntimeWorker:
         return rows
 
     async def periodic_tick(self, *, limit: int = 32):
-        """One periodic node maintenance tick: batch_renew + discover_queued + sweep_expired_leases (3/3/4 SQL)."""
+        """One periodic node maintenance tick: batch_renew + discover_queued + discover_expired_leases (3/3/4 SQL)."""
         r = self.runtime
         renewed = await self.batch_renew()
         queued = await self.inputs.discover_queued(limit=limit)
-        expired = await self.inputs.sweep_expired_leases(
-            node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
-            limit=limit, can_execute=self._capable,
-        )
+        expired_rows = await self.inputs.discover_expired_leases(limit=limit)
         for sid in queued:
             self._activate(sid)
         if len(queued) < limit:
             self._overflow = False
-        for batch in expired:
-            if batch.reclaimed_cancelled:
-                recovered = await self.inputs.final(
-                    batch, status="cancelled", final_text="",
-                    error="cancelled", error_code="cancelled",
-                )
-                await self._notify_results(recovered)
-                if recovered.execution_state == "queued":
-                    self._activate(batch.target.session_id)
-            elif batch.descriptor.kind == "agent" and not batch.reclaimed_has_assistant:
-                self.dispatch_claimed(batch)
+        reclaimed = []
+        for row in expired_rows:
+            sid = str(row["session_id"])
+            if sid in self._active:
+                continue
+            needs_model_slot = (
+                row["session_kind"] == "agent"
+                and row["lifecycle"] == "open"
+                and row["cancel_by"] is None
+            )
+            if needs_model_slot:
+                if self._active_llm_count() >= r.capacity:
+                    # Respect Worker capacity: queue for _dispatch() instead of bypassing concurrency!
+                    self._activate(sid)
+                    continue
+                # Reserve the capacity slot BEFORE awaiting reclaim_running so neither _dispatch()
+                # nor locally fused accept_and_claim can exceed runtime.capacity.
+                self._active[sid] = None
+                dispatched = False
+                try:
+                    batch = await self.inputs.reclaim_running(
+                        TargetRef(r.store.store_id, sid),
+                        expected_epoch=int(row["owner_epoch"]),
+                        node_id=r.node_id, boot_id=r.boot_id,
+                        ttl_s=r.session_lease_ttl_s, can_execute=self._capable,
+                    )
+                    if batch is None:
+                        continue
+                    reclaimed.append(batch)
+                    if batch.reclaimed_cancelled:
+                        recovered = await self.inputs.final(
+                            batch, status="cancelled", final_text="",
+                            error="cancelled", error_code="cancelled",
+                        )
+                        await self._notify_results(recovered)
+                        if recovered.execution_state == "queued":
+                            self._activate(sid)
+                    elif not batch.reclaimed_has_assistant:
+                        self.dispatch_claimed(batch)
+                        dispatched = True
+                    else:
+                        recovered = await self.inputs.final(
+                            batch, status="interrupted", final_text="",
+                            error="execution owner lost", error_code="interrupted",
+                        )
+                        await self._notify_results(recovered)
+                        if recovered.execution_state == "queued":
+                            self._activate(sid)
+                finally:
+                    if not dispatched:
+                        self._active.pop(sid, None)
+                        self._wake.set()
             else:
-                recovered = await self.inputs.final(
-                    batch, status="interrupted", final_text="",
-                    error="execution owner lost", error_code="interrupted",
+                batch = await self.inputs.reclaim_running(
+                    TargetRef(r.store.store_id, sid),
+                    expected_epoch=int(row["owner_epoch"]),
+                    node_id=r.node_id, boot_id=r.boot_id,
+                    ttl_s=r.session_lease_ttl_s, can_execute=self._capable,
                 )
+                if batch is None:
+                    continue
+                reclaimed.append(batch)
+                if batch.reclaimed_cancelled:
+                    recovered = await self.inputs.final(
+                        batch, status="cancelled", final_text="",
+                        error="cancelled", error_code="cancelled",
+                    )
+                else:
+                    recovered = await self.inputs.final(
+                        batch, status="interrupted", final_text="",
+                        error="execution owner lost", error_code="interrupted",
+                    )
                 await self._notify_results(recovered)
                 if recovered.execution_state == "queued":
-                    self._activate(batch.target.session_id)
-        return {"renewed": renewed, "queued": queued, "expired": expired}
+                    self._activate(sid)
+        return {"renewed": renewed, "queued": queued, "expired": reclaimed}
 
     async def _periodic_maintenance(self):
         r = self.runtime
@@ -604,14 +659,23 @@ class RuntimeWorker:
                 else asyncio.create_task(self._renew(sid, batch, ownership, ctx), context=contextvars.Context())
             )
 
+            def _mark_finalized() -> None:
+                ctx.finalized = True
+                ctx.finalizing = False
+
             with _bind_execution_context(ctx.snapshot, r.host_context_fields):
                 await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
                 if batch.reclaimed_cancelled and descriptor.kind != "workflow_driver":
-                    final_batch = await self.inputs.final(
-                        batch, status="cancelled", final_text="",
-                        error="cancelled", error_code="cancelled",
-                    )
-                    ctx.finalized = True
+                    ctx.finalizing = True
+                    try:
+                        final_batch = await self.inputs.final(
+                            batch, status="cancelled", final_text="",
+                            error="cancelled", error_code="cancelled",
+                            _on_committed=_mark_finalized,
+                        )
+                    finally:
+                        if not ctx.finalized:
+                            ctx.finalizing = False
                     await self._notify_results(final_batch)
                     if final_batch.execution_state == "queued":
                         self._activate(sid)
@@ -624,8 +688,12 @@ class RuntimeWorker:
                     self.last_error = {"code": code, "message": str(exc)[:500],
                                        "definition_ref": descriptor.definition_ref}
                     self.capability_missing.add(descriptor.definition_ref)
-                    await self.inputs.release_claim(batch)
-                    ctx.finalized = True
+                    ctx.finalizing = True
+                    try:
+                        await self.inputs.release_claim(batch, _on_committed=_mark_finalized)
+                    finally:
+                        if not ctx.finalized:
+                            ctx.finalizing = False
                     batch = None
                     return
                 # The worker runs each session in a fresh context; honor the factory's
@@ -641,7 +709,7 @@ class RuntimeWorker:
                 if descriptor.kind == "workflow_driver":
                     from power_loop.workflow.runner import run_driver
                     final_batch = await run_driver(self, ctx, env)
-                    ctx.finalized = True
+                    _mark_finalized()
                     await self._notify_results(final_batch)
                     if final_batch.execution_state == "queued":
                         self._activate(sid)
@@ -671,12 +739,17 @@ class RuntimeWorker:
                         # recovery settle this input without publishing a false final.
                         log.exception("managed effect checkpoint unconfirmed for %s", sid)
                         return
-                    final_batch = await self.inputs.final(
-                        final_input_batch, consumed=consumed, status=result.status, final_text=result.final_text,
-                        usage=dict(result.usage or {}), structured_output=result.structured_output,
-                        error=result.error, error_code=result.error_code, result_seq=None,
-                    )
-                    ctx.finalized = True
+                    ctx.finalizing = True
+                    try:
+                        final_batch = await self.inputs.final(
+                            final_input_batch, consumed=consumed, status=result.status, final_text=result.final_text,
+                            usage=dict(result.usage or {}), structured_output=result.structured_output,
+                            error=result.error, error_code=result.error_code, result_seq=None,
+                            _on_committed=_mark_finalized,
+                        )
+                    finally:
+                        if not ctx.finalized:
+                            ctx.finalizing = False
                     await self._notify_results(final_batch)
                     return
                 bus = env.event_bus if env.event_bus is not None else AgentEventBus()
@@ -731,15 +804,20 @@ class RuntimeWorker:
                         structured = parse_structured(result.final_text, schema=schema)
                     except StructuredOutputError as exc:
                         status, error, error_code = "failed", f"structured_output: {exc}", "structured_output"
-                final_batch = await self.inputs.final(
-                    batch, consumed=consumed, status=status, final_text=result.final_text,
-                    usage=dict(result.usage or {}), structured_output=structured,
-                    error=error, error_code=error_code, result_seq=result.result_seq,
-                    assistant_meta=getattr(result, "result_meta", None),
-                    next_seq=getattr(result, "next_seq", None),
-                    projection=getattr(result, "pending_projection", None) if status == "completed" else None,
-                )
-                ctx.finalized = True
+                ctx.finalizing = True
+                try:
+                    final_batch = await self.inputs.final(
+                        batch, consumed=consumed, status=status, final_text=result.final_text,
+                        usage=dict(result.usage or {}), structured_output=structured,
+                        error=error, error_code=error_code, result_seq=result.result_seq,
+                        assistant_meta=getattr(result, "result_meta", None),
+                        next_seq=getattr(result, "next_seq", None),
+                        projection=getattr(result, "pending_projection", None) if status == "completed" else None,
+                        _on_committed=_mark_finalized,
+                    )
+                finally:
+                    if not ctx.finalized:
+                        ctx.finalizing = False
                 if env.command is None:
                     normal_final = final_batch
                 await self._notify_results(final_batch)
@@ -755,22 +833,16 @@ class RuntimeWorker:
         except CancellationRequested:
             if batch is not None:
                 await self._final_cancelled(batch, ctx)
-                if ctx is not None:
-                    ctx.finalized = True
         except RuntimeRequestError as exc:
             # Domain refusal before any model/tool call (e.g. projection_unavailable) keeps its
             # code and diagnostic detail instead of becoming a generic internal_error.
             log.warning("session send stopped for %s: %s", sid, exc)
             if batch is not None:
-                await self._final_failed(batch, exc.code, str(exc))
-                if ctx is not None:
-                    ctx.finalized = True
+                await self._final_failed(batch, exc.code, str(exc), ctx=ctx)
         except Exception:
             log.exception("session send failed for %s", sid)
             if batch is not None:
-                await self._final_failed(batch, "internal_error", "session send raised")
-                if ctx is not None:
-                    ctx.finalized = True
+                await self._final_failed(batch, "internal_error", "session send raised", ctx=ctx)
         finally:
             try:
                 if renewal is not None:
@@ -861,12 +933,12 @@ class RuntimeWorker:
         rerun, ``True`` if recovery left the session queued, or ``False`` otherwise.
         """
         entry = await self.inputs.session_entry(target)
-        if entry is None or entry["lifecycle"] != "open":
+        if entry is None or not self._needs_recovery(entry):
             return False
         descriptor = RuntimeDescriptor(**json.loads(entry["descriptor_json"]))
         if descriptor.kind == "workflow_driver":
             self._drivers.add(target.session_id)
-        if not self._capable(descriptor) or not self._needs_recovery(entry):
+        if not self._capable(descriptor):
             return False
         r = self.runtime
         # 0-assistant crash rerun (e.g. crashed right after fused accept_and_claim):
@@ -884,9 +956,9 @@ class RuntimeWorker:
                     )
                     await self._notify_results(recovered)
                     return recovered.execution_state == "queued"
-                if not reclaimed.reclaimed_has_assistant:
+                if entry["lifecycle"] == "open" and not reclaimed.reclaimed_has_assistant:
                     return reclaimed
-                # Already produced an assistant message: finalize as interrupted via final()
+                # Already produced an assistant message or non-open lifecycle: finalize as interrupted
                 recovered = await self.inputs.final(
                     reclaimed, status="interrupted", final_text="",
                     error="execution interrupted", error_code="interrupted",
@@ -931,21 +1003,24 @@ class RuntimeWorker:
         r = self.runtime
         ttl = r.session_lease_ttl_s
         try:
-            while not ctx.closing:
+            while not ctx.closing and not ctx.finalized:
                 await asyncio.sleep(ttl / 3)
+                if ctx.closing or ctx.finalizing or ctx.finalized:
+                    continue
                 async with asyncio.timeout(max(0, ownership.expires_at - time.monotonic())):
                     renewed = await r.coordinator.renew(ownership, ttl_s=ttl)
                     if renewed and not getattr(r.coordinator, "installs_session_fence", False):
                         from power_loop.runtime.store_session_ownership import StoreSessionOwnershipCoordinator
                         renewed = await StoreSessionOwnershipCoordinator(r.store).renew(ownership, ttl_s=ttl)
-                if not renewed:
+                if not renewed and not ctx.finalizing and not ctx.finalized:
                     ownership.lose()
                     return
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("session renewal failed for %s", sid)
-            ownership.lose()
+            if not ctx.finalizing and not ctx.finalized:
+                ownership.lose()
 
     def _boundary(self, batch, ownership, ctx, consumed):
         target = batch.target
@@ -1073,22 +1148,60 @@ class RuntimeWorker:
         # degraded / timed_out / hit_round_limit / context_checkpoint / capacity_blocked / failed
         return "failed", result.final_text or status, status
 
-    async def _final_failed(self, batch, code, message):
+    async def _final_failed(self, batch, code, message, *, ctx=None):
+        from power_loop.contracts.errors import SessionLeaseLost
+
+        def _mark():
+            if ctx is not None:
+                ctx.finalized = True
+                ctx.finalizing = False
+
+        if ctx is not None:
+            ctx.finalizing = True
         try:
             final_batch = await self.inputs.final(
-                batch, status="failed", final_text="", error=message, error_code=code)
+                batch, status="failed", final_text="", error=message, error_code=code,
+                _on_committed=_mark,
+            )
             await self._notify_results(final_batch)
+        except SessionLeaseLost:
+            if ctx is not None:
+                ctx.finalizing = False
+                if ctx.ownership is not None:
+                    ctx.ownership.lose()
         except Exception:
             log.exception("failed to terminalize send for %s", batch.target.session_id)
+        finally:
+            if ctx is not None and not ctx.finalized:
+                ctx.finalizing = False
 
     async def _final_cancelled(self, batch, ctx):
+        from power_loop.contracts.errors import SessionLeaseLost
+
+        def _mark():
+            if ctx is not None:
+                ctx.finalized = True
+                ctx.finalizing = False
+
+        if ctx is not None:
+            ctx.finalizing = True
         try:
             final_batch = await self.inputs.final(
                 batch, status="cancelled", final_text="",
-                error=(ctx.stop.reason if ctx else None) or "cancelled", error_code="cancelled")
+                error=(ctx.stop.reason if ctx else None) or "cancelled", error_code="cancelled",
+                _on_committed=_mark,
+            )
             await self._notify_results(final_batch)
+        except SessionLeaseLost:
+            if ctx is not None:
+                ctx.finalizing = False
+                if ctx.ownership is not None:
+                    ctx.ownership.lose()
         except Exception:
             log.exception("failed to cancel send for %s", batch.target.session_id)
+        finally:
+            if ctx is not None and not ctx.finalized:
+                ctx.finalizing = False
 
     async def _notify_results(self, final_batch):
         for result in final_batch.results:

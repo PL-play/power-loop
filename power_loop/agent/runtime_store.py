@@ -155,6 +155,7 @@ class ClaimedBatch:
     depth: int = 0
     reply_to_session_id: str | None = None
     reply_result_kind: str | None = None
+    reply_to_item_id: str | None = None
     fold_stats_json: str | None = None
     is_reclaimed: bool = False
     reclaimed_has_assistant: bool = False
@@ -493,8 +494,35 @@ class RuntimeInputStore:
             "staged": desc_json is not None and not applied_immediately,
         }
 
+    async def _lock_ancestors_open_tx(
+        self, tx, parent_session_id: str | None, child_session_id: str,
+    ) -> None:
+        """Walk and share-lock ancestors deep-first (depth d-1 -> 0) to serialize with root close.
+
+        0 extra SQL when ``parent_session_id is None`` (direct child of root or root session).
+        Uses ``FOR SHARE`` on PG/MySQL so sibling spawns do not block each other while mutually
+        excluding ``FOR UPDATE`` in ``set_lifecycle`` / ``cancel`` without violating deep-first order.
+        """
+        if parent_session_id is None:
+            return
+        share_suffix = " FOR SHARE" if self._dialect in ("postgres", "mysql") else ""
+        cur_pid: str | None = parent_session_id
+        visited: set[str] = {child_session_id}
+        while cur_pid is not None and cur_pid not in visited:
+            visited.add(cur_pid)
+            anc = await tx.fetchone(
+                f"SELECT session_id,parent_session_id,lifecycle FROM {self.s} "
+                f"WHERE session_id=?{share_suffix}",
+                (cur_pid,),
+            )
+            if anc is None:
+                raise RuntimeRequestError("not_found", "ancestor session")
+            if anc["lifecycle"] in ("closing", "closed"):
+                raise RuntimeRequestError("session_closed")
+            cur_pid = anc["parent_session_id"]
+
     async def _lock_creation_parent_tx(self, tx, parent, actor, *, existing_id=None):
-        """Lock deep-first (child before parent) consistent with Design 217 lock ordering."""
+        """Lock deep-first (child before parent, then ancestors) consistent with Design 217 lock ordering."""
         from power_loop.contracts.errors import CancellationRequested
 
         lock_ids = []
@@ -515,6 +543,7 @@ class RuntimeInputStore:
             raise RuntimeRequestError("session_closed")
         if parent_session["execution_state"] == "running" and parent_session["cancel_by"] is not None:
             raise CancellationRequested(parent_session["cancel_reason"] or "cancelled")
+        await self._lock_ancestors_open_tx(tx, parent_session["parent_session_id"], parent.session_id)
         return parent_session
 
     async def create_child(
@@ -700,6 +729,7 @@ class RuntimeInputStore:
                     raise RuntimeRequestError("cancelled", parent_row["cancel_reason"] or "parent_cancelled")
                 if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
                     raise RuntimeRequestError("cancelled", "parent_cancelled")
+                await self._lock_ancestors_open_tx(tx, parent_row["parent_session_id"], parent.session_id)
 
                 database_now = await self._db_now(tx)
                 root_id = str(parent_row["root_session_id"])
@@ -834,6 +864,7 @@ class RuntimeInputStore:
                             depth=child_depth,
                             reply_to_session_id=reply_to,
                             reply_result_kind=sp.result_kind,
+                            reply_to_item_id=sp.message_id,
                         ))
                     else:
                         queued.append(child_target)
@@ -1591,6 +1622,7 @@ class RuntimeInputStore:
                         depth=int(srow["depth"]),
                         reply_to_session_id=reply_to_sid,
                         reply_result_kind=reply_rk,
+                        reply_to_item_id=(ref.message_id if reply_to_sid is not None else None),
                         fold_stats_json=srow["fold_stats_json"],
                     )
                 receipt = Receipt(ref, target, ref.message_id, True, "accepted", send_idx, "not_needed")
@@ -1869,12 +1901,10 @@ class RuntimeInputStore:
                     state=MessageState.ACTIVE, meta=message_meta, created_at=db_now,
                     send_index=send_index,
                 )
-                reply_to_sid = next(
-                    (r.get("reply_to_session_id") for r in rows if r.get("reply_to_session_id")), None
-                )
-                reply_rk = next(
-                    (r.get("reply_result_kind") for r in rows if r.get("reply_to_session_id")), None
-                )
+                reply_row = next((r for r in rows if r.get("reply_to_session_id")), None)
+                reply_to_sid = reply_row.get("reply_to_session_id") if reply_row is not None else None
+                reply_rk = reply_row.get("reply_result_kind") if reply_row is not None else None
+                reply_item_id = reply_row.get("item_id") if reply_row is not None else None
                 batch = ClaimedBatch(
                     target=target,
                     send_index=send_index,
@@ -1904,6 +1934,7 @@ class RuntimeInputStore:
                     depth=int(srow["depth"]),
                     reply_to_session_id=reply_to_sid,
                     reply_result_kind=reply_rk,
+                    reply_to_item_id=reply_item_id,
                     fold_stats_json=srow["fold_stats_json"],
                     reclaimed_cancelled=bool(batch_cancel_by is not None and not active_rows),
                 )
@@ -1963,11 +1994,12 @@ class RuntimeInputStore:
             depth=int(srow["depth"]),
             reply_to_session_id=ready.get("reply_to_session_id"),
             reply_result_kind=ready.get("reply_result_kind"),
+            reply_to_item_id=(ready["item_id"] if ready.get("reply_to_session_id") else None),
             fold_stats_json=srow["fold_stats_json"],
             reclaimed_cancelled=bool(srow["cancel_by"] is not None),
         )
 
-    async def release_claim(self, batch: ClaimedBatch):
+    async def release_claim(self, batch: ClaimedBatch, *, _on_committed=None):
         """Atomically release an unexecuted claim with Probe 4B lifecycle/cancel fences.
 
         - ``closing`` / ``closed``: stays ``execution_state='idle'`` (NEVER resurrects to
@@ -2068,6 +2100,8 @@ class RuntimeInputStore:
                 "AND role='user' AND send_index=?",
                 (batch.target.session_id, batch.message_seq, batch.send_index),
             )
+        if _on_committed is not None:
+            _on_committed()
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverable_out:
             await self._fire_result_undeliverable(
                 child_target=c_target,
@@ -2381,6 +2415,7 @@ class RuntimeInputStore:
         usage=None, structured_output=None, error=None, error_code=None, result_seq=None,
         assistant_meta=None, next_seq: int | None = None, result_json: dict | None = None,
         settle_start_input: bool = False, projection: PendingProjection | None = None,
+        _on_committed=None,
     ) -> FinalBatch:
         if consumed is not None:
             consumed = tuple(consumed)
@@ -2405,8 +2440,13 @@ class RuntimeInputStore:
         except (Exception, asyncio.CancelledError) as exc:
             recovered = await self._final_after_unknown(batch, consumed)
             if recovered is not None:
+                if _on_committed is not None:
+                    _on_committed()
                 return recovered
             raise StoreError(consumed[0] if consumed else batch.input_refs[0]) from exc
+
+        if _on_committed is not None:
+            _on_committed()
 
         # Post-commit RESULT_UNDELIVERABLE hook (Design 217 §4.4 / §5.4)
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverable_out:
@@ -2586,20 +2626,30 @@ class RuntimeInputStore:
 
         # Step 1 (Deep-first lock order): Fenced UPDATE on child session FIRST (1 control SQL!).
         post_fold_stats_json: str | None = None
+        has_route = batch.result_route is not None or batch.reply_to_session_id is not None
+        route_changed = False
         if self._dialect == "mysql":
-            # 5-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json SET):
+            # 6-bit LAST_INSERT_ID packing in 1st SET slot (evaluated before fold_stats_json SET):
             # bit 0: has_more_wake | bit 1: subtree_raced | bit 2: cancel_raced
-            # bit 3: closed_raced  | bit 4: fold_stats_conflict
+            # bit 3: closed_raced  | bit 4: fold_stats_conflict | bit 5: route_changed (rebind)
+            mysql_route_changed_bit = ""
+            mysql_route_changed_params: tuple[Any, ...] = ()
+            if has_route:
+                mysql_route_changed_bit = (
+                    "|(CASE WHEN NOT (parent_session_id<=>?) OR runtime_version<>? THEN 32 ELSE 0 END)"
+                )
+                mysql_route_changed_params = (batch.parent_session_id, batch.runtime_version)
             rc, packed = await tx.execute_packed(
                 f"UPDATE {self.s} SET "
                 "owner_epoch=(LAST_INSERT_ID("
-                "(owner_epoch<<5)"
+                "(owner_epoch<<6)"
                 "|(CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) THEN 1 ELSE 0 END)"
                 "|(CASE WHEN cancel_by='subtree' AND cancel_seq>? THEN 2 ELSE 0 END)"
                 "|(CASE WHEN cancel_seq>? THEN 4 ELSE 0 END)"
                 "|(CASE WHEN lifecycle IN ('closing','closed') THEN 8 ELSE 0 END)"
                 f"{mysql_fold_conflict_bit}"
-                ")>>5),"
+                f"{mysql_route_changed_bit}"
+                ")>>6),"
                 "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
@@ -2615,6 +2665,7 @@ class RuntimeInputStore:
                 (
                     int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
                     *mysql_fold_conflict_params,
+                    *mysql_route_changed_params,
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
@@ -2628,14 +2679,14 @@ class RuntimeInputStore:
             cancel_raced = bool(packed & 4)
             closed_raced = bool(packed & 8)
             fold_conflict = bool(packed & 16)
+            route_changed = bool(packed & 32)
             next_state = "queued" if has_more_wake else "idle"
             cancel_by_db = "subtree" if subtree_raced else None
             cancel_reason_db = None
             post_next_seq = effective_next_seq + int(write_message)
             database_now = None
             live_route_json = None
-            has_route = batch.result_route is not None or batch.reply_to_session_id is not None
-            if closed_raced or cancel_raced or write_message or has_route:
+            if closed_raced or cancel_raced or write_message or (route_changed and batch.result_route is not None):
                 diag = await tx.fetchone(
                     f"SELECT next_seq,cancel_by,cancel_reason,updated_at,result_route_json "
                     f"FROM {self.s} WHERE session_id=?",
@@ -2663,7 +2714,8 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} "
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
                 "RETURNING execution_state,lifecycle,wake_pending_count,cancel_seq,"
-                "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,result_route_json",
+                "cancel_by,cancel_reason,next_seq,fold_stats_json,updated_at,"
+                "result_route_json,parent_session_id,runtime_version",
                 (
                     int(has_unconsumed),
                     effective_next_seq, effective_next_seq, int(write_message),
@@ -2683,6 +2735,10 @@ class RuntimeInputStore:
             post_fold_stats_json = srow["fold_stats_json"]
             database_now = int(srow["updated_at"])
             live_route_json = srow["result_route_json"]
+            route_changed = has_route and (
+                srow["parent_session_id"] != batch.parent_session_id
+                or int(srow["runtime_version"]) != batch.runtime_version
+            )
             fold_conflict = (
                 proj_fold_json is not None
                 and not closed_raced
@@ -2755,36 +2811,61 @@ class RuntimeInputStore:
         deliver_parent_sid = None
         deliver_res_kind = None
         deliver_start_ref = None
+        deliver_source_ref = consumed_refs[0] if consumed_refs else None
         if not closed_raced and consumed_refs:
             if route is not None:
                 deliver_parent_sid = route["target"]["session_id"]
                 deliver_res_kind = route["result_kind"]
                 deliver_start_ref = InputRef(**route["input_ref"])
             elif batch.reply_to_session_id is not None:
-                q_live = await tx.fetchone(
-                    f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
-                    "WHERE session_id=? AND item_id=?",
-                    (sid, consumed_refs[0].message_id),
-                )
-                deliver_parent_sid = (
-                    q_live["reply_to_session_id"]
-                    if (q_live is not None and q_live["reply_to_session_id"] is not None)
-                    else batch.reply_to_session_id
-                )
-                deliver_res_kind = (
-                    (q_live["reply_result_kind"] if q_live is not None else None)
-                    or batch.reply_result_kind
-                    or "agent_result"
-                )
-                deliver_start_ref = (
-                    InputRef(batch.target.store_id, sid, batch.start_input_message_id)
-                    if batch.start_input_message_id else consumed_refs[0]
-                )
+                consumed_id_set = {ref.message_id for ref in consumed_refs}
+                reply_item_id = batch.reply_to_item_id
+                effective_reply_to: str | None = batch.reply_to_session_id
+                effective_reply_rk: str | None = batch.reply_result_kind
+                if reply_item_id is not None and reply_item_id not in consumed_id_set:
+                    # Partial consume excluded the batch's originally selected routed item;
+                    # check if another consumed item carries a live reply route.
+                    c_ids = [ref.message_id for ref in consumed_refs]
+                    c_ph = ",".join("?" for _ in c_ids)
+                    q_alt = await tx.fetchone(
+                        f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
+                        f"WHERE session_id=? AND item_id IN ({c_ph}) AND reply_to_session_id IS NOT NULL "
+                        "ORDER BY id ASC LIMIT 1",
+                        (sid, *c_ids),
+                    )
+                    if q_alt is not None:
+                        reply_item_id = str(q_alt["item_id"])
+                        effective_reply_to = str(q_alt["reply_to_session_id"])
+                        effective_reply_rk = q_alt["reply_result_kind"]
+                    else:
+                        reply_item_id = None
+                        effective_reply_to = None
+                else:
+                    if reply_item_id is None:
+                        reply_item_id = consumed_refs[0].message_id
+                    if route_changed:
+                        q_live = await tx.fetchone(
+                            f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
+                            "WHERE session_id=? AND item_id=?",
+                            (sid, reply_item_id),
+                        )
+                        if q_live is not None and q_live["reply_to_session_id"] is not None:
+                            effective_reply_to = str(q_live["reply_to_session_id"])
+                            effective_reply_rk = q_live["reply_result_kind"] or effective_reply_rk
+                if effective_reply_to is not None and reply_item_id is not None:
+                    deliver_parent_sid = effective_reply_to
+                    deliver_res_kind = effective_reply_rk or "agent_result"
+                    deliver_source_ref = InputRef(batch.target.store_id, sid, reply_item_id)
+                    deliver_start_ref = (
+                        InputRef(batch.target.store_id, sid, batch.start_input_message_id)
+                        if batch.start_input_message_id else deliver_source_ref
+                    )
 
         if deliver_parent_sid is not None and deliver_res_kind is not None:
             child_wake = 0 if (effective_cancel_by == "subtree" or subtree_raced) else 1
             route_result = Result(
-                consumed_refs[0], batch.target, effective_status, batch.send_index, result_seq,
+                deliver_source_ref or consumed_refs[0], batch.target, effective_status,
+                batch.send_index, result_seq,
                 final_text, usage, structured_output, effective_error, effective_error_code,
             )
             result_ref, delivery_error = await self._river_deliver_tx(
@@ -3256,17 +3337,22 @@ class RuntimeInputStore:
             (node_id, boot_id),
         )
 
-    async def sweep_expired_leases(
-        self, *, node_id: str, boot_id: str, ttl_s: float = 30.0, limit: int = 32, can_execute=None,
-    ) -> list[ClaimedBatch]:
-        """1 bounded index scan on ``idx_session_recovery``; reclaims expired running sessions."""
+    async def discover_expired_leases(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        """1 bounded index scan on ``idx_session_recovery`` returning expired running candidates."""
         now_sql = self._now_sql()
-        expired = await self.db.fetchall(
-            f"SELECT session_id,owner_epoch FROM {self.s} "
+        rows = await self.db.fetchall(
+            f"SELECT session_id,owner_epoch,session_kind,lifecycle,cancel_by FROM {self.s} "
             f"WHERE execution_state='running' AND owner_lease_until_ms<{now_sql} "
             "ORDER BY owner_lease_until_ms ASC LIMIT ?",
             (limit,),
         )
+        return [dict(r) for r in rows]
+
+    async def sweep_expired_leases(
+        self, *, node_id: str, boot_id: str, ttl_s: float = 30.0, limit: int = 32, can_execute=None,
+    ) -> list[ClaimedBatch]:
+        """1 bounded index scan on ``idx_session_recovery``; reclaims expired running sessions."""
+        expired = await self.discover_expired_leases(limit=limit)
         reclaimed: list[ClaimedBatch] = []
         for row in expired:
             batch = await self.reclaim_running(
@@ -3527,8 +3613,10 @@ class RuntimeInputStore:
                 state=MessageState.ACTIVE, meta={}, created_at=int(srow["updated_at"]),
                 send_index=cur_send_index,
             )
-        reply_to_sid = next((r["reply_to_session_id"] for r in qrows if r["reply_to_session_id"]), None)
-        reply_rk = next((r["reply_result_kind"] for r in qrows if r["reply_to_session_id"]), None)
+        reply_row = next((r for r in qrows if r["reply_to_session_id"]), None)
+        reply_to_sid = reply_row["reply_to_session_id"] if reply_row is not None else None
+        reply_rk = reply_row["reply_result_kind"] if reply_row is not None else None
+        reply_item_id = reply_row["item_id"] if reply_row is not None else None
         return ClaimedBatch(
             target=target,
             send_index=cur_send_index,
@@ -3557,6 +3645,7 @@ class RuntimeInputStore:
             depth=int(srow["depth"]),
             reply_to_session_id=reply_to_sid,
             reply_result_kind=reply_rk,
+            reply_to_item_id=reply_item_id,
             fold_stats_json=srow["fold_stats_json"],
             is_reclaimed=True,
             reclaimed_has_assistant=has_assistant,
@@ -3827,8 +3916,7 @@ class RuntimeInputStore:
                 async with self.db.transaction() as tx:
                     session = await self.authorize(tx, target, actor)
                     desc_by_depth: dict[int, list[str]] = {}
-                    prestaged_desc: list[str] = []
-                    seen_desc_ids: set[str] = set()
+                    expected_depth: dict[str, int] = {}
                     if scope == "subtree":
                         active_desc = await self._collect_active_descendants(
                             tx,
@@ -3837,39 +3925,59 @@ class RuntimeInputStore:
                             target_depth=int(session["depth"]),
                             only_linked=only_linked,
                         )
-                        for d_sid, d_val, d_pre in active_desc:
-                            seen_desc_ids.add(d_sid)
+                        for d_sid, d_val, _d_pre in active_desc:
+                            expected_depth[d_sid] = d_val
                             desc_by_depth.setdefault(d_val, []).append(d_sid)
-                            if d_pre:
-                                prestaged_desc.append(d_sid)
                         for lvl_ids in desc_by_depth.values():
                             lvl_ids.sort()
 
-                    # Level-by-level deep-first locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
-                    cascaded_delivered: dict[str, set[str]] = {}
-                    for d_val in sorted(desc_by_depth, reverse=True):
-                        lvl_ids = desc_by_depth[d_val]
-                        stopped_descendants.extend(lvl_ids)
-                        ph = ",".join("?" for _ in lvl_ids)
-                        lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
-                        lvl_rows = await tx.fetchall(
-                            f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) "
-                            f"ORDER BY session_id ASC{lock_suffix}",
-                            tuple(lvl_ids),
-                        )
-                        for drow in lvl_rows:
-                            await self._cancel_single_session_tx(
-                                tx, drow, reason=reason, cancel_by="subtree",
-                                is_subtree_cascade=True, activations=activations,
-                                completed_refs=completed_refs,
-                                skip_item_ids=cascaded_delivered.get(drow["session_id"]),
-                                cascaded_delivered=cascaded_delivered,
-                                undeliverables=undeliverables,
+                    # Step B (Lock-only, strictly deep-first): lock all candidate descendants and any
+                    # intermediate River route parents (> target depth) before locking target, WITHOUT
+                    # writing any cancellation yet so moved/idle rows are never wrongly cancelled.
+                    lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
+                    locked_desc: dict[str, dict[str, Any]] = {}
+                    extra_lock_by_depth: dict[int, set[str]] = {}
+                    target_depth_snap = int(session["depth"])
+                    if desc_by_depth:
+                        max_d = max(desc_by_depth)
+                        for d_val in range(max_d, target_depth_snap, -1):
+                            lvl_set = set(desc_by_depth.get(d_val, ())) | extra_lock_by_depth.get(d_val, set())
+                            if not lvl_set:
+                                continue
+                            lvl_ids = sorted(lvl_set)
+                            ph = ",".join("?" for _ in lvl_ids)
+                            lvl_rows = await tx.fetchall(
+                                f"SELECT * FROM {self.s} WHERE session_id IN ({ph}) "
+                                f"ORDER BY session_id ASC{lock_suffix}",
+                                tuple(lvl_ids),
                             )
+                            for drow in lvl_rows:
+                                d_sid = str(drow["session_id"])
+                                if d_sid in expected_depth:
+                                    locked_desc[d_sid] = dict(drow)
+                                    if drow.get("result_route_json") and d_val - 1 > target_depth_snap:
+                                        r_obj = json.loads(drow["result_route_json"])
+                                        p_sid = (
+                                            r_obj["target"]["session_id"]
+                                            if isinstance(r_obj, dict) and isinstance(r_obj.get("target"), dict)
+                                            else None
+                                        )
+                                        if p_sid and p_sid != target.session_id:
+                                            extra_lock_by_depth.setdefault(d_val - 1, set()).add(p_sid)
 
-                    # Now lock target itself (strictly shallower than all descendants)
+                    # Now lock target itself (strictly shallower than all descendants & intermediate parents)
                     state = await self.db.dialect.lock_state(tx, self.s, target.session_id)
+
+                    # Step C (Verify under locks): confirm target & every locked candidate still match
+                    # the live subtree topology and active state; retry cleanly with 0 writes if changed!
+                    prestaged_desc: list[str] = []
                     if scope == "subtree":
+                        if (
+                            str(state["root_session_id"]) != str(session["root_session_id"])
+                            or int(state["depth"]) != target_depth_snap
+                            or len(locked_desc) != len(expected_depth)
+                        ):
+                            raise _SubtreeChangedRetry()
                         recheck = await self._collect_active_descendants(
                             tx,
                             session_id=target.session_id,
@@ -3877,8 +3985,34 @@ class RuntimeInputStore:
                             target_depth=int(state["depth"]),
                             only_linked=only_linked,
                         )
-                        if any(d_sid not in seen_desc_ids for d_sid, _, _ in recheck):
+                        recheck_ids = {d_sid for d_sid, _, _ in recheck}
+                        if recheck_ids != set(locked_desc.keys()):
                             raise _SubtreeChangedRetry()
+                        for d_sid, drow in locked_desc.items():
+                            if (
+                                str(drow["root_session_id"]) != str(state["root_session_id"])
+                                or int(drow["depth"]) != expected_depth[d_sid]
+                                or drow["execution_state"] not in ("queued", "running")
+                            ):
+                                raise _SubtreeChangedRetry()
+                            if int(drow["send_index"]) == 0 and bool(drow["ready_item_json"]):
+                                prestaged_desc.append(d_sid)
+
+                    # Step D (Verified writes in deep-first order)
+                    cascaded_delivered: dict[str, set[str]] = {}
+                    for d_val in sorted(desc_by_depth, reverse=True):
+                        lvl_ids = desc_by_depth[d_val]
+                        stopped_descendants.extend(lvl_ids)
+                        for d_sid in lvl_ids:
+                            drow = locked_desc[d_sid]
+                            await self._cancel_single_session_tx(
+                                tx, drow, reason=reason, cancel_by="subtree",
+                                is_subtree_cascade=True, activations=activations,
+                                completed_refs=completed_refs,
+                                skip_item_ids=cascaded_delivered.get(d_sid),
+                                cascaded_delivered=cascaded_delivered,
+                                undeliverables=undeliverables,
+                            )
                     if isinstance(ref, InputRef):
                         record = await self.input(tx, ref)
                         if record is None:
@@ -4477,52 +4611,57 @@ class RuntimeInputStore:
                         return (status_obj, stopped_map, completed_refs) if _with_effects else status_obj
 
                     # lifecycle in ('suspended', 'closed')
-                    prestaged_descendants: list[str] = []
                     desc_by_depth: dict[int, list[str]] = {}
-                    seen_desc_ids: set[str] = set()
+                    expected_depth: dict[str, int] = {}
+                    target_depth_snap = int(session["depth"])
                     if subtree in ("linked", "all"):
                         active_desc = await self._collect_active_descendants(
                             tx,
                             session_id=sid,
                             root_session_id=str(session["root_session_id"]),
-                            target_depth=int(session["depth"]),
+                            target_depth=target_depth_snap,
                             only_linked=(subtree == "linked"),
                         )
-                        for d_sid, d_val, d_pre in active_desc:
-                            seen_desc_ids.add(d_sid)
+                        for d_sid, d_val, _d_pre in active_desc:
+                            expected_depth[d_sid] = d_val
                             desc_by_depth.setdefault(d_val, []).append(d_sid)
-                            if d_pre:
-                                prestaged_descendants.append(d_sid)
                         for lvl_ids in desc_by_depth.values():
                             lvl_ids.sort()
-                        for d_val in sorted(desc_by_depth, reverse=True):
-                            descendants.extend(desc_by_depth[d_val])
 
-                    # Deep-first level-by-level locking (depth DESC, ORDER BY session_id ASC FOR UPDATE)
+                    # Step B (Lock-only, strictly deep-first): lock all candidate descendants
+                    # (depth DESC, ORDER BY session_id ASC FOR UPDATE) WITHOUT writing yet so
+                    # rebound or already-idle sessions are never wrongly cancelled!
+                    lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
+                    locked_desc: dict[str, dict[str, Any]] = {}
                     for d_val in sorted(desc_by_depth, reverse=True):
                         lvl_ids = desc_by_depth[d_val]
                         ph = ",".join("?" for _ in lvl_ids)
-                        if self._dialect in ("postgres", "mysql"):
-                            await tx.fetchall(
-                                f"SELECT session_id FROM {self.s} WHERE session_id IN ({ph}) "
-                                "ORDER BY session_id ASC FOR UPDATE",
-                                tuple(lvl_ids),
-                            )
-                        await tx.execute(
-                            f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by='subtree',"
-                            f"cancel_reason=?,updated_at={now_sql} WHERE session_id IN ({ph})",
-                            (eff_reason, *lvl_ids),
+                        lrows = await tx.fetchall(
+                            f"SELECT session_id,parent_session_id,root_session_id,depth,"
+                            f"execution_state,send_index,ready_item_json,cancel_propagation "
+                            f"FROM {self.s} WHERE session_id IN ({ph}) "
+                            f"ORDER BY session_id ASC{lock_suffix}",
+                            tuple(lvl_ids),
                         )
+                        for lr in lrows:
+                            locked_desc[str(lr["session_id"])] = dict(lr)
 
                     # Now lock target itself (strictly shallower than all descendants)
                     locked = await self.db.dialect.lock_state(tx, self.s, sid)
                     if locked["lifecycle"] in ("closing", "closed") and lifecycle != "closed":
                         raise RuntimeRequestError("session_closed")
 
-                    # Close concurrent child-spawn gap without violating deep-first lock ordering:
-                    # under READ COMMITTED, any create_child/create_many committed before target was
-                    # locked is visible now; roll back and retry so the new child is locked deeper first.
+                    # Step C (Verify under locks): check target topology, re-scan active descendants
+                    # via idx_sessions_root, and verify EVERY locked candidate is still active and
+                    # still belongs to this subtree. Any mismatch rolls back with 0 writes and retries!
+                    prestaged_descendants: list[str] = []
                     if subtree in ("linked", "all"):
+                        if (
+                            str(locked["root_session_id"]) != str(session["root_session_id"])
+                            or int(locked["depth"]) != target_depth_snap
+                            or len(locked_desc) != len(expected_depth)
+                        ):
+                            raise _SubtreeChangedRetry()
                         recheck = await self._collect_active_descendants(
                             tx,
                             session_id=sid,
@@ -4530,8 +4669,32 @@ class RuntimeInputStore:
                             target_depth=int(locked["depth"]),
                             only_linked=(subtree == "linked"),
                         )
-                        if any(d_sid not in seen_desc_ids for d_sid, _, _ in recheck):
+                        recheck_ids = {d_sid for d_sid, _, _ in recheck}
+                        if recheck_ids != set(locked_desc.keys()):
                             raise _SubtreeChangedRetry()
+                        for d_sid, drow in locked_desc.items():
+                            if (
+                                str(drow["root_session_id"]) != str(locked["root_session_id"])
+                                or int(drow["depth"]) != expected_depth[d_sid]
+                                or drow["execution_state"] not in ("queued", "running")
+                            ):
+                                raise _SubtreeChangedRetry()
+                            if int(drow["send_index"]) == 0 and bool(drow["ready_item_json"]):
+                                prestaged_descendants.append(d_sid)
+                        for d_val in sorted(desc_by_depth, reverse=True):
+                            descendants.extend(desc_by_depth[d_val])
+
+                    # Step D (Verified writes): cancel ONLY verified locked active descendants
+                    for d_val in sorted(desc_by_depth, reverse=True):
+                        lvl_ids = desc_by_depth[d_val]
+                        ph = ",".join("?" for _ in lvl_ids)
+                        await tx.execute(
+                            f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by='subtree',"
+                            f"cancel_reason=?,updated_at={now_sql} "
+                            f"WHERE session_id IN ({ph}) AND root_session_id=? "
+                            "AND execution_state IN ('queued','running')",
+                            (eff_reason, *lvl_ids, str(locked["root_session_id"])),
+                        )
 
                     if lifecycle == "suspended":
                         if inflight == "abort":
@@ -4924,7 +5087,8 @@ class RuntimeInputStore:
                                 child["result_route_json"] = new_route_json
                         child["parent_session_id"] = tp_sid
                         await tx.execute(
-                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,updated_at={now_sql} "
+                            f"UPDATE {self.s} SET parent_session_id=?,result_route_json=?,"
+                            f"runtime_version=runtime_version+1,updated_at={now_sql} "
                             "WHERE session_id=?",
                             (tp_sid, new_route_json, child["session_id"]),
                         )
