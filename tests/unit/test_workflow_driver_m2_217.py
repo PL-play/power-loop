@@ -2877,3 +2877,225 @@ async def test_r4_6_ordinary_agent_per_turn_reply_route_recover_matches_m1c_base
     assert parent_st["execution_state"] == "idle"
     assert parent_st["pending_count"] == 0
     assert parent_st["wake_pending_count"] == 0
+
+
+async def test_r5_1_finished_driver_late_plain_input_recover_then_cancel_queued_wfc_no_main_wake(registry_store):
+    """R5-1 (M1a-1/2): Finished Driver claims plain late input -> recover (queued wfc_*) -> cancel(late_ref) never wakes Main."""
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    runner = await RunningAgent(
+        store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+    ).start()
+    try:
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "r51-wf", "root": leaf("L1")},
+            message_id="r51-start", actor=runner.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed"
+        await runner.drain()
+        await runner.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        drv_sid = handle.target.session_id
+        main_sid = runner.target.session_id
+        main_rcpts_before = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_sid,),
+        )
+        assert len(main_rcpts_before) == 1
+        main_st_before = await _assert_session_counts_match_pending(store._db, store, main_sid)
+        assert main_st_before["wake_pending_count"] == 0 and main_st_before["execution_state"] == "idle"
+
+        # Old Worker claims ONLY a plain late user input, lease expires WITHOUT cancel -> recover queues wfc_*
+        late_rcpt = await port.accept(
+            handle.target, "late plain chain", message_id="r51-late-plain", actor=runner.actor,
+        )
+        batch2 = await port.claim(handle.target, node_id="worker-old", boot_id="boot-old")
+        assert batch2 is not None and [r.message_id for r in batch2.input_refs] == ["r51-late-plain"]
+
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec = await port.recover(handle.target, node_id="worker-new", boot_id="boot-new")
+        assert rec is not None and rec.execution_state == "queued"
+
+        late_row_mid = await store._db.fetchone(
+            f"SELECT status,terminal_status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (drv_sid, "r51-late-plain"),
+        )
+        assert dict(late_row_mid) == {"status": "waiting_continuation", "terminal_status": None}
+        wfc_rows = await store._db.fetchall(
+            f"SELECT item_id,status,continuation_of FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_continue' ORDER BY id ASC",
+            (drv_sid,),
+        )
+        assert len(wfc_rows) == 1
+        assert wfc_rows[0]["status"] == "pending" and wfc_rows[0]["continuation_of"] == "r51-late-plain"
+        wfc_ref = InputRef(store.store_id, drv_sid, str(wfc_rows[0]["item_id"]))
+
+        # BEFORE new Worker claims wfc_*, cancel by original late input ref
+        cancel_rcpt = await port.cancel(late_rcpt.input_ref, actor=runner.actor, reason="cancel late chain")
+        assert cancel_rcpt.state == "voided"
+
+        # 1) Queued wfc_* voided as cancelled/user; both original late item and wfc_* read cancelled/user
+        wfc_after = await store._db.fetchone(
+            f"SELECT status,terminal_status,cancel_by,result_delivery_error FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (drv_sid, wfc_ref.message_id),
+        )
+        assert dict(wfc_after) == {
+            "status": "void",
+            "terminal_status": "cancelled",
+            "cancel_by": "user",
+            "result_delivery_error": None,
+        }
+        for ref_chk in (late_rcpt.input_ref, wfc_ref):
+            res_chk = await port.get_result(ref_chk, actor=runner.actor)
+            assert res_chk is not None and res_chk.status == "cancelled" and res_chk.cancel_by == "user"
+
+        # 2) Original workflow result & run journal remain completed
+        saved = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert saved is not None and saved["status"] == "completed" and saved["aggregate_delivered"] is True
+        orig_res = await port.get_result(handle.input_ref, actor=runner.actor)
+        assert orig_res is not None and orig_res.status == "completed"
+
+        # 3) Main STILL has ONLY the original 1 workflow_result and unchanged wake_pending_count == 0
+        main_rcpts_after = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_sid,),
+        )
+        assert len(main_rcpts_after) == 1
+        assert main_rcpts_after[0]["item_id"] == main_rcpts_before[0]["item_id"]
+        main_st_after = await _assert_session_counts_match_pending(store._db, store, main_sid)
+        assert main_st_after["wake_pending_count"] == main_st_before["wake_pending_count"]
+        assert main_st_after["execution_state"] == "idle"
+
+        # 4) Repeat cancel on both refs remains idempotent and never wakes Main
+        assert (await port.cancel(late_rcpt.input_ref, actor=runner.actor, reason="retry1")).state == "already_finished"
+        assert (await port.cancel(wfc_ref, actor=runner.actor, reason="retry2")).state == "already_finished"
+        assert len(await store._db.fetchall(
+            f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_result'",
+            (main_sid,),
+        )) == 1
+        assert (await _assert_session_counts_match_pending(store._db, store, main_sid))["wake_pending_count"] == 0
+    finally:
+        await runner.aclose()
+
+
+async def test_r5_2_queued_continuation_cancel_capacity_exceeded_redelivery_clears_entire_chain(registry_store):
+    """R5-2 (M1a-1/3): Queued wfc_* cancel hits real capacity_exceeded -> drain Main -> retry clears BOTH orig & wfc_*."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store, hard_pending_limit=1)
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    client.inputs.hard_pending_limit = 1
+    rt_helper = RunningAgent(
+        store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    )
+    try:
+        main_target = await client.create_session(rt_helper.descriptor, actor=rt_helper.actor)
+        handle = await client.workflow(
+            main_target, {"name": "r52-wf", "root": leaf("L1")},
+            message_id="r52-start", actor=rt_helper.actor,
+        )
+        drv_sid = handle.target.session_id
+        main_sid = main_target.session_id
+
+        # Claim Driver Turn 1, expire lease, and recover() so orig_start is waiting_continuation & wfc_* is pending
+        batch1 = await port.claim(handle.target, node_id="worker-dead", boot_id="boot-dead")
+        assert batch1 is not None and batch1.send_index == 1
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec = await port.recover(handle.target, node_id="worker-2", boot_id="boot-2")
+        assert rec is not None and rec.execution_state == "queued"
+
+        wfc_rows = await store._db.fetchall(
+            f"SELECT item_id,status,continuation_of FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_continue' ORDER BY id ASC",
+            (drv_sid,),
+        )
+        assert len(wfc_rows) == 1
+        assert wfc_rows[0]["status"] == "pending" and wfc_rows[0]["continuation_of"] == handle.input_ref.message_id
+        wfc_ref = InputRef(store.store_id, drv_sid, str(wfc_rows[0]["item_id"]))
+
+        # Fill Main's inbox to real hard_pending_limit=1 using a wake=0 input
+        fill_rcpt = await client.send(
+            main_target, "fill-main-wake0", message_id="r52-fill-w0",
+            actor=rt_helper.actor, wake=False,
+        )
+        assert fill_rcpt.state == "accepted"
+
+        # Cancel by original handle -> first River delivery genuinely hits capacity_exceeded!
+        cancel_rcpt = await handle.cancel(reason="cancel queued continuation")
+        assert cancel_rcpt.state == "voided"
+
+        for ref_chk in (handle.input_ref, wfc_ref):
+            res_err = await client.wait(ref_chk, actor=rt_helper.actor, deadline_ms=now_ms() + 5000)
+            assert res_err.status == "cancelled"
+            assert res_err.cancel_by == "user"
+            assert res_err.result_delivery_error == "capacity_exceeded"
+        assert await store._db.fetchall(
+            f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_result'",
+            (main_sid,),
+        ) == []
+
+        # Clear the wake=0 filler on Main, then retry cancel on the ORIGINAL handle to trigger redelivery
+        await port.cancel(fill_rcpt.input_ref, actor=rt_helper.actor, reason="clear filler")
+        assert (await _assert_session_counts_match_pending(store._db, store, main_sid))["pending_count"] == 0
+
+        retry1 = await handle.cancel(reason="redeliver queued continuation cancel")
+        assert retry1.state == "already_finished"
+
+        # 1) Main received EXACTLY ONE workflow_result(cancelled, wake=1) with original receipt ID, orig input_ref, send_index=None
+        expected_mid = result_message_id(handle.target, handle.input_ref, None, "workflow_result")
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_sid,),
+        )
+        assert len(main_rcpts) == 1
+        assert main_rcpts[0]["item_id"] == expected_mid
+        assert int(main_rcpts[0]["wake"]) == 1
+        body = json.loads(main_rcpts[0]["content_json"])
+        assert body["status"] == "cancelled"
+        assert body["cancel_by"] == "user"
+        assert body["input_ref"]["message_id"] == handle.input_ref.message_id
+        assert body["send_index"] is None
+
+        # 2) BOTH original handle AND wfc_* now have result_delivery_error=None and cancel_by='user'
+        for ref_chk in (handle.input_ref, wfc_ref):
+            res_ok = await client.wait(ref_chk, actor=rt_helper.actor, deadline_ms=now_ms() + 5000)
+            assert res_ok.status == "cancelled"
+            assert res_ok.cancel_by == "user"
+            assert res_ok.result_delivery_error is None
+            qrow = await store._db.fetchone(
+                f"SELECT result_delivery_error,cancel_by FROM {store.t.follow_up_queue} "
+                "WHERE session_id=? AND item_id=?",
+                (drv_sid, ref_chk.message_id),
+            )
+            assert dict(qrow) == {"result_delivery_error": None, "cancel_by": "user"}
+
+        # 3) Repeat retries keep receipt unique and BOTH handles clean
+        assert (await handle.cancel(reason="retry-again-orig")).state == "already_finished"
+        assert (await port.cancel(wfc_ref, actor=rt_helper.actor, reason="retry-again-wfc")).state == "already_finished"
+        assert len(await store._db.fetchall(
+            f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_result'",
+            (main_sid,),
+        )) == 1
+        for ref_chk in (handle.input_ref, wfc_ref):
+            res_ok2 = await client.wait(ref_chk, actor=rt_helper.actor, deadline_ms=now_ms() + 5000)
+            assert res_ok2.result_delivery_error is None and res_ok2.cancel_by == "user"
+    finally:
+        await client.aclose()
+        await rt_helper.loop.aclose()
+        await rt_helper.runtime.client.aclose()

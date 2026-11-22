@@ -5298,13 +5298,18 @@ class RuntimeInputStore:
         target = TargetRef(self.store.store_id, sid)
         now_sql = self._now_sql()
         root = await self._continuation_root(tx, record)
+        is_driver_run = self._is_driver_run_input(state, root)
         latest = await self._latest_continuation(
             tx, ResultInput(record.ref, {name: record.row[name] for name in _RESULT_INPUT_COLUMNS}),
         )
         derived_latest = await self._derive_input_terminal(tx, dict(state), latest.row)
         if derived_latest["terminal_status"] is not None:
             route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
-            if route is not None and self._can_redeliver_stored_result(state, latest.row):
+            if (
+                route is not None
+                and is_driver_run
+                and self._can_redeliver_stored_result(state, latest.row)
+            ):
                 latest_full = await self.input(tx, latest.ref)
                 if latest_full is not None:
                     await self._route_stored_result_tx(
@@ -5333,13 +5338,15 @@ class RuntimeInputStore:
         w_val = int(latest_full.row["wake"]) if latest_full is not None else 1
         b_val = int(latest_full.row["content_bytes"]) if latest_full is not None else 0
         route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
-        agg_void = await self._close_workflow_run_journal_tx(
-            tx, state, primary_ref=latest.ref, cby=cancel_by, reason=reason,
-            database_now=now_ms(),
-        )
+        agg_void: dict[str, Any] | None = None
+        if is_driver_run:
+            agg_void = await self._close_workflow_run_journal_tx(
+                tx, state, primary_ref=latest.ref, cby=cancel_by, reason=reason,
+                database_now=now_ms(),
+            )
         res_json_void = canonical(agg_void) if agg_void is not None else None
         delivery_error = None
-        if route is not None:
+        if is_driver_run and route is not None:
             cancelled = Result(
                 root.ref, target, "cancelled", None, None,
                 structured_output=agg_void,
@@ -5351,7 +5358,7 @@ class RuntimeInputStore:
                 child_tenant_id=state["tenant_id"],
                 child_principal_id=state["principal_id"],
                 parent_session_id=route["target"]["session_id"],
-                start_ref=InputRef(**route["input_ref"]),
+                start_ref=root.ref,
                 result=cancelled,
                 result_kind=route["result_kind"],
                 child_wake=0 if cancel_by == "subtree" else 1,
@@ -5659,6 +5666,18 @@ class RuntimeInputStore:
             _driver_events_out=_driver_events_out,
         )
         if delivery_error != row["result_delivery_error"]:
+            chain_ids: list[str] = [record.ref.message_id]
+            cur_anc_id = row.get("continuation_of")
+            seen_chain: set[str] = {record.ref.message_id}
+            while cur_anc_id is not None and cur_anc_id not in seen_chain:
+                seen_chain.add(cur_anc_id)
+                chain_ids.append(cur_anc_id)
+                anc_rec = await self.input(
+                    tx, InputRef(record.ref.store_id, record.ref.session_id, cur_anc_id),
+                )
+                if anc_rec is None:
+                    break
+                cur_anc_id = anc_rec.row.get("continuation_of")
             if result_si is not None and delivery_error is None:
                 await tx.execute(
                     f"UPDATE {self.q} SET result_delivery_error=NULL "
@@ -5666,7 +5685,14 @@ class RuntimeInputStore:
                     "AND (delivered_send_index=? OR result_send_index=?)",
                     (record.ref.session_id, result_si, result_si),
                 )
-            else:
+            if len(chain_ids) > 1:
+                c_ph = ",".join("?" for _ in chain_ids)
+                await tx.execute(
+                    f"UPDATE {self.q} SET result_delivery_error=? "
+                    f"WHERE session_id=? AND item_id IN ({c_ph})",
+                    (delivery_error, record.ref.session_id, *chain_ids),
+                )
+            elif not (result_si is not None and delivery_error is None):
                 await tx.execute(
                     f"UPDATE {self.q} SET result_delivery_error=? WHERE session_id=? AND item_id=?",
                     (delivery_error, record.ref.session_id, record.ref.message_id),
