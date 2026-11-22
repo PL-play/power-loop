@@ -3458,8 +3458,19 @@ async def test_stage2_b4_real_two_process_5_leaf_sql_ledgers(registry_store, tmp
     backend = store._db.dialect.name
     repo_root = Path(__file__).resolve().parents[2]
     scenarios = ["concentrated", "dispersed", "mid_stop_1_leaf", "stop_driver_subtree", "real_halt"]
+    xproc_tables = (
+        "follow_up_queue", "messages", "project_messages",
+        "session_runtime_state", "sessions", "schema_migrations",
+    )
+
+    async def _drop_prefix_tables(pfx: str) -> None:
+        if backend in ("postgres", "mysql"):
+            for tbl in xproc_tables:
+                await store._db.execute(f"DROP TABLE IF EXISTS {pfx}{tbl}")
+
     for idx_s, scenario in enumerate(scenarios):
         prefix = f"b4xp{idx_s}_"
+        await _drop_prefix_tables(prefix)
         if backend == "sqlite":
             dsn_or_path = str(tmp_path / f"b4_xproc_{idx_s}.db")
         elif backend == "postgres":
@@ -3471,6 +3482,7 @@ async def test_stage2_b4_real_two_process_5_leaf_sql_ledgers(registry_store, tmp
         events_a: asyncio.Queue[dict] = asyncio.Queue()
         events_b: asyncio.Queue[dict] = asyncio.Queue()
         signals_seen: list[dict] = []
+        proc_a = None
         proc_b = None
 
         async def _send(proc, obj: dict) -> None:
@@ -3483,6 +3495,15 @@ async def test_stage2_b4_real_two_process_5_leaf_sql_ledgers(registry_store, tmp
             while True:
                 line = await src_proc.stdout.readline()
                 if not line:
+                    err_txt = ""
+                    if src_proc.stderr is not None:
+                        try:
+                            err_txt = (await src_proc.stderr.read()).decode("utf-8", errors="replace")[-4000:]
+                        except Exception:
+                            pass
+                    await evt_q.put({
+                        "type": "eof", "role": src_role, "returncode": src_proc.returncode, "stderr": err_txt,
+                    })
                     return
                 msg = json.loads(line)
                 if msg.get("type") == "signal":
@@ -3502,20 +3523,24 @@ async def test_stage2_b4_real_two_process_5_leaf_sql_ledgers(registry_store, tmp
             async with asyncio.timeout(25):
                 while True:
                     m = await q.get()
+                    if m.get("type") == "eof":
+                        raise AssertionError(
+                            f"xproc worker role={m['role']} exited early (rc={m.get('returncode')}):\n{m.get('stderr')}"
+                        )
                     if pred(m):
                         return m
 
         # Start proc_a FIRST and wait for ready_a so DDL init runs once with zero concurrent CREATE TABLE race.
-        proc_a = await asyncio.create_subprocess_exec(
-            sys.executable, "-B", "-m", "tests.unit._m2_xproc_ledger_worker",
-            backend, dsn_or_path, prefix, "a", scenario,
-            cwd=str(repo_root),
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        ra = asyncio.create_task(_relay("a", proc_a, events_a))
+        ra = None
         rb = None
-
         try:
+            proc_a = await asyncio.create_subprocess_exec(
+                sys.executable, "-B", "-m", "tests.unit._m2_xproc_ledger_worker",
+                backend, dsn_or_path, prefix, "a", scenario,
+                cwd=str(repo_root),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            ra = asyncio.create_task(_relay("a", proc_a, events_a))
             ready_a = await _wait_evt(events_a, lambda m: m.get("type") == "ready")
             proc_b = await asyncio.create_subprocess_exec(
                 sys.executable, "-B", "-m", "tests.unit._m2_xproc_ledger_worker",
@@ -3608,23 +3633,19 @@ async def test_stage2_b4_real_two_process_5_leaf_sql_ledgers(registry_store, tmp
                     }) + "\n")
         finally:
             for proc in (proc_a, proc_b):
-                if proc.returncode is None:
+                if proc is not None and proc.returncode is None:
                     try:
                         await _send(proc, {"type": "quit"})
                         await asyncio.wait_for(proc.wait(), 10)
                     except Exception:
                         proc.kill()
                         await proc.wait()
-            ra.cancel()
-            rb.cancel()
-            await asyncio.gather(ra, rb, return_exceptions=True)
-            # Drop temporary prefix tables on server DBs so repeated runs stay spotless
-            if backend in ("postgres", "mysql"):
-                for tbl in (
-                    "follow_up_queue", "messages", "project_messages",
-                    "session_runtime_state", "sessions", "schema_meta",
-                ):
-                    await store._db.execute(f"DROP TABLE IF EXISTS {prefix}{tbl}")
+            for task in (ra, rb):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(*(t for t in (ra, rb) if t is not None), return_exceptions=True)
+            # Drop ALL temporary prefix tables (including schema_migrations!) so repeat runs in the same DB succeed
+            await _drop_prefix_tables(prefix)
 
 
 async def test_stage2_driver_sigkill_takeover_completed_leaf_runs_once(registry_store):
@@ -3741,3 +3762,344 @@ async def test_stage2_driver_sigkill_takeover_completed_leaf_runs_once(registry_
                     await proc.wait()
         await client.aclose()
         await tp.aclose()
+
+
+async def test_stage2_r2_b3_concurrent_rebind_children_preserves_rebound_child_on_close_and_delete(registry_store):
+    """Stage2-R2-B3: Child rebound to same-depth new parent between discovery & lock stays open & intact."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.runtime.store import closing as closing_mod
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store_a, connect = registry_store
+    if store_a._db.dialect.name == "sqlite":
+        pytest.skip("concurrent two-connection rebind vs close/delete requires server DB (PG16/MySQL)")
+
+    async def _setup_tree(port: RuntimeInputStore, tag: str):
+        root = await target(port, f"{tag}-root")
+        cm_parents = await port.create_many(
+            parent=root, actor=ACTOR,
+            specs=[
+                ChildSpec(
+                    session_id=f"{tag}-old-parent", message_id=f"{tag}-op-m1",
+                    body={"text": "old parent"}, descriptor=DESCRIPTOR, result_kind="agent_result",
+                ),
+                ChildSpec(
+                    session_id=f"{tag}-new-parent", message_id=f"{tag}-np-m1",
+                    body={"text": "new parent"}, descriptor=DESCRIPTOR, result_kind="agent_result",
+                ),
+            ],
+            node_id="n1", boot_id="b1", can_execute=True, free_slots=2,
+        )
+        old_b = next(b for b in cm_parents.preclaimed if b.target.session_id == f"{tag}-old-parent")
+        new_b = next(b for b in cm_parents.preclaimed if b.target.session_id == f"{tag}-new-parent")
+        cm_child = await port.create_many(
+            parent=old_b.target, actor=ACTOR,
+            specs=[
+                ChildSpec(
+                    session_id=f"{tag}-child", message_id=f"{tag}-ch-m1",
+                    body={"text": "child work"},
+                    descriptor=replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "C"}}),
+                    result_kind="agent_result",
+                ),
+            ],
+            node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+            parent_owner_epoch=old_b.owner_epoch, parent_cancel_seq=old_b.cancel_seq,
+        )
+        child_b = cm_child.preclaimed[0]
+        await port.final(child_b, status="completed", final_text=f"{tag}-child-result")
+        await port.final(old_b, status="completed", final_text="old-done")
+        await port.final(new_b, status="completed", final_text="new-done")
+        # Consume old_parent's pending agent_result receipt from child so old_parent is completely idle!
+        claim_old2 = await port.claim(old_b.target, node_id="n1", boot_id="b1")
+        if claim_old2 is not None:
+            await port.final(claim_old2, status="completed", final_text="old-drained")
+        return old_b.target, new_b.target, child_b.target, child_b.input_refs[0]
+
+    port_a = RuntimeInputStore(store_a)
+    store_b = await connect()
+    transport = MemoryMessageTransport()
+    client_b = RuntimeClient(store=store_b, transport=transport)
+    orig_discover = closing_mod._discover_linked_tree
+    try:
+        for tag, mode in (("s2r2b3-idle", "close_if_idle"), ("s2r2b3-tree", "close_session_tree")):
+            old_p, new_p, child_t, child_ref = await _setup_tree(port_a, tag)
+
+            discovered_ev = asyncio.Event()
+            release_lock_ev = asyncio.Event()
+            paused_once = False
+
+            async def _paused_discover(st, tx, seed_ids, cascade):
+                nonlocal paused_once
+                res = await orig_discover(st, tx, seed_ids, cascade)
+                if not paused_once and old_p.session_id in res and child_t.session_id in res:
+                    paused_once = True
+                    discovered_ev.set()
+                    await release_lock_ev.wait()
+                return res
+
+            closing_mod._discover_linked_tree = _paused_discover
+            try:
+                if mode == "close_if_idle":
+                    op_task = asyncio.create_task(store_a.close_sessions_if_idle([old_p.session_id]))
+                else:
+                    op_task = asyncio.create_task(store_a.close_session_tree(old_p.session_id))
+                await asyncio.wait_for(discovered_ev.wait(), 5)
+
+                # Connection 2: rebind child from old_parent to same-depth new_parent and commit!
+                rb = await client_b.rebind_children(
+                    old_p, new_p, child_targets=[child_t], actor=ACTOR,
+                )
+                assert rb.depth_delta == 0
+                assert list(rb.rebound_children) == [child_t.session_id]
+
+                release_lock_ev.set()
+                op_result = await asyncio.wait_for(op_task, 10)
+            finally:
+                release_lock_ev.set()
+                closing_mod._discover_linked_tree = orig_discover
+
+            if mode == "close_if_idle":
+                assert op_result == "closed"
+                old_row = await store_b._db.fetchone(
+                    f"SELECT lifecycle FROM {store_b.t.sessions} WHERE session_id=?",
+                    (old_p.session_id,),
+                )
+                assert old_row is not None and old_row["lifecycle"] == "closing"
+            else:
+                assert op_result == [old_p.session_id], op_result
+                old_row = await store_b._db.fetchone(
+                    f"SELECT session_id FROM {store_b.t.sessions} WHERE session_id=?",
+                    (old_p.session_id,),
+                )
+                assert old_row is None
+
+            # Rebound child under new_parent MUST remain open with messages, input terminal status & result intact!
+            ch_row = await store_b._db.fetchone(
+                f"SELECT parent_session_id,lifecycle,execution_state FROM {store_b.t.sessions} WHERE session_id=?",
+                (child_t.session_id,),
+            )
+            assert ch_row is not None
+            assert ch_row["parent_session_id"] == new_p.session_id
+            assert ch_row["lifecycle"] == "open"
+            ch_msgs = await store_b._db.fetchall(
+                f"SELECT role,content FROM {store_b.t.messages} WHERE session_id=? ORDER BY seq ASC",
+                (child_t.session_id,),
+            )
+            assert any(m["role"] == "assistant" and m["content"] == f"{tag}-child-result" for m in ch_msgs)
+            ch_insp = await client_b.inspect(child_ref, actor=ACTOR)
+            assert ch_insp.terminal_status == "completed"
+            ch_res = await client_b.inputs.get_result(child_ref, actor=ACTOR)
+            assert ch_res is not None and ch_res.status == "completed" and ch_res.final_text == f"{tag}-child-result"
+    finally:
+        closing_mod._discover_linked_tree = orig_discover
+        await client_b.aclose()
+        await store_b.close()
+
+
+async def test_stage2_r2_b1_two_explicit_resumes_claimed_together_both_execute_and_deliver(registry_store):
+    """Stage2-R2-B1: Two accepted handle.resume() calls claimed in the same batch both execute and deliver."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    seen_prompts: list[str] = []
+
+    class TwoResumeModel(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                seen_prompts.append(latest)
+                return LLMResponse(raw_text=f"A-call-{len(seen_prompts)}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, TwoResumeModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r2-b1-wf", "root": leaf("A")},
+            message_id="s2-r2-b1-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and len(seen_prompts) == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        # Submit TWO explicit handle.resume() calls with distinct message_ids BEFORE Worker 2 claims!
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(
+            node_id="A", message="resume-prompt-one", message_id="s2-r2-b1-res-1",
+        )
+        res_h2 = await handle_on_client.resume(
+            node_id="A", message="resume-prompt-two", message_id="s2-r2-b1-res-2",
+        )
+
+        # Confirm both are pending in Driver's inbox before Worker 2 starts
+        pend = await store._db.fetchall(
+            f"SELECT item_id,status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND status='pending' ORDER BY id ASC",
+            (handle.target.session_id,),
+        )
+        assert [r["item_id"] for r in pend] == ["s2-r2-b1-res-1", "s2-r2-b1-res-2"]
+
+        # Start Worker 2 -> BOTH explicit resumes are claimed together in send_index=2!
+        rt2 = await RunningAgent(
+            store, TwoResumeModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        claimed_batches: list[tuple[int, list[str]]] = []
+        orig_claim = rt2.runtime.worker.inputs.claim
+
+        async def _spy_claim(target_arg, *args, **kwargs):
+            b = await orig_claim(target_arg, *args, **kwargs)
+            if b is not None and target_arg.session_id == handle.target.session_id:
+                claimed_batches.append((int(b.send_index), [r.message_id for r in b.input_refs]))
+            return b
+
+        rt2.runtime.worker.inputs.claim = _spy_claim
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        r1 = await res_h1.wait(deadline_ms=now_ms() + 10000)
+        r2 = await res_h2.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        # Verify BOTH were claimed together in the same batch (send_index=2), and res-2 re-ran on send_index=3!
+        assert claimed_batches[0] == (2, ["s2-r2-b1-res-1", "s2-r2-b1-res-2"]), claimed_batches
+        assert claimed_batches[1] == (3, ["s2-r2-b1-res-2"]), claimed_batches
+        claimed_rows = await store._db.fetchall(
+            f"SELECT item_id,result_send_index,terminal_status,result_seq FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id IN ('s2-r2-b1-res-1','s2-r2-b1-res-2') ORDER BY id ASC",
+            (handle.target.session_id,),
+        )
+        assert len(claimed_rows) == 2
+        assert [int(r["result_send_index"]) for r in claimed_rows] == [2, 3]
+        assert all(r["terminal_status"] == "completed" for r in claimed_rows)
+        assert claimed_rows[0]["result_seq"] != claimed_rows[1]["result_seq"]
+
+        # Verify BOTH actually ran target leaf A with their respective prompts!
+        assert len(seen_prompts) == 3
+        assert "resume-prompt-one" in seen_prompts[1]
+        assert "resume-prompt-two" in seen_prompts[2]
+        assert r1.status == "completed" and "A" in r1.results and "resume-prompt-one" in r1.results["A"].text
+        assert r2.status == "completed" and "A" in r2.results and "resume-prompt-two" in r2.results["A"].text
+
+        # Verify Main received 3 distinct workflow_result receipts: start + res-1 + res-2!
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        bodies = [json.loads(r["content_json"]) for r in main_rcpts]
+        assert [b["input_ref"]["message_id"] for b in bodies] == [
+            handle.input_ref.message_id, "s2-r2-b1-res-1", "s2-r2-b1-res-2",
+        ]
+        assert "resume-prompt-one" in bodies[1]["final_text"]
+        assert "resume-prompt-two" in bodies[2]["final_text"]
+        assert (await handle_on_client.wait(deadline_ms=now_ms() + 5000)).to_dict() == first.to_dict()
+    finally:
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_r2_b2_inprocess_parallel_two_leaves_staggered_zero_extra_db_reads(registry_store):
+    """Stage2-R2-B2: Same Worker/Store capacity=2 parallel leaves A & B staggered finish -> 0 poll & 0 get_result."""
+    from .test_send_sql_profile import Profiled
+
+    store, _ = registry_store
+    a_entered = asyncio.Event()
+    b_entered = asyncio.Event()
+    release_a = asyncio.Event()
+    release_b = asyncio.Event()
+
+    class StaggeredTwoLeafModel(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                a_entered.set()
+                await release_a.wait()
+                return LLMResponse(raw_text="leaf-A-done")
+            if req.system_prompt.startswith("B"):
+                b_entered.set()
+                await release_b.wait()
+                return LLMResponse(raw_text="leaf-B-done")
+            return LLMResponse(raw_text="main-ack")
+
+    orig_db = store._db
+    prof = Profiled(orig_db)
+    store._db = prof
+    runner = await RunningAgent(
+        store, StaggeredTwoLeafModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+    ).start()
+    try:
+        spec = {
+            "name": "s2-r2-b2-parallel",
+            "root": {"type": "parallel", "max_concurrency": 2, "branches": [leaf("A"), leaf("B")]},
+        }
+        handle = await runner.runtime.client.workflow(
+            runner.target, spec, message_id="s2-r2-b2-par", actor=runner.actor,
+        )
+        await asyncio.wait_for(asyncio.gather(a_entered.wait(), b_entered.wait()), 5)
+        await asyncio.sleep(0.05)
+
+        # Find leaf A's session_id on orig_db (zero profiler impact)
+        child_rows = await orig_db.fetchall(
+            f"SELECT session_id,descriptor_json FROM {store.t.sessions} WHERE parent_session_id=?",
+            (handle.target.session_id,),
+        )
+        a_sid = next(r["session_id"] for r in child_rows if '"node_id":"A"' in r["descriptor_json"] or '"node_id": "A"' in r["descriptor_json"])
+
+        # Clear profiler BEFORE releasing A; release A while keeping B blocked!
+        prof.records.clear()
+        release_a.set()
+
+        # Wait until A has committed Final (execution_state='idle'), then wait across >250ms boundary while B stays active!
+        async with asyncio.timeout(5):
+            while True:
+                arow = await orig_db.fetchone(
+                    f"SELECT execution_state FROM {store.t.sessions} WHERE session_id=?", (a_sid,),
+                )
+                if arow is not None and arow["execution_state"] == "idle":
+                    break
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.35)
+
+        poll_reads = [
+            r for r in prof.records
+            if any("poll_pending_driver_results" in f or "poll_driver_results_for_send" in f for f in r["chain"])
+        ]
+        get_result_reads = [
+            r for r in prof.records
+            if any("get_result" in f or "_result_state" in f for f in r["chain"])
+        ]
+        assert poll_reads == [], f"Unexpected poll_pending_driver_results between A commit and B release: {poll_reads}"
+        assert get_result_reads == [], f"Unexpected leaf get_result between A commit and B release: {get_result_reads}"
+
+        release_b.set()
+        res = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert res.status == "completed"
+        assert res.results["A"].text == "leaf-A-done"
+        assert res.results["B"].text == "leaf-B-done"
+        await runner.drain()
+    finally:
+        release_a.set()
+        release_b.set()
+        await runner.aclose()
+        store._db = orig_db

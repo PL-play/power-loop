@@ -580,6 +580,7 @@ class RuntimeWorker:
         external_ownership = None
         batch = preclaimed_batch
         normal_final = None
+        driver_requeue = False
         try:
             if batch is not None:
                 pass
@@ -755,8 +756,7 @@ class RuntimeWorker:
                     final_batch = await run_driver(self, ctx, env)
                     _mark_finalized()
                     await self._notify_results(final_batch)
-                    if final_batch.execution_state == "queued":
-                        self._activate(sid)
+                    driver_requeue = final_batch.execution_state == "queued"
                     batch = None
                     return
                 if descriptor.kind == "background":
@@ -931,7 +931,9 @@ class RuntimeWorker:
             # A normal final reports its pending snapshot; real new notifications
             # bridge the interval after that snapshot and before active.pop. After
             # pop the ordinary dispatcher waits on the same session lock for aclose.
-            if normal_final is not None and ctx is not None and ctx.consumed is not None:
+            if driver_requeue:
+                self._activate(sid)
+            elif normal_final is not None and ctx is not None and ctx.consumed is not None:
                 if normal_final.execution_state == "queued" or ctx.wake_pending:
                     self._activate(sid)
             elif batch is not None and await self._has_pending(sid):
@@ -1262,22 +1264,22 @@ class RuntimeWorker:
         if final_batch.result_activation is not None:
             target = final_batch.result_activation
             ref = final_batch.result_ref
-            await self.runtime.client._notify(
-                target, ref.message_id, ref, ["work", "activation"]
-            )
-            if (
-                self.runtime.wake_transport is not None
-                and target.session_id not in self.inputs._driver_waiters
-            ):
-                try:
-                    await self.runtime.wake_transport.publish_wake(
-                        target.session_id, reason="river",
-                    )
-                except Exception:
-                    log.warning(
-                        "wake_transport publish_wake failed for %s",
-                        target.session_id, exc_info=True,
-                    )
+            # Skip redundant local activation / wake_transport when the resident Driver on this
+            # Store already received the leaf result directly in _driver_waiters (0 extra DB reads).
+            if target.session_id not in self.inputs._driver_waiters:
+                await self.runtime.client._notify(
+                    target, ref.message_id, ref, ["work", "activation"]
+                )
+                if self.runtime.wake_transport is not None:
+                    try:
+                        await self.runtime.wake_transport.publish_wake(
+                            target.session_id, reason="river",
+                        )
+                    except Exception:
+                        log.warning(
+                            "wake_transport publish_wake failed for %s",
+                            target.session_id, exc_info=True,
+                        )
 
     async def _has_pending(self, sid):
         row = await self.runtime.store._db.fetchone(

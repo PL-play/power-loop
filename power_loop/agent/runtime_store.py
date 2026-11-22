@@ -255,7 +255,9 @@ class RuntimeInputStore:
     def notify_driver_wake(self, sid: str) -> None:
         entry = self._driver_waiters.get(sid)
         if entry is not None:
-            entry[1].set()
+            q, sig, _ = entry
+            q.put_nowait({"type": "remote_wake"})
+            sig.set()
 
     def notify_driver_cancel(
         self, sid: str, *, cancel_by: str | None = None, reason: str = "cancelled",

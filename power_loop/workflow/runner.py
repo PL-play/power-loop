@@ -212,6 +212,7 @@ class DurableExecutor:
             self._waiter_sig = None
             self._subtree_stopped_flag = [False]
         self._in_memory_results: dict[InputRef, tuple[str, dict[str, Any]]] = {}
+        self._remote_wake_pending = False
         self._last_polled_id = 0
 
     async def _load_nodes(self, reader=None):
@@ -522,11 +523,14 @@ class DurableExecutor:
                 ev = self._waiter_q.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if ev.get("type") == "leaf_result":
+            ev_type = ev.get("type")
+            if ev_type == "leaf_result":
                 payload = ev["payload"]
                 src = InputRef(**payload["input_ref"])
                 self._in_memory_results[src] = (str(ev["item_id"]), _normalize_node_status(payload))
-            elif ev.get("type") == "cancel":
+            elif ev_type == "remote_wake":
+                self._remote_wake_pending = True
+            elif ev_type == "cancel":
                 if ev.get("cancel_by") is not None:
                     self.ctx.cancel_by = ev["cancel_by"]
 
@@ -544,6 +548,9 @@ class DurableExecutor:
             payload = json.loads(row["content_json"])
             src = InputRef(**payload["input_ref"])
             self._in_memory_results[src] = (str(row["item_id"]), _normalize_node_status(payload))
+        if rows and self._waiter_sig is not None:
+            # Wake sibling coroutines so they pick up newly cached results without another DB read.
+            self._waiter_sig.set()
         return len(rows)
 
     async def _redeliver_missing_node_result(self, leaf_target: TargetRef, start: InputRef, res: Result) -> None:
@@ -594,17 +601,26 @@ class DurableExecutor:
                 entry["result_input_ref"] = plain(InputRef(self.ctx.store_id, self.ctx.session_id, item_id))
                 return raw
 
-            # If woken by cross-process WakeTransport/transport (or on crash replay), run 1 indexed SELECT
-            if self._waiter_sig.is_set() or (self.ctx.send_index > 1 and not polled_initial):
-                is_recovery_init = self.ctx.send_index > 1 and not polled_initial
-                self._waiter_sig.clear()
+            # Only query DB on crash-replay entry (send_index > 1) OR an external remote wake
+            # when this target leaf is NOT running/queued locally on this Worker!
+            # Local in-memory _push_driver_leaf_result wakes sibling coroutines with 0 DB reads.
+            is_recovery_init = self.ctx.send_index > 1 and not polled_initial
+            is_local_leaf = self._is_leaf_local_pending_or_active(target.session_id)
+            if is_recovery_init or (self._remote_wake_pending and not is_local_leaf):
+                self._remote_wake_pending = False
                 polled_initial = True
-                self._drain_local_waiter()
-                if start in self._in_memory_results:
-                    continue
                 await self._pull_remote_pending_results(include_claimed_send=is_recovery_init)
                 if start in self._in_memory_results:
                     continue
+            elif self._remote_wake_pending and not self.worker.runtime.shared_execution:
+                self._remote_wake_pending = False
+
+            self._waiter_sig.clear()
+            self._drain_local_waiter()
+            if start in self._in_memory_results or self._nodes[key].get("result") is not None:
+                continue
+            if self._remote_wake_pending and not self._is_leaf_local_pending_or_active(target.session_id):
+                continue
 
             try:
                 await asyncio.wait_for(self._waiter_sig.wait(), timeout=0.25)
@@ -904,7 +920,27 @@ async def _prepare_explicit(worker, ctx, saved, origin, options):
     return saved
 
 
-async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_results: bool = False):
+async def _resolve_input_chain_ids(port, store_id: str, session_id: str, origin: InputRecord) -> list[str]:
+    """Walk ``continuation_of`` from ``origin`` back to its business root."""
+    chain_ids: list[str] = [origin.ref.message_id]
+    current = origin
+    while current.row.get("continuation_of") is not None:
+        parent_rec = await port.input(
+            port.db, InputRef(store_id, session_id, current.row["continuation_of"]),
+        )
+        if parent_rec is None:
+            break
+        chain_ids.append(parent_rec.ref.message_id)
+        current = parent_rec
+    return chain_ids
+
+
+async def _complete_driver(
+    worker, ctx, saved, origin, aggregate, *,
+    drain_node_results: bool = False,
+    consumed: tuple[InputRef, ...] | None = None,
+    extra_late_ids: tuple[str, ...] = (),
+):
     """Finalize the resident driver in 1 Final transaction (0 final_lock_asc!)."""
     port = worker.inputs
     status = aggregate["status"]
@@ -920,42 +956,15 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_
     )
     error_code = None if status == "completed" else status
 
-    chain_ids: list[str] = [origin.ref.message_id]
-    if origin.row.get("continuation_of") is not None:
-        current = origin
-        while current.row.get("continuation_of") is not None:
-            parent_rec = await port.input(
-                port.db, InputRef(ctx.store_id, ctx.session_id, current.row["continuation_of"]),
-            )
-            if parent_rec is None:
-                break
-            chain_ids.append(parent_rec.ref.message_id)
-            current = parent_rec
-
+    chain_ids = await _resolve_input_chain_ids(port, ctx.store_id, ctx.session_id, origin)
     root_id = chain_ids[-1]
     chain_id_set = set(chain_ids)
-    # If non-origin plain late inputs (or their continuation chains, e.g., [wfc_late, late_plain])
-    # were merged into the same batch as a real run/resume, settle those late chains locally in the
-    # same Final transaction without touching start_input_message_id or attaching aggregate result_json.
-    extra_late_ids: list[str] = []
-    if len(ctx.batch.input_refs) > 1:
-        seen_late: set[str] = set(chain_id_set)
-        if ctx.batch.start_input_message_id is not None:
-            seen_late.add(ctx.batch.start_input_message_id)
-        for ref in ctx.batch.input_refs:
-            if ref.message_id in seen_late:
-                continue
-            rec = await port.input(port.db, ref)
-            if rec is None or rec.row["kind"] not in {"user", "workflow_continue"}:
-                continue
-            cur = rec
-            while cur is not None and cur.ref.message_id not in seen_late:
-                seen_late.add(cur.ref.message_id)
-                extra_late_ids.append(cur.ref.message_id)
-                parent_mid = cur.row.get("continuation_of")
-                if parent_mid is None:
-                    break
-                cur = await port.input(port.db, InputRef(ctx.store_id, ctx.session_id, parent_mid))
+    # Only settle verified non-formal plain late inputs (passed explicitly by run_driver) —
+    # never sweep unrelated formal workflow_resume inputs!
+    late_ids_to_settle = [
+        mid for mid in dict.fromkeys(extra_late_ids)
+        if mid not in chain_id_set and mid != ctx.batch.start_input_message_id
+    ]
 
     batch_for_final = ctx.batch
     if ctx.cancel_by is not None and batch_for_final.cancel_by is None:
@@ -988,19 +997,19 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_
             last_input_ref=plain(origin.ref),
         )
         await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
-        if extra_late_ids:
-            ep = ",".join("?" for _ in extra_late_ids)
+        if late_ids_to_settle:
+            ep = ",".join("?" for _ in late_ids_to_settle)
             await tx.execute(
                 f"UPDATE {port.q} SET status='delivered',terminal_status='completed',"
                 "result_send_index=?,completed_at=? "
                 f"WHERE session_id=? AND item_id IN ({ep}) AND terminal_status IS NULL",
-                (ctx.send_index, info["database_now"] or now_ms(), ctx.session_id, *extra_late_ids),
+                (ctx.send_index, info["database_now"] or now_ms(), ctx.session_id, *late_ids_to_settle),
             )
         return {"structured_output": agg_final, "result_json": agg_final}
 
     return await port.final(
         batch_for_final,
-        consumed=ctx.batch.input_refs,
+        consumed=ctx.batch.input_refs if consumed is None else consumed,
         status=status,
         final_text=final_text,
         usage=aggregate.get("usage") or {},
@@ -1018,6 +1027,70 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_
     )
 
 
+async def _execute_driver_graph(worker, ctx, env, run_id: str, saved, spec, resident_waiter):
+    """Run one workflow graph execution wave and return ``(result_dict, aborted_early)``."""
+    executor = DurableExecutor(
+        worker, ctx, env, run_id, saved, resident_waiter=resident_waiter,
+    )
+    engine = WorkflowEngine(
+        executor,
+        run_id=run_id,
+        driver_sid=ctx.session_id,
+        allowed_tools=ctx.descriptor.config["workflow"]["allowed_tools"],
+        stop_event=ctx.stop,
+        file_io=env.workflow_file_io,
+    )
+    if executor.plan:
+        engine._usage_acc = dict(executor.plan.get("prior_usage") or {})
+
+    if ctx.stop.is_cancelled():
+        cby = ctx.cancel_by or "user"
+        return engine._build_result(spec, "cancelled", cancel_by=cby).to_dict(), True
+
+    graph = asyncio.create_task(engine.run(spec))
+    stopped = asyncio.create_task(ctx.stop.wait())
+    aborted_early = False
+    try:
+        remaining = (
+            max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000)
+            if spec.timeout_s else None
+        )
+        done, _ = await asyncio.wait(
+            (graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if graph in done:
+            result = graph.result()
+            if result.status == "cancelled" and result.cancel_by is None:
+                executor._drain_local_waiter()
+                result.cancel_by = ctx.cancel_by or "user"
+        else:
+            aborted_early = True
+            timed_out = stopped not in done
+            if timed_out:
+                ctx.cancel_by = "timeout"
+                await worker.inputs.cancel_active(
+                    ctx.batch, reason="workflow timeout", cancel_by="timeout",
+                )
+            else:
+                executor._drain_local_waiter()
+            graph.cancel()
+            await asyncio.gather(graph, return_exceptions=True)
+            if timed_out:
+                result = engine._build_result(spec, "failed")
+                result.errors.append("workflow timeout")
+            else:
+                cby = ctx.cancel_by or "user"
+                result = engine._build_result(spec, "cancelled", cancel_by=cby)
+    finally:
+        stopped.cancel()
+        graph.cancel()
+        await asyncio.gather(stopped, graph, return_exceptions=True)
+
+    if not aborted_early:
+        await executor._consume_results()
+    return result.to_dict(), aborted_early
+
+
 async def _finish_late(worker, ctx, refs):
     """Terminalize late result inputs (including any continuation ancestors) without another graph run."""
     port = worker.inputs
@@ -1030,13 +1103,10 @@ async def _finish_late(worker, ctx, refs):
                 seen.add(ref.message_id)
                 settle_ids.append(ref.message_id)
             continue
-        while cur is not None and cur.ref.message_id not in seen:
-            seen.add(cur.ref.message_id)
-            settle_ids.append(cur.ref.message_id)
-            parent_mid = cur.row.get("continuation_of")
-            if parent_mid is None:
-                break
-            cur = await port.input(port.db, InputRef(ctx.store_id, ctx.session_id, parent_mid))
+        for mid in await _resolve_input_chain_ids(port, ctx.store_id, ctx.session_id, cur):
+            if mid not in seen:
+                seen.add(mid)
+                settle_ids.append(mid)
     return await port.final(
         ctx.batch,
         consumed=tuple(refs),
@@ -1082,10 +1152,13 @@ async def run_driver(worker, ctx, env):
     if saved is None:
         raise RuntimeRequestError("workflow_journal_missing")
 
-    origin = _fast_first_turn_origin(ctx, run_id)
-    resume_options = None
-    resume_origin = origin
-    if origin is None:
+    fast_origin = _fast_first_turn_origin(ctx, run_id)
+    formal_items: list[tuple[InputRecord, InputRecord, dict[str, Any] | None]] = []
+    plain_late_ids: list[str] = []
+
+    if fast_origin is not None:
+        formal_items.append((fast_origin, fast_origin, None))
+    else:
         origins = []
         for ref in ctx.batch.input_refs:
             record = await port.input(port.db, ref)
@@ -1094,9 +1167,13 @@ async def run_driver(worker, ctx, env):
         def_ref = saved.get("definition_ref") if isinstance(saved, dict) else None
         def_msg_id = def_ref.get("message_id") if isinstance(def_ref, dict) else None
 
-        # Classify every candidate by its business root so a plain late continuation (wfc_late)
-        # merged with an explicit handle.resume() never shadows the explicit resume!
-        classified: list[tuple[InputRecord, InputRecord, dict[str, Any] | None, bool]] = []
+        # Classify every candidate by its business root so:
+        # 1) Plain late inputs (and their wfc_late continuations) never shadow formal runs/resumes.
+        # 2) Multiple distinct accepted explicit handle.resume() inputs in the same batch each
+        #    execute in order with independent results & Main receipts (never collapsed as late!).
+        by_root: dict[str, tuple[InputRecord, InputRecord, dict[str, Any] | None]] = {}
+        root_order: list[str] = []
+        plain_late_records: list[InputRecord] = []
         for o in origins:
             parsed = json.loads(o.row["content_json"])
             root_rec = o
@@ -1119,31 +1196,73 @@ async def run_driver(worker, ctx, env):
                 or root_rec.ref.message_id == run_id
                 or (def_msg_id is not None and root_rec.ref.message_id == def_msg_id)
             )
-            classified.append((o, root_rec, res_opts, is_run_or_resume))
+            if is_run_or_resume:
+                rk = root_rec.ref.message_id
+                if rk not in by_root:
+                    root_order.append(rk)
+                    by_root[rk] = (o, root_rec, res_opts)
+                elif o.row["kind"] == "workflow_continue":
+                    # Prefer latest continuation record for the same business root
+                    by_root[rk] = (o, root_rec, res_opts)
+            else:
+                plain_late_records.append(o)
 
-        chosen = next(
-            (item for item in reversed(classified) if item[0].row["kind"] == "workflow_continue" and item[3]),
-            None,
+        for rk in root_order:
+            item = by_root[rk]
+            # Skip already-terminalized formal roots on crash-replay unless no runnable item remains
+            if item[1].row.get("terminal_status") is not None and saved.get("aggregate_delivered"):
+                continue
+            formal_items.append(item)
+
+        formal_id_set = {
+            mid for item in formal_items for mid in (item[0].ref.message_id, item[1].ref.message_id)
+        }
+        seen_late: set[str] = set(formal_id_set)
+        if run_id:
+            seen_late.add(run_id)
+        for rec in plain_late_records:
+            for mid in await _resolve_input_chain_ids(port, ctx.store_id, ctx.session_id, rec):
+                if mid not in seen_late:
+                    seen_late.add(mid)
+                    plain_late_ids.append(mid)
+
+    # Filter out non-resume run roots when aggregate was already delivered (pure late batch)
+    runnable_formal = [
+        item for item in formal_items
+        if not (saved.get("aggregate_delivered") and item[2] is None)
+    ]
+    if not runnable_formal:
+        if saved.get("aggregate_delivered"):
+            executor = DurableExecutor(worker, ctx, env, run_id, saved)
+            await executor._consume_results()
+            return await _finish_late(worker, ctx, list(ctx.batch.input_refs))
+        if not formal_items and not plain_late_ids:
+            raise RuntimeRequestError("workflow_origin_missing")
+        # Non-delivered fallback (e.g. unexpected non-start input before first delivery)
+        fallback_rec = await port.input(port.db, ctx.batch.input_refs[-1])
+        if fallback_rec is None:
+            raise RuntimeRequestError("workflow_origin_missing")
+        runnable_formal = [(fallback_rec, fallback_rec, None)]
+
+    spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
+    origin_0, resume_origin_0, resume_opts_0 = runnable_formal[0]
+    # When multiple distinct formal runs/resumes are claimed in one batch, execute the first one
+    # on this send_index and leave the remaining formal items unconsumed so port.final() atomically
+    # restores them to status='pending' and re-queues the Driver for their own send_index (giving
+    # every accepted resume its own unique send_index, result_seq, and Main result_message_id!).
+    deferred_formal_ids = {
+        mid for item in runnable_formal[1:]
+        for mid in (item[0].ref.message_id, item[1].ref.message_id)
+    }
+    if deferred_formal_ids:
+        consumed_refs = tuple(
+            ref for ref in ctx.batch.input_refs if ref.message_id not in deferred_formal_ids
         )
-        if chosen is None:
-            chosen = next((item for item in classified if item[0].ref.message_id == run_id), None)
-        if chosen is None and def_msg_id:
-            chosen = next((item for item in classified if item[0].ref.message_id == def_msg_id), None)
-        if chosen is None:
-            chosen = next((item for item in reversed(classified) if item[2] is not None), None)
-        if chosen is None and classified:
-            chosen = classified[-1]
-        if chosen is not None:
-            origin, resume_origin, resume_options, _ = chosen
+    else:
+        consumed_refs = ctx.batch.input_refs
 
-    if saved.get("aggregate_delivered") and resume_options is None:
-        executor = DurableExecutor(worker, ctx, env, run_id, saved)
-        await executor._consume_results()
-        return await _finish_late(worker, ctx, list(ctx.batch.input_refs))
-    if origin is None:
-        raise RuntimeRequestError("workflow_origin_missing")
-    if resume_options is not None and resume_origin is not None and saved.get("definition_ref") != plain(resume_origin.ref):
-        saved = await _prepare_explicit(worker, ctx, saved, resume_origin, resume_options)
+    if resume_opts_0 is not None and saved.get("definition_ref") != plain(resume_origin_0.ref):
+        saved = await _prepare_explicit(worker, ctx, saved, resume_origin_0, resume_opts_0)
 
     resident_waiter = port.register_driver_waiter(ctx.session_id)
     try:
@@ -1151,72 +1270,14 @@ async def run_driver(worker, ctx, env):
             ctx.cancel_by = ctx.batch.cancel_by or "user"
             ctx.stop.cancel("cancelled")
 
-        executor = DurableExecutor(
-            worker, ctx, env, run_id, saved, resident_waiter=resident_waiter,
+        result_dict, aborted_early = await _execute_driver_graph(
+            worker, ctx, env, run_id, saved, spec, resident_waiter,
         )
-        spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
-        engine = WorkflowEngine(
-            executor,
-            run_id=run_id,
-            driver_sid=ctx.session_id,
-            allowed_tools=ctx.descriptor.config["workflow"]["allowed_tools"],
-            stop_event=ctx.stop,
-            file_io=env.workflow_file_io,
-        )
-        if executor.plan:
-            engine._usage_acc = dict(executor.plan.get("prior_usage") or {})
-
-        if ctx.stop.is_cancelled():
-            cby = ctx.cancel_by or "user"
-            result = engine._build_result(spec, "cancelled", cancel_by=cby)
-            return await _complete_driver(
-                worker, ctx, saved, origin, result.to_dict(), drain_node_results=True,
-            )
-
-        graph = asyncio.create_task(engine.run(spec))
-        stopped = asyncio.create_task(ctx.stop.wait())
-        timed_out = False
-        aborted_early = False
-        try:
-            remaining = (
-                max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000)
-                if spec.timeout_s else None
-            )
-            done, _ = await asyncio.wait(
-                (graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED,
-            )
-            if graph in done:
-                result = graph.result()
-                if result.status == "cancelled" and result.cancel_by is None:
-                    executor._drain_local_waiter()
-                    result.cancel_by = ctx.cancel_by or "user"
-            else:
-                aborted_early = True
-                timed_out = stopped not in done
-                if timed_out:
-                    ctx.cancel_by = "timeout"
-                    await worker.inputs.cancel_active(
-                        ctx.batch, reason="workflow timeout", cancel_by="timeout",
-                    )
-                else:
-                    executor._drain_local_waiter()
-                graph.cancel()
-                await asyncio.gather(graph, return_exceptions=True)
-                if timed_out:
-                    result = engine._build_result(spec, "failed")
-                    result.errors.append("workflow timeout")
-                else:
-                    cby = ctx.cancel_by or "user"
-                    result = engine._build_result(spec, "cancelled", cancel_by=cby)
-        finally:
-            stopped.cancel()
-            graph.cancel()
-            await asyncio.gather(stopped, graph, return_exceptions=True)
-
-        if not aborted_early:
-            await executor._consume_results()
         return await _complete_driver(
-            worker, ctx, saved, origin, result.to_dict(), drain_node_results=aborted_early,
+            worker, ctx, saved, origin_0, result_dict,
+            drain_node_results=aborted_early,
+            consumed=consumed_refs,
+            extra_late_ids=tuple(plain_late_ids),
         )
     finally:
         port.unregister_driver_waiter(ctx.session_id)

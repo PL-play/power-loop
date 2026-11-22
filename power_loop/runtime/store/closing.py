@@ -95,10 +95,30 @@ async def lock_sessions(store, tx, session_id, cascade, *, stop_on_busy=False):
     if set(locked.keys()) != set(discovered.keys()):
         raise _CloseTreeChanged()
     if cascade and locked:
-        # Verify under locks that no concurrent create_many/rebind added a new linked child or moved depth.
+        # Verify under locks that no concurrent create_many/rebind added, moved, unlinked,
+        # or reparented any discovered session (including same-depth rebind_children!).
         for sid, row in locked.items():
-            if int(row.get('depth') or 0) != int(discovered[sid].get('depth') or 0):
+            orig = discovered[sid]
+            if (
+                int(row.get('depth') or 0) != int(orig.get('depth') or 0)
+                or row.get('parent_session_id') != orig.get('parent_session_id')
+                or row.get('cancel_propagation') != orig.get('cancel_propagation')
+            ):
                 raise _CloseTreeChanged()
+        reachable = {sid for sid in seed_ids if sid in locked}
+        grew = True
+        while grew:
+            grew = False
+            for sid, row in locked.items():
+                if (
+                    sid not in reachable
+                    and row.get('parent_session_id') in reachable
+                    and row.get('cancel_propagation') == 'linked'
+                ):
+                    reachable.add(sid)
+                    grew = True
+        if reachable != set(locked.keys()):
+            raise _CloseTreeChanged()
         l_ids = sorted(locked.keys())
         ph = ','.join('?' for _ in l_ids)
         recheck = await tx.fetchall(
