@@ -972,7 +972,7 @@ async def _complete_driver(
     worker, ctx, saved, origin, aggregate, *,
     drain_node_results: bool = False,
     consumed: tuple[InputRef, ...] | None = None,
-    extra_late_ids: tuple[str, ...] = (),
+    extra_late_chains: tuple[tuple[str, tuple[str, ...]], ...] = (),
 ):
     """Finalize the resident driver in 1 Final transaction (0 final_lock_asc!)."""
     if getattr(ctx, "ownership", None) is not None and ctx.ownership.lost:
@@ -994,12 +994,20 @@ async def _complete_driver(
     chain_ids = await _resolve_input_chain_ids(port, ctx.store_id, ctx.session_id, origin)
     root_id = chain_ids[-1]
     chain_id_set = set(chain_ids)
-    # Only settle verified non-formal plain late inputs (passed explicitly by run_driver) —
-    # never sweep unrelated formal workflow_resume inputs!
-    late_ids_to_settle = [
-        mid for mid in dict.fromkeys(extra_late_ids)
-        if mid not in chain_id_set and mid != ctx.batch.start_input_message_id
+    # Only settle verified non-formal plain late chains whose tip is still delivered in this turn —
+    # never sweep unrelated formal workflow_resume inputs or restored-to-pending siblings!
+    late_chains_to_check = [
+        (
+            tip_id,
+            tuple(
+                mid for mid in dict.fromkeys(cids)
+                if mid not in chain_id_set and mid != ctx.batch.start_input_message_id
+            ),
+        )
+        for tip_id, cids in extra_late_chains
+        if tip_id not in chain_id_set and tip_id != ctx.batch.start_input_message_id
     ]
+    late_chains_to_check = [(tip_id, cids) for tip_id, cids in late_chains_to_check if cids]
 
     batch_for_final = ctx.batch
     if ctx.cancel_by is not None and batch_for_final.cancel_by is None:
@@ -1032,14 +1040,27 @@ async def _complete_driver(
             last_input_ref=plain(origin.ref),
         )
         await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
-        if late_ids_to_settle:
-            ep = ",".join("?" for _ in late_ids_to_settle)
-            await tx.execute(
-                f"UPDATE {port.q} SET status='delivered',terminal_status='completed',"
-                "result_send_index=?,completed_at=? "
-                f"WHERE session_id=? AND item_id IN ({ep}) AND terminal_status IS NULL",
-                (ctx.send_index, info["database_now"] or now_ms(), ctx.session_id, *late_ids_to_settle),
+        if late_chains_to_check:
+            tip_ids = [tip_id for tip_id, _ in late_chains_to_check]
+            tph = ",".join("?" for _ in tip_ids)
+            live_rows = await tx.fetchall(
+                f"SELECT item_id FROM {port.q} WHERE session_id=? AND item_id IN ({tph}) "
+                "AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL",
+                (ctx.session_id, *tip_ids, ctx.send_index),
             )
+            live_tips = {str(r["item_id"]) for r in live_rows}
+            live_late_ids = list(dict.fromkeys(
+                mid for tip_id, cids in late_chains_to_check if tip_id in live_tips for mid in cids
+            ))
+            if live_late_ids:
+                ep = ",".join("?" for _ in live_late_ids)
+                await tx.execute(
+                    f"UPDATE {port.q} SET status='delivered',terminal_status='completed',"
+                    "result_send_index=?,completed_at=? "
+                    f"WHERE session_id=? AND item_id IN ({ep}) "
+                    "AND status IN ('delivered','waiting_continuation') AND terminal_status IS NULL",
+                    (ctx.send_index, info["database_now"] or now_ms(), ctx.session_id, *live_late_ids),
+                )
         return {"structured_output": agg_final, "result_json": agg_final}
 
     return await port.final(
@@ -1193,16 +1214,25 @@ async def run_driver(worker, ctx, env):
 
     fast_origin = _fast_first_turn_origin(ctx, run_id)
     formal_items: list[tuple[InputRecord, InputRecord, dict[str, Any] | None]] = []
-    plain_late_ids: list[str] = []
+    plain_late_chains: list[tuple[str, tuple[str, ...]]] = []
 
     if fast_origin is not None:
         formal_items.append((fast_origin, fast_origin, None))
     else:
         origins = []
+        live_input_refs: list[InputRef] = []
         for ref in ctx.batch.input_refs:
             record = await port.input(port.db, ref)
-            if record is not None and record.row["kind"] in {"user", "workflow_continue"}:
-                origins.append(record)
+            if (
+                record is not None
+                and record.row["status"] == "delivered"
+                and record.row["delivered_send_index"] == ctx.send_index
+            ):
+                live_input_refs.append(ref)
+                if record.row["kind"] in {"user", "workflow_continue"}:
+                    origins.append(record)
+        if len(live_input_refs) != len(ctx.batch.input_refs) and live_input_refs:
+            ctx.batch = replace(ctx.batch, input_refs=tuple(live_input_refs))
         def_ref = saved.get("definition_ref") if isinstance(saved, dict) else None
         def_msg_id = def_ref.get("message_id") if isinstance(def_ref, dict) else None
 
@@ -1270,10 +1300,13 @@ async def run_driver(worker, ctx, env):
         if run_id:
             seen_late.add(run_id)
         for rec in plain_late_records:
+            rec_chain: list[str] = []
             for mid in await _resolve_input_chain_ids(port, ctx.store_id, ctx.session_id, rec):
                 if mid not in seen_late:
                     seen_late.add(mid)
-                    plain_late_ids.append(mid)
+                    rec_chain.append(mid)
+            if rec_chain:
+                plain_late_chains.append((rec.ref.message_id, tuple(rec_chain)))
 
     # Filter out non-resume run roots when aggregate was already delivered (pure late batch)
     runnable_formal = [
@@ -1285,7 +1318,7 @@ async def run_driver(worker, ctx, env):
             executor = DurableExecutor(worker, ctx, env, run_id, saved)
             await executor._consume_results()
             return await _finish_late(worker, ctx, list(ctx.batch.input_refs))
-        if not formal_items and not plain_late_ids:
+        if not formal_items and not plain_late_chains:
             raise RuntimeRequestError("workflow_origin_missing")
         # Non-delivered fallback (e.g. unexpected non-start input before first delivery)
         fallback_rec = await port.input(port.db, ctx.batch.input_refs[-1])
@@ -1348,7 +1381,7 @@ async def run_driver(worker, ctx, env):
             worker, ctx, saved, origin_0, result_dict,
             drain_node_results=aborted_early,
             consumed=consumed_refs,
-            extra_late_ids=tuple(plain_late_ids),
+            extra_late_chains=tuple(plain_late_chains),
         )
     finally:
         port.unregister_driver_waiter(ctx.session_id)

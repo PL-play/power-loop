@@ -3317,7 +3317,8 @@ class RuntimeInputStore:
                 f"UPDATE {self.q} SET status='delivered',terminal_status=?,cancel_by=?,result_seq=?,"
                 "result_send_index=?,result_json=?,error_code=?,error_detail=?,"
                 f"result_delivery_error=?,completed_at={now_sql} "
-                f"WHERE session_id=? AND item_id IN ({ph}) AND terminal_status IS NULL",
+                f"WHERE session_id=? AND item_id IN ({ph}) "
+                "AND status IN ('delivered','waiting_continuation') AND terminal_status IS NULL",
                 (
                     effective_status,
                     effective_cancel_by if effective_status == "cancelled" else None,
@@ -4288,57 +4289,85 @@ class RuntimeInputStore:
             delivery_error = None
             result_ref = None
             activations: list[TargetRef] = []
-            settled_refs: list[InputRef] = []
-            agg_final: dict[str, Any] | None = None
+            settled_results: list[Result] = []
+            seen_result_refs: set[InputRef] = set()
             if origins:
                 primary = await self._select_workflow_origin_tx(tx, own_state, origins)
-                root = await self._continuation_root(tx, primary)
-                is_driver_run = self._is_driver_run_input(own_state, root)
-                if is_driver_run:
-                    agg_final = await self._close_workflow_run_journal_tx(
-                        tx, own_state, primary_ref=primary.ref, root_ref=root.ref, cby=cby, reason=reason,
-                        database_now=database_now,
-                    )
-                res_json_str = canonical(agg_final) if agg_final is not None else None
                 route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
-                if is_driver_run and route is not None:
-                    cancelled_res = Result(
-                        root.ref, target, "cancelled", active, None,
-                        structured_output=agg_final,
-                        error=reason, error_code="cancelled", cancel_by=cby,
-                    )
-                    result_ref, delivery_error = await self._river_deliver_tx(
-                        tx,
-                        child_target=target,
-                        child_tenant_id=own_state["tenant_id"],
-                        child_principal_id=own_state["principal_id"],
-                        parent_session_id=route["target"]["session_id"],
-                        start_ref=root.ref,
-                        result=cancelled_res,
-                        result_kind=route["result_kind"],
-                        child_wake=0 if cby == "subtree" else 1,
-                        activations=activations,
-                        _driver_events_out=driver_events_out,
-                    )
-                    if delivery_error is not None:
-                        undeliverable_out.append((
-                            target,
-                            route["target"]["session_id"],
-                            replace(cancelled_res, result_delivery_error=delivery_error),
-                            route["result_kind"],
-                            delivery_error,
-                        ))
-                await tx.execute(
-                    f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
-                    "result_send_index=?,result_json=?,error_code='cancelled',error_detail=?,"
-                    "result_delivery_error=?,completed_at=? WHERE session_id=? "
-                    "AND delivered_send_index=? AND terminal_status IS NULL",
-                    (cby, active, res_json_str, reason, delivery_error, database_now, sid, active),
-                )
-                ancestors: list[str] = []
-                seen_anc: set[str] = set()
-                for orig in origins:
-                    settled_refs.append(orig.ref)
+                # Process primary first, then any remaining co-claimed origins (only possible on
+                # whole-session/subtree cancel or close; single-input cancel already restored others).
+                ordered_origins = [
+                    primary, *(o for o in origins if o.ref.message_id != primary.ref.message_id),
+                ]
+                for orig in ordered_origins:
+                    is_primary = orig.ref.message_id == primary.ref.message_id
+                    orig_root = await self._continuation_root(tx, orig)
+                    orig_is_run = self._is_driver_run_input(own_state, orig_root)
+                    orig_agg: dict[str, Any] | None = None
+                    if orig_is_run:
+                        orig_agg = await self._close_workflow_run_journal_tx(
+                            tx, own_state, primary_ref=orig.ref, root_ref=orig_root.ref,
+                            cby=cby, reason=reason, database_now=database_now,
+                        )
+                    orig_res_json = canonical(orig_agg) if orig_agg is not None else None
+                    orig_ref, orig_deliv_err = None, None
+                    orig_send_idx = active if is_primary else None
+                    if orig_is_run and route is not None:
+                        cancelled_res = Result(
+                            orig_root.ref, target, "cancelled", orig_send_idx, None,
+                            structured_output=orig_agg,
+                            error=reason, error_code="cancelled", cancel_by=cby,
+                        )
+                        orig_ref, orig_deliv_err = await self._river_deliver_tx(
+                            tx,
+                            child_target=target,
+                            child_tenant_id=own_state["tenant_id"],
+                            child_principal_id=own_state["principal_id"],
+                            parent_session_id=route["target"]["session_id"],
+                            start_ref=orig_root.ref,
+                            result=cancelled_res,
+                            result_kind=route["result_kind"],
+                            child_wake=0 if cby == "subtree" else 1,
+                            activations=activations,
+                            _driver_events_out=driver_events_out,
+                        )
+                        if orig_deliv_err is not None:
+                            undeliverable_out.append((
+                                target,
+                                route["target"]["session_id"],
+                                replace(cancelled_res, result_delivery_error=orig_deliv_err),
+                                route["result_kind"],
+                                orig_deliv_err,
+                            ))
+                    if is_primary:
+                        result_ref = orig_ref
+                        delivery_error = orig_deliv_err
+                    if is_primary:
+                        await tx.execute(
+                            f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
+                            "result_send_index=?,result_json=?,error_code='cancelled',error_detail=?,"
+                            "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                            "AND item_id=? AND delivered_send_index=? AND terminal_status IS NULL",
+                            (
+                                cby, active, orig_res_json, reason, orig_deliv_err,
+                                database_now, sid, orig.ref.message_id, active,
+                            ),
+                        )
+                    else:
+                        await tx.execute(
+                            f"UPDATE {self.q} SET status='void',delivered_at=NULL,delivered_seq=NULL,"
+                            "delivered_send_index=NULL,terminal_status='cancelled',cancel_by=?,"
+                            "result_send_index=NULL,result_json=?,error_code='cancelled',error_detail=?,"
+                            "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                            "AND item_id=? AND delivered_send_index=? AND terminal_status IS NULL",
+                            (
+                                cby, orig_res_json, reason, orig_deliv_err,
+                                database_now, sid, orig.ref.message_id, active,
+                            ),
+                        )
+                    orig_refs: list[InputRef] = [orig.ref]
+                    ancestors: list[str] = []
+                    seen_anc: set[str] = {orig.ref.message_id}
                     current = orig
                     while current.row["continuation_of"] is not None:
                         anc_id = current.row["continuation_of"]
@@ -4351,14 +4380,36 @@ class RuntimeInputStore:
                             break
                         seen_anc.add(anc_id)
                         ancestors.append(anc_id)
-                        settled_refs.append(current.ref)
-                if ancestors:
+                        orig_refs.append(current.ref)
+                    if ancestors:
+                        aph = ",".join("?" for _ in ancestors)
+                        await tx.execute(
+                            f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
+                            "result_send_index=?,result_json=?,error_code='cancelled',error_detail=?,"
+                            "result_delivery_error=?,completed_at=? WHERE session_id=? "
+                            f"AND item_id IN ({aph}) AND terminal_status IS NULL",
+                            (
+                                cby, orig_send_idx, orig_res_json, reason, orig_deliv_err,
+                                database_now, sid, *ancestors,
+                            ),
+                        )
+                    for ref in orig_refs:
+                        if ref not in seen_result_refs:
+                            seen_result_refs.add(ref)
+                            settled_results.append(Result(
+                                ref, target, "cancelled", orig_send_idx, None,
+                                structured_output=orig_agg,
+                                error=reason, error_code="cancelled",
+                                result_delivery_error=orig_deliv_err,
+                                cancel_by=cby,
+                            ))
+                if len(origins) < len(rows):
                     await tx.execute(
                         f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"
-                        "result_send_index=?,result_json=?,error_code='cancelled',error_detail=?,"
-                        "result_delivery_error=?,completed_at=? WHERE session_id=? "
-                        f"AND item_id IN ({','.join('?' for _ in ancestors)})",
-                        (cby, active, res_json_str, reason, delivery_error, database_now, sid, *ancestors),
+                        "result_send_index=?,error_code='cancelled',error_detail=?,"
+                        "completed_at=? WHERE session_id=? "
+                        "AND delivered_send_index=? AND terminal_status IS NULL",
+                        (cby, active, reason, database_now, sid, active),
                     )
             w_drain, p_drain, b_drain = await self._drain_pending_driver_node_results_tx(
                 tx, sid, active,
@@ -4386,17 +4437,8 @@ class RuntimeInputStore:
             )
             if changed != 1:
                 raise SessionLeaseLost(sid)
-            results = tuple(
-                Result(
-                    ref, target, "cancelled", active, None,
-                    structured_output=agg_final,
-                    error=reason, error_code="cancelled", result_delivery_error=delivery_error,
-                    cancel_by=cby,
-                )
-                for ref in dict.fromkeys(settled_refs)
-            )
             return FinalBatch(
-                next_state, results, result_ref,
+                next_state, tuple(settled_results), result_ref,
                 activations[0] if activations else None, delivery_error,
             )
 
@@ -5367,16 +5409,34 @@ class RuntimeInputStore:
                 (sid, active_si),
             )
             del_origins = [self.record(r) for r in del_rows]
+            restore_others: list[InputRecord] = []
             if len(del_origins) > 1:
                 primary = await self._select_workflow_origin_tx(tx, state, del_origins)
                 primary_root = await self._continuation_root(tx, primary)
                 if primary_root.ref.message_id != root.ref.message_id:
                     is_deferred_secondary = True
+                else:
+                    restore_others = [
+                        o for o in del_origins if o.ref.message_id != primary.ref.message_id
+                    ]
             if not is_deferred_secondary:
+                w_add = sum(int(o.row["wake"]) for o in restore_others)
+                c_add = len(restore_others)
+                b_add = sum(int(o.row["content_bytes"]) for o in restore_others)
+                if restore_others:
+                    oph = ",".join("?" for _ in restore_others)
+                    await tx.execute(
+                        f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+                        "delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
+                        f"AND delivered_send_index=? AND terminal_status IS NULL AND item_id IN ({oph})",
+                        (sid, active_si, *(o.ref.message_id for o in restore_others)),
+                    )
                 await tx.execute(
                     f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
-                    f"updated_at={now_sql} WHERE session_id=? AND execution_state='running'",
-                    (cancel_by, reason, sid),
+                    "wake_pending_count=wake_pending_count+?,pending_count=pending_count+?,"
+                    f"pending_bytes=pending_bytes+?,updated_at={now_sql} "
+                    "WHERE session_id=? AND execution_state='running'",
+                    (cancel_by, reason, w_add, c_add, b_add, sid),
                 )
                 return Receipt(
                     record.ref, target, record.ref.message_id, False, "cancel_requested",

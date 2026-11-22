@@ -4658,3 +4658,204 @@ async def test_stage2_r4_b1_2_cancelled_continuation_chain_second_lease_expiry_c
         await client.aclose()
         await rt_helper.loop.aclose()
         await rt_helper.runtime.client.aclose()
+
+
+async def test_stage2_r5_cancel_first_of_two_co_claimed_resumes_before_prepare_takeover_runs_second(
+    registry_store,
+):
+    """Stage2-R5: Two resumes co-claimed before prepare -> cancel(first) -> real lease expiry -> 1st cancelled, 2nd runs."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    seen_prompts: list[str] = []
+
+    class R5Model(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                seen_prompts.append(latest)
+                return LLMResponse(raw_text=f"A-r5-{len(seen_prompts)}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, R5Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r5-wf", "root": leaf("A")},
+            message_id="s2-r5-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and len(seen_prompts) == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(
+            node_id="A", message="r5-first-cancelled", message_id="s2-r5-res-1",
+        )
+        res_h2 = await handle_on_client.resume(
+            node_id="A", message="r5-second-runs", message_id="s2-r5-res-2",
+        )
+
+        # Old holder claims BOTH explicit resumes in send_index=2 with a short real lease before prepare!
+        b2 = await port.claim(handle.target, node_id="dead-r5", boot_id="b-dead", ttl_s=0.1)
+        assert b2 is not None and b2.send_index == 2
+        assert [r.message_id for r in b2.input_refs] == ["s2-r5-res-1", "s2-r5-res-2"]
+
+        # Public single-input cancel ONLY on the 1st resume handle
+        c_rcpt = await res_h1.cancel(reason="cancel first resume only")
+        assert c_rcpt.state == "cancel_requested", c_rcpt
+
+        # Let the real DB lease expire naturally, then take over via healthy recover()
+        await asyncio.sleep(0.25)
+        rec = await port.recover(handle.target, node_id="healthy-rec", boot_id="hb-rec")
+        assert rec is not None and rec.execution_state == "queued", rec
+
+        # 1st resume is truthfully cancelled/user with its exact reason; 2nd is STILL pending (NOT cancelled!)
+        r1_insp = await client.inspect(res_h1.input_ref, actor=rt1.actor)
+        assert r1_insp.terminal_status == "cancelled", r1_insp
+        r1_res = await port.get_result(res_h1.input_ref, actor=rt1.actor)
+        assert r1_res is not None and r1_res.status == "cancelled" and r1_res.cancel_by == "user"
+        assert r1_res.error == "cancel first resume only"
+        r1_wf = await res_h1.wait(deadline_ms=now_ms() + 5000)
+        assert r1_wf.status == "cancelled" and r1_wf.cancel_by == "user"
+
+        r2_insp = await client.inspect(res_h2.input_ref, actor=rt1.actor)
+        assert r2_insp.input_state == "pending" and r2_insp.terminal_status is None and r2_insp.reason is None, r2_insp
+        assert await port.get_result(res_h2.input_ref, actor=rt1.actor) is None
+        drv_mid = await _assert_session_counts_match_pending(store._db, store, handle.target.session_id)
+        assert drv_mid["execution_state"] == "queued" and drv_mid["wake_pending_count"] == 1
+
+        # Healthy Worker runs periodic_tick -> claims and executes 2nd resume to full completion!
+        rt2 = await RunningAgent(
+            store, R5Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        r2_wf = await res_h2.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+        assert r2_wf.status == "completed" and "A" in r2_wf.results
+        assert "r5-second-runs" in r2_wf.results["A"].text
+        assert len(seen_prompts) == 2 and all("r5-first-cancelled" not in p for p in seen_prompts)
+
+        drv_end = await _assert_session_counts_match_pending(store._db, store, handle.target.session_id)
+        assert drv_end["execution_state"] == "idle" and drv_end["wake_pending_count"] == 0
+
+        # Main received 3 distinct receipts matching exact input & terminal status
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        by_in = {json.loads(r["content_json"])["input_ref"]["message_id"]: json.loads(r["content_json"]) for r in main_rcpts}
+        assert set(by_in.keys()) == {handle.input_ref.message_id, "s2-r5-res-1", "s2-r5-res-2"}
+        assert by_in["s2-r5-res-1"]["status"] == "cancelled" and by_in["s2-r5-res-1"]["cancel_by"] == "user"
+        assert by_in["s2-r5-res-1"]["error"] == "cancel first resume only"
+        assert by_in["s2-r5-res-2"]["status"] == "completed" and "r5-second-runs" in by_in["s2-r5-res-2"]["final_text"]
+    finally:
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_r5_whole_session_stop_two_co_claimed_resumes_before_prepare_cancels_both(
+    registry_store,
+):
+    """Stage2-R5 contrast: Whole-session stop on two co-claimed resumes before prepare -> takeover cancels both with distinct receipts."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    a_calls = 0
+
+    class R5WholeModel(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal a_calls
+            if req.system_prompt.startswith("A"):
+                a_calls += 1
+                return LLMResponse(raw_text=f"A-whole-{a_calls}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, R5WholeModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r5w-wf", "root": leaf("A")},
+            message_id="s2-r5w-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and a_calls == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(
+            node_id="A", message="r5w-first", message_id="s2-r5w-res-1",
+        )
+        res_h2 = await handle_on_client.resume(
+            node_id="A", message="r5w-second", message_id="s2-r5w-res-2",
+        )
+
+        b2 = await port.claim(handle.target, node_id="dead-r5w", boot_id="b-dead", ttl_s=0.1)
+        assert b2 is not None and b2.send_index == 2
+        assert [r.message_id for r in b2.input_refs] == ["s2-r5w-res-1", "s2-r5w-res-2"]
+
+        c_rcpt = await client.cancel(handle.target, actor=rt1.actor, scope="self", reason="stop whole driver")
+        assert c_rcpt.state == "cancel_requested", c_rcpt
+
+        await asyncio.sleep(0.25)
+        rec = await port.recover(handle.target, node_id="healthy-rec", boot_id="hb-rec")
+        assert rec is not None and rec.execution_state == "idle", rec
+        assert a_calls == 1
+
+        for h in (res_h1, res_h2):
+            stored = await port.get_result(h.input_ref, actor=rt1.actor)
+            assert stored is not None and stored.status == "cancelled" and stored.cancel_by == "user"
+            assert stored.error == "stop whole driver"
+            wres = await h.wait(deadline_ms=now_ms() + 5000)
+            assert wres.status == "cancelled" and wres.cancel_by == "user"
+
+        drv_end = await _assert_session_counts_match_pending(store._db, store, handle.target.session_id)
+        assert drv_end["execution_state"] == "idle" and drv_end["wake_pending_count"] == 0
+
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        assert len({r["item_id"] for r in main_rcpts}) == 3
+        by_in = {json.loads(r["content_json"])["input_ref"]["message_id"]: json.loads(r["content_json"]) for r in main_rcpts}
+        assert set(by_in.keys()) == {handle.input_ref.message_id, "s2-r5w-res-1", "s2-r5w-res-2"}
+        for mid in ("s2-r5w-res-1", "s2-r5w-res-2"):
+            assert by_in[mid]["status"] == "cancelled" and by_in[mid]["cancel_by"] == "user"
+            assert by_in[mid]["error"] == "stop whole driver"
+    finally:
+        await client.aclose()
+        await rt1.aclose()
