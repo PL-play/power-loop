@@ -4342,6 +4342,8 @@ class RuntimeInputStore:
                     if is_primary:
                         result_ref = orig_ref
                         delivery_error = orig_deliv_err
+                    elif orig_ref is not None and result_ref is None:
+                        result_ref = orig_ref
                     if is_primary:
                         await tx.execute(
                             f"UPDATE {self.q} SET status='delivered',terminal_status='cancelled',cancel_by=?,"

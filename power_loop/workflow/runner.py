@@ -902,9 +902,57 @@ async def _requeue_deferred_inputs_tx(port, tx, sid: str, send_index: int, reque
     )
 
 
+async def _finalize_cancelled_driver_batch_tx(port, tx, state, ctx):
+    """Settle an already-cancelled driver batch inside an existing locked-state transaction."""
+    undeliverables: list[tuple[Any, str, Any, str, str]] = []
+    driver_events_out: list[tuple[str, str, dict[str, Any]]] = []
+    eff_state = state
+    if eff_state["cancel_by"] is None and eff_state["lifecycle"] not in ("closing", "closed"):
+        eff_state = dict(eff_state)
+        eff_state["cancel_by"] = ctx.cancel_by or ctx.batch.cancel_by or "user"
+        if eff_state.get("cancel_reason") is None:
+            eff_state["cancel_reason"] = ctx.stop.reason or "cancelled"
+    final_batch = await port._recover_workflow_tx(
+        tx,
+        eff_state,
+        ctx.batch.target,
+        int(ctx.send_index),
+        int(ctx.batch.owner_epoch),
+        await port._db_now(tx),
+        undeliverables,
+        driver_events_out,
+    )
+    return final_batch, undeliverables, driver_events_out
+
+
+async def _flush_cancelled_driver_post_commit(port, undeliverables, driver_events_out) -> None:
+    for drv_sid, item_id, payload in driver_events_out:
+        port._push_driver_leaf_result(drv_sid, item_id, payload)
+    for c_target, p_sid, r_res, r_kind, r_reason in undeliverables:
+        await port._fire_result_undeliverable(
+            child_target=c_target,
+            parent_session_id=p_sid,
+            result=r_res,
+            result_kind=r_kind,
+            reason=r_reason,
+        )
+
+
+def _driver_batch_cancelled_in_state(state, ctx) -> bool:
+    return (
+        int(state["cancel_seq"]) > int(ctx.batch.cancel_seq)
+        or state["lifecycle"] in ("closing", "closed")
+        or bool(ctx.batch.reclaimed_cancelled)
+        or ctx.batch.cancel_by is not None
+        or ctx.stop.is_cancelled()
+    )
+
+
 async def _prepare_explicit(worker, ctx, saved, origin, options, *, requeue_ids: tuple[str, ...] = ()):
     from .continuation import plan_continuation
 
+    if getattr(ctx, "ownership", None) is not None and ctx.ownership.lost:
+        raise SessionLeaseLost(ctx.session_id)
     port = worker.inputs
     spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
     plan = plan_continuation(spec, options["node_id"])
@@ -921,6 +969,9 @@ async def _prepare_explicit(worker, ctx, saved, origin, options, *, requeue_ids:
         "invalidated": sorted(plan.invalidated),
         "revision": revision,
     }
+    cancelled_batch = None
+    undeliverables: list[tuple[Any, str, Any, str, str]] = []
+    driver_events_out: list[tuple[str, str, dict[str, Any]]] = []
     async with port.db.transaction() as tx:
         state = await port.store._db.dialect.lock_state(tx, port.s, ctx.session_id)
         if (
@@ -929,28 +980,36 @@ async def _prepare_explicit(worker, ctx, saved, origin, options, *, requeue_ids:
             or int(state["owner_epoch"]) != int(ctx.batch.owner_epoch)
         ):
             raise SessionLeaseLost(ctx.session_id)
-        if requeue_ids:
-            await _requeue_deferred_inputs_tx(port, tx, ctx.session_id, ctx.send_index, requeue_ids)
-        to_write: list[tuple[str, dict[str, Any]]] = []
-        for entry in entries:
-            if entry["path"] in plan.invalidated:
-                entry["superseded"] = True
-                key = journal.node_key(
-                    TargetRef(ctx.store_id, ctx.session_id), saved["run_id"],
-                    entry["path"], entry["iteration"], entry["attempt"], entry["continuation_index"],
-                )
-                to_write.append((key, entry))
-        saved.update(
-            continuation=continuation,
-            execution_revision=revision,
-            definition_ref=plain(origin.ref),
-            status="running",
-            cancel_by=None,
-            aggregate_delivered=False,
-        )
-        to_write.append((journal.run_key(saved["run_id"]), saved))
-        await journal.put_many(port.store, tx, ctx.session_id, to_write)
-    return saved
+        if _driver_batch_cancelled_in_state(state, ctx):
+            cancelled_batch, undeliverables, driver_events_out = (
+                await _finalize_cancelled_driver_batch_tx(port, tx, state, ctx)
+            )
+        else:
+            if requeue_ids:
+                await _requeue_deferred_inputs_tx(port, tx, ctx.session_id, ctx.send_index, requeue_ids)
+            to_write: list[tuple[str, dict[str, Any]]] = []
+            for entry in entries:
+                if entry["path"] in plan.invalidated:
+                    entry["superseded"] = True
+                    key = journal.node_key(
+                        TargetRef(ctx.store_id, ctx.session_id), saved["run_id"],
+                        entry["path"], entry["iteration"], entry["attempt"], entry["continuation_index"],
+                    )
+                    to_write.append((key, entry))
+            saved.update(
+                continuation=continuation,
+                execution_revision=revision,
+                definition_ref=plain(origin.ref),
+                status="running",
+                cancel_by=None,
+                aggregate_delivered=False,
+            )
+            to_write.append((journal.run_key(saved["run_id"]), saved))
+            await journal.put_many(port.store, tx, ctx.session_id, to_write)
+    if cancelled_batch is not None:
+        await _flush_cancelled_driver_post_commit(port, undeliverables, driver_events_out)
+        return saved, cancelled_batch
+    return saved, None
 
 
 async def _resolve_input_chain_ids(port, store_id: str, session_id: str, origin: InputRecord) -> list[str]:
@@ -1348,10 +1407,17 @@ async def run_driver(worker, ctx, env):
         resume_opts_0 is not None and saved.get("definition_ref") != plain(resume_origin_0.ref)
     )
     if need_prepare:
-        saved = await _prepare_explicit(
+        saved, cancelled_batch = await _prepare_explicit(
             worker, ctx, saved, resume_origin_0, resume_opts_0, requeue_ids=deferred_formal_ids,
         )
+        if cancelled_batch is not None:
+            return cancelled_batch
     elif deferred_formal_ids:
+        if getattr(ctx, "ownership", None) is not None and ctx.ownership.lost:
+            raise SessionLeaseLost(ctx.session_id)
+        cancelled_batch = None
+        undeliverables: list[tuple[Any, str, Any, str, str]] = []
+        driver_events_out: list[tuple[str, str, dict[str, Any]]] = []
         async with port.db.transaction() as tx:
             state = await port.store._db.dialect.lock_state(tx, port.s, ctx.session_id)
             if (
@@ -1360,7 +1426,17 @@ async def run_driver(worker, ctx, env):
                 or int(state["owner_epoch"]) != int(ctx.batch.owner_epoch)
             ):
                 raise SessionLeaseLost(ctx.session_id)
-            await _requeue_deferred_inputs_tx(port, tx, ctx.session_id, ctx.send_index, deferred_formal_ids)
+            if _driver_batch_cancelled_in_state(state, ctx):
+                cancelled_batch, undeliverables, driver_events_out = (
+                    await _finalize_cancelled_driver_batch_tx(port, tx, state, ctx)
+                )
+            else:
+                await _requeue_deferred_inputs_tx(
+                    port, tx, ctx.session_id, ctx.send_index, deferred_formal_ids,
+                )
+        if cancelled_batch is not None:
+            await _flush_cancelled_driver_post_commit(port, undeliverables, driver_events_out)
+            return cancelled_batch
     if deferred_formal_ids:
         # Deferred resumes are already back in status='pending' (tracked by wake_pending_count),
         # so drop them from ctx.batch.input_refs: if cancelled/voided mid-flight, port.final sees

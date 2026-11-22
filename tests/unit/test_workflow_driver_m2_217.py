@@ -4859,3 +4859,244 @@ async def test_stage2_r5_whole_session_stop_two_co_claimed_resumes_before_prepar
     finally:
         await client.aclose()
         await rt1.aclose()
+
+
+@pytest.mark.parametrize("stop_scope", ["subtree", "self"])
+async def test_stage2_r6_whole_session_stop_before_prepare_live_worker_cancels_both_co_claimed_resumes(
+    registry_store, stop_scope,
+):
+    """Stage2-R6: Live Worker claims two resumes together -> paused before prepare -> stop Driver -> BOTH cancelled, 0 leaf calls."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow import runner as wf_runner
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    a_calls = 0
+
+    class R6WholeLiveModel(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal a_calls
+            if req.system_prompt.startswith("A"):
+                a_calls += 1
+                return LLMResponse(raw_text=f"A-r6-{stop_scope}-{a_calls}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, R6WholeLiveModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    orig_prepare = wf_runner._prepare_explicit
+    entered_prepare = asyncio.Event()
+    release_prepare = asyncio.Event()
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": f"s2-r6-{stop_scope}-wf", "root": leaf("A")},
+            message_id=f"s2-r6-{stop_scope}-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and a_calls == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        res1_id = f"s2-r6-{stop_scope}-res-1"
+        res2_id = f"s2-r6-{stop_scope}-res-2"
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(node_id="A", message="r6-first", message_id=res1_id)
+        res_h2 = await handle_on_client.resume(node_id="A", message="r6-second", message_id=res2_id)
+
+        async def _gated_prepare(worker_arg, ctx_arg, *args, **kwargs):
+            if ctx_arg.session_id == handle.target.session_id and ctx_arg.send_index == 2:
+                entered_prepare.set()
+                await release_prepare.wait()
+            return await orig_prepare(worker_arg, ctx_arg, *args, **kwargs)
+
+        wf_runner._prepare_explicit = _gated_prepare
+
+        rt2 = await RunningAgent(
+            store, R6WholeLiveModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        claimed_batches: list[tuple[int, list[str]]] = []
+        orig_claim = rt2.runtime.worker.inputs.claim
+
+        async def _spy_claim(target_arg, *args, **kwargs):
+            b = await orig_claim(target_arg, *args, **kwargs)
+            if b is not None and target_arg.session_id == handle.target.session_id:
+                claimed_batches.append((int(b.send_index), [r.message_id for r in b.input_refs]))
+            return b
+
+        rt2.runtime.worker.inputs.claim = _spy_claim
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        await asyncio.wait_for(entered_prepare.wait(), 5)
+        assert claimed_batches == [(2, [res1_id, res2_id])], claimed_batches
+
+        # Verify BOTH resumes are delivered in send_index=2 before prepare runs
+        pre_rows = await store._db.fetchall(
+            f"SELECT item_id,status,delivered_send_index,terminal_status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id IN (?,?) ORDER BY id ASC",
+            (handle.target.session_id, res1_id, res2_id),
+        )
+        assert [
+            (r["item_id"], r["status"], int(r["delivered_send_index"]), r["terminal_status"])
+            for r in pre_rows
+        ] == [(res1_id, "delivered", 2, None), (res2_id, "delivered", 2, None)]
+
+        # Stop whole Driver via public API while live Worker is paused before prepare
+        stop_reason = f"stop driver {stop_scope} live"
+        c_rcpt = await client.cancel(handle.target, actor=rt1.actor, scope=stop_scope, reason=stop_reason)
+        assert c_rcpt.state == "cancel_requested", c_rcpt
+
+        release_prepare.set()
+        w1 = await res_h1.wait(deadline_ms=now_ms() + 10000)
+        w2 = await res_h2.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        assert a_calls == 1
+        assert claimed_batches == [(2, [res1_id, res2_id])], claimed_batches
+        assert w1.status == "cancelled" and w1.cancel_by == "user", w1
+        assert w2.status == "cancelled" and w2.cancel_by == "user", w2
+        for h in (res_h1, res_h2):
+            stored = await port.get_result(h.input_ref, actor=rt1.actor)
+            assert stored is not None and stored.status == "cancelled" and stored.cancel_by == "user"
+            assert stored.error == stop_reason
+
+        drv_end = await _assert_session_counts_match_pending(store._db, store, handle.target.session_id)
+        assert drv_end["execution_state"] == "idle" and drv_end["wake_pending_count"] == 0
+
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        assert len({r["item_id"] for r in main_rcpts}) == 3
+        by_in = {
+            json.loads(r["content_json"])["input_ref"]["message_id"]: (int(r["wake"]), json.loads(r["content_json"]))
+            for r in main_rcpts
+        }
+        assert set(by_in.keys()) == {handle.input_ref.message_id, res1_id, res2_id}
+        for mid in (res1_id, res2_id):
+            w_val, body = by_in[mid]
+            assert w_val == 1 and body["status"] == "cancelled" and body["cancel_by"] == "user"
+            assert body["error"] == stop_reason
+    finally:
+        release_prepare.set()
+        wf_runner._prepare_explicit = orig_prepare
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_r6_single_input_cancel_before_prepare_live_worker_runs_second_co_claimed_resume(
+    registry_store,
+):
+    """Stage2-R6 contrast: Live Worker claims two resumes together -> cancel ONLY 1st before prepare -> 1st cancelled, 2nd runs."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow import runner as wf_runner
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    seen_prompts: list[str] = []
+
+    class R6SingleLiveModel(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                seen_prompts.append(latest)
+                return LLMResponse(raw_text=f"A-r6s-{len(seen_prompts)}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, R6SingleLiveModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    orig_prepare = wf_runner._prepare_explicit
+    entered_prepare = asyncio.Event()
+    release_prepare = asyncio.Event()
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r6s-wf", "root": leaf("A")},
+            message_id="s2-r6s-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and len(seen_prompts) == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(node_id="A", message="r6-live-first", message_id="s2-r6s-res-1")
+        res_h2 = await handle_on_client.resume(node_id="A", message="r6-live-second", message_id="s2-r6s-res-2")
+
+        async def _gated_prepare(worker_arg, ctx_arg, *args, **kwargs):
+            if ctx_arg.session_id == handle.target.session_id and ctx_arg.send_index == 2:
+                entered_prepare.set()
+                await release_prepare.wait()
+            return await orig_prepare(worker_arg, ctx_arg, *args, **kwargs)
+
+        wf_runner._prepare_explicit = _gated_prepare
+
+        rt2 = await RunningAgent(
+            store, R6SingleLiveModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        await asyncio.wait_for(entered_prepare.wait(), 5)
+        c_rcpt = await res_h1.cancel(reason="cancel first only live")
+        assert c_rcpt.state == "cancel_requested", c_rcpt
+
+        release_prepare.set()
+        w1 = await res_h1.wait(deadline_ms=now_ms() + 10000)
+        w2 = await res_h2.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        assert w1.status == "cancelled" and w1.cancel_by == "user", w1
+        stored1 = await port.get_result(res_h1.input_ref, actor=rt1.actor)
+        assert stored1 is not None and stored1.error == "cancel first only live"
+        assert w2.status == "completed" and "A" in w2.results and "r6-live-second" in w2.results["A"].text
+        assert len(seen_prompts) == 2 and all("r6-live-first" not in p for p in seen_prompts)
+
+        drv_end = await _assert_session_counts_match_pending(store._db, store, handle.target.session_id)
+        assert drv_end["execution_state"] == "idle" and drv_end["wake_pending_count"] == 0
+
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        by_in = {
+            json.loads(r["content_json"])["input_ref"]["message_id"]: (int(r["wake"]), json.loads(r["content_json"]))
+            for r in main_rcpts
+        }
+        assert set(by_in.keys()) == {handle.input_ref.message_id, "s2-r6s-res-1", "s2-r6s-res-2"}
+        assert by_in["s2-r6s-res-1"][1]["status"] == "cancelled" and by_in["s2-r6s-res-1"][1]["error"] == "cancel first only live"
+        assert by_in["s2-r6s-res-2"][1]["status"] == "completed" and "r6-live-second" in by_in["s2-r6s-res-2"][1]["final_text"]
+    finally:
+        release_prepare.set()
+        wf_runner._prepare_explicit = orig_prepare
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
