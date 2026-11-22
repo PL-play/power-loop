@@ -4184,7 +4184,9 @@ class RuntimeInputStore:
         """
         for o in reversed(origins):
             if o.row["kind"] == "workflow_continue":
-                return o
+                root = await self._continuation_root(tx, o)
+                if self._is_driver_run_input(own_state, root):
+                    return o
         start_id = own_state["start_input_message_id"]
         if start_id is not None:
             for o in origins:

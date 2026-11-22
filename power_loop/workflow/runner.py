@@ -565,6 +565,16 @@ class DurableExecutor:
         for drv_sid, item_id, payload in driver_events:
             self.port._push_driver_leaf_result(drv_sid, item_id, payload)
 
+    def _is_leaf_local_pending_or_active(self, leaf_sid: str) -> bool:
+        """True when this Worker owns or is actively draining the local queue for ``leaf_sid``."""
+        if leaf_sid in self.worker._active or leaf_sid in self.worker._pending:
+            return True
+        if not self.worker.runtime.shared_execution and (
+            self.worker._active_llm_count() > 0 or bool(self.worker._pending)
+        ):
+            return True
+        return False
+
     async def _wait_resident_node_result(self, key: str, start: InputRef, target: TargetRef) -> dict[str, Any]:
         """Wait for a leaf result: 0 DB reads in-process; 1 indexed SELECT on cross-process wake."""
         assert self._waiter_sig is not None and self._nodes is not None
@@ -599,6 +609,10 @@ class DurableExecutor:
             try:
                 await asyncio.wait_for(self._waiter_sig.wait(), timeout=0.25)
             except TimeoutError:
+                # Same-process leaf still executing or queued locally: 0 extra DB reads!
+                # When it commits Final, RuntimeInputStore pushes directly to _waiter_q & sets _waiter_sig.
+                if self._is_leaf_local_pending_or_active(target.session_id):
+                    continue
                 idle_polls += 1
                 # Fallback for cross-process DatabasePollingTransport / lost hints or full inbox
                 found = await self._pull_remote_pending_results(
@@ -919,6 +933,30 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_
             current = parent_rec
 
     root_id = chain_ids[-1]
+    chain_id_set = set(chain_ids)
+    # If non-origin plain late inputs (or their continuation chains, e.g., [wfc_late, late_plain])
+    # were merged into the same batch as a real run/resume, settle those late chains locally in the
+    # same Final transaction without touching start_input_message_id or attaching aggregate result_json.
+    extra_late_ids: list[str] = []
+    if len(ctx.batch.input_refs) > 1:
+        seen_late: set[str] = set(chain_id_set)
+        if ctx.batch.start_input_message_id is not None:
+            seen_late.add(ctx.batch.start_input_message_id)
+        for ref in ctx.batch.input_refs:
+            if ref.message_id in seen_late:
+                continue
+            rec = await port.input(port.db, ref)
+            if rec is None or rec.row["kind"] not in {"user", "workflow_continue"}:
+                continue
+            cur = rec
+            while cur is not None and cur.ref.message_id not in seen_late:
+                seen_late.add(cur.ref.message_id)
+                extra_late_ids.append(cur.ref.message_id)
+                parent_mid = cur.row.get("continuation_of")
+                if parent_mid is None:
+                    break
+                cur = await port.input(port.db, InputRef(ctx.store_id, ctx.session_id, parent_mid))
+
     batch_for_final = ctx.batch
     if ctx.cancel_by is not None and batch_for_final.cancel_by is None:
         batch_for_final = replace(batch_for_final, cancel_by=ctx.cancel_by)
@@ -950,6 +988,14 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_
             last_input_ref=plain(origin.ref),
         )
         await journal.put(port.store, tx, ctx.session_id, journal.run_key(saved["run_id"]), saved)
+        if extra_late_ids:
+            ep = ",".join("?" for _ in extra_late_ids)
+            await tx.execute(
+                f"UPDATE {port.q} SET status='delivered',terminal_status='completed',"
+                "result_send_index=?,completed_at=? "
+                f"WHERE session_id=? AND item_id IN ({ep}) AND terminal_status IS NULL",
+                (ctx.send_index, info["database_now"] or now_ms(), ctx.session_id, *extra_late_ids),
+            )
         return {"structured_output": agg_final, "result_json": agg_final}
 
     return await port.final(
@@ -973,15 +1019,31 @@ async def _complete_driver(worker, ctx, saved, origin, aggregate, *, drain_node_
 
 
 async def _finish_late(worker, ctx, refs):
-    """Terminalize late result inputs without another graph run or parent result."""
+    """Terminalize late result inputs (including any continuation ancestors) without another graph run."""
     port = worker.inputs
+    settle_ids: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        cur = await port.input(port.db, ref)
+        if cur is None:
+            if ref.message_id not in seen:
+                seen.add(ref.message_id)
+                settle_ids.append(ref.message_id)
+            continue
+        while cur is not None and cur.ref.message_id not in seen:
+            seen.add(cur.ref.message_id)
+            settle_ids.append(cur.ref.message_id)
+            parent_mid = cur.row.get("continuation_of")
+            if parent_mid is None:
+                break
+            cur = await port.input(port.db, InputRef(ctx.store_id, ctx.session_id, parent_mid))
     return await port.final(
         ctx.batch,
         consumed=tuple(refs),
         status="completed",
         final_text="",
         next_seq=max(1, ctx.batch.message_seq),
-        settle_chain_ids=tuple(ref.message_id for ref in refs),
+        settle_chain_ids=tuple(settle_ids),
         drain_driver_node_results=True,
         deliver_to_parent=False,
         write_driver_message=False,
@@ -1031,39 +1093,48 @@ async def run_driver(worker, ctx, env):
                 origins.append(record)
         def_ref = saved.get("definition_ref") if isinstance(saved, dict) else None
         def_msg_id = def_ref.get("message_id") if isinstance(def_ref, dict) else None
-        origin = next(
-            (o for o in reversed(origins) if o.row["kind"] == "workflow_continue"),
+
+        # Classify every candidate by its business root so a plain late continuation (wfc_late)
+        # merged with an explicit handle.resume() never shadows the explicit resume!
+        classified: list[tuple[InputRecord, InputRecord, dict[str, Any] | None, bool]] = []
+        for o in origins:
+            parsed = json.loads(o.row["content_json"])
+            root_rec = o
+            res_opts = parsed["workflow_resume"] if isinstance(parsed, dict) and "workflow_resume" in parsed else None
+            if (
+                o.row["kind"] == "workflow_continue"
+                and isinstance(parsed, dict)
+                and isinstance(parsed.get("workflow_continue"), dict)
+                and isinstance(parsed["workflow_continue"].get("origin_input_ref"), dict)
+            ):
+                root_ref = InputRef(**parsed["workflow_continue"]["origin_input_ref"])
+                loaded_root = await port.input(port.db, root_ref)
+                if loaded_root is not None:
+                    root_rec = loaded_root
+                    root_parsed = json.loads(loaded_root.row["content_json"])
+                    if isinstance(root_parsed, dict) and "workflow_resume" in root_parsed:
+                        res_opts = root_parsed["workflow_resume"]
+            is_run_or_resume = (
+                res_opts is not None
+                or root_rec.ref.message_id == run_id
+                or (def_msg_id is not None and root_rec.ref.message_id == def_msg_id)
+            )
+            classified.append((o, root_rec, res_opts, is_run_or_resume))
+
+        chosen = next(
+            (item for item in reversed(classified) if item[0].row["kind"] == "workflow_continue" and item[3]),
             None,
         )
-        if origin is None:
-            origin = next((o for o in origins if o.ref.message_id == run_id), None)
-        if origin is None and def_msg_id:
-            origin = next((o for o in origins if o.ref.message_id == def_msg_id), None)
-        if origin is None:
-            for o in reversed(origins):
-                parsed = json.loads(o.row["content_json"])
-                if isinstance(parsed, dict) and "workflow_resume" in parsed:
-                    origin = o
-                    break
-        if origin is None and origins:
-            origin = origins[-1]
-        resume_origin = origin
-        if origin is not None:
-            content = json.loads(origin.row["content_json"])
-            if isinstance(content, dict) and "workflow_resume" in content:
-                resume_options = content["workflow_resume"]
-            elif (
-                isinstance(content, dict)
-                and isinstance(content.get("workflow_continue"), dict)
-                and isinstance(content["workflow_continue"].get("origin_input_ref"), dict)
-            ):
-                root_ref = InputRef(**content["workflow_continue"]["origin_input_ref"])
-                root_rec = await port.input(port.db, root_ref)
-                if root_rec is not None:
-                    root_content = json.loads(root_rec.row["content_json"])
-                    if isinstance(root_content, dict) and "workflow_resume" in root_content:
-                        resume_options = root_content["workflow_resume"]
-                        resume_origin = root_rec
+        if chosen is None:
+            chosen = next((item for item in classified if item[0].ref.message_id == run_id), None)
+        if chosen is None and def_msg_id:
+            chosen = next((item for item in classified if item[0].ref.message_id == def_msg_id), None)
+        if chosen is None:
+            chosen = next((item for item in reversed(classified) if item[2] is not None), None)
+        if chosen is None and classified:
+            chosen = classified[-1]
+        if chosen is not None:
+            origin, resume_origin, resume_options, _ = chosen
 
     if saved.get("aggregate_delivered") and resume_options is None:
         executor = DurableExecutor(worker, ctx, env, run_id, saved)

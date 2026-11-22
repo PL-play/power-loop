@@ -3099,3 +3099,645 @@ async def test_r5_2_queued_continuation_cancel_capacity_exceeded_redelivery_clea
         await client.aclose()
         await rt_helper.loop.aclose()
         await rt_helper.runtime.client.aclose()
+
+
+async def test_stage2_b1_mixed_claim_late_continuation_and_explicit_resume(registry_store):
+    """Stage2-B1: Finished Driver's plain late input recovers to wfc_late, merged with handle.resume() in 1 claim."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    leaf_calls = 0
+
+    class B1MixedModel(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal leaf_calls
+            if req.system_prompt.startswith("A"):
+                leaf_calls += 1
+                return LLMResponse(raw_text=f"A-{leaf_calls}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, B1MixedModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-b1-wf", "root": leaf("A")},
+            message_id="s2-b1-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and first.results["A"].text == "A-1"
+        await rt1.drain()
+        assert leaf_calls == 1
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        drv_sid = handle.target.session_id
+        # 1) Plain late input claimed by old Worker -> lease expires -> recover() queues wfc_late (BEFORE resume!)
+        late_rcpt = await port.accept(handle.target, "plain late msg", message_id="s2-b1-late", actor=rt1.actor)
+        batch2 = await port.claim(handle.target, node_id="worker-dead", boot_id="boot-dead")
+        assert batch2 is not None and [r.message_id for r in batch2.input_refs] == ["s2-b1-late"]
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec = await port.recover(handle.target, node_id="worker-2", boot_id="boot-2")
+        assert rec is not None and rec.execution_state == "queued"
+
+        wfc_row = await store._db.fetchone(
+            f"SELECT item_id,status,continuation_of FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_continue' ORDER BY id DESC LIMIT 1",
+            (drv_sid,),
+        )
+        assert wfc_row is not None and wfc_row["status"] == "pending" and wfc_row["continuation_of"] == "s2-b1-late"
+        wfc_late_ref = InputRef(store.store_id, drv_sid, str(wfc_row["item_id"]))
+
+        # 2) Submit explicit handle.resume() AFTER wfc_late is already pending, BEFORE new Worker claims!
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        resume_handle = await handle_on_client.resume(
+            node_id="A", message="rerun A for B1", message_id="s2-b1-resume",
+        )
+
+        # 3) Start real Worker 2 -> claims BOTH [wfc_late, resume_input] in send_index=3!
+        rt2 = await RunningAgent(
+            store, B1MixedModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        resumed = await resume_handle.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        # Verify explicit resume ACTUALLY executed target leaf A and returned full result!
+        assert leaf_calls == 2
+        assert resumed.status == "completed"
+        assert "A" in resumed.results and resumed.results["A"].text == "A-2"
+        assert resumed.final is not None and resumed.final.text == "A-2"
+
+        # Verify the late continuation chain (both s2-b1-late and wfc_late) settled cleanly as completed!
+        for ref_chk in (late_rcpt.input_ref, wfc_late_ref):
+            qrow = await store._db.fetchone(
+                f"SELECT status,terminal_status FROM {store.t.follow_up_queue} "
+                "WHERE session_id=? AND item_id=?",
+                (drv_sid, ref_chk.message_id),
+            )
+            assert qrow["status"] == "delivered" and qrow["terminal_status"] == "completed"
+            res_chk = await port.get_result(ref_chk, actor=rt1.actor)
+            assert res_chk is not None and res_chk.status == "completed"
+
+        # Verify Main received EXACTLY ONE new workflow_result pointing to resume_handle.input_ref (2 total)
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 2
+        body2 = json.loads(main_rcpts[1]["content_json"])
+        assert body2["status"] == "completed"
+        assert body2["input_ref"]["message_id"] == resume_handle.input_ref.message_id
+        assert body2["final_text"] == "A-2"
+
+        # Original handle result untouched
+        assert (await handle_on_client.wait(deadline_ms=now_ms() + 5000)).to_dict() == first.to_dict()
+    finally:
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_b2_inprocess_slow_leaf_zero_extra_db_reads_and_remote_delivery(registry_store):
+    """Stage2-B2: Single-Worker slow leaf (>3x250ms) causes 0 poll/get_result DB reads; remote delivery still works."""
+    from .test_send_sql_profile import Profiled
+
+    store, connect = registry_store
+    leaf_entered = asyncio.Event()
+    release_leaf = asyncio.Event()
+
+    class SlowLeafModel(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("SLOW"):
+                leaf_entered.set()
+                await release_leaf.wait()
+                return LLMResponse(raw_text="slow-leaf-done")
+            return LLMResponse(raw_text="main-ack")
+
+    # Part A: Single Worker, capacity=1, same Store — Driver & slow leaf in-process
+    orig_db = store._db
+    prof = Profiled(orig_db)
+    store._db = prof
+    runner = await RunningAgent(
+        store, SlowLeafModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+    ).start()
+    try:
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "s2-b2-slow", "root": leaf("SLOW")},
+            message_id="s2-b2-slow", actor=runner.actor,
+        )
+        await asyncio.wait_for(leaf_entered.wait(), 5)
+        # Wait a short beat for node-journal write to settle, then clear profiler and sleep across 3x250ms!
+        await asyncio.sleep(0.05)
+        prof.records.clear()
+        await asyncio.sleep(0.85)
+
+        poll_reads = [
+            r for r in prof.records
+            if any("poll_pending_driver_results" in f or "poll_driver_results_for_send" in f for f in r["chain"])
+        ]
+        get_result_reads = [
+            r for r in prof.records
+            if any("get_result" in f or "_result_state" in f for f in r["chain"])
+        ]
+        assert poll_reads == [], f"Unexpected in-process Driver poll SQL during slow leaf: {poll_reads}"
+        assert get_result_reads == [], f"Unexpected in-process leaf get_result SQL during slow leaf: {get_result_reads}"
+
+        release_leaf.set()
+        res = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert res.status == "completed" and res.final.text == "slow-leaf-done"
+        await runner.drain()
+    finally:
+        release_leaf.set()
+        await runner.aclose()
+        store._db = orig_db
+
+    # Part B: Remote leaf on a separate Store/Worker (shared_execution=True) still delivers cleanly!
+    from .test_send_sql_profile import _cross_process_workflow_cluster
+
+    remote_entered = asyncio.Event()
+    release_remote = asyncio.Event()
+
+    class RemoteMainModel(Model):
+        async def complete(self, req, **kwargs):
+            return LLMResponse(raw_text="main-remote-ack")
+
+    class RemoteLeafModel(Model):
+        async def complete(self, req, **kwargs):
+            remote_entered.set()
+            await release_remote.wait()
+            return LLMResponse(raw_text="remote-slow-done")
+
+    async with _cross_process_workflow_cluster(
+        store, connect, RemoteMainModel(), RemoteLeafModel(), leaf_capacity=1,
+    ) as (rt_a, rt_b, main_target, actor, desc, _master):
+        h_rem = await rt_a.client.workflow(
+            main_target,
+            {
+                "name": "s2-b2-remote",
+                "root": {
+                    "type": "agent", "id": "R1", "input": "work",
+                    "spec": {"name": "R1", "system_prompt": "REMOTE", "tools": []},
+                },
+            },
+            message_id="s2-b2-remote", actor=actor, descriptor=desc,
+        )
+        await asyncio.wait_for(remote_entered.wait(), 5)
+        await asyncio.sleep(0.35)
+        release_remote.set()
+        r_res = await h_rem.wait(deadline_ms=now_ms() + 10000)
+        assert r_res.status == "completed" and r_res.final.text == "remote-slow-done"
+        async with asyncio.timeout(5):
+            while rt_a.worker._active or rt_b.worker._active:
+                await asyncio.sleep(0.01)
+
+
+async def test_stage2_b3_concurrent_close_sessions_if_idle_vs_leaf_final_returns_busy_no_deadlock(registry_store):
+    """Stage2-B3: Concurrent close_sessions_if_idle([driver]) while leaf Final holds leaf lock returns busy (0 deadlock)."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store_a, connect = registry_store
+    port_a = RuntimeInputStore(store_a)
+    main = await target(port_a, "s2b3-main")
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port_a.create_many(
+        parent=main, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="s2b3-drv", message_id="s2b3-dm1", body={"wf": "go"},
+            descriptor=drv_desc, result_kind="workflow_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    drv_b = cm_drv.preclaimed[0]
+    drv_sid = drv_b.target.session_id
+    leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L1"}})
+    cm_leaf = await port_a.create_many(
+        parent=drv_b.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="s2b3-leaf", message_id="s2b3-lm1", body={"text": "work"},
+            descriptor=leaf_desc, result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        parent_owner_epoch=drv_b.owner_epoch, parent_cancel_seq=drv_b.cancel_seq,
+    )
+    leaf_b = cm_leaf.preclaimed[0]
+
+    # Connection 1: pause leaf Final right AFTER locking/updating leaf row and BEFORE River UPDATE on Driver!
+    leaf_locked_ev = asyncio.Event()
+    release_river_ev = asyncio.Event()
+    orig_river = port_a._river_deliver_tx
+
+    async def paused_river(tx, *args, **kwargs):
+        leaf_locked_ev.set()
+        await release_river_ev.wait()
+        return await orig_river(tx, *args, **kwargs)
+
+    port_a._river_deliver_tx = paused_river
+
+    store_b = await connect()
+    try:
+        leaf_task = asyncio.create_task(
+            port_a.final(leaf_b, status="completed", final_text="leaf-done"),
+        )
+        await asyncio.wait_for(leaf_locked_ev.wait(), 5)
+
+        # Connection 2: call close_sessions_if_idle([driver]) concurrently while Connection 1 holds leaf lock!
+        close_task = asyncio.create_task(store_b.close_sessions_if_idle([drv_sid]))
+        # Give close_task a brief beat to run concurrently before releasing leaf_task
+        await asyncio.sleep(0.05)
+        release_river_ev.set()
+
+        close_status, leaf_fin = await asyncio.wait_for(
+            asyncio.gather(close_task, leaf_task), timeout=10,
+        )
+        assert close_status == "busy"
+        assert leaf_fin.result_delivery_error is None
+    finally:
+        release_river_ev.set()
+        port_a._river_deliver_tx = orig_river
+        await store_b.close()
+
+    # Probe 9 closure & 2-page retention with REAL residual halt wake=0 workflow_node_result (NO manual delete!)
+    cm_leaf2 = await port_a.create_many(
+        parent=drv_b.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="s2b3-leaf-slow", message_id="s2b3-lm2", body={"text": "slow"},
+            descriptor=replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L2"}}),
+            result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        parent_owner_epoch=drv_b.owner_epoch, parent_cancel_seq=drv_b.cancel_seq,
+    )
+    leaf2_b = cm_leaf2.preclaimed[0]
+    await port_a.cancel(leaf2_b.target, actor=ACTOR, scope="self", reason="halt", cancel_by="subtree")
+    await port_a.final(
+        drv_b, status="failed", final_text="", error="halt", error_code="failed",
+        drain_driver_node_results=True, settle_start_input=True, write_driver_message=True,
+    )
+    # Slow sibling finishes AFTER Driver is idle -> on server DBs also verify concurrent close vs leaf2 Final!
+    if store_a._db.dialect.name in ("postgres", "mysql"):
+        leaf2_locked_ev = asyncio.Event()
+        release_river2_ev = asyncio.Event()
+
+        async def paused_river2(tx, *args, **kwargs):
+            leaf2_locked_ev.set()
+            await release_river2_ev.wait()
+            return await orig_river(tx, *args, **kwargs)
+
+        port_a._river_deliver_tx = paused_river2
+        store_b2 = await connect()
+        try:
+            leaf2_task = asyncio.create_task(
+                port_a.final(leaf2_b, status="cancelled", final_text="", error="halt", error_code="cancelled"),
+            )
+            await asyncio.wait_for(leaf2_locked_ev.wait(), 5)
+            close2_task = asyncio.create_task(store_b2.close_sessions_if_idle([drv_sid]))
+            await asyncio.sleep(0.05)
+            release_river2_ev.set()
+            close2_status, leaf2_fin = await asyncio.wait_for(
+                asyncio.gather(close2_task, leaf2_task), timeout=10,
+            )
+            assert close2_status == "busy"
+            assert leaf2_fin.result_delivery_error is None
+        finally:
+            release_river2_ev.set()
+            port_a._river_deliver_tx = orig_river
+            await store_b2.close()
+    else:
+        leaf2_fin = await port_a.final(
+            leaf2_b, status="cancelled", final_text="", error="halt", error_code="cancelled",
+        )
+        assert leaf2_fin.result_delivery_error is None
+
+    pending_wake0 = await store_a._db.fetchall(
+        f"SELECT wake,status,content_json FROM {store_a.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_node_result' AND status='pending'",
+        (drv_sid,),
+    )
+    assert len(pending_wake0) == 1 and int(pending_wake0[0]["wake"]) == 0
+    assert json.loads(pending_wake0[0]["content_json"])["cancel_by"] == "subtree"
+
+    # With the real pending wake=0 receipt STILL in Driver's inbox, close_sessions_if_idle MUST return 'closed'!
+    assert await store_a.close_sessions_if_idle([drv_sid]) == "closed"
+    future_ms = now_ms() + 31 * 86400 * 1000
+    page1 = await store_a.purge_expired_page(future_ms, limit=50)
+    page2 = await store_a.purge_expired_page(future_ms, limit=50)
+    assert sum(page1.deleted.values()) > 0 or sum(page2.deleted.values()) > 0
+    leftover = await store_a._db.fetchall(
+        f"SELECT session_id FROM {store_a.t.sessions} WHERE session_id IN (?,?,?)",
+        (drv_sid, "s2b3-leaf", "s2b3-leaf-slow"),
+    )
+    assert leftover == []
+
+
+async def test_stage2_b4_real_two_process_5_leaf_sql_ledgers(registry_store, tmp_path):
+    """Stage2-B4: Genuine 2-OS-process (separate PIDs, Stores, waiter tables, signal-only pipe) 5-leaf SQL ledgers."""
+    import os
+    import sys
+    from pathlib import Path
+
+    store, _ = registry_store
+    backend = store._db.dialect.name
+    repo_root = Path(__file__).resolve().parents[2]
+    scenarios = ["concentrated", "dispersed", "mid_stop_1_leaf", "stop_driver_subtree", "real_halt"]
+    for idx_s, scenario in enumerate(scenarios):
+        prefix = f"b4xp{idx_s}_"
+        if backend == "sqlite":
+            dsn_or_path = str(tmp_path / f"b4_xproc_{idx_s}.db")
+        elif backend == "postgres":
+            dsn_or_path = os.environ["POWER_LOOP_TASK_PG_DSN"]
+        else:
+            dsn_or_path = os.environ["POWER_LOOP_TASK_MYSQL_DSN"]
+
+        node_a_sids: set[str] = {"000_main"}
+        events_a: asyncio.Queue[dict] = asyncio.Queue()
+        events_b: asyncio.Queue[dict] = asyncio.Queue()
+        signals_seen: list[dict] = []
+        proc_b = None
+
+        async def _send(proc, obj: dict) -> None:
+            assert proc.stdin is not None
+            proc.stdin.write((json.dumps(obj) + "\n").encode())
+            await proc.stdin.drain()
+
+        async def _relay(src_role: str, src_proc, evt_q: asyncio.Queue[dict]) -> None:
+            assert src_proc.stdout is not None
+            while True:
+                line = await src_proc.stdout.readline()
+                if not line:
+                    return
+                msg = json.loads(line)
+                if msg.get("type") == "signal":
+                    # Strictly enforce signal-only contract (ONLY session_id + kind + reason/cancel_by, 0 payload!)
+                    assert set(msg.keys()) <= {"type", "kind", "session_id", "reason", "cancel_by"}, msg
+                    signals_seen.append(msg)
+                    sid = msg["session_id"]
+                    if src_role == "a" and msg["kind"] == "wake" and msg.get("reason") == "accept" and len(node_a_sids) == 1:
+                        node_a_sids.add(sid)
+                    dst = proc_a if sid in node_a_sids else proc_b
+                    assert dst is not None
+                    await _send(dst, msg)
+                else:
+                    await evt_q.put(msg)
+
+        async def _wait_evt(q: asyncio.Queue[dict], pred) -> dict:
+            async with asyncio.timeout(25):
+                while True:
+                    m = await q.get()
+                    if pred(m):
+                        return m
+
+        # Start proc_a FIRST and wait for ready_a so DDL init runs once with zero concurrent CREATE TABLE race.
+        proc_a = await asyncio.create_subprocess_exec(
+            sys.executable, "-B", "-m", "tests.unit._m2_xproc_ledger_worker",
+            backend, dsn_or_path, prefix, "a", scenario,
+            cwd=str(repo_root),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        ra = asyncio.create_task(_relay("a", proc_a, events_a))
+        rb = None
+
+        try:
+            ready_a = await _wait_evt(events_a, lambda m: m.get("type") == "ready")
+            proc_b = await asyncio.create_subprocess_exec(
+                sys.executable, "-B", "-m", "tests.unit._m2_xproc_ledger_worker",
+                backend, dsn_or_path, prefix, "b", scenario,
+                cwd=str(repo_root),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            assert proc_a.pid != proc_b.pid
+            rb = asyncio.create_task(_relay("b", proc_b, events_b))
+            ready_b = await _wait_evt(events_b, lambda m: m.get("type") == "ready")
+            assert ready_a["pid"] != ready_b["pid"]
+
+            await _send(proc_a, {"type": "start_workflow"})
+            sub_ev = await _wait_evt(events_a, lambda m: m.get("name") == "workflow_submitted")
+            node_a_sids.add(sub_ev["driver_sid"])
+
+            if scenario == "mid_stop_1_leaf":
+                # Wait until all 5 remote leaves have started in Process B
+                seen_idxs = set()
+                while len(seen_idxs) < 5:
+                    ev = await _wait_evt(events_b, lambda m: m.get("name") == "leaf_started")
+                    seen_idxs.add(ev["idx"])
+                await _send(proc_a, {"type": "stop_l0"})
+                st_ev = await _wait_evt(events_a, lambda m: m.get("name") == "l0_stopped")
+                assert st_ev["state"] == "cancel_requested"
+                await _send(proc_b, {"type": "release_l0"})
+                await _send(proc_b, {"type": "release_all"})
+                await _send(proc_a, {"type": "wait_workflow_and_main"})
+                done_ev = await _wait_evt(events_a, lambda m: m.get("name") == "workflow_and_main_done")
+                assert done_ev["wf_result_statuses"]["L0"] == "cancelled"
+                assert done_ev["wf_result_cancel_bys"]["L0"] == "user"
+                for i in range(1, 5):
+                    assert done_ev["wf_result_statuses"][f"L{i}"] == "completed"
+                assert done_ev["main_status"] == "completed"
+            elif scenario == "stop_driver_subtree":
+                seen_idxs = set()
+                while len(seen_idxs) < 5:
+                    ev = await _wait_evt(events_b, lambda m: m.get("name") == "leaf_started")
+                    seen_idxs.add(ev["idx"])
+                await _send(proc_a, {"type": "stop_driver_subtree"})
+                st_ev = await _wait_evt(events_a, lambda m: m.get("name") == "driver_subtree_stopped")
+                assert st_ev["state"] == "cancel_requested"
+                # Wait for Driver + Main BEFORE releasing slow leaves (0 dead-wait!)
+                await _send(proc_a, {"type": "wait_workflow_and_main"})
+                done_ev = await _wait_evt(events_a, lambda m: m.get("name") == "workflow_and_main_done")
+                assert done_ev["wf_status"] == "cancelled" and done_ev["wf_cancel_by"] == "user"
+                assert done_ev["main_status"] == "completed"
+                await _send(proc_b, {"type": "release_all"})
+            elif scenario == "real_halt":
+                # L0 fails once L1..L4 have started -> Driver halts slow siblings BEFORE release_all!
+                await _send(proc_a, {"type": "wait_workflow_and_main"})
+                done_ev = await _wait_evt(events_a, lambda m: m.get("name") == "workflow_and_main_done")
+                assert done_ev["wf_status"] == "failed" and done_ev["main_status"] == "completed"
+                await _send(proc_b, {"type": "release_all"})
+            else:
+                await _send(proc_a, {"type": "wait_workflow_and_main"})
+                done_ev = await _wait_evt(events_a, lambda m: m.get("name") == "workflow_and_main_done")
+                assert done_ev["wf_status"] == "completed" and done_ev["main_status"] == "completed"
+
+            await _send(proc_a, {"type": "wait_idle"})
+            await _send(proc_b, {"type": "wait_idle"})
+            await _wait_evt(events_a, lambda m: m.get("name") == "idle")
+            await _wait_evt(events_b, lambda m: m.get("name") == "idle")
+
+            await _send(proc_a, {"type": "report"})
+            await _send(proc_b, {"type": "report"})
+            rep_a = await _wait_evt(events_a, lambda m: m.get("type") == "report")
+            rep_b = await _wait_evt(events_b, lambda m: m.get("type") == "report")
+            assert rep_a["legacy_job_control"] == 0 and rep_b["legacy_job_control"] == 0
+            assert rep_a["billing"] == 0 and rep_b["billing"] == 0
+            assert rep_a["main_llm_calls"] == 1 and rep_b["leaf_llm_calls"] == 5
+
+            if out := os.environ.get("M2_REAL_XPROC_LEDGER_OUT"):
+                with open(out, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "scenario": scenario,
+                        "db": backend,
+                        "pid_a": rep_a["pid"],
+                        "pid_b": rep_b["pid"],
+                        "proc_a": {k: rep_a[k] for k in ("transactions", "session_control", "message", "total", "kv_sql", "by_func")},
+                        "proc_b": {k: rep_b[k] for k in ("transactions", "session_control", "message", "total", "kv_sql", "by_func")},
+                        "combined": {
+                            "transactions": rep_a["transactions"] + rep_b["transactions"],
+                            "session_control": rep_a["session_control"] + rep_b["session_control"],
+                            "message": rep_a["message"] + rep_b["message"],
+                            "total": rep_a["total"] + rep_b["total"],
+                            "kv_sql": rep_a["kv_sql"] + rep_b["kv_sql"],
+                        },
+                        "signal_count": len(signals_seen),
+                    }) + "\n")
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.returncode is None:
+                    try:
+                        await _send(proc, {"type": "quit"})
+                        await asyncio.wait_for(proc.wait(), 10)
+                    except Exception:
+                        proc.kill()
+                        await proc.wait()
+            ra.cancel()
+            rb.cancel()
+            await asyncio.gather(ra, rb, return_exceptions=True)
+            # Drop temporary prefix tables on server DBs so repeated runs stay spotless
+            if backend in ("postgres", "mysql"):
+                for tbl in (
+                    "follow_up_queue", "messages", "project_messages",
+                    "session_runtime_state", "sessions", "schema_meta",
+                ):
+                    await store._db.execute(f"DROP TABLE IF EXISTS {prefix}{tbl}")
+
+
+async def test_stage2_driver_sigkill_takeover_completed_leaf_runs_once(registry_store):
+    """Real Driver SIGKILL (-9) after leaf A persists completion: replacement Driver finishes B, A called once."""
+    import os
+    import signal
+    import sys
+    from pathlib import Path
+
+    from power_loop import DatabasePollingTransport, RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import RuntimeDescriptor
+
+    store, _ = registry_store
+    backend = store._db.dialect.name
+    if backend == "sqlite":
+        pytest.skip("real Driver SIGKILL takeover uses shared server DB (PG16/MySQL)")
+    dsn = os.environ["POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
+    repo_root = Path(__file__).resolve().parents[2]
+
+    desc = RuntimeDescriptor(
+        2, "agent", "m2.sigkill@215", None, "m2.tools@215", "m2.hooks@215", "m2.res@215", {}, {},
+    )
+    actor = TrustedActor("t-sigkill", "u-sigkill", None)
+    port = RuntimeInputStore(store)
+    root = await port.create_session(desc, actor=actor, options={"session_id": "sigkill-main"})
+    tp = DatabasePollingTransport(port, interval_s=0.03)
+    client = RuntimeClient(store=store, transport=tp)
+
+    async def _spawn(role: str):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-B", "-m", "tests.unit._m2_xproc_ledger_worker",
+            backend, dsn, store.table_prefix, role, "sigkill_ab",
+            cwd=str(repo_root),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        async with asyncio.timeout(20):
+            line = await proc.stdout.readline()
+            assert line, (await proc.stderr.read()).decode()[-4000:]
+            msg = json.loads(line)
+            assert msg.get("type") == "ready"
+        return proc
+
+    async def _wait_msg(proc, pred) -> dict:
+        async with asyncio.timeout(25):
+            while True:
+                line = await proc.stdout.readline()
+                assert line, (await proc.stderr.read()).decode()[-4000:]
+                msg = json.loads(line)
+                if pred(msg):
+                    return msg
+
+    async def _cmd(proc, obj: dict) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write((json.dumps(obj) + "\n").encode())
+        await proc.stdin.drain()
+
+    procs = []
+    try:
+        spec = {
+            "name": "sigkill-a-then-b",
+            "root": {
+                "type": "sequence",
+                "steps": [
+                    {
+                        "type": "agent", "id": "A", "input": "step-A",
+                        "spec": {"name": "A", "system_prompt": "LEAF-A", "tools": []},
+                    },
+                    {
+                        "type": "agent", "id": "B", "input": "step-B", "inputs_from": ["A"],
+                        "spec": {"name": "B", "system_prompt": "LEAF-B", "tools": []},
+                    },
+                ],
+            },
+        }
+        handle = await client.workflow(root, spec, message_id="sigkill-ab-run", actor=actor)
+        drv1 = await _spawn("sigkill_c1")
+        procs.append(drv1)
+        assert (await _wait_msg(drv1, lambda m: m.get("name") == "driver_claimed"))["send_index"] == 1
+        leaf_w = await _spawn("sigkill_n")
+        procs.append(leaf_w)
+
+        # Wait until A completed & Driver persisted A + spawned B -> B actually started!
+        await _wait_msg(leaf_w, lambda m: m.get("name") == "leaf_done" and m.get("node") == "A")
+        await _wait_msg(leaf_w, lambda m: m.get("name") == "leaf_started" and m.get("node") == "B")
+
+        # Real OS SIGKILL (-9) on Driver 1!
+        os.kill(drv1.pid, signal.SIGKILL)
+        rc = await drv1.wait()
+        assert rc == -signal.SIGKILL
+
+        # Start replacement Driver 2; wait for takeover at send_index=2, then release B.
+        drv2 = await _spawn("sigkill_c2")
+        procs.append(drv2)
+        assert (await _wait_msg(drv2, lambda m: m.get("name") == "driver_claimed"))["send_index"] == 2
+        await _cmd(leaf_w, {"type": "release_b"})
+
+        wf_res = await handle.wait(deadline_ms=now_ms() + 20000)
+        assert wf_res.status == "completed"
+        assert wf_res.results["A"].text == "A-once-result"
+        assert "A-once-result" in wf_res.results["B"].text
+
+        await _cmd(leaf_w, {"type": "report_calls"})
+        call_msg = await _wait_msg(leaf_w, lambda m: m.get("type") == "calls")
+        assert call_msg["calls"] == {"A": 1, "B": 1}, call_msg
+    finally:
+        for proc in procs:
+            if proc.returncode is None:
+                try:
+                    await _cmd(proc, {"type": "quit"})
+                    await asyncio.wait_for(proc.wait(), 10)
+                except Exception:
+                    proc.kill()
+                    await proc.wait()
+        await client.aclose()
+        await tp.aclose()

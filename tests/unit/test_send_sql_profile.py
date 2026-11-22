@@ -1084,3 +1084,100 @@ async def test_m2_cross_process_5_leaf_subtree_stop_and_halt_sql_profile(registr
                     "message": counts["message"],
                     "total": len(records),
                 }) + "\n")
+
+
+async def test_m2_cross_process_5_leaf_halt_sql_profile(registry_store):
+    """Cross-process 5-leaf on_error='halt': failing leaf L0 halts 4 slow siblings (cancel_by='subtree', wake=0)."""
+    from power_loop.agent.runtime_store import now_ms
+    from power_loop.agent.runtime_types import InputRef, result_message_id
+
+    store_a, connect = registry_store
+    db = store_a._db.dialect.name
+    siblings_started = [asyncio.Event() for _ in range(4)]
+    release_siblings = asyncio.Event()
+
+    class _MainModel(LLMService):
+        async def complete(self, req, **kwargs):
+            return LLMResponse(raw_text="main handled halted workflow")
+
+        async def close(self):
+            pass
+
+    class _LeafModel(LLMService):
+        async def complete(self, req, **kwargs):
+            idx = int(req.system_prompt.splitlines()[0].split("-")[1])
+            if idx == 0:
+                await asyncio.gather(*(ev.wait() for ev in siblings_started))
+                raise RuntimeError("L0 deliberate halt failure")
+            siblings_started[idx - 1].set()
+            await release_siblings.wait()
+            return LLMResponse(raw_text=f"leaf-{idx}-late")
+
+        async def close(self):
+            pass
+
+    branches = [
+        {
+            "type": "agent", "id": f"L{i}", "input": f"work-{i}",
+            "spec": {"name": f"L{i}", "system_prompt": f"LEAF-{i}", "tools": []},
+        }
+        for i in range(5)
+    ]
+    spec = {
+        "name": "five-leaf-real-halt",
+        "root": {"type": "parallel", "on_error": "halt", "max_concurrency": 5, "branches": branches},
+    }
+
+    async with _cross_process_workflow_cluster(store_a, connect, _MainModel(), _LeafModel()) as (
+        rt_a, rt_b, main_target, actor, desc, master,
+    ):
+        handle = await rt_a.client.workflow(
+            main_target, spec, message_id="wf-real-halt", actor=actor, descriptor=desc,
+        )
+        # Failing leaf L0 triggers real on_error='halt' while L1..L4 are still blocked (0 dead-wait!)
+        wf_res = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert wf_res.status == "failed"
+        parent_ref = InputRef(
+            store_a.store_id, main_target.session_id,
+            result_message_id(handle.target, handle.input_ref, 1, "workflow_result"),
+        )
+        main_res = await rt_a.client.wait(parent_ref, actor=actor, deadline_ms=now_ms() + 10000)
+        assert main_res.status == "completed"
+
+        # Now release slow siblings L1..L4 and confirm cancel_by='subtree', wake=0, 0 ghost re-wake!
+        release_siblings.set()
+        async with asyncio.timeout(10):
+            while rt_a.worker._active or rt_b.worker._active:
+                await asyncio.sleep(0.01)
+
+        drv_row = await rt_a.worker.inputs.db.fetchone(
+            f"SELECT execution_state,send_index,wake_pending_count FROM {store_a.t.sessions} "
+            "WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert dict(drv_row) == {
+            "execution_state": "idle", "send_index": 1, "wake_pending_count": 0,
+        }
+        late_rows = await rt_a.worker.inputs.db.fetchall(
+            f"SELECT wake,content_json FROM {store_a.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_node_result' AND status='pending'",
+            (handle.target.session_id,),
+        )
+        assert len(late_rows) == 4
+        assert all(int(r["wake"]) == 0 for r in late_rows)
+        assert all(json.loads(r["content_json"])["cancel_by"] == "subtree" for r in late_rows)
+
+        records = [r for r in master.records if _category(r["chain"], r["sql"]) != "periodic"]
+        counts = _counts(records, master.tx_sites, master.tx_categories)
+        assert counts["legacy_job_control"] == 0 and counts["billing"] == 0
+        assert counts.get("unfinished_transactions", 0) == 0
+        if out := os.environ.get("M2_WORKFLOW_LEDGER_OUT"):
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "case": "5_leaf_xproc_real_halt",
+                    "db": db,
+                    "transactions": master.transactions,
+                    "session_control": counts["session_control"],
+                    "message": counts["message"],
+                    "total": len(records),
+                }) + "\n")

@@ -1,9 +1,12 @@
 """Design 203 workflow behavior through the public runtime."""
 
+import json
+
 import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse
 from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import InputRef
 from tests.runtime_fixture import RunningAgent
 
 from ._workflow_fixture_203 import Model, leaf
@@ -147,6 +150,9 @@ async def test_model_submission_returns_receipt_and_delivers_to_parent(registry_
 
 
 async def test_required_child_finishes_before_downstream(registry_store, tmp_path):
+    """Under M1c single-level delegation, upstream leaf A must persist completion before downstream leaf B starts."""
+    import asyncio
+
     from power_loop.contracts.tools import ToolDefinition
     from power_loop.runtime.pricing import Free
     from power_loop.tools import create_default_tool_registry
@@ -155,10 +161,15 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
     store, _ = registry_store
     registry = create_default_tool_registry(workspace_dir=str(tmp_path))
     register_spawn_agent(registry)
+    a_entered = asyncio.Event()
+    release_a = asyncio.Event()
 
     class Delegating(Model):
         tool_done = False
         a_called_tool = False
+        b_calls = 0
+        b_saw_a_output = False
+        b_saw_a_persisted_completed = False
         saw_tools_on_a: tuple[str, ...] = ()
 
         async def complete(self, request, **kwargs):
@@ -169,6 +180,8 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
                 )
                 if not self.a_called_tool:
                     self.a_called_tool = True
+                    a_entered.set()
+                    await release_a.wait()
                     return LLMResponse(
                         raw_text="",
                         tool_calls=[
@@ -179,9 +192,47 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
                             }
                         ],
                     )
-                return LLMResponse(raw_text="A done")
+                return LLMResponse(raw_text="A persisted result")
             if request.system_prompt.startswith("B"):
+                self.b_calls += 1
                 assert self.tool_done
+                joined_msgs = "\n".join(str(m.get("content") or "") for m in request.messages)
+                self.b_saw_a_output = "A persisted result" in joined_msgs
+                # Verify upstream leaf A has ALREADY persisted its assistant message & idle completion in DB
+                a_sess = await store._db.fetchone(
+                    f"SELECT session_id,execution_state,send_index FROM {store.t.sessions} "
+                    "WHERE session_kind='agent' "
+                    "AND (descriptor_json LIKE '%\"node_id\":\"A\"%' OR descriptor_json LIKE '%\"node_id\": \"A\"%')",
+                )
+                assert a_sess is not None
+                a_msg = await store._db.fetchone(
+                    f"SELECT content FROM {store.t.messages} "
+                    "WHERE session_id=? AND role='assistant' AND content LIKE '%A persisted result%'",
+                    (a_sess["session_id"],),
+                )
+                a_inp = await store._db.fetchone(
+                    f"SELECT item_id,status,delivered_send_index FROM {store.t.follow_up_queue} "
+                    "WHERE session_id=? ORDER BY id ASC LIMIT 1",
+                    (a_sess["session_id"],),
+                )
+                assert a_inp is not None
+                a_mid_done = await runner.runtime.client.inspect(
+                    InputRef(store.store_id, a_sess["session_id"], a_inp["item_id"]),
+                    actor=runner.actor,
+                )
+                self.b_saw_a_snapshot = {
+                    "sess": dict(a_sess),
+                    "msg": dict(a_msg) if a_msg else None,
+                    "inp": dict(a_inp),
+                    "inspected_terminal": a_mid_done.terminal_status,
+                }
+                self.b_saw_a_persisted_completed = (
+                    a_sess["execution_state"] == "idle"
+                    and int(a_sess["send_index"]) >= 1
+                    and a_msg is not None
+                    and a_inp["status"] == "delivered"
+                    and a_mid_done.terminal_status == "completed"
+                )
                 return LLMResponse(raw_text="B done")
             return LLMResponse(raw_text="parent ack")
 
@@ -199,22 +250,63 @@ async def test_required_child_finishes_before_downstream(registry_store, tmp_pat
     a = leaf("A")
     # Design 217 §5.3 / M1c single-level delegation: spawn_agent is stripped on workflow_node (depth=2)
     a["spec"].update(tools=["spawn_agent", "step_work"], max_rounds=5)
+    b = leaf("B")
+    b["inputs_from"] = ["A"]
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
-            {"name": "required", "root": {"type": "sequence", "steps": [a, leaf("B")]}},
+            {"name": "required", "root": {"type": "sequence", "steps": [a, b]}},
             message_id="children",
             actor=runner.actor,
         )
+        # Wait until upstream leaf A is actively running (not yet persisted completed)
+        await asyncio.wait_for(a_entered.wait(), 5)
+        await asyncio.sleep(0.05)
+
+        # Before upstream A persists completion, downstream B must have neither started nor produced output!
+        assert model.b_calls == 0
+        mid_children = await store._db.fetchall(
+            f"SELECT session_id,descriptor_json FROM {store.t.sessions} WHERE parent_session_id=?",
+            (handle.target.session_id,),
+        )
+        assert len(mid_children) == 1
+        assert json.loads(mid_children[0]["descriptor_json"])["config"]["workflow_node"]["node_id"] == "A"
+        b_mid_msgs = await store._db.fetchall(
+            f"SELECT id FROM {store.t.messages} WHERE role='assistant' AND content LIKE '%B done%'",
+        )
+        assert b_mid_msgs == []
+        a_mid_inspect = await runner.runtime.client.inspect(handle.input_ref, actor=runner.actor)
+        assert a_mid_inspect.terminal_status is None
+
+        # Release A -> A persists completion, then downstream B runs once with A's result
+        release_a.set()
         result = await handle.wait(deadline_ms=now_ms() + 15000)
         assert result.status == "completed" and model.tool_done, result
+        assert model.b_calls == 1
+        assert model.b_saw_a_output is True
+        assert model.b_saw_a_persisted_completed is True, model.b_saw_a_snapshot
+        assert result.results["A"].text == "A persisted result"
+        assert result.results["B"].text == "B done"
         assert "spawn_agent" not in model.saw_tools_on_a and "step_work" in model.saw_tools_on_a
+
+        # Confirm persisted terminal completion of upstream leaf A and ZERO depth>=3 sessions
+        a_leaf_input = await store._db.fetchone(
+            f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC LIMIT 1",
+            (result.results["A"].session_id,),
+        )
+        assert a_leaf_input is not None
+        a_inspected = await runner.runtime.client.inspect(
+            InputRef(store.store_id, result.results["A"].session_id, a_leaf_input["item_id"]),
+            actor=runner.actor,
+        )
+        assert a_inspected.terminal_status == "completed"
         children = await store._db.fetchall(
             f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? OR depth>=3",
             (result.results["A"].session_id,),
         )
         assert children == []
     finally:
+        release_a.set()
         await runner.aclose()
 
 
