@@ -186,7 +186,7 @@ async def _run_sigkill_worker(backend: str, dsn_or_path: str, prefix: str, role:
         boot_id=f"{role}-{os.getpid()}",
         capacity=2,
         transport=DatabasePollingTransport(RuntimeInputStore(store), interval_s=0.03),
-        session_lease_ttl_s=1.0,
+        session_lease_ttl_s=1.0 if role == "sigkill_c1" else 10.0,
         recovery_interval_s=0.05,
         shared_execution=True,
         timers_enabled=False,

@@ -4103,3 +4103,315 @@ async def test_stage2_r2_b2_inprocess_parallel_two_leaves_staggered_zero_extra_d
         release_b.set()
         await runner.aclose()
         store._db = orig_db
+
+
+async def test_stage2_r3_b1_1_cancel_second_resume_while_first_running_completes_first_voids_second(registry_store):
+    """Stage2-R3-B1.1: Two explicit resumes claimed together -> cancel 2nd while 1st runs -> 1st completes, 2nd voided (0 LLM)."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    seen_prompts: list[str] = []
+    first_resume_entered = asyncio.Event()
+    release_first_resume = asyncio.Event()
+
+    class B11Model(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                seen_prompts.append(latest)
+                if "first-run-prompt" in latest:
+                    first_resume_entered.set()
+                    await release_first_resume.wait()
+                return LLMResponse(raw_text=f"A-call-{len(seen_prompts)}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, B11Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r3-b11-wf", "root": leaf("A")},
+            message_id="s2-r3-b11-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and len(seen_prompts) == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(
+            node_id="A", message="first-run-prompt", message_id="s2-r3-b11-res-1",
+        )
+        res_h2 = await handle_on_client.resume(
+            node_id="A", message="second-cancelled-prompt", message_id="s2-r3-b11-res-2",
+        )
+
+        rt2 = await RunningAgent(
+            store, B11Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        claimed_batches: list[tuple[int, list[str]]] = []
+        orig_claim = rt2.runtime.worker.inputs.claim
+
+        async def _spy_claim(target_arg, *args, **kwargs):
+            b = await orig_claim(target_arg, *args, **kwargs)
+            if b is not None and target_arg.session_id == handle.target.session_id:
+                claimed_batches.append((int(b.send_index), [r.message_id for r in b.input_refs]))
+            return b
+
+        rt2.runtime.worker.inputs.claim = _spy_claim
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        # Wait until 1st explicit resume is actively inside leaf A's model call
+        await asyncio.wait_for(first_resume_entered.wait(), 5)
+        assert claimed_batches == [(2, ["s2-r3-b11-res-1", "s2-r3-b11-res-2"])], claimed_batches
+
+        # Cancel ONLY the 2nd resume handle while 1st resume is running!
+        cancel_rcpt = await res_h2.cancel(reason="cancel second only")
+        assert cancel_rcpt.state == "voided", cancel_rcpt
+
+        r2 = await res_h2.wait(deadline_ms=now_ms() + 10000)
+        assert r2.status == "cancelled" and r2.cancel_by == "user", r2
+
+        # Release 1st resume -> MUST finish completed with full result!
+        release_first_resume.set()
+        r1 = await res_h1.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        assert r1.status == "completed" and "A" in r1.results and "first-run-prompt" in r1.results["A"].text
+        # 2nd resume NEVER called the leaf model!
+        assert len(seen_prompts) == 2, seen_prompts
+        assert all("second-cancelled-prompt" not in p for p in seen_prompts)
+
+        # Driver must finish idle with 0 wake_pending_count
+        drv_row = await store._db.fetchone(
+            f"SELECT execution_state,wake_pending_count FROM {store.t.sessions} WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert drv_row["execution_state"] == "idle" and int(drv_row["wake_pending_count"]) == 0
+
+        # Main received 3 distinct receipts matching exact input_ref & terminal status (start + res-2 cancelled + res-1 completed)
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        by_input = {json.loads(r["content_json"])["input_ref"]["message_id"]: json.loads(r["content_json"]) for r in main_rcpts}
+        assert set(by_input.keys()) == {handle.input_ref.message_id, "s2-r3-b11-res-1", "s2-r3-b11-res-2"}
+        assert by_input["s2-r3-b11-res-1"]["status"] == "completed"
+        assert "first-run-prompt" in by_input["s2-r3-b11-res-1"]["final_text"]
+        assert by_input["s2-r3-b11-res-2"]["status"] == "cancelled"
+        assert by_input["s2-r3-b11-res-2"]["cancel_by"] == "user"
+    finally:
+        release_first_resume.set()
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_r3_b1_2_two_resumes_claimed_together_lease_expires_before_graph_both_execute_truthfully(registry_store):
+    """Stage2-R3-B1.2: Two resumes claimed together, lease expires before graph -> recover + takeover runs both truthfully."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    seen_prompts: list[str] = []
+
+    class B12Model(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                seen_prompts.append(latest)
+                return LLMResponse(raw_text=f"A-b12-{len(seen_prompts)}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, B12Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r3-b12-wf", "root": leaf("A")},
+            message_id="s2-r3-b12-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and len(seen_prompts) == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        drv_sid = handle.target.session_id
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h1 = await handle_on_client.resume(
+            node_id="A", message="takeover-prompt-one", message_id="s2-r3-b12-res-1",
+        )
+        res_h2 = await handle_on_client.resume(
+            node_id="A", message="takeover-prompt-two", message_id="s2-r3-b12-res-2",
+        )
+
+        # Dead Worker claims BOTH explicit resumes in send_index=2, then lease expires BEFORE graph runs!
+        batch2 = await port.claim(handle.target, node_id="worker-dead", boot_id="boot-dead")
+        assert batch2 is not None and batch2.send_index == 2
+        assert [r.message_id for r in batch2.input_refs] == ["s2-r3-b12-res-1", "s2-r3-b12-res-2"]
+
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec = await port.recover(handle.target, node_id="worker-2", boot_id="boot-2")
+        assert rec is not None and rec.execution_state == "queued"
+
+        # Immediately after recover() (before Worker 2 runs), NEITHER input may falsely report completed!
+        insp1_pre = await client.inspect(res_h1.input_ref, actor=rt1.actor)
+        insp2_pre = await client.inspect(res_h2.input_ref, actor=rt1.actor)
+        assert insp1_pre.terminal_status is None, insp1_pre
+        assert insp2_pre.terminal_status is None, insp2_pre
+        assert await port.get_result(res_h1.input_ref, actor=rt1.actor) is None
+        assert await port.get_result(res_h2.input_ref, actor=rt1.actor) is None
+
+        q_pre = await store._db.fetchall(
+            f"SELECT item_id,status,terminal_status FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id IN ('s2-r3-b12-res-1','s2-r3-b12-res-2') ORDER BY id ASC",
+            (drv_sid,),
+        )
+        assert [(r["item_id"], r["status"], r["terminal_status"]) for r in q_pre] == [
+            ("s2-r3-b12-res-1", "waiting_continuation", None),
+            ("s2-r3-b12-res-2", "pending", None),
+        ]
+
+        # Healthy Worker 2 takes over and runs BOTH resumes truthfully!
+        rt2 = await RunningAgent(
+            store, B12Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        r1 = await res_h1.wait(deadline_ms=now_ms() + 10000)
+        r2 = await res_h2.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        assert len(seen_prompts) == 3, seen_prompts
+        assert "takeover-prompt-one" in seen_prompts[1]
+        assert "takeover-prompt-two" in seen_prompts[2]
+        assert r1.status == "completed" and "A" in r1.results and "takeover-prompt-one" in r1.results["A"].text
+        assert r2.status == "completed" and "A" in r2.results and "takeover-prompt-two" in r2.results["A"].text
+
+        for rh, expected_sub in ((res_h1, "takeover-prompt-one"), (res_h2, "takeover-prompt-two")):
+            insp = await client.inspect(rh.input_ref, actor=rt1.actor)
+            assert insp.terminal_status == "completed"
+            gr = await port.get_result(rh.input_ref, actor=rt1.actor)
+            assert gr is not None and gr.status == "completed" and expected_sub in gr.final_text
+
+        main_rcpts = await store._db.fetchall(
+            f"SELECT item_id,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 3
+        bodies = [json.loads(r["content_json"]) for r in main_rcpts]
+        assert [b["input_ref"]["message_id"] for b in bodies] == [
+            handle.input_ref.message_id, "s2-r3-b12-res-1", "s2-r3-b12-res-2",
+        ]
+        assert "takeover-prompt-one" in bodies[1]["final_text"]
+        assert "takeover-prompt-two" in bodies[2]["final_text"]
+    finally:
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_r3_b2_normal_local_explicit_resume_zero_extra_db_reads(registry_store):
+    """Stage2-R3-B2: Single Runtime/Store capacity=1 normal handle.resume() slow leaf -> 0 poll & 0 get_result reads."""
+    from .test_send_sql_profile import Profiled
+
+    store, _ = registry_store
+    resume_entered = asyncio.Event()
+    release_resume = asyncio.Event()
+    a_calls = 0
+
+    class ResumeSlowLeafModel(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal a_calls
+            if req.system_prompt.startswith("A"):
+                a_calls += 1
+                if a_calls == 2:
+                    resume_entered.set()
+                    await release_resume.wait()
+                    return LLMResponse(raw_text="A-resumed-slow-done")
+                return LLMResponse(raw_text="A-initial-done")
+            return LLMResponse(raw_text="main-ack")
+
+    orig_db = store._db
+    prof = Profiled(orig_db)
+    store._db = prof
+    runner = await RunningAgent(
+        store, ResumeSlowLeafModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+    ).start()
+    try:
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "s2-r3-b2-res", "root": leaf("A")},
+            message_id="s2-r3-b2-start", actor=runner.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and first.results["A"].text == "A-initial-done"
+        await runner.drain()
+        assert a_calls == 1
+
+        # Clear profiler BEFORE calling handle.resume() so even initial wait entry is strictly audited!
+        prof.records.clear()
+        res_h = await handle.resume(
+            node_id="A", message="slow-local-resume", message_id="s2-r3-b2-resume",
+        )
+        await asyncio.wait_for(resume_entered.wait(), 5)
+        # Cross >3x250ms wait boundaries while local resumed slow leaf is active
+        await asyncio.sleep(0.85)
+
+        poll_pending = [
+            r for r in prof.records
+            if any("poll_pending_driver_results" in f for f in r["chain"])
+        ]
+        poll_for_send = [
+            r for r in prof.records
+            if any("poll_driver_results_for_send" in f for f in r["chain"])
+        ]
+        get_result_reads = [
+            r for r in prof.records
+            if any("get_result" in f or "_result_state" in f for f in r["chain"])
+        ]
+        assert poll_pending == [], f"Unexpected poll_pending_driver_results during local resume: {poll_pending}"
+        assert poll_for_send == [], f"Unexpected poll_driver_results_for_send during local resume: {poll_for_send}"
+        assert get_result_reads == [], f"Unexpected leaf get_result during local resume: {get_result_reads}"
+
+        release_resume.set()
+        resumed = await res_h.wait(deadline_ms=now_ms() + 10000)
+        assert resumed.status == "completed" and resumed.results["A"].text == "A-resumed-slow-done"
+        await runner.drain()
+    finally:
+        release_resume.set()
+        await runner.aclose()
+        store._db = orig_db

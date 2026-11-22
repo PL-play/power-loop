@@ -188,7 +188,7 @@ class WorkflowRunHandle:
 class DurableExecutor:
     """Session-Core Executor adapter over ``create_many``, ``workflow_continue``, and local/remote River."""
 
-    def __init__(self, worker, ctx, env, run_id, saved, *, resident_waiter=None):
+    def __init__(self, worker, ctx, env, run_id, saved, *, resident_waiter=None, is_recovery: bool = False):
         self.worker, self.ctx, self.env = worker, ctx, env
         self.client = worker.runtime.client
         self.port = worker.inputs
@@ -213,6 +213,7 @@ class DurableExecutor:
             self._subtree_stopped_flag = [False]
         self._in_memory_results: dict[InputRef, tuple[str, dict[str, Any]]] = {}
         self._remote_wake_pending = False
+        self._is_recovery = bool(is_recovery)
         self._last_polled_id = 0
 
     async def _load_nodes(self, reader=None):
@@ -601,10 +602,10 @@ class DurableExecutor:
                 entry["result_input_ref"] = plain(InputRef(self.ctx.store_id, self.ctx.session_id, item_id))
                 return raw
 
-            # Only query DB on crash-replay entry (send_index > 1) OR an external remote wake
-            # when this target leaf is NOT running/queued locally on this Worker!
-            # Local in-memory _push_driver_leaf_result wakes sibling coroutines with 0 DB reads.
-            is_recovery_init = self.ctx.send_index > 1 and not polled_initial
+            # Only query DB on real crash-takeover entry (origin kind == 'workflow_continue') OR
+            # an external remote wake when this target leaf is NOT running/queued locally!
+            # Normal local explicit handle.resume() (send_index > 1, kind == 'user') does 0 DB reads.
+            is_recovery_init = self._is_recovery and not polled_initial
             is_local_leaf = self._is_leaf_local_pending_or_active(target.session_id)
             if is_recovery_init or (self._remote_wake_pending and not is_local_leaf):
                 self._remote_wake_pending = False
@@ -632,7 +633,7 @@ class DurableExecutor:
                 idle_polls += 1
                 # Fallback for cross-process DatabasePollingTransport / lost hints or full inbox
                 found = await self._pull_remote_pending_results(
-                    include_claimed_send=(self.ctx.send_index > 1),
+                    include_claimed_send=self._is_recovery,
                 )
                 if found or start in self._in_memory_results:
                     continue
@@ -871,7 +872,37 @@ class DurableExecutor:
         return [item["text"] for item in state.get("items", []) if item["status"] != "completed"]
 
 
-async def _prepare_explicit(worker, ctx, saved, origin, options):
+async def _requeue_deferred_inputs_tx(port, tx, sid: str, send_index: int, requeue_ids: tuple[str, ...]) -> None:
+    """Restore co-claimed secondary formal resumes to ``pending`` before starting the first graph."""
+    if not requeue_ids:
+        return
+    ph = ",".join("?" for _ in requeue_ids)
+    urows = await tx.fetchall(
+        f"SELECT item_id,wake,content_bytes FROM {port.q} WHERE session_id=? "
+        f"AND status='delivered' AND delivered_send_index=? AND terminal_status IS NULL "
+        f"AND item_id IN ({ph})",
+        (sid, send_index, *requeue_ids),
+    )
+    if not urows:
+        return
+    live_ids = [str(r["item_id"]) for r in urows]
+    lph = ",".join("?" for _ in live_ids)
+    await tx.execute(
+        f"UPDATE {port.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+        "delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
+        f"AND delivered_send_index=? AND terminal_status IS NULL AND item_id IN ({lph})",
+        (sid, send_index, *live_ids),
+    )
+    w_add = sum(int(r["wake"]) for r in urows)
+    b_add = sum(int(r["content_bytes"]) for r in urows)
+    await tx.execute(
+        f"UPDATE {port.s} SET wake_pending_count=wake_pending_count+?,"
+        "pending_count=pending_count+?,pending_bytes=pending_bytes+? WHERE session_id=?",
+        (w_add, len(urows), b_add, sid),
+    )
+
+
+async def _prepare_explicit(worker, ctx, saved, origin, options, *, requeue_ids: tuple[str, ...] = ()):
     from .continuation import plan_continuation
 
     port = worker.inputs
@@ -898,6 +929,8 @@ async def _prepare_explicit(worker, ctx, saved, origin, options):
             or int(state["owner_epoch"]) != int(ctx.batch.owner_epoch)
         ):
             raise SessionLeaseLost(ctx.session_id)
+        if requeue_ids:
+            await _requeue_deferred_inputs_tx(port, tx, ctx.session_id, ctx.send_index, requeue_ids)
         to_write: list[tuple[str, dict[str, Any]]] = []
         for entry in entries:
             if entry["path"] in plan.invalidated:
@@ -942,6 +975,8 @@ async def _complete_driver(
     extra_late_ids: tuple[str, ...] = (),
 ):
     """Finalize the resident driver in 1 Final transaction (0 final_lock_asc!)."""
+    if getattr(ctx, "ownership", None) is not None and ctx.ownership.lost:
+        raise SessionLeaseLost(ctx.session_id)
     port = worker.inputs
     status = aggregate["status"]
     if status == "budget_exceeded":
@@ -1027,10 +1062,12 @@ async def _complete_driver(
     )
 
 
-async def _execute_driver_graph(worker, ctx, env, run_id: str, saved, spec, resident_waiter):
+async def _execute_driver_graph(
+    worker, ctx, env, run_id: str, saved, spec, resident_waiter, *, is_recovery: bool = False,
+):
     """Run one workflow graph execution wave and return ``(result_dict, aborted_early)``."""
     executor = DurableExecutor(
-        worker, ctx, env, run_id, saved, resident_waiter=resident_waiter,
+        worker, ctx, env, run_id, saved, resident_waiter=resident_waiter, is_recovery=is_recovery,
     )
     engine = WorkflowEngine(
         executor,
@@ -1064,6 +1101,8 @@ async def _execute_driver_graph(worker, ctx, env, run_id: str, saved, spec, resi
                 executor._drain_local_waiter()
                 result.cancel_by = ctx.cancel_by or "user"
         else:
+            if getattr(ctx, "ownership", None) is not None and ctx.ownership.lost:
+                raise SessionLeaseLost(ctx.session_id)
             aborted_early = True
             timed_out = stopped not in done
             if timed_out:
@@ -1214,6 +1253,16 @@ async def run_driver(worker, ctx, env):
                 continue
             formal_items.append(item)
 
+        def _formal_priority(item):
+            orig_rec, r_rec, _ = item
+            if orig_rec.row["kind"] == "workflow_continue":
+                return 0
+            if r_rec.ref.message_id == run_id or (def_msg_id is not None and r_rec.ref.message_id == def_msg_id):
+                return 1
+            return 2
+
+        formal_items.sort(key=_formal_priority)
+
         formal_id_set = {
             mid for item in formal_items for mid in (item[0].ref.message_id, item[1].ref.message_id)
         }
@@ -1246,23 +1295,44 @@ async def run_driver(worker, ctx, env):
 
     spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
     origin_0, resume_origin_0, resume_opts_0 = runnable_formal[0]
-    # When multiple distinct formal runs/resumes are claimed in one batch, execute the first one
-    # on this send_index and leave the remaining formal items unconsumed so port.final() atomically
-    # restores them to status='pending' and re-queues the Driver for their own send_index (giving
-    # every accepted resume its own unique send_index, result_seq, and Main result_message_id!).
-    deferred_formal_ids = {
+    # When multiple distinct formal runs/resumes are claimed in one batch, immediately restore
+    # deferred secondary resumes back to status='pending' BEFORE starting the first graph so:
+    # 1) cancel(second_resume) voids ONLY the second resume without cancelling the running first!
+    # 2) If not cancelled, live wake_pending_count > 0 cleanly re-queues Driver for send_index+1!
+    deferred_formal_ids = tuple(dict.fromkeys(
         mid for item in runnable_formal[1:]
         for mid in (item[0].ref.message_id, item[1].ref.message_id)
-    }
-    if deferred_formal_ids:
+    ))
+    deferred_set = set(deferred_formal_ids)
+    if deferred_set:
         consumed_refs = tuple(
-            ref for ref in ctx.batch.input_refs if ref.message_id not in deferred_formal_ids
+            ref for ref in ctx.batch.input_refs if ref.message_id not in deferred_set
         )
     else:
         consumed_refs = ctx.batch.input_refs
 
-    if resume_opts_0 is not None and saved.get("definition_ref") != plain(resume_origin_0.ref):
-        saved = await _prepare_explicit(worker, ctx, saved, resume_origin_0, resume_opts_0)
+    need_prepare = (
+        resume_opts_0 is not None and saved.get("definition_ref") != plain(resume_origin_0.ref)
+    )
+    if need_prepare:
+        saved = await _prepare_explicit(
+            worker, ctx, saved, resume_origin_0, resume_opts_0, requeue_ids=deferred_formal_ids,
+        )
+    elif deferred_formal_ids:
+        async with port.db.transaction() as tx:
+            state = await port.store._db.dialect.lock_state(tx, port.s, ctx.session_id)
+            if (
+                state["execution_state"] != "running"
+                or int(state["send_index"]) != int(ctx.send_index)
+                or int(state["owner_epoch"]) != int(ctx.batch.owner_epoch)
+            ):
+                raise SessionLeaseLost(ctx.session_id)
+            await _requeue_deferred_inputs_tx(port, tx, ctx.session_id, ctx.send_index, deferred_formal_ids)
+    if deferred_formal_ids:
+        # Deferred resumes are already back in status='pending' (tracked by wake_pending_count),
+        # so drop them from ctx.batch.input_refs: if cancelled/voided mid-flight, port.final sees
+        # wake_pending_count==0 and cleanly transitions Driver to 'idle'.
+        ctx.batch = replace(ctx.batch, input_refs=consumed_refs)
 
     resident_waiter = port.register_driver_waiter(ctx.session_id)
     try:
@@ -1272,6 +1342,7 @@ async def run_driver(worker, ctx, env):
 
         result_dict, aborted_early = await _execute_driver_graph(
             worker, ctx, env, run_id, saved, spec, resident_waiter,
+            is_recovery=(origin_0.row["kind"] == "workflow_continue"),
         )
         return await _complete_driver(
             worker, ctx, saved, origin_0, result_dict,

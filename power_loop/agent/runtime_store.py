@@ -4184,7 +4184,7 @@ class RuntimeInputStore:
            carrying ``{"workflow_resume": ...}``.
         4. Fallback to ``origins[-1]`` (late inputs after completion).
         """
-        for o in reversed(origins):
+        for o in origins:
             if o.row["kind"] == "workflow_continue":
                 root = await self._continuation_root(tx, o)
                 if self._is_driver_run_input(own_state, root):
@@ -4204,7 +4204,7 @@ class RuntimeInputStore:
                 for o in origins:
                     if o.ref.message_id == def_msg_id:
                         return o
-        for o in reversed(origins):
+        for o in origins:
             try:
                 parsed = json.loads(o.row["content_json"])
             except Exception:
@@ -4215,8 +4215,9 @@ class RuntimeInputStore:
 
     async def _close_workflow_run_journal_tx(
         self, tx, state, *, primary_ref: InputRef, cby: str, reason: str, database_now: int,
+        root_ref: InputRef | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically close an open workflow run journal on cancelled takeover/void."""
+        """Build cancelled WorkflowResult and close open run journal only if owned by ``root_ref``."""
         if state["session_kind"] != "workflow_driver":
             return None
         run_id = state["start_input_message_id"]
@@ -4226,8 +4227,6 @@ class RuntimeInputStore:
 
         sid = state["session_id"]
         saved = await journal.get(self.store, tx, sid, journal.run_key(run_id))
-        if saved is None or saved.get("aggregate_delivered"):
-            return None
         desc_obj = json.loads(state["descriptor_json"])
         wf_name = (
             ((desc_obj.get("config") or {}).get("workflow") or {}).get("spec", {}).get("name")
@@ -4243,17 +4242,30 @@ class RuntimeInputStore:
             "tolerated": [],
             "cancel_by": cby,
         }
-        saved.update(
-            status="cancelled",
-            cancel_by=cby,
-            result=agg_final,
-            result_seq=None,
-            aggregate_delivered=True,
-            aggregate_delivered_at=database_now,
-            continuation={},
-            last_input_ref=plain(primary_ref),
+        effective_root = root_ref or primary_ref
+        def_ref = saved.get("definition_ref") if isinstance(saved, dict) else None
+        def_mid = def_ref.get("message_id") if isinstance(def_ref, dict) else None
+        matches_open_run = (
+            saved is not None
+            and not saved.get("aggregate_delivered")
+            and (
+                effective_root.message_id == run_id
+                or (def_mid is not None and effective_root.message_id == def_mid)
+                or (def_mid is None and state["execution_state"] != "running")
+            )
         )
-        await journal.put(self.store, tx, sid, journal.run_key(run_id), saved)
+        if matches_open_run:
+            saved.update(
+                status="cancelled",
+                cancel_by=cby,
+                result=agg_final,
+                result_seq=None,
+                aggregate_delivered=True,
+                aggregate_delivered_at=database_now,
+                continuation={},
+                last_input_ref=plain(primary_ref),
+            )
+            await journal.put(self.store, tx, sid, journal.run_key(run_id), saved)
         return agg_final
 
     async def _recover_workflow_tx(
@@ -4460,6 +4472,22 @@ class RuntimeInputStore:
                 "AND terminal_status IS NULL",
                 (sid, origin.ref.message_id, active),
             )
+            # Restore every other co-claimed user/workflow_continue input (e.g., secondary
+            # formal handle.resume() or merged plain late input) back to pending so no input
+            # is ever orphaned in delivered(terminal_status=NULL) after takeover!
+            other_origins = [o for o in origins if o.ref.message_id != origin.ref.message_id]
+            if other_origins:
+                other_ids = [o.ref.message_id for o in other_origins]
+                oph = ",".join("?" for _ in other_ids)
+                await tx.execute(
+                    f"UPDATE {self.q} SET status='pending',delivered_at=NULL,delivered_seq=NULL,"
+                    "delivered_send_index=NULL WHERE session_id=? AND status='delivered' "
+                    f"AND delivered_send_index=? AND terminal_status IS NULL AND item_id IN ({oph})",
+                    (sid, active, *other_ids),
+                )
+                restored_wake += sum(int(o.row["wake"]) for o in other_origins)
+                restored_count += len(other_origins)
+                restored_bytes += sum(int(o.row["content_bytes"]) for o in other_origins)
             next_state = "queued" if own_state["lifecycle"] == "open" else "idle"
 
         changed = await tx.execute(
@@ -5321,21 +5349,37 @@ class RuntimeInputStore:
                         _driver_events_out=_driver_events_out,
                     )
             return self.receipt(record, state="already_finished")
+        was_pending = latest.row["status"] == "pending"
+        is_deferred_secondary = False
         if (
             latest.row["status"] == "delivered"
             and state["execution_state"] == "running"
             and latest.row["delivered_send_index"] == int(state["send_index"])
         ):
-            await tx.execute(
-                f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
-                f"updated_at={now_sql} WHERE session_id=? AND execution_state='running'",
-                (cancel_by, reason, sid),
+            active_si = int(state["send_index"])
+            del_rows = await tx.fetchall(
+                f"SELECT * FROM {self.q} WHERE session_id=? AND status='delivered' "
+                "AND delivered_send_index=? AND terminal_status IS NULL "
+                "AND kind IN ('user','workflow_continue') ORDER BY id ASC",
+                (sid, active_si),
             )
-            return Receipt(
-                record.ref, target, record.ref.message_id, False, "cancel_requested",
-                int(state["send_index"]), "not_needed", reason,
-            )
-        if latest.row["status"] != "pending":
+            del_origins = [self.record(r) for r in del_rows]
+            if len(del_origins) > 1 and is_driver_run:
+                primary = await self._select_workflow_origin_tx(tx, state, del_origins)
+                primary_root = await self._continuation_root(tx, primary)
+                if primary_root.ref.message_id != root.ref.message_id:
+                    is_deferred_secondary = True
+            if not is_deferred_secondary:
+                await tx.execute(
+                    f"UPDATE {self.s} SET cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
+                    f"updated_at={now_sql} WHERE session_id=? AND execution_state='running'",
+                    (cancel_by, reason, sid),
+                )
+                return Receipt(
+                    record.ref, target, record.ref.message_id, False, "cancel_requested",
+                    int(state["send_index"]), "not_needed", reason,
+                )
+        if not was_pending and not is_deferred_secondary:
             return self.receipt(record, state="already_finished")
 
         latest_full = await self.input(tx, latest.ref)
@@ -5345,7 +5389,7 @@ class RuntimeInputStore:
         agg_void: dict[str, Any] | None = None
         if is_driver_run:
             agg_void = await self._close_workflow_run_journal_tx(
-                tx, state, primary_ref=latest.ref, cby=cancel_by, reason=reason,
+                tx, state, primary_ref=latest.ref, root_ref=root.ref, cby=cancel_by, reason=reason,
                 database_now=now_ms(),
             )
         res_json_void = canonical(agg_void) if agg_void is not None else None
@@ -5377,12 +5421,22 @@ class RuntimeInputStore:
                     route["result_kind"],
                     delivery_error,
                 ))
-        changed = await tx.execute(
-            f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
-            "result_json=COALESCE(result_json,?),error_code='cancelled',error_detail=?,"
-            f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
-            (cancel_by, res_json_void, reason, delivery_error, sid, latest.ref.message_id),
-        )
+        if was_pending:
+            changed = await tx.execute(
+                f"UPDATE {self.q} SET status='void',terminal_status='cancelled',cancel_by=?,"
+                "result_json=COALESCE(result_json,?),error_code='cancelled',error_detail=?,"
+                f"result_delivery_error=?,completed_at={now_sql} WHERE session_id=? AND item_id=? AND status='pending'",
+                (cancel_by, res_json_void, reason, delivery_error, sid, latest.ref.message_id),
+            )
+        else:
+            changed = await tx.execute(
+                f"UPDATE {self.q} SET status='void',delivered_at=NULL,delivered_seq=NULL,"
+                "delivered_send_index=NULL,terminal_status='cancelled',cancel_by=?,result_send_index=NULL,"
+                "result_json=COALESCE(result_json,?),error_code='cancelled',error_detail=?,"
+                f"result_delivery_error=?,completed_at={now_sql} "
+                "WHERE session_id=? AND item_id=? AND status='delivered' AND delivered_send_index=?",
+                (cancel_by, res_json_void, reason, delivery_error, sid, latest.ref.message_id, int(state["send_index"])),
+            )
         if changed != 1:
             raise SessionLeaseLost(sid)
         completed_refs.append(latest.ref)
@@ -5414,16 +5468,17 @@ class RuntimeInputStore:
             )
             completed_refs.extend(closed_refs)
 
-        await tx.execute(
-            f"UPDATE {self.s} SET "
-            "execution_state=CASE WHEN execution_state='queued' AND (wake_pending_count-?)<=0 "
-            "THEN 'idle' ELSE execution_state END,"
-            "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
-            "pending_count=CASE WHEN pending_count>=1 THEN pending_count-1 ELSE 0 END,"
-            "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
-            f"updated_at={now_sql} WHERE session_id=?",
-            (w_val, w_val, w_val, b_val, b_val, sid),
-        )
+        if was_pending:
+            await tx.execute(
+                f"UPDATE {self.s} SET "
+                "execution_state=CASE WHEN execution_state='queued' AND (wake_pending_count-?)<=0 "
+                "THEN 'idle' ELSE execution_state END,"
+                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                "pending_count=CASE WHEN pending_count>=1 THEN pending_count-1 ELSE 0 END,"
+                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+                f"updated_at={now_sql} WHERE session_id=?",
+                (w_val, w_val, w_val, b_val, b_val, sid),
+            )
         return self.receipt(record, state="voided", reason=reason)
 
     async def _cancel_input_tx(
@@ -7203,8 +7258,7 @@ class RuntimeInputStore:
         if dsi is None:
             return out
         is_driver = session_row["session_kind"] == "workflow_driver"
-        start_id = session_row.get("start_input_message_id")
-        if is_driver and start_id is not None and out["item_id"] == start_id:
+        if is_driver and out.get("kind") in {"user", "workflow_continue"}:
             return out
         cur_si = int(session_row["send_index"])
         is_running = session_row["execution_state"] == "running"
