@@ -3078,15 +3078,41 @@ class RuntimeInputStore:
                     route = parsed_live
         # Design 217 §5.3: human direct chat with a finished workflow leaf (reply_to_session_id IS NULL)
         # replies ONLY to human + delivers system_notice(wake=0) to root_session_id (NEVER wakes Driver!).
+        # Judge against the actually-consumed input subset so partial consume of only a human-chat
+        # input does not inherit reply_to_session_id from an unconsumed input returned to pending.
         is_human_direct_leaf_chat = False
-        if (
-            route is not None
-            and route.get("result_kind") == "workflow_node_result"
-            and batch.reply_to_session_id is None
-            and not any(to for to, _ in delivered_routes.values())
-        ):
-            route = None
-            is_human_direct_leaf_chat = True
+        if route is not None and route.get("result_kind") == "workflow_node_result":
+            consumed_has_reply_route = False
+            if not has_unconsumed:
+                consumed_has_reply_route = (
+                    batch.reply_to_session_id is not None
+                    or any(to for to, _ in delivered_routes.values())
+                )
+            elif consumed_refs:
+                consumed_id_set_chk = {ref.message_id for ref in consumed_refs}
+                if (
+                    batch.reply_to_session_id is not None
+                    and batch.reply_to_item_id is not None
+                    and batch.reply_to_item_id in consumed_id_set_chk
+                ):
+                    consumed_has_reply_route = True
+                elif delivered_routes:
+                    consumed_has_reply_route = any(
+                        delivered_routes.get(mid, (None, None))[0] is not None
+                        for mid in consumed_id_set_chk
+                    )
+                else:
+                    c_ids_chk = [ref.message_id for ref in consumed_refs]
+                    c_ph_chk = ",".join("?" for _ in c_ids_chk)
+                    q_has_route = await tx.fetchone(
+                        f"SELECT 1 FROM {self.q} WHERE session_id=? AND item_id IN ({c_ph_chk}) "
+                        "AND reply_to_session_id IS NOT NULL LIMIT 1",
+                        (sid, *c_ids_chk),
+                    )
+                    consumed_has_reply_route = q_has_route is not None
+            if not consumed_has_reply_route:
+                route = None
+                is_human_direct_leaf_chat = True
 
         deliver_parent_sid = None
         deliver_res_kind = None
@@ -3100,7 +3126,7 @@ class RuntimeInputStore:
                 deliver_start_ref = InputRef(**route["input_ref"])
                 if is_driver:
                     deliver_source_ref = deliver_start_ref
-            elif batch.reply_to_session_id is not None:
+            elif not is_human_direct_leaf_chat and batch.reply_to_session_id is not None:
                 consumed_id_set = {ref.message_id for ref in consumed_refs}
                 reply_item_id = batch.reply_to_item_id
                 effective_reply_to: str | None = batch.reply_to_session_id
@@ -4252,13 +4278,15 @@ class RuntimeInputStore:
             if origins:
                 primary = await self._select_workflow_origin_tx(tx, own_state, origins)
                 root = await self._continuation_root(tx, primary)
-                agg_final = await self._close_workflow_run_journal_tx(
-                    tx, own_state, primary_ref=primary.ref, cby=cby, reason=reason,
-                    database_now=database_now,
-                )
+                is_driver_run = self._is_driver_run_input(own_state, root)
+                if is_driver_run:
+                    agg_final = await self._close_workflow_run_journal_tx(
+                        tx, own_state, primary_ref=primary.ref, cby=cby, reason=reason,
+                        database_now=database_now,
+                    )
                 res_json_str = canonical(agg_final) if agg_final is not None else None
                 route = json.loads(own_state["result_route_json"]) if own_state["result_route_json"] else None
-                if route is not None:
+                if is_driver_run and route is not None:
                     cancelled_res = Result(
                         root.ref, target, "cancelled", active, None,
                         structured_output=agg_final,
@@ -4270,7 +4298,7 @@ class RuntimeInputStore:
                         child_tenant_id=own_state["tenant_id"],
                         child_principal_id=own_state["principal_id"],
                         parent_session_id=route["target"]["session_id"],
-                        start_ref=InputRef(**route["input_ref"]),
+                        start_ref=root.ref,
                         result=cancelled_res,
                         result_kind=route["result_kind"],
                         child_wake=0 if cby == "subtree" else 1,
@@ -4535,22 +4563,11 @@ class RuntimeInputStore:
                 deliver_res_kind = None
                 deliver_start_ref = None
                 deliver_source_ref = None
-                if rows:
-                    if route is not None:
-                        deliver_parent_sid = route["target"]["session_id"]
-                        deliver_res_kind = route["result_kind"]
-                        deliver_start_ref = InputRef(**route["input_ref"])
-                        deliver_source_ref = self.record(rows[0]).ref
-                    elif not is_human_direct_leaf_chat:
-                        reply_row = next((r for r in rows if r["reply_to_session_id"] is not None), None)
-                        if reply_row is not None:
-                            deliver_parent_sid = str(reply_row["reply_to_session_id"])
-                            deliver_res_kind = reply_row["reply_result_kind"] or "agent_result"
-                            deliver_source_ref = InputRef(self.store.store_id, sid, reply_row["item_id"])
-                            deliver_start_ref = (
-                                InputRef(self.store.store_id, sid, own_state["start_input_message_id"])
-                                if own_state["start_input_message_id"] else deliver_source_ref
-                            )
+                if rows and route is not None:
+                    deliver_parent_sid = route["target"]["session_id"]
+                    deliver_res_kind = route["result_kind"]
+                    deliver_start_ref = InputRef(**route["input_ref"])
+                    deliver_source_ref = self.record(rows[0]).ref
 
                 if deliver_parent_sid is not None and deliver_res_kind is not None and deliver_source_ref is not None:
                     route_result = Result(
@@ -4864,10 +4881,9 @@ class RuntimeInputStore:
                     cascaded_delivered: dict[str, set[str]] = {}
                     for d_val in sorted(desc_by_depth, reverse=True):
                         lvl_ids = desc_by_depth[d_val]
-                        stopped_descendants.extend(lvl_ids)
                         for d_sid in lvl_ids:
                             drow = locked_desc[d_sid]
-                            await self._cancel_single_session_tx(
+                            d_rcpt = await self._cancel_single_session_tx(
                                 tx, drow, reason=reason, cancel_by="subtree",
                                 is_subtree_cascade=True, activations=activations,
                                 completed_refs=completed_refs,
@@ -4876,6 +4892,8 @@ class RuntimeInputStore:
                                 undeliverables=undeliverables,
                                 _driver_events_out=driver_events_out,
                             )
+                            if d_rcpt.state == "cancel_requested":
+                                stopped_descendants.append(d_sid)
                     if isinstance(ref, InputRef):
                         record = await self.input(tx, ref)
                         if record is None:
@@ -4956,18 +4974,17 @@ class RuntimeInputStore:
 
         for drv_sid, item_id, payload in driver_events_out:
             self._push_driver_leaf_result(drv_sid, item_id, payload)
-        if receipt.state == "cancel_requested":
-            if target_is_driver:
-                self.notify_driver_cancel(
-                    target.session_id,
-                    cancel_by=eff_cancel_by,
-                    reason=reason,
-                    subtree_stopped=(scope == "subtree"),
-                )
-            for d_sid in stopped_descendants:
-                self.notify_driver_cancel(
-                    d_sid, cancel_by="subtree", reason=reason, subtree_stopped=True,
-                )
+        if receipt.state == "cancel_requested" and target_is_driver:
+            self.notify_driver_cancel(
+                target.session_id,
+                cancel_by=eff_cancel_by,
+                reason=reason,
+                subtree_stopped=(scope == "subtree"),
+            )
+        for d_sid in stopped_descendants:
+            self.notify_driver_cancel(
+                d_sid, cancel_by="subtree", reason=reason, subtree_stopped=True,
+            )
 
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverables:
             await self._fire_result_undeliverable(
@@ -5211,10 +5228,13 @@ class RuntimeInputStore:
                 "WHERE session_id=? AND item_id=? AND status='delivered' AND delivered_send_index=1",
                 (cancel_by, reason, delivery_error, sid, ready["item_id"]),
             )
+            prestaged_voided = affected
             changed += affected
             if affected:
                 voided_wake += 1
                 completed_refs.append(pre_ref)
+        else:
+            prestaged_voided = 0
 
         if not pending_rows and not is_prestaged and route is not None:
             start = await self.input(tx, InputRef(**route["input_ref"]))
@@ -5225,15 +5245,27 @@ class RuntimeInputStore:
                 )
 
         if state["execution_state"] == "queued" or changed > 0:
-            rem_count = max(0, int(state["pending_count"]) - (changed - (1 if is_prestaged and changed else 0)))
-            rem_bytes = max(0, int(state["pending_bytes"]) - voided_bytes)
-            rem_wake = max(0, int(state["wake_pending_count"]) - voided_wake)
+            # Deduct ONLY the rows actually voided in this step relative to the live locked
+            # sessions row, preserving any wake=0 receipts delivered by deeper descendants
+            # earlier in the same subtree-cancel transaction.
+            voided_pending = max(0, changed - prestaged_voided)
             await tx.execute(
-                f"UPDATE {self.s} SET execution_state='idle',cancel_seq=cancel_seq+1,"
-                "cancel_by=?,cancel_reason=?,wake_pending_count=?,pending_count=?,"
-                f"pending_bytes=?,ready_item_json=NULL,updated_at={now_sql} "
+                f"UPDATE {self.s} SET "
+                "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count-?)>0 "
+                "THEN 'queued' ELSE 'idle' END,"
+                "cancel_seq=cancel_seq+1,cancel_by=?,cancel_reason=?,"
+                "wake_pending_count=CASE WHEN wake_pending_count>=? THEN wake_pending_count-? ELSE 0 END,"
+                "pending_count=CASE WHEN pending_count>=? THEN pending_count-? ELSE 0 END,"
+                "pending_bytes=CASE WHEN pending_bytes>=? THEN pending_bytes-? ELSE 0 END,"
+                f"ready_item_json=NULL,updated_at={now_sql} "
                 "WHERE session_id=? AND execution_state IN ('idle','queued')",
-                (cancel_by, reason, rem_wake, rem_count, rem_bytes, sid),
+                (
+                    voided_wake, cancel_by, reason,
+                    voided_wake, voided_wake,
+                    voided_pending, voided_pending,
+                    voided_bytes, voided_bytes,
+                    sid,
+                ),
             )
         return Receipt(
             None, target, None, False,
@@ -5552,8 +5584,9 @@ class RuntimeInputStore:
         first_meta_json: str | None = None
         if row.get("continuation_of") is not None:
             source_ref = (await self._continuation_root(tx, record)).ref
-        elif session_kind == "workflow_driver" and route is not None:
-            source_ref = start_ref
+        elif session_kind == "workflow_driver":
+            # Keep the terminal input's own identity (original start input OR explicit resume input).
+            source_ref = record.ref
         elif result_si is not None:
             stored_source_id = record.meta.get("result_source_item_id")
             if stored_source_id:
@@ -5572,7 +5605,8 @@ class RuntimeInputStore:
                     source_ref = InputRef(self.store.store_id, record.ref.session_id, str(first_row["item_id"]))
                     first_meta_json = first_row["meta_json"]
 
-        effective_start = source_ref if result_si is None else start_ref
+        route_start_ref = source_ref if session_kind == "workflow_driver" else start_ref
+        effective_start = source_ref if result_si is None else route_start_ref
         message_id = result_message_id(child_target, effective_start, result_si, route["result_kind"])
         if row["result_delivery_error"] is None:
             existing_parent = await tx.fetchone(
@@ -5617,7 +5651,7 @@ class RuntimeInputStore:
             child_tenant_id=session["tenant_id"],
             child_principal_id=session["principal_id"],
             parent_session_id=parent_sid,
-            start_ref=start_ref,
+            start_ref=route_start_ref,
             result=existing,
             result_kind=route["result_kind"],
             child_wake=child_wake,
@@ -5628,8 +5662,9 @@ class RuntimeInputStore:
             if result_si is not None and delivery_error is None:
                 await tx.execute(
                     f"UPDATE {self.q} SET result_delivery_error=NULL "
-                    "WHERE session_id=? AND status='delivered' AND delivered_send_index=?",
-                    (record.ref.session_id, result_si),
+                    "WHERE session_id=? AND status='delivered' "
+                    "AND (delivered_send_index=? OR result_send_index=?)",
+                    (record.ref.session_id, result_si, result_si),
                 )
             else:
                 await tx.execute(

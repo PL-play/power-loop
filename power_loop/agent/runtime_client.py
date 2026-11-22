@@ -167,31 +167,35 @@ class RuntimeClient:
         )
         target = receipt.target
         eff_cancel_by = cancel_by or ("agent" if actor.session_id is not None else "user")
+        signal_target = receipt.state == "cancel_requested"
         if self._local_worker is not None:
-            self._local_worker._activate(
-                target.session_id, receipt.input_ref,
-                cancelled=True, cancel_reason=reason, cancel_verified=True,
-                cancel_by=eff_cancel_by,
-            )
+            if signal_target:
+                self._local_worker._activate(
+                    target.session_id, receipt.input_ref,
+                    cancelled=True, cancel_reason=reason, cancel_verified=True,
+                    cancel_by=eff_cancel_by,
+                )
             for d_sid in stopped_descendants:
                 self._local_worker._activate(
                     d_sid, None, cancelled=True, cancel_reason=reason, cancel_verified=True,
                     cancel_by="subtree",
                 )
         if self.wake_transport is not None:
-            try:
-                await self.wake_transport.publish_cancel(target.session_id, cancel_by=eff_cancel_by)
-            except Exception:
-                log.warning("wake_transport publish_cancel failed for %s", target.session_id, exc_info=True)
+            if signal_target:
+                try:
+                    await self.wake_transport.publish_cancel(target.session_id, cancel_by=eff_cancel_by)
+                except Exception:
+                    log.warning("wake_transport publish_cancel failed for %s", target.session_id, exc_info=True)
             for d_sid in stopped_descendants:
                 try:
                     await self.wake_transport.publish_cancel(d_sid, cancel_by="subtree")
                 except Exception:
                     log.warning("wake_transport publish_cancel failed for %s", d_sid, exc_info=True)
-        # Wake the owner so it can observe the cancel marker at its next checkpoint; the
-        # marker itself is durable and is also read at every loop boundary.
-        await self._notify(target, receipt.message_id or "cancel", receipt.input_ref,
-                           ["activation", "work"], {"cancelled": True, "reason": reason, "verified": True})
+        # Wake the owner only when storage confirmed an active running turn was cancelled;
+        # finished/voided cancels must not stop a newer turn on the same session.
+        if signal_target:
+            await self._notify(target, receipt.message_id or "cancel", receipt.input_ref,
+                               ["activation", "work"], {"cancelled": True, "reason": reason, "verified": True})
         for d_sid in stopped_descendants:
             await self._notify(
                 TargetRef(target.store_id, d_sid), "cancel", None,

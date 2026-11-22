@@ -2399,3 +2399,481 @@ async def test_b4_2_explicit_resume_takeover_before_prepare_executes_node_and_de
             await rt2.aclose()
         await client.aclose()
         await rt1.aclose()
+
+
+async def test_r4_1_cancel_completed_old_handle_does_not_stop_running_resume(registry_store):
+    """R4-1 (M1a-1): Cancelling a completed old handle while a resume is inside model call must not stop the resume."""
+    store, _ = registry_store
+    resume_in_model = asyncio.Event()
+    release_resume = asyncio.Event()
+    leaf_calls = 0
+
+    class R41Model(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal leaf_calls
+            if req.system_prompt.startswith("L1"):
+                leaf_calls += 1
+                if leaf_calls == 2:
+                    resume_in_model.set()
+                    await release_resume.wait()
+                    return LLMResponse(raw_text="L1-resumed-ok")
+                return LLMResponse(raw_text="L1-first-ok")
+            return LLMResponse(raw_text="main-ack")
+
+    runner = await RunningAgent(
+        store, R41Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+    ).start()
+    try:
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "r41-wf", "root": leaf("L1")},
+            message_id="r41-first", actor=runner.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and first.results["L1"].text == "L1-first-ok"
+        await runner.drain()
+
+        # Start explicit resume and wait until new leaf actually enters model.complete()
+        resume_handle = await handle.resume(
+            node_id="L1", message="recompute L1", message_id="r41-resume",
+        )
+        await asyncio.wait_for(resume_in_model.wait(), 5)
+
+        # Cancel the ALREADY-COMPLETED old handle while resume is running!
+        old_cancel_rcpt = await handle.cancel(reason="stale cancel on completed handle")
+        assert old_cancel_rcpt.state == "already_finished"
+
+        drv_row = await store._db.fetchone(
+            f"SELECT cancel_seq,cancel_by FROM {store.t.sessions} WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert int(drv_row["cancel_seq"]) == 0 and drv_row["cancel_by"] is None
+
+        # Release the running resume -> MUST complete normally without being cancelled!
+        release_resume.set()
+        resumed = await resume_handle.wait(deadline_ms=now_ms() + 10000)
+        await runner.drain()
+
+        assert resumed.status == "completed"
+        assert resumed.results["L1"].text == "L1-resumed-ok"
+        assert (await handle.wait(deadline_ms=now_ms() + 5000)).to_dict() == first.to_dict()
+        drv_after = await store._db.fetchone(
+            f"SELECT cancel_seq,cancel_by FROM {store.t.sessions} WHERE session_id=?",
+            (handle.target.session_id,),
+        )
+        assert int(drv_after["cancel_seq"]) == 0 and drv_after["cancel_by"] is None
+    finally:
+        release_resume.set()
+        await runner.aclose()
+
+
+async def test_r4_2_finished_driver_late_plain_input_cancel_takeover_no_duplicate_main_receipt(registry_store):
+    """R4-2 (M1a-2/3): Finished Driver claims only a plain late input -> cancel + takeover emits 0 extra workflow_results."""
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    runner = await RunningAgent(
+        store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+    ).start()
+    try:
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "r42-wf", "root": leaf("L1")},
+            message_id="r42-start", actor=runner.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed"
+        await runner.drain()
+        # Shut down worker cleanly before simulating old Worker claiming only a plain late input
+        await runner.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        drv_sid = handle.target.session_id
+        main_rcpts_before = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (runner.target.session_id,),
+        )
+        assert len(main_rcpts_before) == 1
+
+        # Accept and claim ONLY a plain late user input on the already-finished Driver
+        late_rcpt = await port.accept(handle.target, "late plain input", message_id="r42-late", actor=runner.actor)
+        batch2 = await port.claim(handle.target, node_id="worker-old", boot_id="boot-old")
+        assert batch2 is not None and [r.message_id for r in batch2.input_refs] == ["r42-late"]
+
+        # Stop Driver, expire lease, and take over via recover()
+        await port.cancel(handle.target, actor=runner.actor, scope="subtree", reason="stop late turn")
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec = await port.recover(handle.target, node_id="worker-new", boot_id="boot-new")
+        assert rec is not None and rec.result_ref is None and rec.result_activation is None
+
+        # 1) Late plain input reads cancelled/user
+        late_res = await port.get_result(late_rcpt.input_ref, actor=runner.actor)
+        assert late_res is not None and late_res.status == "cancelled" and late_res.cancel_by == "user"
+
+        # 2) Original run journal and original start result remain completed
+        saved = await store.get_runtime_state(drv_sid, journal.run_key(handle.input_ref.message_id))
+        assert saved is not None and saved["status"] == "completed" and saved["aggregate_delivered"] is True
+        orig_res = await port.get_result(handle.input_ref, actor=runner.actor)
+        assert orig_res is not None and orig_res.status == "completed"
+
+        # 3) Main still has ONLY the original workflow_result receipt (NO duplicate!)
+        main_rcpts_after = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (runner.target.session_id,),
+        )
+        assert len(main_rcpts_after) == 1
+        assert main_rcpts_after[0]["item_id"] == main_rcpts_before[0]["item_id"]
+        assert json.loads(main_rcpts_after[0]["content_json"])["status"] == "completed"
+    finally:
+        await runner.aclose()
+
+
+async def test_r4_3_explicit_resume_capacity_exceeded_redelivery_keeps_resume_input_ref(registry_store):
+    """R4-3 (M1a-3): Real capacity_exceeded on explicit resume -> drain Main -> retry cancel redelivers with resume input_ref."""
+    store, _ = registry_store
+    undeliverable_events: list[dict] = []
+
+    def on_undeliverable(child_sid, parent_sid, result_dict, reason):
+        undeliverable_events.append({
+            "child_sid": child_sid,
+            "parent_sid": parent_sid,
+            "input_ref": InputRef(**result_dict["input_ref"]),
+            "send_index": result_dict["send_index"],
+            "reason": reason,
+        })
+
+    runner = await RunningAgent(
+        store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+    ).start()
+    try:
+        # Enforce real hard_pending_limit=1 and observe post-commit RESULT_UNDELIVERABLE callback
+        runner.runtime.client.inputs.hard_pending_limit = 1
+        runner.runtime.worker.inputs.hard_pending_limit = 1
+        runner.runtime.worker.inputs.on_result_undeliverable = on_undeliverable
+
+        handle = await runner.runtime.client.workflow(
+            runner.target, {"name": "r43-wf", "root": leaf("L1")},
+            message_id="r43-start", actor=runner.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed"
+        await runner.drain()
+
+        # Fill Main's inbox to hard_pending_limit=1 with a real wake=0 input (Main stays idle)
+        fill_rcpt = await runner.runtime.client.send(
+            runner.target, "fill-main-wake0", message_id="r43-fill-w0",
+            actor=runner.actor, wake=False,
+        )
+        assert fill_rcpt.state == "accepted"
+
+        # Execute explicit resume -> first River delivery to Main hits REAL capacity_exceeded
+        resume_handle = await handle.resume(
+            node_id="L1", message="resume-with-full-main", message_id="r43-route-resume",
+        )
+        resumed = await resume_handle.wait(deadline_ms=now_ms() + 10000)
+        assert resumed.status == "completed"
+        await runner.drain()
+
+        assert len(undeliverable_events) == 1
+        assert undeliverable_events[0]["input_ref"] == resume_handle.input_ref
+        assert undeliverable_events[0]["send_index"] == 2
+        assert undeliverable_events[0]["reason"] == "capacity_exceeded"
+
+        q_before = await store._db.fetchone(
+            f"SELECT result_delivery_error,result_send_index FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (handle.target.session_id, resume_handle.input_ref.message_id),
+        )
+        assert q_before["result_delivery_error"] == "capacity_exceeded"
+        assert int(q_before["result_send_index"]) == 2
+
+        # Drain Main's inbox legitimately by consuming the wake=0 filler (normal send drains all pending)
+        await runner.runtime.client.inputs.cancel(
+            fill_rcpt.input_ref, actor=runner.actor, reason="clear filler",
+        )
+        main_st = await _assert_session_counts_match_pending(store._db, store, runner.target.session_id)
+        assert main_st["pending_count"] == 0
+
+        # Retry cancel on the completed resume handle to trigger redelivery
+        retry_rcpt = await resume_handle.cancel(reason="redeliver resume result")
+        assert retry_rcpt.state == "already_finished"
+        await runner.drain()
+
+        # Delivery error cleared
+        q_after = await store._db.fetchone(
+            f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (handle.target.session_id, resume_handle.input_ref.message_id),
+        )
+        assert q_after["result_delivery_error"] is None
+
+        # Verify Main's redelivered workflow_result matches first delivery's item_id, input_ref, send_index, wake
+        expected_mid = result_message_id(handle.target, resume_handle.input_ref, 2, "workflow_result")
+        redel_rows = await store._db.fetchall(
+            f"SELECT item_id,wake,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' AND item_id=?",
+            (runner.target.session_id, expected_mid),
+        )
+        assert len(redel_rows) == 1
+        assert redel_rows[0]["item_id"] == expected_mid
+        assert int(redel_rows[0]["wake"]) == 1
+        body = json.loads(redel_rows[0]["content_json"])
+        assert body["input_ref"]["message_id"] == resume_handle.input_ref.message_id
+        assert int(body["send_index"]) == 2
+        assert body["status"] == "completed"
+    finally:
+        await runner.aclose()
+
+
+async def test_r4_4_stop_queued_subtree_preserves_driver_counts_and_spares_independent_siblings(registry_store):
+    """R4-4 (M1a-4): stop(main, subtree) with queued Driver + pre-staged Leaf keeps Driver counts exact & spares independent siblings."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    main = await target(port, "r44-main")
+
+    # 1) Create independent workflow_driver (claimed Turn 1)
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port.create_many(
+        parent=main, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="r44-drv", message_id="r44-dm1", body={"wf": "go"},
+            descriptor=drv_desc, result_kind="workflow_result",
+            cancel_propagation="independent",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    drv_b = cm_drv.preclaimed[0]
+    drv = drv_b.target
+
+    # 2) Pre-stage a queued, un-claimed Leaf under Driver
+    leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L1"}})
+    cm_leaf = await port.create_many(
+        parent=drv, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="r44-leaf", message_id="r44-lm1", body={"text": "prestaged"},
+            descriptor=leaf_desc, result_kind="workflow_node_result",
+            cancel_propagation="linked",
+        )],
+        node_id="n1", boot_id="b1", can_execute=False, free_slots=0,
+        parent_owner_epoch=drv_b.owner_epoch, parent_cancel_seq=drv_b.cancel_seq,
+    )
+    assert len(cm_leaf.queued_targets) == 1
+
+    # 3) Create ordinary independent agent and independent background child under Main (both running)
+    indep_agent = await port.create_session(
+        DESCRIPTOR, actor=ACTOR, parent=main, cancel_propagation="independent",
+    )
+    await port.accept(indep_agent, "work", message_id="r44-ia1", actor=ACTOR)
+    assert await port.claim(indep_agent, node_id="n1", boot_id="b1") is not None
+
+    bg_desc = replace(DESCRIPTOR, kind="background")
+    indep_bg = await port.create_session(
+        bg_desc, actor=ACTOR, parent=main, cancel_propagation="independent",
+    )
+    await port.accept(indep_bg, "bg-work", message_id="r44-bg1", actor=ACTOR)
+    assert await port.claim(indep_bg, node_id="n1", boot_id="b1") is not None
+
+    # 4) Expire Driver's lease and recover() so Driver enters queued state with wfc_1 pending
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv.session_id,),
+    )
+    rec_drv = await port.recover(drv, node_id="n2", boot_id="b2")
+    assert rec_drv is not None and rec_drv.execution_state == "queued"
+
+    # 5) Stop Main with scope='subtree'
+    await port.cancel(main, actor=ACTOR, scope="subtree", reason="stop whole conversation")
+
+    # 6) Both levels of receipts carry cancel_by='subtree' & wake=0
+    drv_node_rcpts = await store._db.fetchall(
+        f"SELECT item_id,wake,status,content_bytes,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_node_result' AND status='pending'",
+        (drv.session_id,),
+    )
+    assert len(drv_node_rcpts) == 1
+    assert int(drv_node_rcpts[0]["wake"]) == 0
+    assert json.loads(drv_node_rcpts[0]["content_json"])["cancel_by"] == "subtree"
+
+    main_wf_rcpts = await store._db.fetchall(
+        f"SELECT item_id,wake,status,content_json FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='workflow_result' AND status='pending'",
+        (main.session_id,),
+    )
+    assert len(main_wf_rcpts) == 1
+    assert int(main_wf_rcpts[0]["wake"]) == 0
+    assert json.loads(main_wf_rcpts[0]["content_json"])["cancel_by"] == "subtree"
+
+    # 7) Driver & Main pending_count / pending_bytes / wake_pending_count match actual pending rows EXACTLY!
+    drv_st = await _assert_session_counts_match_pending(store._db, store, drv.session_id)
+    assert drv_st["execution_state"] == "idle"
+    assert drv_st["pending_count"] == 1
+    assert drv_st["pending_bytes"] == int(drv_node_rcpts[0]["content_bytes"])
+    assert drv_st["wake_pending_count"] == 0
+    await _assert_session_counts_match_pending(store._db, store, main.session_id)
+
+    # 8) Ordinary independent agent and independent background child remain completely untouched!
+    for sid in (indep_agent.session_id, indep_bg.session_id):
+        row = await store._db.fetchone(
+            f"SELECT execution_state,cancel_by,cancel_seq FROM {store.t.sessions} WHERE session_id=?",
+            (sid,),
+        )
+        assert dict(row) == {"execution_state": "running", "cancel_by": None, "cancel_seq": 0}, sid
+
+
+async def test_r4_5_finished_leaf_mixed_claim_partial_consume_human_only_does_not_wake_driver(registry_store):
+    """R4-5 (M1a-5): Finished leaf claims [human_direct, routed_other] and Final consumes ONLY human_direct."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_store import ChildSpec, RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    main = await target(port, "r45-main")
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port.create_many(
+        parent=main, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="r45-drv", message_id="r45-dm1", body={"wf": "start"},
+            descriptor=drv_desc, result_kind="workflow_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+    )
+    drv_b = cm_drv.preclaimed[0]
+    drv_sid = drv_b.target.session_id
+
+    leaf_desc = replace(DESCRIPTOR, config={**dict(DESCRIPTOR.config), "workflow_node": {"id": "L1"}})
+    cm_leaf = await port.create_many(
+        parent=drv_b.target, actor=ACTOR,
+        specs=[ChildSpec(
+            session_id="r45-leaf", message_id="r45-lm1", body={"text": "turn1"},
+            descriptor=leaf_desc, result_kind="workflow_node_result",
+        )],
+        node_id="n1", boot_id="b1", can_execute=True, free_slots=1,
+        parent_owner_epoch=drv_b.owner_epoch, parent_cancel_seq=drv_b.cancel_seq,
+    )
+    leaf_b1 = cm_leaf.preclaimed[0]
+    leaf_t = leaf_b1.target
+    await port.final(leaf_b1, status="completed", final_text="turn1-done")
+    await port.final(
+        drv_b, status="completed", final_text="wf-done",
+        drain_driver_node_results=True, settle_start_input=True, write_driver_message=True,
+    )
+    # Settle Main's workflow_result so Main starts clean
+    main_b = await port.claim(main, node_id="n1", boot_id="b1")
+    assert main_b is not None
+    await port.final(main_b, status="completed", final_text="main-ack")
+
+    drv_rcpt_cnt_0 = len(await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_node_result'",
+        (drv_sid,),
+    ))
+    assert drv_rcpt_cnt_0 == 1
+
+    # Queue BOTH a pure human direct-chat input (reply_to=None) AND a separately routed input
+    human_rcpt = await port.accept(leaf_t, "pure human chat", message_id="r45-pure-human", actor=ACTOR)
+    routed_rcpt = await port.accept(
+        leaf_t, "routed input", message_id="r45-routed-other", actor=ACTOR,
+        reply_route={"target": main, "result_kind": "agent_result"},
+    )
+    leaf_b2 = await port.claim(leaf_t, node_id="n1", boot_id="b1")
+    assert leaf_b2 is not None and [r.message_id for r in leaf_b2.input_refs] == [
+        "r45-pure-human", "r45-routed-other",
+    ]
+
+    # Final consumes ONLY pure-human; routed-other must return to pending with its route intact
+    fin2 = await port.final(
+        leaf_b2, consumed=(human_rcpt.input_ref,), status="completed", final_text="reply to human only",
+    )
+    assert fin2.result_delivery_error is None and fin2.result_activation is None
+
+    # 1) Unconsumed routed input returned to pending with original reply_to_session_id preserved
+    other_row = await store._db.fetchone(
+        f"SELECT status,reply_to_session_id,reply_result_kind FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND item_id=?",
+        (leaf_t.session_id, routed_rcpt.input_ref.message_id),
+    )
+    assert dict(other_row) == {
+        "status": "pending",
+        "reply_to_session_id": main.session_id,
+        "reply_result_kind": "agent_result",
+    }
+    leaf_st = await _assert_session_counts_match_pending(store._db, store, leaf_t.session_id)
+    assert leaf_st["execution_state"] == "queued" and leaf_st["pending_count"] == 1 and leaf_st["wake_pending_count"] == 1
+
+    # 2) Live root (Main) receives unique system_notice(wake=0) and 0 agent_result
+    notices = await store._db.fetchall(
+        f"SELECT item_id,wake,status FROM {store.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='system_notice'",
+        (main.session_id,),
+    )
+    assert len(notices) == 1 and int(notices[0]["wake"]) == 0 and notices[0]["status"] == "pending"
+    agent_res_rows = await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='agent_result'",
+        (main.session_id,),
+    )
+    assert agent_res_rows == []
+
+    # 3) Finished Driver's workflow_node_result count, wake_pending_count, and idle state remain unchanged!
+    drv_rcpt_cnt_after = len(await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_node_result'",
+        (drv_sid,),
+    ))
+    assert drv_rcpt_cnt_after == drv_rcpt_cnt_0
+    drv_st = await _assert_session_counts_match_pending(store._db, store, drv_sid)
+    assert drv_st["execution_state"] == "idle" and drv_st["wake_pending_count"] == 0
+
+
+async def test_r4_6_ordinary_agent_per_turn_reply_route_recover_matches_m1c_baseline(registry_store):
+    """R4-6 (M1c 45bc524 baseline): Ordinary agent child with result_route_json=NULL & per-turn reply_route does not emit agent_result on recover."""
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
+    from .session_native_fixture import ACTOR, DESCRIPTOR, target
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    parent = await target(port, "r46-parent")
+    child = await port.create_session(DESCRIPTOR, actor=ACTOR, parent=parent, result_route=None)
+
+    srow = await store._db.fetchone(
+        f"SELECT session_kind,result_route_json FROM {store.t.sessions} WHERE session_id=?",
+        (child.session_id,),
+    )
+    assert srow["session_kind"] == "agent" and srow["result_route_json"] is None
+
+    rcpt = await port.accept(
+        child, "per-turn routed task", message_id="r46-inp1", actor=ACTOR,
+        reply_route={"target": parent, "result_kind": "agent_result"},
+    )
+    batch = await port.claim(child, node_id="n1", boot_id="b1")
+    assert batch is not None and batch.result_route is None and batch.reply_to_session_id == parent.session_id
+
+    # Lease expires -> recover() must follow M1c 45bc524 baseline: settle child input as interrupted,
+    # emit 0 agent_result rows to parent, and do NOT wake parent!
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (child.session_id,),
+    )
+    rec = await port.recover(child, node_id="n2", boot_id="b2")
+    assert rec is not None
+    assert len(rec.results) == 1 and rec.results[0].status == "interrupted"
+    assert rec.result_ref is None and rec.result_activation is None
+
+    stored = await port.get_result(rcpt.input_ref, actor=ACTOR)
+    assert stored is not None and stored.status == "interrupted"
+
+    parent_results = await store._db.fetchall(
+        f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='agent_result'",
+        (parent.session_id,),
+    )
+    assert parent_results == []
+    parent_st = await _assert_session_counts_match_pending(store._db, store, parent.session_id)
+    assert parent_st["execution_state"] == "idle"
+    assert parent_st["pending_count"] == 0
+    assert parent_st["wake_pending_count"] == 0
