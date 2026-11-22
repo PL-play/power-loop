@@ -3317,7 +3317,7 @@ class RuntimeInputStore:
                 f"UPDATE {self.q} SET status='delivered',terminal_status=?,cancel_by=?,result_seq=?,"
                 "result_send_index=?,result_json=?,error_code=?,error_detail=?,"
                 f"result_delivery_error=?,completed_at={now_sql} "
-                f"WHERE session_id=? AND item_id IN ({ph})",
+                f"WHERE session_id=? AND item_id IN ({ph}) AND terminal_status IS NULL",
                 (
                     effective_status,
                     effective_cancel_by if effective_status == "cancelled" else None,
@@ -4214,8 +4214,8 @@ class RuntimeInputStore:
         return origins[-1]
 
     async def _close_workflow_run_journal_tx(
-        self, tx, state, *, primary_ref: InputRef, cby: str, reason: str, database_now: int,
-        root_ref: InputRef | None = None,
+        self, tx, state, *, primary_ref: InputRef, root_ref: InputRef, cby: str, reason: str,
+        database_now: int,
     ) -> dict[str, Any] | None:
         """Build cancelled WorkflowResult and close open run journal only if owned by ``root_ref``."""
         if state["session_kind"] != "workflow_driver":
@@ -4242,15 +4242,14 @@ class RuntimeInputStore:
             "tolerated": [],
             "cancel_by": cby,
         }
-        effective_root = root_ref or primary_ref
         def_ref = saved.get("definition_ref") if isinstance(saved, dict) else None
         def_mid = def_ref.get("message_id") if isinstance(def_ref, dict) else None
         matches_open_run = (
             saved is not None
             and not saved.get("aggregate_delivered")
             and (
-                effective_root.message_id == run_id
-                or (def_mid is not None and effective_root.message_id == def_mid)
+                root_ref.message_id == run_id
+                or (def_mid is not None and root_ref.message_id == def_mid)
                 or (def_mid is None and state["execution_state"] != "running")
             )
         )
@@ -4297,7 +4296,7 @@ class RuntimeInputStore:
                 is_driver_run = self._is_driver_run_input(own_state, root)
                 if is_driver_run:
                     agg_final = await self._close_workflow_run_journal_tx(
-                        tx, own_state, primary_ref=primary.ref, cby=cby, reason=reason,
+                        tx, own_state, primary_ref=primary.ref, root_ref=root.ref, cby=cby, reason=reason,
                         database_now=database_now,
                     )
                 res_json_str = canonical(agg_final) if agg_final is not None else None
@@ -4930,7 +4929,11 @@ class RuntimeInputStore:
                         record = await self.input(tx, ref)
                         if record is None:
                             raise RuntimeRequestError("not_found")
-                        if record.row["kind"] == "workflow_continue" or record.row["status"] == "waiting_continuation":
+                        if (
+                            state["session_kind"] == "workflow_driver"
+                            or record.row["kind"] == "workflow_continue"
+                            or record.row["status"] == "waiting_continuation"
+                        ):
                             receipt = await self._cancel_workflow_input_tx(
                                 tx, state, record, reason=reason, cancel_by=eff_cancel_by,
                                 activations=activations, completed_refs=completed_refs,
@@ -5152,7 +5155,7 @@ class RuntimeInputStore:
                 )
             ):
                 agg_void = await self._close_workflow_run_journal_tx(
-                    tx, state, primary_ref=rec.ref, cby=cancel_by, reason=reason,
+                    tx, state, primary_ref=rec.ref, root_ref=root_rec.ref, cby=cancel_by, reason=reason,
                     database_now=now_ms(),
                 )
             res_json_void = canonical(agg_void) if agg_void is not None else None
@@ -5364,7 +5367,7 @@ class RuntimeInputStore:
                 (sid, active_si),
             )
             del_origins = [self.record(r) for r in del_rows]
-            if len(del_origins) > 1 and is_driver_run:
+            if len(del_origins) > 1:
                 primary = await self._select_workflow_origin_tx(tx, state, del_origins)
                 primary_root = await self._continuation_root(tx, primary)
                 if primary_root.ref.message_id != root.ref.message_id:
@@ -5479,6 +5482,11 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} WHERE session_id=?",
                 (w_val, w_val, w_val, b_val, b_val, sid),
             )
+        if is_deferred_secondary:
+            return Receipt(
+                record.ref, target, record.ref.message_id, False, "voided",
+                None, "not_needed", reason,
+            )
         return self.receipt(record, state="voided", reason=reason)
 
     async def _cancel_input_tx(
@@ -5520,7 +5528,7 @@ class RuntimeInputStore:
                 and ref.message_id == state["start_input_message_id"]
             ):
                 agg_void = await self._close_workflow_run_journal_tx(
-                    tx, state, primary_ref=ref, cby=cancel_by, reason=reason,
+                    tx, state, primary_ref=ref, root_ref=ref, cby=cancel_by, reason=reason,
                     database_now=now_ms(),
                 )
             res_json_void = canonical(agg_void) if agg_void is not None else None

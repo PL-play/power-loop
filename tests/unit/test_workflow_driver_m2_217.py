@@ -4415,3 +4415,246 @@ async def test_stage2_r3_b2_normal_local_explicit_resume_zero_extra_db_reads(reg
         release_resume.set()
         await runner.aclose()
         store._db = orig_db
+
+
+async def test_stage2_r4_b1_1_cancel_plain_late_input_in_same_batch_as_explicit_resume_completes_resume_voids_late(
+    registry_store,
+):
+    """Stage2-R4-B1.1: Plain late + explicit resume in same batch -> cancel(late) voids late without stopping resume."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    seen_prompts: list[str] = []
+    resume_entered = asyncio.Event()
+    release_resume = asyncio.Event()
+
+    class R4B11Model(Model):
+        async def complete(self, req, **kwargs):
+            if req.system_prompt.startswith("A"):
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                seen_prompts.append(latest)
+                if "r4-resume-prompt" in latest:
+                    resume_entered.set()
+                    await release_resume.wait()
+                return LLMResponse(raw_text=f"A-r4-{len(seen_prompts)}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    rt1 = await RunningAgent(
+        store, R4B11Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    ).start()
+    client = RuntimeClient(store=store, transport=transport)
+    rt2 = None
+    try:
+        main_target = rt1.target
+        handle = await rt1.runtime.client.workflow(
+            main_target, {"name": "s2-r4-b11-wf", "root": leaf("A")},
+            message_id="s2-r4-b11-start", actor=rt1.actor,
+        )
+        first = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert first.status == "completed" and len(seen_prompts) == 1
+        await rt1.drain()
+        await rt1.runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+
+        # Queue a plain late input FIRST, then an explicit handle.resume() BEFORE Worker 2 claims!
+        late_rcpt = await client.send(
+            handle.target, "plain late message", message_id="s2-r4-b11-late", actor=rt1.actor,
+        )
+        handle_on_client = WorkflowRunHandle(client, rt1.actor, handle.target, handle.input_ref)
+        res_h = await handle_on_client.resume(
+            node_id="A", message="r4-resume-prompt", message_id="s2-r4-b11-res-1",
+        )
+
+        rt2 = await RunningAgent(
+            store, R4B11Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        claimed_batches: list[tuple[int, list[str]]] = []
+        orig_claim = rt2.runtime.worker.inputs.claim
+
+        async def _spy_claim(target_arg, *args, **kwargs):
+            b = await orig_claim(target_arg, *args, **kwargs)
+            if b is not None and target_arg.session_id == handle.target.session_id:
+                claimed_batches.append((int(b.send_index), [r.message_id for r in b.input_refs]))
+            return b
+
+        rt2.runtime.worker.inputs.claim = _spy_claim
+        await rt2.runtime.worker.periodic_tick(limit=32)
+
+        # Wait until explicit resume is actively inside leaf A's model call
+        await asyncio.wait_for(resume_entered.wait(), 5)
+        assert claimed_batches == [(2, ["s2-r4-b11-late", "s2-r4-b11-res-1"])], claimed_batches
+
+        # Cancel ONLY the co-claimed plain late input by its InputRef!
+        cancel_rcpt = await client.cancel(
+            late_rcpt.input_ref, actor=rt1.actor, scope="self", reason="cancel late only",
+        )
+        assert cancel_rcpt.state == "voided", cancel_rcpt
+
+        # Release explicit resume -> MUST complete cleanly with full result!
+        release_resume.set()
+        resumed = await res_h.wait(deadline_ms=now_ms() + 10000)
+        await rt2.drain()
+
+        assert resumed.status == "completed" and "A" in resumed.results and "r4-resume-prompt" in resumed.results["A"].text
+        assert len(seen_prompts) == 2
+
+        # Plain late input MUST remain cancelled/user (NEVER overwritten to completed!)
+        late_insp = await client.inspect(late_rcpt.input_ref, actor=rt1.actor)
+        assert late_insp.terminal_status == "cancelled", late_insp
+        late_res = await port.get_result(late_rcpt.input_ref, actor=rt1.actor)
+        assert late_res is not None and late_res.status == "cancelled" and late_res.cancel_by == "user"
+        late_row = await store._db.fetchone(
+            f"SELECT status,terminal_status,cancel_by FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id=?",
+            (handle.target.session_id, "s2-r4-b11-late"),
+        )
+        assert dict(late_row) == {"status": "void", "terminal_status": "cancelled", "cancel_by": "user"}
+
+        # Main received ONLY start + completed explicit resume (0 spurious cancelled receipt!)
+        main_rcpts = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts) == 2
+        bodies = [json.loads(r["content_json"]) for r in main_rcpts]
+        assert [b["input_ref"]["message_id"] for b in bodies] == [
+            handle.input_ref.message_id, "s2-r4-b11-res-1",
+        ]
+        assert bodies[1]["status"] == "completed" and "r4-resume-prompt" in bodies[1]["final_text"]
+    finally:
+        release_resume.set()
+        if rt2 is not None:
+            await rt2.aclose()
+        await client.aclose()
+        await rt1.aclose()
+
+
+async def test_stage2_r4_b1_2_cancelled_continuation_chain_second_lease_expiry_closes_journal_and_allows_resume(
+    registry_store,
+):
+    """Stage2-R4-B1.2: Recovered wfc_* cancelled & expired again -> recover closes journal so handle.resume() succeeds."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+    from power_loop.workflow import journal
+    from power_loop.workflow.runner import WorkflowRunHandle
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    a_calls = 0
+
+    class R4B12Model(Model):
+        async def complete(self, req, **kwargs):
+            nonlocal a_calls
+            if req.system_prompt.startswith("A"):
+                a_calls += 1
+                user_texts = [
+                    str(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                    for m in req.messages
+                    if (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "user"
+                ]
+                latest = user_texts[-1] if user_texts else ""
+                return LLMResponse(raw_text=f"A-r4b12-{a_calls}:{latest}")
+            return LLMResponse(raw_text="main-ack")
+
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    rt_helper = RunningAgent(
+        store, R4B12Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+        transport=transport,
+    )
+    rt_worker = None
+    try:
+        main_target = await client.create_session(rt_helper.descriptor, actor=rt_helper.actor)
+        handle = await client.workflow(
+            main_target, {"name": "s2-r4-b12-wf", "root": leaf("A")},
+            message_id="s2-r4-b12-start", actor=rt_helper.actor,
+        )
+        drv_sid = handle.target.session_id
+        run_id = handle.input_ref.message_id
+
+        # 1) Turn 1 claimed by dead Worker 1, lease expires before graph -> recover() queues wfc_1
+        b1 = await port.claim(handle.target, node_id="dead-1", boot_id="b-1")
+        assert b1 is not None and b1.send_index == 1
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec1 = await port.recover(handle.target, node_id="rec-1", boot_id="rb-1")
+        assert rec1 is not None and rec1.execution_state == "queued"
+
+        # 2) Turn 2 claims wfc_1, original handle is cancelled, then lease expires AGAIN before Final!
+        b2 = await port.claim(handle.target, node_id="dead-2", boot_id="b-2")
+        assert b2 is not None and b2.send_index == 2
+        assert b2.input_refs[0].message_id.startswith("wfc_")
+
+        c_rcpt = await handle.cancel(reason="cancel recovered continuation")
+        assert c_rcpt.state == "cancel_requested"
+
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?", (drv_sid,),
+        )
+        rec2 = await port.recover(handle.target, node_id="healthy-1", boot_id="hb-1")
+        assert rec2 is not None and rec2.execution_state == "idle"
+
+        # Verify original input, Main receipt, AND run journal are ALL closed as cancelled!
+        cancelled_res = await handle.wait(deadline_ms=now_ms() + 5000)
+        assert cancelled_res.status == "cancelled" and cancelled_res.cancel_by == "user"
+
+        saved_j = await journal.get(store, store._db, drv_sid, journal.run_key(run_id))
+        assert saved_j is not None
+        assert saved_j["status"] == "cancelled" and saved_j["aggregate_delivered"] is True, saved_j
+
+        main_rcpts1 = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts1) == 1
+        b_c = json.loads(main_rcpts1[0]["content_json"])
+        assert b_c["status"] == "cancelled" and b_c["cancel_by"] == "user"
+        assert b_c["input_ref"]["message_id"] == run_id
+
+        # 3) Subsequent public handle.resume() on the SAME Driver MUST be accepted and execute!
+        handle_on_client = WorkflowRunHandle(client, rt_helper.actor, handle.target, handle.input_ref)
+        res_h = await handle_on_client.resume(
+            node_id="A", message="resume-after-cancelled-wfc", message_id="s2-r4-b12-res",
+        )
+        rt_worker = await RunningAgent(
+            store, R4B12Model(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=2,
+            transport=transport,
+        ).start(target=main_target)
+        await rt_worker.runtime.worker.periodic_tick(limit=32)
+
+        resumed = await res_h.wait(deadline_ms=now_ms() + 10000)
+        await rt_worker.drain()
+        assert a_calls == 1
+        assert resumed.status == "completed" and "A" in resumed.results
+        assert "resume-after-cancelled-wfc" in resumed.results["A"].text
+
+        main_rcpts2 = await store._db.fetchall(
+            f"SELECT content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='workflow_result' ORDER BY id ASC",
+            (main_target.session_id,),
+        )
+        assert len(main_rcpts2) == 2
+        b_r = json.loads(main_rcpts2[1]["content_json"])
+        assert b_r["status"] == "completed" and b_r["input_ref"]["message_id"] == "s2-r4-b12-res"
+        assert "resume-after-cancelled-wfc" in b_r["final_text"]
+    finally:
+        if rt_worker is not None:
+            await rt_worker.aclose()
+        await client.aclose()
+        await rt_helper.loop.aclose()
+        await rt_helper.runtime.client.aclose()
