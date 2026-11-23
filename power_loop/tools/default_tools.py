@@ -355,6 +355,20 @@ _BASH_READ_HINTS = (
 )
 
 
+_BASH_PATH_STOP = " \t\n\r'\"`;:|&()<>"
+_BASH_PATH_BOUNDARY = "/\\" + _BASH_PATH_STOP
+_POWER_LOOP_HOME_COMPLEX_VAR_RE = re.compile(r"\$\{POWER_LOOP_HOME[^}]+\}")
+_POWER_LOOP_HOME_VAR_RE = re.compile(r"\$\{POWER_LOOP_HOME\}|\$POWER_LOOP_HOME(?![A-Za-z0-9_])")
+
+
+def _norm_bash_path(path_text: str) -> str:
+    import posixpath
+
+    normalized = path_text.replace("\\", "/")
+    collapsed = posixpath.normpath(normalized)
+    return collapsed.lower()
+
+
 def _path_referenced(haystack_lower: str, target_lower: str) -> bool:
     """True iff ``target_lower`` appears in ``haystack_lower`` as a PATH — itself or ``target/<sub>``
     — not merely as a substring of a longer path component (default-tools-3): home ``/var/lib/agent``
@@ -365,7 +379,7 @@ def _path_referenced(haystack_lower: str, target_lower: str) -> bool:
     idx = haystack_lower.find(target_lower)
     while idx != -1:
         after = haystack_lower[idx + len(target_lower): idx + len(target_lower) + 1]
-        if after == "" or after in "/\\ \t\n\r'\"`;:|&()<>":
+        if after == "" or after in _BASH_PATH_BOUNDARY:
             return True
         idx = haystack_lower.find(target_lower, idx + 1)
     return False
@@ -375,21 +389,51 @@ def _is_agent_path_allowed_for_bash(command: str) -> bool:
     runtime_env = get_runtime_env()
     if runtime_env.home_dir is None:
         return True
-    lowered = command.lower()
-    if not _path_referenced(lowered, str(runtime_env.home_dir).lower()):
-        return True
-    return any(_path_referenced(lowered, str(path).lower()) for path in runtime_env.home_rw_allowlist)
+    if _POWER_LOOP_HOME_COMPLEX_VAR_RE.search(command):
+        return False
+
+    home_raw = str(runtime_env.home_dir)
+    home_resolved = str(runtime_env.home_dir.resolve())
+    expanded = _POWER_LOOP_HOME_VAR_RE.sub(lambda _: home_raw, command)
+    lowered = expanded.lower()
+
+    home_roots = list(dict.fromkeys(_norm_bash_path(p) for p in (home_raw, home_resolved)))
+    allow_roots = tuple(
+        dict.fromkeys(
+            _norm_bash_path(str(p))
+            for root in runtime_env.home_rw_allowlist
+            for p in (root, root.resolve())
+        )
+    )
+
+    for home_lower in home_roots:
+        if not home_lower:
+            continue
+        idx = lowered.find(home_lower)
+        while idx != -1:
+            end_home = idx + len(home_lower)
+            after = lowered[end_home : end_home + 1]
+            if after == "" or after in _BASH_PATH_BOUNDARY:
+                end = end_home
+                while end < len(lowered) and lowered[end] not in _BASH_PATH_STOP:
+                    end += 1
+                candidate = _norm_bash_path(lowered[idx:end])
+                if not any(
+                    candidate == allow or candidate.startswith(allow + "/")
+                    for allow in allow_roots
+                ):
+                    return False
+            idx = lowered.find(home_lower, idx + 1)
+    return True
 
 
 def _validate_bash_command_scope(command: str) -> str | None:
     runtime_env = get_runtime_env()
     if runtime_env.home_dir is None:
         return None
-    lowered = f" {command.lower()} "
-    if not _path_referenced(lowered, str(runtime_env.home_dir).lower()):
-        return None
     if _is_agent_path_allowed_for_bash(command):
         return None
+    lowered = f" {command.lower()} "
 
     if any(hint in lowered for hint in _BASH_WRITE_HINTS):
         return (
@@ -1359,7 +1403,7 @@ WAKEUP_MAX_LIVE = 10  # live (armed) timers per session
 
 
 async def run_schedule_wakeup(
-    action: str,
+    action: str | None = None,
     delay_seconds: int | None = None,
     note: str | None = None,
     every_seconds: int | None = None,
@@ -1800,7 +1844,7 @@ async def _h_note(**kw: Any) -> Any:
 
 async def _h_schedule_wakeup(**kw: Any) -> Any:
     return await run_schedule_wakeup(
-        kw["action"],
+        kw.get("action"),
         kw.get("delay_seconds"),
         kw.get("note"),
         kw.get("every_seconds"),

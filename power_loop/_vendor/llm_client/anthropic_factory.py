@@ -91,14 +91,13 @@ class AnthropicMessagesLLMService(LLMService):
             self._client = None
 
     def _usage_dict_from_any(self, usage: Any = None):
-        from power_loop.llm_metrics import DefaultTokenUsageExtractor
-        result = DefaultTokenUsageExtractor().extract({"usage": self._last_usage if usage is None else usage})
+        result = self._usage_obj(usage)
         return result.as_dict() if result is not None else {}
 
     def _usage_obj(self, usage: Any = None):
-        from power_loop.llm_metrics import DefaultTokenUsageExtractor
-        result = DefaultTokenUsageExtractor().extract({"usage": self._last_usage if usage is None else usage})
-        return result
+        from power_loop.llm_metrics import DefaultTokenUsageExtractor, response_dict
+        raw_usage = self._last_usage if usage is None else response_dict(usage)
+        return DefaultTokenUsageExtractor().extract({"usage": raw_usage})
 
     def _record_usage(self, usage: Any) -> None:
         self._last_usage = self._usage_dict_from_any(usage)
@@ -358,7 +357,6 @@ class AnthropicMessagesLLMService(LLMService):
         kwargs = self._request_kwargs(request)
         response = await client.messages.create(**kwargs)
         text, think, tool_calls = self._extract_response(response)
-        self._record_usage(getattr(response, "usage", None))
 
         if request.parse_json:
             result = parse_json_from_model_output_detailed(text)
@@ -369,8 +367,17 @@ class AnthropicMessagesLLMService(LLMService):
         result.think = think
         result.tool_calls = tool_calls
         # From THIS response only — never the instance's shared last-usage (design/124 U1).
+        from power_loop.llm_metrics import ResponseMetrics
+        ResponseMetrics(self._cfg.response_extraction).apply(result)
         _u = getattr(response, "usage", None)
-        result.token_usage = self._usage_obj(_u) if _u is not None else None
+        if (
+            result.token_usage is None
+            and _u is not None
+            and not result.debug.get("response_extraction", {}).get("errors")
+            and not (self._cfg.response_extraction or {}).get("usage")
+        ):
+            result.token_usage = self._usage_obj(_u)
+        self._last_usage = result.token_usage.as_dict() if result.token_usage is not None else {}
 
         if on_chunk_delta_text and text:
             maybe = on_chunk_delta_text(text)
@@ -384,8 +391,6 @@ class AnthropicMessagesLLMService(LLMService):
             maybe = on_stream_end(result)
             if hasattr(maybe, "__await__"):
                 await maybe
-        from power_loop.llm_metrics import ResponseMetrics
-        ResponseMetrics(self._cfg.response_extraction).apply(result)
         return result
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
@@ -405,6 +410,8 @@ class AnthropicMessagesLLMService(LLMService):
             tool_calls=response.tool_calls,
             token_usage=response.token_usage,
             raw_event=response.raw_completion,
+            provider_cost=response.provider_cost,
+            response_metrics=dict(response.debug.get("response_extraction") or {}),
             is_final=True,
         )
 

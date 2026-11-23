@@ -131,7 +131,7 @@ def test_frozen_v14():
     import importlib.metadata
 
     assert set(power_loop.STABLE_API) == _FROZEN_STABLE_V14
-    assert power_loop.__version__ == importlib.metadata.version('power-loop') == '14.0.0'
+    assert power_loop.__version__ == importlib.metadata.version('power-loop') == '14.0.1'
     assert not {'JobRef', 'JobPage', 'Command', 'SubagentLifecycle'} & set(power_loop.__all__)
 
 

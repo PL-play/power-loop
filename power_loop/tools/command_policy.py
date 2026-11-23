@@ -39,8 +39,17 @@ from power_loop.tools.command_rules import (
 ALWAYS_BLOCKED: frozenset[str] = DEFAULT_ALWAYS_BLOCKED
 
 _OPERATORS = {"|", "||", "&&", ";", "&", "(", ")", ";;", "|&"}
+_PIPE_OPERATORS = {"|", "|&"}
 _INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "python", "python3", "node", "perl", "ruby", "php"}
-_WRAPPERS = {"env", "nice", "time", "command", "exec", "builtin", "nohup", "setsid", "stdbuf", "timeout"}
+_WRAPPERS = {"env", "nice", "time", "command", "exec", "builtin", "nohup", "setsid", "stdbuf", "timeout", "sudo"}
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+    "sudo": frozenset({"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-T", "-U", "--user", "--group"}),
+}
+_DOWNLOAD_PIPE_SOURCES = {"curl", "wget"}
 
 _NODE_PM = {"npm", "pnpm", "yarn", "bun"}
 _NODE_PM_INSTALL = {"i", "install", "add", "ci", "update", "upgrade", "up", "dlx", "exec"}
@@ -55,15 +64,19 @@ _SERVER_PROGS = {"node", "python", "python3", "npm", "npx", "pnpm", "yarn", "bun
                  "http-server", "uvicorn", "gunicorn", "flask", "ruby", "php", "caddy", "nginx"}
 
 _PIPE_TO_SHELL_RE = re.compile(
-    r"(?:\bcurl\b|\bwget\b)[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|ksh|python3?|node|perl|ruby)\b"
-    r"|<\(\s*(?:curl|wget)\b"
-    r"|\b(?:sh|bash|zsh|python3?|node)\s+-c\s+[\"']?\$\(\s*(?:curl|wget)\b",
+    r"<\(\s*(?:/\S+/)?(?:curl|wget)\b"
+    r"|(?:^|[\s;&|(])(?:/\S+/)?(?:sh|bash|zsh|dash|ksh|python\d*(?:\.\d+)?|node|perl|ruby|php)\s+-c\s+[\"']?\$\(\s*(?:/\S+/)?(?:curl|wget)\b",
     re.I,
 )
 
 
-def _segments(command: str) -> list[list[str]]:
-    """Split a shell command into simple commands (token lists) on operators."""
+def _is_interpreter(prog: str) -> bool:
+    name = prog.lower()
+    return name in _INTERPRETERS or bool(re.fullmatch(r"python\d+(?:\.\d+)?", name))
+
+
+def _segments_with_separators(command: str) -> list[tuple[list[str], str]]:
+    """Split a shell command into (token_list, preceding_separator) pairs."""
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -71,20 +84,32 @@ def _segments(command: str) -> list[list[str]]:
         tokens = list(lexer)
     except ValueError:
         tokens = command.split()
-    segs: list[list[str]] = []
+    segs: list[tuple[list[str], str]] = []
     cur: list[str] = []
+    pending_sep = ""
     for tok in tokens:
         if tok in _OPERATORS or tok == "\n":
             if cur:
-                segs.append(cur)
-            cur = []
+                segs.append((cur, pending_sep))
+                cur = []
+                pending_sep = ""
             if tok == "&":
-                segs.append(["&"])  # marker: previous segment was backgrounded
+                segs.append((["&"], "&"))  # marker: previous segment was backgrounded
+                pending_sep = ""
+            elif tok in {"(", ")"}:
+                continue
+            else:
+                pending_sep = tok
         else:
             cur.append(tok)
     if cur:
-        segs.append(cur)
+        segs.append((cur, pending_sep))
     return segs
+
+
+def _segments(command: str) -> list[list[str]]:
+    """Split a shell command into simple commands (token lists) on operators."""
+    return [seg for seg, _ in _segments_with_separators(command)]
 
 
 def _program(seg: list[str]) -> tuple[str, list[str]]:
@@ -97,10 +122,44 @@ def _program(seg: list[str]) -> tuple[str, list[str]]:
             continue
         name = Path(tok).name
         if name in _WRAPPERS:
+            value_flags = _WRAPPER_VALUE_FLAGS.get(name, frozenset())
+            split_string = False
             i += 1
-            # `timeout 30 cmd`, `nice -n 5 cmd`: skip their own option/value tokens
-            while i < len(seg) and (seg[i].startswith("-") or re.fullmatch(r"\d+[smhd]?", seg[i])):
-                i += 1
+            # `timeout 30 cmd`, `nice -n 5 cmd`, `env -S sh`, `env -u FOO sh`: skip wrapper options/values
+            while i < len(seg):
+                opt = seg[i]
+                if opt == "--":
+                    i += 1
+                    break
+                if name == "env" and opt in {"-S", "--split-string"}:
+                    split_string = True
+                    i += 1
+                    continue
+                if name == "env" and opt.startswith("--split-string="):
+                    payload = opt.split("=", 1)[1].strip()
+                    if payload:
+                        try:
+                            parts = shlex.split(payload, posix=True)
+                        except ValueError:
+                            parts = payload.split()
+                        if parts:
+                            return _program(parts + seg[i + 1:])
+                    i += 1
+                    continue
+                if opt in value_flags:
+                    i += 2
+                    continue
+                if opt.startswith("-") or re.fullmatch(r"\d+[smhd]?", opt):
+                    i += 1
+                    continue
+                break
+            if split_string and i < len(seg) and any(ch.isspace() for ch in seg[i]):
+                try:
+                    parts = shlex.split(seg[i], posix=True)
+                except ValueError:
+                    parts = seg[i].split()
+                if parts:
+                    return _program(parts + seg[i + 1:])
             continue
         return name, seg[i + 1:]
     return "", []
@@ -120,15 +179,21 @@ def classify_command(command: str) -> set[str]:
         return cats
     if _PIPE_TO_SHELL_RE.search(command):
         cats.add("pipe_to_shell")
-    segs = _segments(command)
-    for idx, seg in enumerate(segs):
+    segs_with_seps = _segments_with_separators(command)
+    prev_prog = ""
+    for idx, (seg, sep) in enumerate(segs_with_seps):
         if seg == ["&"]:
+            prev_prog = ""
             continue
         prog, args = _program(seg)
         if not prog:
+            prev_prog = ""
             continue
+        if sep in _PIPE_OPERATORS and prev_prog in _DOWNLOAD_PIPE_SOURCES and _is_interpreter(prog):
+            cats.add("pipe_to_shell")
+        prev_prog = prog.lower()
         sub = _subcommand(args)
-        backgrounded = idx + 1 < len(segs) and segs[idx + 1] == ["&"]
+        backgrounded = idx + 1 < len(segs_with_seps) and segs_with_seps[idx + 1][0] == ["&"]
 
         # ── package_install ──
         if prog in _NODE_PM and (sub in _NODE_PM_INSTALL or (prog == "yarn" and not sub)):

@@ -60,7 +60,11 @@ def response_dict(response):
         except Exception:
             return {}
     if hasattr(response, '__dict__'):
-        return {key: value for key, value in vars(response).items() if not key.startswith('_')}
+        return {
+            key: (response_dict(value) if hasattr(value, 'model_dump') else value)
+            for key, value in vars(response).items()
+            if not key.startswith('_')
+        }
     return {}
 
 
@@ -75,6 +79,11 @@ def read_path(response, path):
             value = value.get(part)
         elif isinstance(value, (list, tuple)) and part.isdecimal() and int(part) < len(value):
             value = value[int(part)]
+        elif not isinstance(value, (str, bytes, int, float, bool)) and (
+            hasattr(value, 'model_dump') or hasattr(value, '__dict__')
+        ):
+            mapped = response_dict(value)
+            value = mapped.get(part) if isinstance(mapped, dict) else None
         else:
             return None
         if value is None:
@@ -103,17 +112,24 @@ class DefaultTokenUsageExtractor:
     def extract(self, response):
         for path in ('usage', 'x_openai_usage', 'x_usage', 'usage_metadata', 'usageMetadata', 'message.usage'):
             raw = read_path(response, path)
+            if raw is not None and not isinstance(raw, dict):
+                raw = response_dict(raw) or None
             if not isinstance(raw, dict):
                 continue
             if 'promptTokenCount' in raw or 'candidatesTokenCount' in raw:
                 return _usage({'prompt_tokens': raw.get('promptTokenCount'),
                     'completion_tokens': raw.get('candidatesTokenCount'), 'total_tokens': raw.get('totalTokenCount'),
                     'prompt_cached_tokens': raw.get('cachedContentTokenCount')})
-            if 'input_tokens' in raw and ('cache_read_input_tokens' in raw or 'cache_creation_input_tokens' in raw):
+            cache_read = raw.get('cache_read_input_tokens')
+            cache_creation = raw.get('cache_creation_input_tokens')
+            if raw.get('input_tokens') is not None and (cache_read is not None or cache_creation is not None):
                 copied = dict(raw)
-                copied['prompt_tokens'] = _token(raw['input_tokens']) + _token(raw.get('cache_read_input_tokens', 0)) + _token(raw.get('cache_creation_input_tokens', 0))
-                copied['prompt_cached_tokens'] = raw.get('cache_read_input_tokens')
-                copied['prompt_cache_miss_tokens'] = _token(raw['input_tokens']) + _token(raw.get('cache_creation_input_tokens', 0))
+                input_tokens = _token(raw['input_tokens'])
+                read_tokens = _token(cache_read) if cache_read is not None else 0
+                creation_tokens = _token(cache_creation) if cache_creation is not None else 0
+                copied['prompt_tokens'] = input_tokens + read_tokens + creation_tokens
+                copied['prompt_cached_tokens'] = read_tokens if cache_read is not None else None
+                copied['prompt_cache_miss_tokens'] = input_tokens + creation_tokens
                 return _usage(normalize_usage(copied))
             result = _usage(normalize_usage(raw))
             if result is not None:

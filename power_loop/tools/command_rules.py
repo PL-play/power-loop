@@ -111,6 +111,37 @@ def _compile(pattern: str, flags: int = 0) -> re.Pattern[str]:
     return re.compile(pattern, flags)
 
 
+def _tokenize_for_deny(command: str) -> list[str]:
+    import shlex
+
+    def _lex(text: str) -> list[str]:
+        try:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            return list(lexer)
+        except ValueError:
+            return [part for part in re.split(r"[\s;|&()<>]+", text) if part]
+
+    tokens: list[str] = []
+    for tok in _lex(command):
+        if not tok:
+            continue
+        cleaned = tok
+        if cleaned.startswith("$("):
+            cleaned = cleaned[2:]
+        cleaned = cleaned.strip("`")
+        if cleaned:
+            tokens.append(cleaned)
+        if "$(" in tok or "`" in tok:
+            inner = tok.replace("$(", " ").replace("`", " ")
+            for sub in _lex(inner):
+                sub_clean = sub.strip("`()")
+                if sub_clean:
+                    tokens.append(sub_clean)
+    return tokens
+
+
 def dangerous_command_reason(command: str, rules: CommandRules | None = None) -> str | None:
     """Absolute deny-list check. Returns the refusal reason, or None when the command is allowed."""
     r = rules or DEFAULT_COMMAND_RULES
@@ -119,13 +150,9 @@ def dangerous_command_reason(command: str, rules: CommandRules | None = None) ->
         if _compile(dp.pattern).search(compact):
             return dp.reason
     if r.deny_programs:
-        import shlex
         from pathlib import Path
 
-        try:
-            tokens = shlex.split(command, comments=False, posix=True)
-        except ValueError:
-            tokens = command.split()
+        tokens = _tokenize_for_deny(command)
         used = sorted({Path(t).name for t in tokens if t and not t.startswith("-")} & set(r.deny_programs))
         if used:
             return f"refusing privileged or device-level command: {', '.join(used)}"
