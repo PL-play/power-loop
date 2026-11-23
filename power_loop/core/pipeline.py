@@ -1488,6 +1488,14 @@ class AgentPipeline:
                             historical_end_idx=hist_end,
                         )
                         if self.store is not None and self.session_id:
+                            from power_loop.runtime.session_ownership import current_ownership
+                            reads_getter = getattr(self.store, "_reads_for", None)
+                            holding = reads_getter(self.session_id) if reads_getter is not None else None
+                            ownership = (
+                                holding.ownership
+                                if holding is not None and holding.ownership is not None
+                                else current_ownership(self.store, self.session_id)
+                            )
                             if folded_by_send:
                                 for orig_si, f_text in sorted(folded_by_send.items()):
                                     await self.store.upsert_repaired_projection(
@@ -1500,6 +1508,7 @@ class AgentPipeline:
                                             "orig_send_index": orig_si,
                                             "text": f_text,
                                         },
+                                        ownership=ownership,
                                     )
                             elif cur_folded:
                                 await self.store.upsert_repaired_projection(
@@ -1511,6 +1520,7 @@ class AgentPipeline:
                                         "scope": "current_turn",
                                         "text": cur_folded,
                                     },
+                                    ownership=ownership,
                                 )
                         if folded_by_send or cur_folded:
                             if folded_msgs and folded_msgs[0]["role"] == "system":

@@ -2762,32 +2762,32 @@ class RuntimeInputStore:
             fold_set_params: tuple[Any, ...] = ()
         elif expected_fold_json is None:
             fold_set_clause = (
-                "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended','closed') AND cancel_seq=? "
                 "AND fold_stats_json IS NULL THEN ? ELSE fold_stats_json END,"
             )
             fold_set_params = (batch.cancel_seq, proj_fold_json)
             if self._dialect == "mysql":
                 mysql_fold_conflict_bit = (
-                    "|(CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "|(CASE WHEN lifecycle IN ('open','suspended','closed') AND cancel_seq=? "
                     "AND fold_stats_json IS NOT NULL THEN 16 ELSE 0 END)"
                 )
                 mysql_fold_conflict_params = (batch.cancel_seq,)
         else:
             if self._dialect == "mysql":
                 fold_set_clause = (
-                    "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended','closed') AND cancel_seq=? "
                     "AND CAST(fold_stats_json AS BINARY)=CAST(? AS BINARY) "
                     "THEN ? ELSE fold_stats_json END,"
                 )
                 mysql_fold_conflict_bit = (
-                    "|(CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "|(CASE WHEN lifecycle IN ('open','suspended','closed') AND cancel_seq=? "
                     "AND (fold_stats_json IS NULL "
                     "OR CAST(fold_stats_json AS BINARY)<>CAST(? AS BINARY)) THEN 16 ELSE 0 END)"
                 )
                 mysql_fold_conflict_params = (batch.cancel_seq, expected_fold_json)
             else:
                 fold_set_clause = (
-                    "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended') AND cancel_seq=? "
+                    "fold_stats_json=CASE WHEN lifecycle IN ('open','suspended','closed') AND cancel_seq=? "
                     "AND fold_stats_json=? THEN ? ELSE fold_stats_json END,"
                 )
             fold_set_params = (batch.cancel_seq, expected_fold_json, proj_fold_json)
@@ -2828,7 +2828,7 @@ class RuntimeInputStore:
                 "|(CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) THEN 1 ELSE 0 END)"
                 "|(CASE WHEN cancel_by='subtree' AND cancel_seq>? THEN 2 ELSE 0 END)"
                 "|(CASE WHEN cancel_seq>? THEN 4 ELSE 0 END)"
-                "|(CASE WHEN lifecycle IN ('closing','closed') THEN 8 ELSE 0 END)"
+                "|(CASE WHEN lifecycle='closing' OR (lifecycle='closed' AND cancel_seq>?) THEN 8 ELSE 0 END)"
                 f"{mysql_fold_conflict_bit}"
                 f"{mysql_route_changed_bit}"
                 f"{mysql_has_pending_bit}"
@@ -2837,7 +2837,7 @@ class RuntimeInputStore:
                 "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-                "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
+                "next_seq=CASE WHEN lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?) THEN "
                 "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
                 "pending_tool_seq=CASE WHEN ?=1 THEN pending_tool_seq ELSE NULL END,"
                 "ready_item_json=NULL,"
@@ -2847,11 +2847,12 @@ class RuntimeInputStore:
                 f"updated_at={now_sql} "
                 "WHERE session_id=? AND owner_epoch=? AND execution_state='running'",
                 (
-                    int(has_unconsumed), batch.cancel_seq, batch.cancel_seq,
+                    int(has_unconsumed), batch.cancel_seq, batch.cancel_seq, batch.cancel_seq,
                     *mysql_fold_conflict_params,
                     *mysql_route_changed_params,
                     *mysql_root_changed_params,
                     int(has_unconsumed),
+                    batch.cancel_seq,
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
@@ -2898,7 +2899,7 @@ class RuntimeInputStore:
                 "execution_state=CASE WHEN lifecycle='open' AND (wake_pending_count>0 OR ?=1) "
                 "THEN 'queued' ELSE 'idle' END,"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
-                "next_seq=CASE WHEN lifecycle IN ('open','suspended') THEN "
+                "next_seq=CASE WHEN lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?) THEN "
                 "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
                 "pending_tool_seq=CASE WHEN ?=1 THEN pending_tool_seq ELSE NULL END,"
                 "ready_item_json=NULL,"
@@ -2912,6 +2913,7 @@ class RuntimeInputStore:
                 "result_route_json,root_session_id,pending_count",
                 (
                     int(has_unconsumed),
+                    batch.cancel_seq,
                     effective_next_seq, effective_next_seq, int(write_message),
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
@@ -2920,8 +2922,11 @@ class RuntimeInputStore:
             if srow is None:
                 raise SessionLeaseLost(sid)
             next_state = str(srow["execution_state"])
-            closed_raced = srow["lifecycle"] in ("closing", "closed")
             cancel_raced = int(srow["cancel_seq"]) > batch.cancel_seq
+            closed_raced = (
+                srow["lifecycle"] == "closing"
+                or (srow["lifecycle"] == "closed" and cancel_raced)
+            )
             subtree_raced = cancel_raced and srow["cancel_by"] == "subtree"
             cancel_by_db = srow["cancel_by"]
             cancel_reason_db = srow["cancel_reason"]
@@ -3831,13 +3836,31 @@ class RuntimeInputStore:
         )
         return [dict(r) for r in rows]
 
+    async def release_orphan_lease(
+        self,
+        session_id: str,
+        *,
+        node_id: str,
+        boot_id: str,
+        owner_epoch: int,
+    ) -> int:
+        """Slow-path conditional lease release for a DB running row absent from local active set."""
+        now_sql = self._now_sql()
+        return await self.db.execute(
+            f"UPDATE {self.s} SET owner_lease_until_ms=0,updated_at={now_sql} "
+            "WHERE session_id=? AND owner_node_id=? AND owner_boot_id=? "
+            "AND owner_epoch=? AND execution_state='running'",
+            (session_id, node_id, boot_id, int(owner_epoch)),
+        )
+
     async def discover_queued(self, *, limit: int = 32) -> list[str]:
         """1 bounded index scan on ``idx_session_recovery``."""
         if not 1 <= limit <= 1000:
             raise RuntimeRequestError("invalid_options", "limit")
         rows = await self.db.fetchall(
             f"SELECT session_id FROM {self.s} "
-            "WHERE execution_state='queued' AND lifecycle='open' AND wake_pending_count>0 "
+            "WHERE execution_state='queued' AND owner_lease_until_ms IS NULL "
+            "AND lifecycle='open' AND wake_pending_count>0 "
             "ORDER BY session_id ASC LIMIT ?",
             (limit,),
         )
@@ -3857,7 +3880,7 @@ class RuntimeInputStore:
         now_sql = self._now_sql()
         rows = await self.db.fetchall(
             f"SELECT session_id,owner_epoch,session_kind,lifecycle,cancel_by FROM {self.s} "
-            f"WHERE execution_state='running' AND owner_lease_until_ms<{now_sql} "
+            f"WHERE execution_state='running' AND owner_lease_until_ms<={now_sql} "
             "ORDER BY owner_lease_until_ms ASC LIMIT ?",
             (limit,),
         )
@@ -3910,9 +3933,10 @@ class RuntimeInputStore:
         now_sql = self._now_sql()
         ttl_ms = int(ttl_s * 1000)
         sid = target.session_id
+        expiry_cond = f"AND owner_lease_until_ms<={now_sql}"
         epoch_cond = (
-            "AND owner_epoch=?"
-            if expected_epoch is not None else f"AND owner_lease_until_ms<={now_sql}"
+            f"{expiry_cond} AND owner_epoch=?"
+            if expected_epoch is not None else expiry_cond
         )
         extra_params = (expected_epoch,) if expected_epoch is not None else ()
         prev_node_id: str | None = None

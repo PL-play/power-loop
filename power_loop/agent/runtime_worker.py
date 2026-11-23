@@ -118,6 +118,7 @@ class RuntimeWorker:
         self._bindings = []
         self._pending = {}
         self._active = {}
+        self._fusing: dict[str, int] = {}
         self._drivers = set()
         self._tasks = set()
         self._capacity = asyncio.Semaphore(runtime.capacity)
@@ -219,6 +220,16 @@ class RuntimeWorker:
             and len(self._tasks) < 1024
             and self._active_llm_count() < self.runtime.capacity
         )
+
+    def _begin_fuse(self, sid: str) -> None:
+        self._fusing[sid] = self._fusing.get(sid, 0) + 1
+
+    def _end_fuse(self, sid: str) -> None:
+        count = self._fusing.get(sid, 0) - 1
+        if count <= 0:
+            self._fusing.pop(sid, None)
+        else:
+            self._fusing[sid] = count
 
     def dispatch_claimed(self, batch) -> None:
         """Schedule a locally fused accept_and_claim or pre-claimed batch without re-claiming."""
@@ -322,7 +333,7 @@ class RuntimeWorker:
                 continue
             if ctx.ownership is not None:
                 ctx.ownership.expires_at = now_mono
-            if row["lifecycle"] in ("closing", "closed") or int(row["cancel_seq"]) > ctx.batch.cancel_seq:
+            if row["lifecycle"] == "closing" or int(row["cancel_seq"]) > ctx.batch.cancel_seq:
                 cby = row.get("cancel_by") or ("removed" if row["lifecycle"] in ("closing", "closed") else "user")
                 ctx.cancel_by = cby
                 if ctx.descriptor.kind == "workflow_driver":
@@ -330,6 +341,28 @@ class RuntimeWorker:
                         sid, cancel_by=cby, reason=row.get("cancel_reason") or "cancelled",
                     )
                 ctx.stop.cancel(row.get("cancel_reason") or "cancelled")
+        # Slow path (P0-1): expire orphan running leases owned by this (node_id, boot_id)
+        # that are absent from local active/fusing sets or have a mismatched owner_epoch.
+        for row in rows:
+            sid = str(row["session_id"])
+            if sid in self._fusing:
+                continue
+            if sid in self._active:
+                ctx = self._active[sid]
+                if ctx is None:
+                    continue
+                if int(row["owner_epoch"]) == ctx.batch.owner_epoch:
+                    if ctx.finalized or (
+                        not ctx.closing
+                        and not (ctx.ownership is not None and ctx.ownership.released)
+                    ):
+                        continue
+            await self.inputs.release_orphan_lease(
+                sid,
+                node_id=r.node_id,
+                boot_id=r.boot_id,
+                owner_epoch=int(row["owner_epoch"]),
+            )
         return rows
 
     async def periodic_tick(self, *, limit: int = 32):
@@ -396,10 +429,14 @@ class RuntimeWorker:
                         self._wake.set()
             elif row["session_kind"] == "workflow_driver":
                 self._drivers.add(sid)
-                recovered = await self.inputs.recover(
-                    TargetRef(r.store.store_id, sid),
-                    node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
-                )
+                self._begin_fuse(sid)
+                try:
+                    recovered = await self.inputs.recover(
+                        TargetRef(r.store.store_id, sid),
+                        node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
+                    )
+                finally:
+                    self._end_fuse(sid)
                 if recovered is None:
                     continue
                 reclaimed.append(recovered)
@@ -407,25 +444,29 @@ class RuntimeWorker:
                 if recovered.execution_state == "queued":
                     self._activate(sid)
             else:
-                batch = await self.inputs.reclaim_running(
-                    TargetRef(r.store.store_id, sid),
-                    expected_epoch=int(row["owner_epoch"]),
-                    node_id=r.node_id, boot_id=r.boot_id,
-                    ttl_s=r.session_lease_ttl_s, can_execute=self._capable,
-                )
-                if batch is None:
-                    continue
-                reclaimed.append(batch)
-                if batch.reclaimed_cancelled:
-                    recovered = await self.inputs.final(
-                        batch, status="cancelled", final_text="",
-                        error="cancelled", error_code="cancelled",
+                self._begin_fuse(sid)
+                try:
+                    batch = await self.inputs.reclaim_running(
+                        TargetRef(r.store.store_id, sid),
+                        expected_epoch=int(row["owner_epoch"]),
+                        node_id=r.node_id, boot_id=r.boot_id,
+                        ttl_s=r.session_lease_ttl_s, can_execute=self._capable,
                     )
-                else:
-                    recovered = await self.inputs.final(
-                        batch, status="interrupted", final_text="",
-                        error="execution owner lost", error_code="interrupted",
-                    )
+                    if batch is None:
+                        continue
+                    reclaimed.append(batch)
+                    if batch.reclaimed_cancelled:
+                        recovered = await self.inputs.final(
+                            batch, status="cancelled", final_text="",
+                            error="cancelled", error_code="cancelled",
+                        )
+                    else:
+                        recovered = await self.inputs.final(
+                            batch, status="interrupted", final_text="",
+                            error="execution owner lost", error_code="interrupted",
+                        )
+                finally:
+                    self._end_fuse(sid)
                 await self._notify_results(recovered)
                 if recovered.execution_state == "queued":
                     self._activate(sid)
@@ -1122,7 +1163,7 @@ class RuntimeWorker:
                 holding.background_version = int(diag["background_version"])
                 holding.runtime_version = int(diag["runtime_version"])
                 if (
-                    diag["lifecycle"] in ("closing", "closed")
+                    diag["lifecycle"] == "closing"
                     or int(diag["cancel_seq"]) > batch.cancel_seq
                 ):
                     ctx.stop.cancel(diag.get("cancel_reason") or "cancelled")
@@ -1169,7 +1210,7 @@ class RuntimeWorker:
                 from power_loop.contracts.errors import SessionLeaseLost
                 raise SessionLeaseLost(target.session_id)
             if (
-                row["lifecycle"] in ("closing", "closed")
+                row["lifecycle"] == "closing"
                 or int(row["cancel_seq"]) > batch.cancel_seq
             ):
                 ctx.stop.cancel(row["cancel_reason"] or "cancelled")

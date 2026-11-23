@@ -726,8 +726,7 @@ class SessionStore:
             "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
             "round_index, state, meta_json, send_index, created_at) "
             f"SELECT {select_vals} FROM {self.t.sessions} "
-            "WHERE session_id=? AND owner_epoch=? AND execution_state='running' "
-            "AND lifecycle IN ('open','suspended')"
+            "WHERE session_id=? AND owner_epoch=? AND execution_state='running'"
         )
         base_values = (
             session_id, seq, role, _nul_safe(name), _nul_safe(content),
@@ -739,7 +738,7 @@ class SessionStore:
         if piggyback:
             sql = (
                 base_sql
-                + " AND ((lifecycle='open' AND wake_inbox_seq=?) OR lifecycle='suspended') "
+                + " AND ((lifecycle='open' AND wake_inbox_seq=?) OR lifecycle IN ('suspended','closed')) "
                 "AND cancel_seq=?"
             )
             values = (*base_values, int(boundary_wake_inbox_seq), int(boundary_cancel_seq))
@@ -753,11 +752,14 @@ class SessionStore:
             sql = base_sql
             values = base_values
 
+        lock_suffix = " FOR SHARE" if dialect in ("postgres", "mysql") else ""
+
         async def _run_insert(stmt, vals):
+            locked_stmt = stmt + lock_suffix
             if dialect != "mysql" and self.has_message_ids:
-                row = await self._db.fetchone(stmt + " RETURNING id", vals)
+                row = await self._db.fetchone(locked_stmt + " RETURNING id", vals)
                 return (1, int(row["id"])) if row is not None else (0, None)
-            rc = await self._db.execute(stmt, vals)
+            rc = await self._db.execute(locked_stmt, vals)
             return rc, None
 
         rc, row_id = await _run_insert(sql, values)
@@ -776,11 +778,6 @@ class SessionStore:
             ):
                 raise SessionLeaseLost(session_id)
             boundary_row = dict(diag)
-            if diag["lifecycle"] not in ("open", "suspended"):
-                if holding.active:
-                    holding.piggyback_boundary = boundary_row
-                    holding.piggyback_verified = False
-                return seq, boundary_row
             if not piggyback:
                 raise SessionLeaseLost(session_id)
             rc2, row_id = await _run_insert(base_sql, base_values)
@@ -1542,15 +1539,27 @@ class SessionStore:
         source_seq_lo: int | None = None,
         source_seq_hi: int | None = None,
         projector_version: int = 1,
+        ownership=None,
     ) -> None:
         """Persist a ``kind='repaired'`` projection via same-tx ``DELETE + INSERT`` (Probe 7 & 10).
 
         Deleting before inserting guarantees a strictly fresh auto-increment ``id`` for
         same-``send_index`` arbitration and eliminates ``uq_project_send_kind`` collisions.
         """
+        if ownership is not None:
+            ownership.require_owned()
+        send_reads.forget(self, session_id, "state")
         now = _now_ms()
         tok_est = max(1, len(rendered_text) // 4) if rendered_text else 0
         async with self._db.transaction() as tx:
+            suffix = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
+            await tx.fetchone(
+                f"SELECT next_seq FROM {self.t.sessions} WHERE session_id=?" + suffix,
+                (session_id,),
+            )
+            await self.fence_owner_tx(tx, session_id, ownership)
+            from .projection_fold import invalidate
+            await invalidate(self, tx, session_id)
             await tx.execute(
                 f"DELETE FROM {self.t.project_messages} "
                 "WHERE session_id=? AND send_index=? AND kind='repaired'",
