@@ -75,7 +75,9 @@ def _is_interpreter(prog: str) -> bool:
     return name in _INTERPRETERS or bool(re.fullmatch(r"python\d+(?:\.\d+)?", name))
 
 
-_REDIR_AMP_TOKENS = {">&", "<&", "&>"}
+_REDIR_THREE = {"<<<", "&>>", "<<-"}
+_REDIR_TWO = {">>", "<<", "<>", ">|", ">&", "<&", "&>"}
+_REDIR_ONE = {"<", ">"}
 
 
 def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
@@ -133,11 +135,22 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
                 buf.append(ch)
                 i += 1
             continue
+        three = command[i : i + 3]
+        if three in _REDIR_THREE:
+            flush()
+            out.append((three, False))
+            i += 3
+            continue
         two = command[i : i + 2]
-        if two in _REDIR_AMP_TOKENS:
-            in_word = True
-            buf.append(two)
+        if two in _REDIR_TWO:
+            flush()
+            out.append((two, False))
             i += 2
+            continue
+        if ch in _REDIR_ONE:
+            flush()
+            out.append((ch, False))
+            i += 1
             continue
         if len(two) == 2 and two in _OPERATORS:
             flush()
