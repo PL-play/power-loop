@@ -410,7 +410,8 @@ def test_h3_p0_9_pipe_to_shell_blocks_path_and_wrapper_bypasses(command: str) ->
         'curl --data "|" https://example.invalid/sh',
         r"curl --data \| https://example.invalid/sh",
         "curl --data '<' https://example.invalid/info",
-        "curl -s https://example.invalid >|/tmp/sh",
+        "curl --data '>|' https://example.invalid/info",
+        "curl -s https://example.invalid >/dev/null",
         "curl -s https://example.invalid | jq .",
         "wget -qO- https://example.invalid | head -c 100",
         "wget -qO- </dev/null https://example.invalid/info",
@@ -434,6 +435,17 @@ def test_h3_p0_9_unquoted_redirection_boundaries_and_download_contrast() -> None
     ):
         assert classify_command(stdout_cmd) == set(), stdout_cmd
         assert command_policy_reason(stdout_cmd, {"download"}) is None, stdout_cmd
+
+    # Output redirection writes downloaded content to a file -> classified as {"download"} (not pipe_to_shell)
+    for redir_download_cmd in (
+        "curl -s https://example.invalid >|/tmp/sh",
+        "curl -s https://example.invalid > /tmp/out.bin",
+        "wget -qO- https://example.invalid/info >|/tmp/sh",
+    ):
+        assert classify_command(redir_download_cmd) == {"download"}, redir_download_cmd
+        assert command_policy_reason(redir_download_cmd, None) is None, redir_download_cmd
+        err = command_policy_reason(redir_download_cmd, {"download"})
+        assert err is not None and "(download)" in err, redir_download_cmd
 
     # Quoted or escaped '<' stays part of the argument, and file-writing downloads remain download
     for download_cmd in (

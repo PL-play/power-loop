@@ -78,11 +78,12 @@ def _is_interpreter(prog: str) -> bool:
 _REDIR_THREE = {"<<<", "&>>", "<<-"}
 _REDIR_TWO = {">>", "<<", "<>", ">|", ">&", "<&", "&>"}
 _REDIR_ONE = {"<", ">"}
+_FILE_OUTPUT_REDIRS = {">", ">>", ">|", "&>", "&>>"}
 
 
-def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
-    """Tokenize a shell command into ``(text, is_operator)`` pairs, preserving quote boundaries."""
-    out: list[tuple[str, bool]] = []
+def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
+    """Tokenize a shell command into ``(text, kind)`` pairs (``word`` / ``redir`` / ``op``)."""
+    out: list[tuple[str, str]] = []
     buf: list[str] = []
     in_word = False
     i = 0
@@ -91,7 +92,7 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
     def flush() -> None:
         nonlocal in_word
         if in_word:
-            out.append(("".join(buf), False))
+            out.append(("".join(buf), "word"))
             buf.clear()
             in_word = False
 
@@ -138,28 +139,28 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
         three = command[i : i + 3]
         if three in _REDIR_THREE:
             flush()
-            out.append((three, False))
+            out.append((three, "redir"))
             i += 3
             continue
         two = command[i : i + 2]
         if two in _REDIR_TWO:
             flush()
-            out.append((two, False))
+            out.append((two, "redir"))
             i += 2
             continue
         if ch in _REDIR_ONE:
             flush()
-            out.append((ch, False))
+            out.append((ch, "redir"))
             i += 1
             continue
         if len(two) == 2 and two in _OPERATORS:
             flush()
-            out.append((two, True))
+            out.append((two, "op"))
             i += 2
             continue
         if ch in _OPERATORS or ch == "\n":
             flush()
-            out.append((ch, True))
+            out.append((ch, "op"))
             i += 1
             continue
         in_word = True
@@ -169,27 +170,37 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
     return out
 
 
-def _segments_with_separators(command: str) -> list[tuple[list[str], str]]:
-    """Split a shell command into (token_list, preceding_separator) pairs."""
+def _has_file_output_redirect(seg_tokens: list[tuple[str, str]]) -> bool:
+    for idx, (tok, kind) in enumerate(seg_tokens):
+        if kind != "redir" or tok not in _FILE_OUTPUT_REDIRS:
+            continue
+        target = seg_tokens[idx + 1][0] if idx + 1 < len(seg_tokens) and seg_tokens[idx + 1][1] == "word" else ""
+        if target != "/dev/null":
+            return True
+    return False
+
+
+def _segments_with_separators(command: str) -> list[tuple[list[tuple[str, str]], str]]:
+    """Split a shell command into (typed_token_list, preceding_separator) pairs."""
     tokens = _lex_shell_tokens(command)
-    segs: list[tuple[list[str], str]] = []
-    cur: list[str] = []
+    segs: list[tuple[list[tuple[str, str]], str]] = []
+    cur: list[tuple[str, str]] = []
     pending_sep = ""
-    for tok, is_op in tokens:
-        if is_op:
+    for tok, kind in tokens:
+        if kind == "op":
             if cur:
                 segs.append((cur, pending_sep))
                 cur = []
                 pending_sep = ""
             if tok == "&":
-                segs.append((["&"], "&"))  # marker: previous segment was backgrounded
+                segs.append(([("&", "op")], "&"))  # marker: previous segment was backgrounded
                 pending_sep = ""
             elif tok in {"(", ")"}:
                 continue
             else:
                 pending_sep = tok
         else:
-            cur.append(tok)
+            cur.append((tok, kind))
     if cur:
         segs.append((cur, pending_sep))
     return segs
@@ -197,7 +208,7 @@ def _segments_with_separators(command: str) -> list[tuple[list[str], str]]:
 
 def _segments(command: str) -> list[list[str]]:
     """Split a shell command into simple commands (token lists) on operators."""
-    return [seg for seg, _ in _segments_with_separators(command)]
+    return [[tok for tok, _ in seg] for seg, _ in _segments_with_separators(command)]
 
 
 def _program(seg: list[str]) -> tuple[str, list[str]]:
@@ -269,10 +280,11 @@ def classify_command(command: str) -> set[str]:
         cats.add("pipe_to_shell")
     segs_with_seps = _segments_with_separators(command)
     prev_prog = ""
-    for idx, (seg, sep) in enumerate(segs_with_seps):
-        if seg == ["&"]:
+    for idx, (typed_seg, sep) in enumerate(segs_with_seps):
+        if typed_seg == [("&", "op")]:
             prev_prog = ""
             continue
+        seg = [tok for tok, _ in typed_seg]
         prog, args = _program(seg)
         if not prog:
             prev_prog = ""
@@ -281,7 +293,7 @@ def classify_command(command: str) -> set[str]:
             cats.add("pipe_to_shell")
         prev_prog = prog.lower()
         sub = _subcommand(args)
-        backgrounded = idx + 1 < len(segs_with_seps) and segs_with_seps[idx + 1][0] == ["&"]
+        backgrounded = idx + 1 < len(segs_with_seps) and segs_with_seps[idx + 1][0] == [("&", "op")]
 
         # ── package_install ──
         if prog in _NODE_PM and (sub in _NODE_PM_INSTALL or (prog == "yarn" and not sub)):
@@ -305,15 +317,17 @@ def classify_command(command: str) -> set[str]:
 
         # ── download ──
         if prog == "curl":
-            if any(a in {"-o", "-O", "--output", "--remote-name", "-J", "--remote-header-name"}
-                   or a.startswith(("-o", "--output=")) or re.fullmatch(r"-[a-zA-Z]*[oO][a-zA-Z]*", a)
-                   for a in args):
+            if _has_file_output_redirect(typed_seg) or any(
+                a in {"-o", "-O", "--output", "--remote-name", "-J", "--remote-header-name"}
+                or a.startswith(("-o", "--output=")) or re.fullmatch(r"-[a-zA-Z]*[oO][a-zA-Z]*", a)
+                for a in args
+            ):
                 cats.add("download")
         elif prog == "wget":
             to_stdout = any(a in {"-O-", "-qO-", "-O", "--output-document=-"} and (a.endswith("-") or
                             (a == "-O" and "-" in args[args.index(a) + 1:args.index(a) + 2]))
                             for a in args)
-            if not to_stdout:
+            if not to_stdout or _has_file_output_redirect(typed_seg):
                 cats.add("download")
         elif prog in {"aria2c", "axel"}:
             cats.add("download")
