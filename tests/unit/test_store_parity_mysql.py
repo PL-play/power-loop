@@ -111,7 +111,7 @@ async def _content_data_type(db, table: str) -> str:
 async def test_mysql_old_format_is_refused_without_implicit_widening() -> None:
     import secrets
 
-    from power_loop.runtime.store.schema import _STORE_TABLES, StoreSchemaError
+    from power_loop.runtime.store.schema import _STORE_TABLES, CURRENT_SCHEMA_VERSION, StoreSchemaError
     prefix = _MIG_PREFIX + secrets.token_hex(4) + "_"
     store = await open_store(MYSQL_DSN, table_prefix=prefix)
     try:
@@ -120,7 +120,7 @@ async def test_mysql_old_format_is_refused_without_implicit_widening() -> None:
         before = await store._db.fetchall(f"SELECT * FROM {prefix}messages")
         await store._db.execute(f"ALTER TABLE {prefix}messages MODIFY content TEXT")
         await store._db.execute(f"UPDATE {prefix}schema_migrations SET version=3 WHERE id=1")
-        with pytest.raises(StoreSchemaError, match="create a fresh store for task schema v15"):
+        with pytest.raises(StoreSchemaError, match=f"create a fresh schema v{CURRENT_SCHEMA_VERSION} store"):
             await open_store(MYSQL_DSN, table_prefix=prefix)
         assert await _content_data_type(store._db, prefix+'messages') == 'text'
         assert await store._db.fetchall(f"SELECT * FROM {prefix}messages") == before

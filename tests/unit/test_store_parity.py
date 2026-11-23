@@ -41,7 +41,6 @@ async def _async_snapshot(store: AsyncStore, sid: str) -> Any:
         await store.get_state(sid), await store.list_compactions(sid),
         await store.list_timers(sid, statuses=("armed", "firing", "fired", "cancelled")),
         await store.list_notes(sid), await store.get_session_stats(sid),
-        await store.list_background_tasks(sid),
     )
 
 
@@ -239,7 +238,7 @@ async def exercise_large_payload(store: Any) -> None:
     assert asst.tool_calls[0]["function"]["arguments"] == big_args
     assert tool.content == big
     sess = await store.get_session("big")
-    assert sess.system_prompt == big_prompt
+    assert sess.descriptor.config["system_prompt"] == big_prompt
     notes = await store.list_notes("big")
     assert notes and len(notes[0].content) == 100_000
 

@@ -34,7 +34,7 @@ async def exercise_hook_events_crud(store: SessionStore) -> None:
         sid, role="assistant", content="b", round_index=1, send_index=1, hook_injected=hi
     )
     evs = await store.list_hook_events(sid)
-    assert [e.event_id for e in evs] == [1, 2]  # per-session monotonic
+    assert [e.event_id for e in evs] == [seq1, seq2]  # schema 18 keys hook events by message_seq
     assert [e.message_seq for e in evs] == [seq1, seq2]
     assert evs[0].hook == "builtin.memory_recall" and evs[0].position == "tail"
     assert evs[0].payload["items"][0]["name"] == "memory_0"
