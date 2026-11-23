@@ -130,13 +130,24 @@ class WorkflowRunError(RuntimeError):
     """Raised when a node references missing data, or a ``halt`` branch fails."""
 
 
+_CONTINUATION_TODO_RE = re.compile(r"\n剩余待办：\n(?:- [^\n]*\n)*(?:- [^\n]*)")
+
+
 def _continuation_prompt(remaining: list[str], i: int, n: int) -> str:
-    todo_block = ("\n剩余待办：\n" + "\n".join(f"- {t}" for t in remaining)) if remaining else ""
+    clean = [" ".join(str(t).splitlines()) for t in remaining]
+    todo_block = ("\n剩余待办：\n" + "\n".join(f"- {t}" for t in clean)) if clean else ""
     return (
         f"[continuation {i}/{n}] 你在轮数用尽前写下了「做了什么、还剩什么」的总结（见上）。"
         f"现在给你追加了预算：**接着做剩余的部分，不要重做已完成的**。{todo_block}\n"
         "做完后按原任务要求给出最终结果；仍完不成就明确说剩什么。"
     )
+
+
+def _strip_continuation_todos(body: Any) -> Any:
+    """Remove only the dynamic ``剩余待办`` bullet block from a continuation prompt for stable hashing."""
+    if not isinstance(body, str):
+        return body
+    return _CONTINUATION_TODO_RE.sub("", body, count=1)
 
 
 @dataclass(frozen=True)
@@ -151,7 +162,6 @@ class NodeRequest:
     body: str
     continuation: int = 0
     session_id: str | None = None
-    hash_body: str | None = None
 
 
 class Executor(Protocol):
@@ -437,7 +447,6 @@ class WorkflowEngine:
                         session_id=raw["session_id"],
                         spec=asdict(replace(spec, max_rounds=cont.extra_rounds)),
                         body=_continuation_prompt(remaining, index, cont.max_continuations),
-                        hash_body=_continuation_prompt([], index, cont.max_continuations),
                     ),
                     allow_start=not self._budget or self._budget.can_spawn(),
                 )

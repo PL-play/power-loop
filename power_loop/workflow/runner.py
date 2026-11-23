@@ -36,7 +36,7 @@ from power_loop.agent.runtime_types import (
 from power_loop.contracts.errors import SessionLeaseLost
 
 from . import journal
-from .engine import WorkflowEngine
+from .engine import WorkflowEngine, _strip_continuation_todos
 from .spec import WorkflowSpec
 
 
@@ -253,9 +253,8 @@ class DurableExecutor:
         if body != request.body:
             request = replace(request, body=body)
         hash_payload = plain(request)
-        hash_body = hash_payload.pop("hash_body", None)
-        if hash_body is not None:
-            hash_payload["body"] = hash_body
+        if request.continuation > 0:
+            hash_payload["body"] = _strip_continuation_todos(hash_payload.get("body"))
         request_hash = sha256_canonical(hash_payload)
         resume_sid: str | None = None
         if request.session_id is None and request.continuation == 0 and raw_attempt == 1 and self.plan:
@@ -510,17 +509,29 @@ class DurableExecutor:
                 parent_cancel_seq=self.ctx.batch.cancel_seq,
             )
             preclaimed_by_sid = {b.target.session_id: b for b in cm.preclaimed}
-            cancelled_items = [item for item in batch_items if item.future.cancelled()]
-            live_items = [item for item in batch_items if not item.future.cancelled()]
-            cancelled_sids = {item.target.session_id for item in cancelled_items}
+            live_items = list(batch_items)
+            # Cancel any leaves whose futures were cancelled during create_many FIRST —
+            # before dispatching or awaiting notifications for surviving siblings in the
+            # same batch, so a concurrent worker scan cannot claim a cancelled queued leaf.
+            while True:
+                newly_cancelled = [item for item in live_items if item.future.cancelled()]
+                if not newly_cancelled:
+                    break
+                live_items = [item for item in live_items if not item.future.cancelled()]
+                await self._cancel_aborted_leaf_creates(newly_cancelled, preclaimed_by_sid)
 
+            live_sids = {item.target.session_id for item in live_items}
             for b in cm.preclaimed:
-                if b.target.session_id not in cancelled_sids:
+                if b.target.session_id in live_sids:
                     self.worker.dispatch_claimed(b)
             spec_by_sid = {item.target.session_id: item for item in live_items}
+            mid_notify_cancelled: list[_PendingLeafCreate] = []
             for qt in cm.queued_targets:
                 it = spec_by_sid.get(qt.session_id)
                 if it is None:
+                    continue
+                if it.future.cancelled():
+                    mid_notify_cancelled.append(it)
                     continue
                 await self.client._notify(qt, it.start.message_id, it.start, ["work", "activation"])
                 if self.client.wake_transport is not None:
@@ -530,6 +541,9 @@ class DurableExecutor:
                         pass
             if cm.already_created:
                 for item in live_items:
+                    if item.future.cancelled():
+                        mid_notify_cancelled.append(item)
+                        continue
                     await self.client._notify(
                         item.target, item.start.message_id, item.start, ["work", "activation"],
                     )
@@ -538,8 +552,10 @@ class DurableExecutor:
                             await self.client.wake_transport.publish_wake(item.target.session_id)
                         except Exception:
                             pass
-            if cancelled_items:
-                await self._cancel_aborted_leaf_creates(cancelled_items, preclaimed_by_sid)
+            if mid_notify_cancelled:
+                mid_sids = {item.target.session_id for item in mid_notify_cancelled}
+                live_items = [item for item in live_items if item.target.session_id not in mid_sids]
+                await self._cancel_aborted_leaf_creates(mid_notify_cancelled, preclaimed_by_sid)
         except BaseException as exc:
             for item in batch_items:
                 if not item.future.done():
