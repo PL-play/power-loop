@@ -581,6 +581,19 @@ class RuntimeWorker:
         batch = preclaimed_batch
         normal_final = None
         driver_requeue = False
+
+        async def _flush_output():
+            nonlocal output_task, on_delta
+            if bus is not None and on_delta is not None:
+                await bus.drain(timeout=r.hook_timeout_s)
+                bus.unsubscribe(on_delta)
+                on_delta = None
+            if output_task is not None and ctx is not None:
+                task = output_task
+                output_task = None
+                await ctx.output.put(None)
+                await asyncio.gather(task, return_exceptions=True)
+
         try:
             if batch is not None:
                 pass
@@ -865,6 +878,7 @@ class RuntimeWorker:
                         ctx.finalizing = False
                 if env.command is None:
                     normal_final = final_batch
+                await _flush_output()
                 await self._notify_results(final_batch)
         except SessionLeaseLost:
             # Another owner took over; stop immediately and trigger EXECUTION_LOST hook.
@@ -877,17 +891,17 @@ class RuntimeWorker:
                     ctx.output.put_nowait({"kind": "gap", "session_id": sid})
         except CancellationRequested:
             if batch is not None:
-                await self._final_cancelled(batch, ctx)
+                await self._final_cancelled(batch, ctx, before_notify=_flush_output)
         except RuntimeRequestError as exc:
             # Domain refusal before any model/tool call (e.g. projection_unavailable) keeps its
             # code and diagnostic detail instead of becoming a generic internal_error.
             log.warning("session send stopped for %s: %s", sid, exc)
             if batch is not None:
-                await self._final_failed(batch, exc.code, str(exc), ctx=ctx)
+                await self._final_failed(batch, exc.code, str(exc), ctx=ctx, before_notify=_flush_output)
         except Exception:
             log.exception("session send failed for %s", sid)
             if batch is not None:
-                await self._final_failed(batch, "internal_error", "session send raised", ctx=ctx)
+                await self._final_failed(batch, "internal_error", "session send raised", ctx=ctx, before_notify=_flush_output)
         finally:
             try:
                 if renewal is not None:
@@ -905,12 +919,7 @@ class RuntimeWorker:
             # Detached tasks retain the same retired handle in their own Context.
             if env_ctx is not None:
                 env_ctx.__exit__(None, None, None)
-            if output_task is not None:
-                await ctx.output.put(None)
-                await asyncio.gather(output_task, return_exceptions=True)
-            if bus is not None and on_delta is not None:
-                bus.unsubscribe(on_delta)
-                await bus.drain(timeout=r.hook_timeout_s)
+            await _flush_output()
             if ctx is not None:
                 ctx.closing = True
                 if ctx._lost_hook_task is not None:
@@ -1199,7 +1208,7 @@ class RuntimeWorker:
         # degraded / timed_out / hit_round_limit / context_checkpoint / capacity_blocked / failed
         return "failed", result.final_text or status, status
 
-    async def _final_failed(self, batch, code, message, *, ctx=None):
+    async def _final_failed(self, batch, code, message, *, ctx=None, before_notify=None):
         from power_loop.contracts.errors import SessionLeaseLost
 
         def _mark():
@@ -1214,6 +1223,8 @@ class RuntimeWorker:
                 batch, status="failed", final_text="", error=message, error_code=code,
                 _on_committed=_mark,
             )
+            if before_notify is not None:
+                await before_notify()
             await self._notify_results(final_batch)
         except SessionLeaseLost:
             if ctx is not None:
@@ -1226,7 +1237,7 @@ class RuntimeWorker:
             if ctx is not None and not ctx.finalized:
                 ctx.finalizing = False
 
-    async def _final_cancelled(self, batch, ctx):
+    async def _final_cancelled(self, batch, ctx, *, before_notify=None):
         from power_loop.contracts.errors import SessionLeaseLost
 
         def _mark():
@@ -1242,6 +1253,8 @@ class RuntimeWorker:
                 error=(ctx.stop.reason if ctx else None) or "cancelled", error_code="cancelled",
                 _on_committed=_mark,
             )
+            if before_notify is not None:
+                await before_notify()
             await self._notify_results(final_batch)
         except SessionLeaseLost:
             if ctx is not None:

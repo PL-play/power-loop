@@ -3236,3 +3236,82 @@ async def test_m1c_r7_concurrent_rebound_child_and_old_parent_final_no_deadlock(
         await tr1.aclose()
         await tr2.aclose()
         await peer.close()
+
+
+async def test_m1c_output_deltas_flush_strictly_before_completed_notification(registry_store, tmp_path):
+    """Stream deltas queued in output_task MUST finish publishing before completed is emitted."""
+    from power_loop import LLMService
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    published_kinds: list[tuple[str, str]] = []
+
+    class _SlowOutputTransport(MemoryMessageTransport):
+        async def publish(self, packet):
+            if packet.channel == "output":
+                payload = packet.payload or {}
+                if payload.get("kind") == "delta":
+                    await asyncio.sleep(0.03)
+                published_kinds.append((str(payload.get("kind")), str(payload.get("text", ""))))
+            return await super().publish(packet)
+
+    class _StreamingModel(LLMService):
+        async def complete(self, request, **callbacks):
+            callbacks.get("on_chunk_delta_text", lambda _t: None)("42")
+            return LLMResponse(raw_text="42")
+
+        async def close(self):
+            pass
+
+    transport = _SlowOutputTransport()
+    factory = RegistryRuntimeFactory()
+
+    async def build(_desc, _ctx):
+        hooks = AgentHooks()
+
+        async def before_model(_hook_ctx):
+            from power_loop.core.agent_context import get_current_loop
+
+            loop = get_current_loop()
+            ex = loop._runtime_worker_context
+            await ex.output.put({
+                "kind": "delta", "reset": True, "text": "",
+                "session_id": ex.session_id, "send_index": ex.send_index,
+            })
+
+        hooks.register(HookPoint.LLM_BEFORE, before_model, name="emit_reset")
+        return ExecutionEnvironment(
+            _StreamingModel(),
+            create_default_tool_registry(workspace_dir=str(tmp_path)),
+            AgentLoopConfig(context_budget_tokens=10**9),
+            hooks=hooks,
+        )
+
+    factory.register(DESCRIPTOR.definition_ref, build)
+    runtime = Runtime(
+        store=store,
+        factory=factory,
+        transport=transport,
+        node_id="m1c-stream-order",
+        capacity=1,
+        recovery_interval_s=None,
+        timers_enabled=False,
+    )
+    await runtime.worker.start()
+    try:
+        sid = await runtime.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "stream-order"})
+        ref = InputRef(store.store_id, sid.session_id, "inp-stream-order")
+        sub = await runtime.client.subscribe_output(ref, actor=ACTOR, before_send=True)
+        await runtime.client.send(sid, "return 42", message_id=ref.message_id, actor=ACTOR)
+        items = []
+        async with asyncio.timeout(10):
+            async for item in sub:
+                items.append(item)
+        assert [it.kind for it in items] == ["gap", "delta", "delta", "completed"], items
+        assert items[1].payload.get("reset") is True
+        assert items[2].payload.get("text") == "42"
+        assert published_kinds == [("delta", ""), ("delta", "42"), ("completed", "")]
+    finally:
+        await runtime.worker.shutdown(timeout_s=5)
+        await runtime.client.aclose()
+        await transport.aclose()
