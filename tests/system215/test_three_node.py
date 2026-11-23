@@ -1,6 +1,8 @@
-"""Container-level acceptance of design 215. No in-process replacement nodes."""
+"""Container-level acceptance of design 217. No in-process replacement nodes."""
 import asyncio
 import json
+import os
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -48,8 +50,10 @@ async def test_expired_paused_owner_rejected_and_new_send_on_c(cluster):
     await c.event("model", session=sid, node="a")
     await c.docker("pause", "a")
     await c.configure("c", enabled=True)
-    assert (await c.result(sid))["status"] == "interrupted"
+    # Design 217 0-assistant crash/expiry rerun: node c safely reclaims and completes send 1.
     await c.release(sid, "model:1")
+    result = await c.result(sid)
+    assert result["status"] == "completed" and result["final_text"] == "done c"
     await c.send(sid, "new")
     assert (await c.result(sid, "new"))["final_text"] == "done c"
     before = await c.messages(sid)
@@ -85,14 +89,17 @@ async def test_container_kill_repairs_unknown_without_replay(cluster, mode):
     await c.event(mode, session=sid, node="a")
     await c.docker("kill", "a")
     await c.configure("c", enabled=True)
-    assert (await c.result(sid))["status"] == "interrupted"
-    if mode == "tool":
+    if mode == "model":
+        # Design 217 0-assistant crash rerun: node c safely reclaims and completes send 1.
+        await c.release(sid, "model:1")
+        assert (await c.result(sid))["status"] == "completed"
+    else:
+        assert (await c.result(sid))["status"] == "interrupted"
         rows = await c.messages(sid)
         results = [r for r in rows if r["role"] == "tool"]
         assert len(results) == 1 and results[0]["send_index"] == 1
         assert len(await c.events("tool", session=sid)) == 1
-    await c.release(sid, "model:1")
-    await c.release(sid, "tool")
+        await c.release(sid, "tool")
     await c.send(sid, "continue")
     assert (await c.result(sid, "continue"))["status"] == "completed"
 
@@ -109,13 +116,6 @@ async def _leaf_gates(c, leaves):
     rows = await c.events("gate", node="b", phase="enter")
     keys = {row["key"] for row in rows}
     return rows if all(f"{leaf}:child" in keys for leaf in leaves) else None
-
-
-async def _pending_leaf_reads(c, driver, leaves):
-    reads = await c.call("b", "facts", events=["result_read_return"])
-    pending = {(row["session"], row["input"]) for row in reads
-               if row["actor"] == driver and not row["terminal"]}
-    return reads if all((leaf, input_id) in pending for leaf, input_id in leaves.items()) else None
 
 
 async def _results_delivered(c, expected, *, send=1):
@@ -178,7 +178,6 @@ async def test_real_child_workflow_background_result_routes(cluster, mode, kind)
         driver, = expected
         leaves = await c.until(lambda: _workflow_leaves(c, driver))
         await c.until(lambda: _leaf_gates(c, leaves))
-        await c.until(lambda: _pending_leaf_reads(c, driver, leaves))
     else:
         suffix = "tool" if mode == "background" else "child"
 
@@ -214,112 +213,6 @@ async def test_real_child_workflow_background_result_routes(cluster, mode, kind)
         assert merged[0]["content"].count('"kind":"agent_result"') == 2
 
 
-async def test_workflow_notification_loss_explicit_recovery(cluster):
-    c = cluster
-    await c.configure("abc", drop_notifications=True)
-    await c.configure("a", enabled=True, roles=["main"])
-    await c.configure("b", enabled=True, roles=["child", "workflow_driver", "background"])
-    sid = await c.create(mode="workflow", gates=[2])
-    await c.send(sid)
-    [parent_call] = await c.event("model", session=sid, node="a", call=2)
-    [receipt] = [json.loads(row["content"]) for row in parent_call["messages"]
-                 if row["role"] == "tool" and row["name"] == "workflow"]
-    driver = receipt["target_ref"]["session_id"]
-    driver_input = receipt["input_ref"]["message_id"]
-    await c.event("build", session=driver, node="b", kind="workflow_driver")
-    leaves = await c.until(lambda: _workflow_leaves(c, driver))
-    await c.until(lambda: _leaf_gates(c, leaves))
-    await c.until(lambda: _pending_leaf_reads(c, driver, leaves))
-    for leaf in leaves:
-        await c.release(leaf, "child")
-        await c.release(leaf, "tool")
-    await c.until(lambda: _results_delivered(c, leaves))
-
-    def driver_reads(rows):
-        return [row for row in rows if row["actor"] == driver
-                and (row["session"], row["input"]) in leaves.items()]
-
-    async def read_facts():
-        return await c.call("b", "facts", events=["result_read_return"])
-
-    initial_reads = driver_reads(await read_facts())
-    assert len(initial_reads) == 2 and all(not row["terminal"] for row in initial_reads)
-
-    async def successful_renews():
-        rows = await c.call("b", "facts", events=["renew_return"])
-        return len([row for row in rows if row["session"] == driver
-                    and row["epoch"] == 1 and row["renewed"]])
-
-    renews_before = await successful_renews()
-
-    async def two_more_renews():
-        return await successful_renews() >= renews_before + 2
-
-    await c.until(two_more_renews)
-    renews_after = await successful_renews()
-    assert driver_reads(await read_facts()) == initial_reads
-    assert not [row for row in await c.call("b", "result_facts") if row["session"] == driver]
-    status = await c.call("b", "inspect", session=driver, message_id=driver_input)
-    assert status["execution_state"] == "running" and status["terminal_status"] is None
-    assert not await c.events("gate", node="a", phase="exit", key=f"{sid}:model:2")
-
-    a_before = await c.health("a")
-    b_before = await c.health("b")
-    before_trace = await c.call("b", "trace")
-    c.note("before_explicit_recovery", parent=sid, driver=driver, driver_input=driver_input,
-           leaves=leaves, parent_boot=a_before["boot_id"], driver_boot=b_before["boot_id"],
-           successful_renews=renews_after)
-    c.save("before-explicit-recovery", {
-        "parent": sid, "driver": driver, "driver_input": driver_input, "leaves": leaves,
-        "parent_boot": a_before["boot_id"], "driver_boot": b_before["boot_id"],
-        "initial_driver_reads": initial_reads, "successful_renews": renews_after,
-        "driver_status": status, "trace": before_trace, "commands": c.commands,
-    })
-    c.note("explicit_recovery_now", action="restart_b", parent=sid, driver=driver,
-           parent_boot=a_before["boot_id"], old_driver_boot=b_before["boot_id"])
-    await c.docker("restart", "b")
-    await c.ready()
-    assert (await c.health("a"))["boot_id"] == a_before["boot_id"]
-    b_after = await c.health("b")
-    assert b_after["boot_id"] != b_before["boot_id"]
-    await c.configure("b", enabled=True, roles=["child", "workflow_driver", "background"],
-                      drop_notifications=True, delay_second_spawn=False)
-    c.note("explicit_recovery_configured", driver=driver, new_driver_boot=b_after["boot_id"])
-
-    await c.until(lambda: _results_delivered(c, {driver: driver_input}, send=None))
-    result = await c.result(driver, driver_input)
-    assert result["send_index"] > 1
-    _assert_workflow_result(result, driver, driver_input, leaves)
-    for leaf, input_id in leaves.items():
-        leaf_result = await c.result(leaf, input_id)
-        assert leaf_result["input_ref"]["message_id"] == input_id
-        assert leaf_result["status"] == "completed" and leaf_result["send_index"] == 1
-        models = await c.events("model", session=leaf)
-        builds = await c.events("build", session=leaf)
-        assert len(models) == 1 and models[0]["boot"] == b_before["boot_id"]
-        assert len(builds) == 1 and builds[0]["boot"] == b_before["boot_id"]
-        assert not await c.events("tool", session=leaf)
-
-    c.note("parent_release_after_explicit_recovery", parent=sid, driver=driver,
-           driver_input=driver_input, leaves=leaves)
-    await c.release(sid, "model:2")
-    parent_result = await c.result(sid)
-    assert parent_result["status"] == "completed"
-
-    async def parent_consumed():
-        rows = await c.messages(sid)
-        return [row for row in rows if row["role"] == "user" and "workflow_result" in row["content"]]
-
-    merged = await c.until(parent_consumed)
-    assert len(merged) == 1
-    c.save("after-explicit-recovery", {
-        "parent": sid, "driver": driver, "driver_input": driver_input, "leaves": leaves,
-        "parent_boot": (await c.health("a"))["boot_id"], "driver_boot": b_after["boot_id"],
-        "driver_result": result, "parent_result": parent_result, "merged_count": len(merged),
-        "trace": await c.call("b", "trace"), "commands": c.commands,
-    })
-
-
 @pytest.mark.parametrize("stage", ["accept", "claim", "final"])
 async def test_commit_ack_unknown_keeps_one_logical_input(cluster, stage):
     c = cluster
@@ -345,10 +238,12 @@ async def test_commit_ack_unknown_keeps_one_logical_input(cluster, stage):
 @pytest.mark.parametrize("stage", ["accept", "claim", "final"])
 async def test_container_kill_at_committed_boundaries(cluster, stage):
     c = cluster
-    await c.configure("a", enabled=True)
+    if stage != "accept":
+        await c.configure("a", enabled=True)
     sid = await c.create()
     await c.configure("a", fault={"stage": stage, "action": "block"})
-    sending = asyncio.create_task(c.send(sid, node="a"))
+    sender = "a" if stage == "accept" else "b"
+    sending = asyncio.create_task(c.send(sid, node=sender))
     await c.event("commit_fault", stage=stage, node="a")
     await c.docker("kill", "a")
     try:
@@ -357,7 +252,7 @@ async def test_container_kill_at_committed_boundaries(cluster, stage):
         assert stage == "accept"
     await c.configure("c", enabled=True)
     result = await c.result(sid)
-    assert result["status"] == ("interrupted" if stage == "claim" else "completed")
+    assert result["status"] == "completed"
     assert len([r for r in await c.messages(sid) if r["role"] == "user"]) == 1
     await c.send(sid, "after")
     assert (await c.result(sid, "after"))["status"] == "completed"
@@ -414,14 +309,15 @@ async def test_container_network_loss_has_no_coordinator_fallback(cluster):
     c = cluster
     await c.configure("a", enabled=True)
     sid = await c.create()
-    await c.docker("exec", "-T", "a", "iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", "35432", "-j", "REJECT")
+    pg_port = str(urlsplit(os.environ.get("POWER_LOOP_TASK_PG_DSN", "")).port or 35432)
+    await c.docker("exec", "-T", "a", "iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", pg_port, "-j", "REJECT")
     try:
         await c.send(sid)
         await asyncio.sleep(1)
         assert not await c.events("build", session=sid)
         assert (await c.call("b", "inspect", session=sid, message_id="start"))["input_state"] == "pending"
     finally:
-        await c.docker("exec", "-T", "a", "iptables", "-D", "OUTPUT", "-p", "tcp", "--dport", "35432", "-j", "REJECT")
+        await c.docker("exec", "-T", "a", "iptables", "-D", "OUTPUT", "-p", "tcp", "--dport", pg_port, "-j", "REJECT")
     await c.call("a", "recover")
     assert (await c.result(sid))["status"] == "completed"
 

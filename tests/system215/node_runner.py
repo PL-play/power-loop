@@ -181,6 +181,13 @@ class Node:
             return batch
 
         coordinator.claim = claim
+        original_dispatch_claimed = self.runtime.worker.dispatch_claimed
+
+        def dispatch_claimed(batch):
+            self.trace("claim_return", **self.batch_facts(batch))
+            return original_dispatch_claimed(batch)
+
+        self.runtime.worker.dispatch_claimed = dispatch_claimed
         original_renew = coordinator.renew
 
         async def renew(lease, *, ttl_s):
