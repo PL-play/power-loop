@@ -501,3 +501,24 @@ async def test_result_read_follows_multihop_continuation(registry_store):
     assert state.result.status == "completed" and state.result.final_text == "multihop done"
     assert state.result.send_index == 2
     assert state.result.input_ref == receipt.input_ref
+
+
+async def test_result_read_recovers_cancelled_usage_without_exposing_meta_json(registry_store):
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    session = await target(port, "read-cancelled-usage")
+    receipt = await port.accept(session, "run", message_id="start", actor=ACTOR)
+    batch = await port.claim(session, node_id="a", boot_id="a")
+    await port.final(
+        batch,
+        status="cancelled",
+        usage={"input_tokens": 11, "output_tokens": 5, "total_tokens": 16},
+    )
+
+    state = await port.read_result_state(receipt.input_ref, actor=ACTOR)
+    assert "content_json" not in state.record.row and "meta_json" not in state.record.row
+    assert "content_json" not in state.resolved.row and "meta_json" not in state.resolved.row
+    assert state.record.row["result_seq"] is None
+    assert state.result is not None
+    assert state.result.status == "cancelled"
+    assert state.result.usage == {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}

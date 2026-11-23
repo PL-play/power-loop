@@ -77,8 +77,15 @@ _RESULT_INPUT_COLUMNS = (
     "session_id", "item_id", "kind", "status", "terminal_status",
     "result_seq", "result_send_index", "error_code", "error_detail",
     "result_delivery_error", "delivered_send_index", "continuation_of",
-    "result_json", "cancel_by", "meta_json",
+    "result_json", "cancel_by",
 )
+
+
+def _extract_result_usage(raw_meta: str | None) -> dict[str, Any] | None:
+    if not raw_meta:
+        return None
+    usage = json.loads(raw_meta).get("result_usage")
+    return dict(usage) if usage else None
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,7 @@ class ResultInput:
     """Narrow input view needed to resolve and report a durable result."""
     ref: InputRef
     row: dict
+    result_usage: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -5379,7 +5387,12 @@ class RuntimeInputStore:
         root = await self._continuation_root(tx, record)
         is_driver_run = self._is_driver_run_input(state, root)
         latest = await self._latest_continuation(
-            tx, ResultInput(record.ref, {name: record.row[name] for name in _RESULT_INPUT_COLUMNS}),
+            tx,
+            ResultInput(
+                record.ref,
+                {name: record.row[name] for name in _RESULT_INPUT_COLUMNS},
+                result_usage=_extract_result_usage(record.row.get("meta_json")),
+            ),
         )
         derived_latest = await self._derive_input_terminal(tx, dict(state), latest.row)
         if derived_latest["terminal_status"] is not None:
@@ -7419,6 +7432,7 @@ class RuntimeInputStore:
         return ResultInput(
             InputRef(self.store.store_id, row["session_id"], row["item_id"]),
             {name: row[name] for name in _RESULT_INPUT_COLUMNS},
+            result_usage=_extract_result_usage(row["meta_json"]),
         )
 
     async def _latest_continuation(self, reader, record):
@@ -7485,9 +7499,10 @@ class RuntimeInputStore:
             "continuation_of": row["input_continuation_of"],
             "result_json": row["input_result_json"],
             "cancel_by": row["input_cancel_by"],
-            "meta_json": row["input_meta_json"],
         }
-        record = ResultInput(ref, input_dict)
+        record = ResultInput(
+            ref, input_dict, result_usage=_extract_result_usage(row["input_meta_json"]),
+        )
         continuation = (
             record.row["status"] == "waiting_continuation"
             or record.row["kind"] == "workflow_continue"
@@ -7510,7 +7525,7 @@ class RuntimeInputStore:
                         derived["result_send_index"] = dsi_i
                         if derived.get("result_seq") is None and row["message_seq"] is not None:
                             derived["result_seq"] = int(row["message_seq"])
-            resolved = ResultInput(ref, derived)
+            resolved = ResultInput(ref, derived, result_usage=record.result_usage)
             joined_msg = (
                 {"content": row["message_content"], "meta_json": row["message_meta_json"]}
                 if row["message_seq"] is not None else None
@@ -7519,7 +7534,7 @@ class RuntimeInputStore:
             return ResultRead(ref, target, session, record, resolved, result), False
         resolved = await self._latest_continuation(reader, record)
         derived = await self._derive_input_terminal(reader, session, resolved.row)
-        resolved = ResultInput(resolved.ref, derived)
+        resolved = ResultInput(resolved.ref, derived, result_usage=resolved.result_usage)
         result = await self._terminal_result(reader, ref, target, resolved)
         return ResultRead(ref, target, session, record, resolved, result), False
 
@@ -7546,10 +7561,8 @@ class RuntimeInputStore:
                 meta = json.loads(message["meta_json"] or "{}")
                 usage = meta.get("usage") or {}
                 structured = meta.get("structured_output")
-        if not usage and resolved.row.get("meta_json"):
-            qmeta = json.loads(resolved.row["meta_json"] or "{}")
-            if qmeta.get("result_usage"):
-                usage = dict(qmeta["result_usage"])
+        if not usage and resolved.result_usage:
+            usage = dict(resolved.result_usage)
         if structured is None and resolved.row.get("result_json"):
             structured = json.loads(resolved.row["result_json"])
         return Result(
