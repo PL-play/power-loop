@@ -14,7 +14,6 @@ from typing import Any
 import pytest
 
 from power_loop.runtime.store.store import SessionStore as AsyncStore
-from power_loop.runtime.store.types import SubagentLifecycle as Lc
 from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
 from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
@@ -157,11 +156,16 @@ async def scn_bgtasks(st: Any) -> list[Any]:
 
 async def scn_cascade(st: Any) -> list[Any]:
     await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
-    await st.create_session(session_id="linked", parent_session_id="p", lifecycle=Lc.LINKED)
-    await st.create_session(session_id="eph", parent_session_id="p", lifecycle=Lc.EPHEMERAL)
-    await st.create_session(session_id="det", parent_session_id="p", lifecycle=Lc.DETACHED)
+    await st.create_session(
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="linked",
+        parent_session_id="p", cancel_propagation="linked",
+    )
+    await st.create_session(
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="det",
+        parent_session_id="p", cancel_propagation="independent",
+    )
     removed = await st.close_session("p", cascade=True)
-    survivors = [bool(await st.get_session(x)) for x in ("p", "linked", "eph", "det")]
+    survivors = [bool(await st.get_session(x)) for x in ("p", "linked", "det")]
     det = await st.get_session("det")
     return [removed, survivors, det.parent_session_id if det else None]
 
