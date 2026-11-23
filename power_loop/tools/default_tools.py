@@ -357,7 +357,7 @@ _BASH_READ_HINTS = (
 
 _BASH_PATH_STOP = " \t\n\r'\"`;:|&()<>"
 _BASH_PATH_BOUNDARY = "/\\" + _BASH_PATH_STOP
-_POWER_LOOP_HOME_COMPLEX_VAR_RE = re.compile(r"\$\{POWER_LOOP_HOME[^}]+\}")
+_POWER_LOOP_HOME_COMPLEX_VAR_RE = re.compile(r"\$\{POWER_LOOP_HOME(?![A-Za-z0-9_}])[^}]+\}")
 _POWER_LOOP_HOME_VAR_RE = re.compile(r"\$\{POWER_LOOP_HOME\}|\$POWER_LOOP_HOME(?![A-Za-z0-9_])")
 
 
@@ -366,7 +366,7 @@ def _norm_bash_path(path_text: str) -> str:
 
     normalized = path_text.replace("\\", "/")
     collapsed = posixpath.normpath(normalized)
-    return collapsed.lower()
+    return collapsed.lower() if os.name == "nt" else collapsed
 
 
 def _path_referenced(haystack_lower: str, target_lower: str) -> bool:
@@ -395,7 +395,7 @@ def _is_agent_path_allowed_for_bash(command: str) -> bool:
     home_raw = str(runtime_env.home_dir)
     home_resolved = str(runtime_env.home_dir.resolve())
     expanded = _POWER_LOOP_HOME_VAR_RE.sub(lambda _: home_raw, command)
-    lowered = expanded.lower()
+    haystack = expanded.lower() if os.name == "nt" else expanded
 
     home_roots = list(dict.fromkeys(_norm_bash_path(p) for p in (home_raw, home_resolved)))
     allow_roots = tuple(
@@ -406,24 +406,24 @@ def _is_agent_path_allowed_for_bash(command: str) -> bool:
         )
     )
 
-    for home_lower in home_roots:
-        if not home_lower:
+    for home_root in home_roots:
+        if not home_root:
             continue
-        idx = lowered.find(home_lower)
+        idx = haystack.find(home_root)
         while idx != -1:
-            end_home = idx + len(home_lower)
-            after = lowered[end_home : end_home + 1]
+            end_home = idx + len(home_root)
+            after = haystack[end_home : end_home + 1]
             if after == "" or after in _BASH_PATH_BOUNDARY:
                 end = end_home
-                while end < len(lowered) and lowered[end] not in _BASH_PATH_STOP:
+                while end < len(haystack) and haystack[end] not in _BASH_PATH_STOP:
                     end += 1
-                candidate = _norm_bash_path(lowered[idx:end])
+                candidate = _norm_bash_path(haystack[idx:end])
                 if not any(
                     candidate == allow or candidate.startswith(allow + "/")
                     for allow in allow_roots
                 ):
                     return False
-            idx = lowered.find(home_lower, idx + 1)
+            idx = haystack.find(home_root, idx + 1)
     return True
 
 

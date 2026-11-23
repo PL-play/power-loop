@@ -75,20 +75,95 @@ def _is_interpreter(prog: str) -> bool:
     return name in _INTERPRETERS or bool(re.fullmatch(r"python\d+(?:\.\d+)?", name))
 
 
+_REDIR_AMP_TOKENS = {">&", "<&", "&>"}
+
+
+def _lex_shell_tokens(command: str) -> list[tuple[str, bool]]:
+    """Tokenize a shell command into ``(text, is_operator)`` pairs, preserving quote boundaries."""
+    out: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    in_word = False
+    i = 0
+    n = len(command)
+
+    def flush() -> None:
+        nonlocal in_word
+        if in_word:
+            out.append(("".join(buf), False))
+            buf.clear()
+            in_word = False
+
+    while i < n:
+        ch = command[i]
+        if ch in " \t\r":
+            flush()
+            i += 1
+            continue
+        if ch == "'":
+            in_word = True
+            i += 1
+            while i < n and command[i] != "'":
+                buf.append(command[i])
+                i += 1
+            if i < n:
+                i += 1
+            continue
+        if ch == '"':
+            in_word = True
+            i += 1
+            while i < n and command[i] != '"':
+                if command[i] == "\\" and i + 1 < n and command[i + 1] in {'"', "\\", "$", "`", "\n"}:
+                    if command[i + 1] != "\n":
+                        buf.append(command[i + 1])
+                    i += 2
+                else:
+                    buf.append(command[i])
+                    i += 1
+            if i < n:
+                i += 1
+            continue
+        if ch == "\\":
+            if i + 1 < n:
+                if command[i + 1] != "\n":
+                    in_word = True
+                    buf.append(command[i + 1])
+                i += 2
+            else:
+                in_word = True
+                buf.append(ch)
+                i += 1
+            continue
+        two = command[i : i + 2]
+        if two in _REDIR_AMP_TOKENS:
+            in_word = True
+            buf.append(two)
+            i += 2
+            continue
+        if len(two) == 2 and two in _OPERATORS:
+            flush()
+            out.append((two, True))
+            i += 2
+            continue
+        if ch in _OPERATORS or ch == "\n":
+            flush()
+            out.append((ch, True))
+            i += 1
+            continue
+        in_word = True
+        buf.append(ch)
+        i += 1
+    flush()
+    return out
+
+
 def _segments_with_separators(command: str) -> list[tuple[list[str], str]]:
     """Split a shell command into (token_list, preceding_separator) pairs."""
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        tokens = command.split()
+    tokens = _lex_shell_tokens(command)
     segs: list[tuple[list[str], str]] = []
     cur: list[str] = []
     pending_sep = ""
-    for tok in tokens:
-        if tok in _OPERATORS or tok == "\n":
+    for tok, is_op in tokens:
+        if is_op:
             if cur:
                 segs.append((cur, pending_sep))
                 cur = []
