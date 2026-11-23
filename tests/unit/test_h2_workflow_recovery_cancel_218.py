@@ -804,3 +804,181 @@ async def test_h2_p0_7_mixed_batch_cancels_aborted_leaf_before_notifying_live_si
         b_future_cancelled.set()
         batch_committed.set()
         await runner.aclose()
+
+
+async def test_h2_p0_7_mid_notify_cancel_cancels_before_notifying_next_sibling(
+    registry_store, monkeypatch,
+):
+    """P0-7 rework 2: A, B, C coalesce in one create_many batch (fuse_local_send=False).
+    When B is cancelled by inner halt DURING A's notification, B's subtree cancel MUST finish
+    BEFORE C's notification begins so a worker periodic_tick during C's notify cannot claim B."""
+    store, _ = registry_store
+    model_calls: list[str] = []
+    events: list[str] = []
+
+    allow_a_finish = asyncio.Event()
+
+    class ABCModel(Model):
+        async def complete(self, req, **kwargs):
+            model_calls.append(req.system_prompt)
+            if req.system_prompt.startswith("A"):
+                await asyncio.wait_for(allow_a_finish.wait(), 5)
+                return LLMResponse(raw_text="A-live-ok")
+            if req.system_prompt.startswith("C"):
+                return LLMResponse(raw_text="C-live-ok")
+            if req.system_prompt.startswith("B"):
+                events.append("model_B_called")
+                return LLMResponse(raw_text="B-must-never-run")
+            return LLMResponse(raw_text="main ack")
+
+    runner = await RunningAgent(
+        store, ABCModel(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=4,
+    ).start()
+    runner.runtime.fuse_local_send = False
+
+    orig_create_many = runner.runtime.worker.inputs.create_many
+    orig_cancel = runner.runtime.client.cancel
+    orig_notify = runner.runtime.client._notify
+    orig_flush = DurableExecutor._flush_pending_creates
+    from power_loop.workflow.engine import WorkflowEngine
+
+    orig_exec_agent = WorkflowEngine._exec_agent
+
+    notify_a_entered = asyncio.Event()
+    b_future_cancelled = asyncio.Event()
+    mixed_batch_sizes: list[int] = []
+    sid_by_node: dict[str, str] = {}
+    created_executors: list[DurableExecutor] = []
+    orig_exec_init = DurableExecutor.__init__
+
+    def spy_exec_init(self, *args, **kwargs):
+        orig_exec_init(self, *args, **kwargs)
+        created_executors.append(self)
+
+    monkeypatch.setattr(DurableExecutor, "__init__", spy_exec_init)
+
+    async def spy_flush(self):
+        # Allow outer-depth A, C and inner-depth B to coalesce into ONE 3-leaf create_many batch.
+        for _ in range(10):
+            if {"A", "B", "C"} <= {it.request.node_path for it in self._pending_creates}:
+                break
+            await asyncio.sleep(0)
+        for item in self._pending_creates:
+            if item.request.node_path == "B":
+                item.future.add_done_callback(lambda _f: b_future_cancelled.set())
+        return await orig_flush(self)
+
+    monkeypatch.setattr(DurableExecutor, "_flush_pending_creates", spy_flush)
+
+    async def spy_create_many(*args, **kwargs):
+        specs = kwargs.get("specs") if "specs" in kwargs else args[2]
+        nids = []
+        for sp in specs:
+            nid = (sp.descriptor.config.get("workflow_node") or {}).get("node_id")
+            if nid:
+                nids.append(nid)
+                sid_by_node[nid] = sp.session_id
+        mixed_batch_sizes.append(len(nids))
+        return await orig_create_many(*args, **kwargs)
+
+    monkeypatch.setattr(runner.runtime.worker.inputs, "create_many", spy_create_many)
+
+    async def staged_exec_agent(self, node, env, driver_sid):
+        if node.id == "FAIL":
+            await asyncio.wait_for(notify_a_entered.wait(), 5)
+        return await orig_exec_agent(self, node, env, driver_sid)
+
+    monkeypatch.setattr(WorkflowEngine, "_exec_agent", staged_exec_agent)
+
+    async def spy_cancel(target, *args, **kwargs):
+        if target.session_id == sid_by_node.get("B"):
+            events.append("cancel_B_start")
+        res = await orig_cancel(target, *args, **kwargs)
+        if target.session_id == sid_by_node.get("B"):
+            events.append("cancel_B_done")
+        return res
+
+    monkeypatch.setattr(runner.runtime.client, "cancel", spy_cancel)
+
+    notified_a = False
+    scan_ran = False
+
+    async def spy_notify(target, *args, **kwargs):
+        nonlocal notified_a, scan_ran
+        if target.session_id == sid_by_node.get("A") and not notified_a:
+            notified_a = True
+            events.append("notify_A_start")
+            notify_a_entered.set()
+            await asyncio.wait_for(b_future_cancelled.wait(), 5)
+            events.append("b_future_cancelled_during_notify_A")
+        elif target.session_id == sid_by_node.get("C") and not scan_ran:
+            scan_ran = True
+            events.append("notify_C_start")
+            await runner.runtime.worker.periodic_tick(limit=32)
+            await asyncio.sleep(0.05)
+            allow_a_finish.set()
+        return await orig_notify(target, *args, **kwargs)
+
+    monkeypatch.setattr(runner.runtime.client, "_notify", spy_notify)
+
+    try:
+        leaf_a = leaf("A")
+        leaf_b = leaf("B")
+        leaf_c = leaf("C")
+        leaf_fail = leaf("FAIL")
+        leaf_fail["input"] = "@@FILEREF:missing.txt@@"
+
+        spec = {
+            "name": "p0-7-abc-mid-notify",
+            "root": {
+                "type": "parallel",
+                "on_error": "continue",
+                "branches": [
+                    leaf_a,
+                    {
+                        "type": "parallel",
+                        "on_error": "halt",
+                        "branches": [leaf_b, leaf_fail],
+                    },
+                    leaf_c,
+                ],
+            },
+        }
+        handle = await runner.runtime.client.workflow(
+            runner.target, spec, message_id="p0-7-abc-mid-notify", actor=runner.actor,
+        )
+        res = await handle.wait(deadline_ms=now_ms() + 15000)
+        await runner.drain()
+
+        assert mixed_batch_sizes == [3], f"A/B/C must coalesce in one batch: {mixed_batch_sizes}"
+        assert notified_a and scan_ran
+        assert "cancel_B_done" in events and "notify_C_start" in events, events
+        assert events.index("cancel_B_done") < events.index("notify_C_start"), events
+        assert not any(sp.startswith("B") for sp in model_calls), (
+            f"B model called ({model_calls}); events={events}"
+        )
+        assert "A" in res.results and "C" in res.results, (res.status, res.errors, events)
+        assert res.results["A"].status == "completed" and res.results["A"].text == "A-live-ok"
+        assert res.results["C"].status == "completed" and res.results["C"].text == "C-live-ok"
+
+        b_row = await store._db.fetchone(
+            f"SELECT execution_state,owner_node_id,owner_lease_until_ms,cancel_by "
+            f"FROM {store.t.sessions} WHERE session_id=?",
+            (sid_by_node["B"],),
+        )
+        assert b_row is not None
+        assert b_row["execution_state"] == "idle", dict(b_row)
+        assert b_row["owner_node_id"] is None, dict(b_row)
+        assert b_row["owner_lease_until_ms"] is None, dict(b_row)
+        assert b_row["cancel_by"] == "subtree", dict(b_row)
+        q_rows = await store._db.fetchall(
+            f"SELECT terminal_status,cancel_by FROM {store.t.follow_up_queue} WHERE session_id=?",
+            (sid_by_node["B"],),
+        )
+        assert q_rows and all(r["terminal_status"] == "cancelled" for r in q_rows), [dict(r) for r in q_rows]
+        assert created_executors and all(not ex._flush_tasks for ex in created_executors)
+    finally:
+        allow_a_finish.set()
+        notify_a_entered.set()
+        b_future_cancelled.set()
+        await runner.aclose()

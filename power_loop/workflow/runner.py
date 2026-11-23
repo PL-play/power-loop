@@ -510,28 +510,38 @@ class DurableExecutor:
             )
             preclaimed_by_sid = {b.target.session_id: b for b in cm.preclaimed}
             live_items = list(batch_items)
+            cancelled_sids: set[str] = set()
+
+            async def _cancel_newly_cancelled() -> None:
+                nonlocal live_items
+                while True:
+                    newly_cancelled = [
+                        item for item in live_items
+                        if item.future.cancelled() and item.target.session_id not in cancelled_sids
+                    ]
+                    if not newly_cancelled:
+                        break
+                    for item in newly_cancelled:
+                        cancelled_sids.add(item.target.session_id)
+                    live_items = [
+                        item for item in live_items if item.target.session_id not in cancelled_sids
+                    ]
+                    await self._cancel_aborted_leaf_creates(newly_cancelled, preclaimed_by_sid)
+
             # Cancel any leaves whose futures were cancelled during create_many FIRST —
             # before dispatching or awaiting notifications for surviving siblings in the
             # same batch, so a concurrent worker scan cannot claim a cancelled queued leaf.
-            while True:
-                newly_cancelled = [item for item in live_items if item.future.cancelled()]
-                if not newly_cancelled:
-                    break
-                live_items = [item for item in live_items if not item.future.cancelled()]
-                await self._cancel_aborted_leaf_creates(newly_cancelled, preclaimed_by_sid)
+            await _cancel_newly_cancelled()
 
             live_sids = {item.target.session_id for item in live_items}
             for b in cm.preclaimed:
                 if b.target.session_id in live_sids:
                     self.worker.dispatch_claimed(b)
             spec_by_sid = {item.target.session_id: item for item in live_items}
-            mid_notify_cancelled: list[_PendingLeafCreate] = []
             for qt in cm.queued_targets:
+                await _cancel_newly_cancelled()
                 it = spec_by_sid.get(qt.session_id)
-                if it is None:
-                    continue
-                if it.future.cancelled():
-                    mid_notify_cancelled.append(it)
+                if it is None or it.target.session_id in cancelled_sids:
                     continue
                 await self.client._notify(qt, it.start.message_id, it.start, ["work", "activation"])
                 if self.client.wake_transport is not None:
@@ -540,9 +550,9 @@ class DurableExecutor:
                     except Exception:
                         pass
             if cm.already_created:
-                for item in live_items:
-                    if item.future.cancelled():
-                        mid_notify_cancelled.append(item)
+                for item in list(live_items):
+                    await _cancel_newly_cancelled()
+                    if item.target.session_id in cancelled_sids:
                         continue
                     await self.client._notify(
                         item.target, item.start.message_id, item.start, ["work", "activation"],
@@ -552,10 +562,7 @@ class DurableExecutor:
                             await self.client.wake_transport.publish_wake(item.target.session_id)
                         except Exception:
                             pass
-            if mid_notify_cancelled:
-                mid_sids = {item.target.session_id for item in mid_notify_cancelled}
-                live_items = [item for item in live_items if item.target.session_id not in mid_sids]
-                await self._cancel_aborted_leaf_creates(mid_notify_cancelled, preclaimed_by_sid)
+            await _cancel_newly_cancelled()
         except BaseException as exc:
             for item in batch_items:
                 if not item.future.done():
