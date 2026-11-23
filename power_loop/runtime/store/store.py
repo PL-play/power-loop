@@ -721,18 +721,34 @@ class SessionStore:
             )
         else:
             select_vals = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        expected_cancel_seq = (
+            int(boundary_cancel_seq)
+            if boundary_cancel_seq is not None
+            else (int(holding.cancel_seq) if holding.cancel_seq is not None else None)
+        )
+        if expected_cancel_seq is not None:
+            lifecycle_guard = " AND (lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?))"
+            base_values = (
+                session_id, seq, role, _nul_safe(name), _nul_safe(content),
+                calls_json, stored_call_id, round_index,
+                MessageState.ACTIVE.value, meta_json, stored_send, now,
+                session_id, int(owner_epoch), expected_cancel_seq,
+            )
+        else:
+            lifecycle_guard = " AND (lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_by IS NULL))"
+            base_values = (
+                session_id, seq, role, _nul_safe(name), _nul_safe(content),
+                calls_json, stored_call_id, round_index,
+                MessageState.ACTIVE.value, meta_json, stored_send, now,
+                session_id, int(owner_epoch),
+            )
         base_sql = (
             f"INSERT INTO {self.t.messages} ("
             "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
             "round_index, state, meta_json, send_index, created_at) "
             f"SELECT {select_vals} FROM {self.t.sessions} "
             "WHERE session_id=? AND owner_epoch=? AND execution_state='running'"
-        )
-        base_values = (
-            session_id, seq, role, _nul_safe(name), _nul_safe(content),
-            calls_json, stored_call_id, round_index,
-            MessageState.ACTIVE.value, meta_json, stored_send, now,
-            session_id, int(owner_epoch),
+            + lifecycle_guard
         )
         piggyback = boundary_wake_inbox_seq is not None and boundary_cancel_seq is not None
         if piggyback:
@@ -762,6 +778,15 @@ class SessionStore:
             rc = await self._db.execute(locked_stmt, vals)
             return rc, None
 
+        def _is_closed_aborted(row_dict: Mapping[str, Any]) -> bool:
+            if row_dict["lifecycle"] == "closing":
+                return True
+            if row_dict["lifecycle"] == "closed":
+                if expected_cancel_seq is not None:
+                    return int(row_dict["cancel_seq"]) > expected_cancel_seq
+                return row_dict["cancel_by"] is not None
+            return False
+
         rc, row_id = await _run_insert(sql, values)
         boundary_row: dict[str, Any] | None = None
         if rc == 0:
@@ -778,10 +803,29 @@ class SessionStore:
             ):
                 raise SessionLeaseLost(session_id)
             boundary_row = dict(diag)
+            if _is_closed_aborted(boundary_row):
+                if holding.active:
+                    holding.piggyback_boundary = boundary_row
+                    holding.piggyback_verified = False
+                from power_loop.contracts.errors import CancellationRequested
+                raise CancellationRequested(boundary_row.get("cancel_reason") or "cancelled")
             if not piggyback:
                 raise SessionLeaseLost(session_id)
             rc2, row_id = await _run_insert(base_sql, base_values)
             if rc2 == 0:
+                diag2 = await self._db.fetchone(
+                    f"SELECT lifecycle,cancel_seq,cancel_by,cancel_reason,owner_epoch,execution_state "
+                    f"FROM {self.t.sessions} WHERE session_id=?",
+                    (session_id,),
+                )
+                if (
+                    diag2 is not None
+                    and int(diag2["owner_epoch"]) == int(owner_epoch)
+                    and diag2["execution_state"] == "running"
+                    and _is_closed_aborted(diag2)
+                ):
+                    from power_loop.contracts.errors import CancellationRequested
+                    raise CancellationRequested(diag2.get("cancel_reason") or "cancelled")
                 raise SessionLeaseLost(session_id)
 
         if holding.active:

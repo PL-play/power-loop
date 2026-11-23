@@ -226,6 +226,8 @@ class RuntimeInputStore:
         on_repair_interrupted_turn=None,
         on_session_takeover=None,
         on_result_undeliverable=None,
+        on_local_claim=None,
+        on_local_claim_cancel=None,
     ):
         self.store = store
         self.s = store.t.sessions
@@ -244,6 +246,8 @@ class RuntimeInputStore:
         self.on_repair_interrupted_turn = on_repair_interrupted_turn
         self.on_session_takeover = on_session_takeover
         self.on_result_undeliverable = on_result_undeliverable
+        self._on_local_claim = on_local_claim
+        self._on_local_claim_cancel = on_local_claim_cancel
         waiters = getattr(store, "_driver_waiters", None)
         if waiters is None:
             waiters = {}
@@ -754,193 +758,202 @@ class RuntimeInputStore:
                 sp.creation_tool_call_id, sp.message_id, sp.descriptor,
             ])
 
+        registered_claims: list[tuple[str, int]] = []
         try:
             now_sql = self._now_sql()
             lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
-            async with self.db.transaction() as tx:
-                parent_row = await tx.fetchone(
-                    f"SELECT *,{now_sql} AS _db_now FROM {self.s} WHERE session_id=?{lock_suffix}",
-                    (parent.session_id,),
-                )
-                if parent_row is None:
-                    raise ValueError(f"unknown session: {parent.session_id}")
-                await self._authorize_known(tx, parent, actor, parent_row)
-                if parent_owner_epoch is not None and (
-                    int(parent_row["owner_epoch"]) != int(parent_owner_epoch)
-                    or parent_row["execution_state"] != "running"
-                ):
-                    raise SessionLeaseLost(parent.session_id)
-                if parent_row["lifecycle"] != "open":
-                    raise RuntimeRequestError("session_closed")
-                if parent_row["execution_state"] == "running" and parent_row["cancel_by"] is not None:
-                    raise RuntimeRequestError("cancelled", parent_row["cancel_reason"] or "parent_cancelled")
-                if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
-                    raise RuntimeRequestError("cancelled", "parent_cancelled")
-                if any(sp.descriptor.kind == "workflow_driver" for sp in specs) and (
-                    parent_row["parent_session_id"] is not None or parent_row["session_kind"] != "agent"
-                ):
-                    raise RuntimeRequestError("forbidden", "execution_role_forbids_workflow")
-
-                database_now = int(parent_row["_db_now"])
-                root_id = str(parent_row["root_session_id"])
-                child_depth = int(parent_row["depth"]) + 1
-                if child_depth > self.store.max_spawn_depth:
-                    raise RuntimeRequestError(
-                        "invalid_options",
-                        f"child depth exceeds max {self.store.max_spawn_depth}",
+            try:
+                async with self.db.transaction() as tx:
+                    parent_row = await tx.fetchone(
+                        f"SELECT *,{now_sql} AS _db_now FROM {self.s} WHERE session_id=?{lock_suffix}",
+                        (parent.session_id,),
                     )
-                lease_until = database_now + ttl_ms
+                    if parent_row is None:
+                        raise ValueError(f"unknown session: {parent.session_id}")
+                    await self._authorize_known(tx, parent, actor, parent_row)
+                    if parent_owner_epoch is not None and (
+                        int(parent_row["owner_epoch"]) != int(parent_owner_epoch)
+                        or parent_row["execution_state"] != "running"
+                    ):
+                        raise SessionLeaseLost(parent.session_id)
+                    if parent_row["lifecycle"] != "open":
+                        raise RuntimeRequestError("session_closed")
+                    if parent_row["execution_state"] == "running" and parent_row["cancel_by"] is not None:
+                        raise RuntimeRequestError("cancelled", parent_row["cancel_reason"] or "parent_cancelled")
+                    if parent_cancel_seq is not None and int(parent_row["cancel_seq"]) > int(parent_cancel_seq):
+                        raise RuntimeRequestError("cancelled", "parent_cancelled")
+                    if any(sp.descriptor.kind == "workflow_driver" for sp in specs) and (
+                        parent_row["parent_session_id"] is not None or parent_row["session_kind"] != "agent"
+                    ):
+                        raise RuntimeRequestError("forbidden", "execution_role_forbids_workflow")
 
-                preclaimed: list[ClaimedBatch] = []
-                queued: list[TargetRef] = []
-                sess_rows_sql: list[str] = []
-                sess_params: list[Any] = []
-                queue_rows_sql: list[str] = []
-                queue_params: list[Any] = []
-                msg_rows_sql: list[str] = []
-                msg_params: list[Any] = []
-
-                for idx, sp in enumerate(specs):
-                    is_preclaimed = idx < k
-                    child_target = TargetRef(parent.store_id, sp.session_id)
-                    start_ref = InputRef(parent.store_id, sp.session_id, sp.message_id)
-                    reply_to = sp.reply_to_session_id or parent.session_id
-                    route = self._result_route(
-                        parent,
-                        {"target": parent, "input_ref": start_ref, "result_kind": sp.result_kind},
-                        sp.session_id,
-                    )
-                    content = canonical(sp.body)
-                    meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
-                    content_bytes = len(content.encode()) + len(meta.encode())
-                    if content_bytes > self.inbox_byte_limit:
-                        raise CapacityError()
-                    req_hash = self.request_hash(child_target, sp.body, "normal")
-                    is_driver = sp.descriptor.kind == "workflow_driver"
-                    merged = self.merge_batch([{
-                        "item_id": sp.message_id, "kind": "user", "priority": "normal",
-                        "content_json": content,
-                    }])
-                    merged_json = canonical(merged)
-                    msg_meta = {"content_encoding": "json", "input_refs": [plain(start_ref)]}
-
-                    ready_item = None if is_preclaimed else canonical({
-                        "item_id": sp.message_id,
-                        "kind": "user",
-                        "priority": "normal",
-                        "wake": 1,
-                        "content_json": content,
-                        "content_bytes": content_bytes,
-                        "meta_json": meta,
-                        "reply_to_session_id": reply_to,
-                        "reply_result_kind": sp.result_kind,
-                        "user_content": merged_json,
-                        "user_seq": None if is_driver else 1,
-                    })
-
-                    execution_state_val = "running" if is_preclaimed else "queued"
-                    send_idx_col = 1 if is_preclaimed else 0
-                    next_seq_col = 1 if is_driver else 2
-                    owner_epoch_col = 1 if is_preclaimed else 0
-                    owner_node_col = node_id if is_preclaimed else None
-                    owner_boot_col = boot_id if is_preclaimed else None
-                    lease_col = lease_until if is_preclaimed else None
-                    wake_pending_col = 0 if is_preclaimed else 1
-
-                    sess_rows_sql.append(
-                        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                    )
-                    sess_params.extend((
-                        sp.session_id, parent.session_id, actor.session_id, root_id, child_depth,
-                        sp.descriptor.kind, canonical(sp.descriptor), sha256_canonical(sp.descriptor),
-                        spec_hashes[sp.session_id],
-                        canonical(sp.creation_call_ref) if sp.creation_call_ref else None,
-                        sp.creation_tool_call_id, sp.message_id,
-                        parent_row["tenant_id"], parent_row["principal_id"],
-                        canonical(route), sp.cancel_propagation,
-                        next_seq_col, send_idx_col, execution_state_val, owner_epoch_col,
-                        owner_node_col, owner_boot_col, lease_col,
-                        1, 1, wake_pending_col, 0, 0, ready_item,
-                        database_now, database_now,
-                    ))
-                    deliv_seq = None if is_driver else 1
-                    queue_rows_sql.append(
-                        "(?,?,1,'user','normal',1,'delivered',?,?,?,?,?,?,NULL,?,?,?,1)"
-                    )
-                    queue_params.extend((
-                        sp.session_id, sp.message_id, reply_to, sp.result_kind,
-                        content, content_bytes, meta, req_hash, database_now,
-                        database_now, deliv_seq,
-                    ))
-                    if not is_driver:
-                        msg_rows_sql.append("(?,?,?,?,?,?,?)")
-                        msg_params.extend((
-                            sp.session_id, 1, "user", merged_json,
-                            canonical(msg_meta), 1, database_now,
-                        ))
-                    if is_preclaimed:
-                        user_row = StoredMessageRow(
-                            session_id=sp.session_id, seq=1, role="user", name=None,
-                            content=merged_json, tool_calls=None, tool_call_id=None,
-                            round_index=0, state=MessageState.ACTIVE, meta=msg_meta,
-                            created_at=database_now, send_index=1,
+                    database_now = int(parent_row["_db_now"])
+                    root_id = str(parent_row["root_session_id"])
+                    child_depth = int(parent_row["depth"]) + 1
+                    if child_depth > self.store.max_spawn_depth:
+                        raise RuntimeRequestError(
+                            "invalid_options",
+                            f"child depth exceeds max {self.store.max_spawn_depth}",
                         )
-                        preclaimed.append(ClaimedBatch(
-                            target=child_target,
-                            send_index=1,
-                            message_seq=1 if not is_driver else 0,
-                            input_refs=(start_ref,),
-                            owner_epoch=1,
-                            owner_node_id=node_id,
-                            owner_boot_id=boot_id,
-                            descriptor=sp.descriptor,
-                            tenant_id=parent_row["tenant_id"],
-                            principal_id=parent_row["principal_id"],
-                            parent_session_id=parent.session_id,
-                            user_row=user_row,
-                            result_route=route,
-                            session_updated_at=database_now,
-                            inbox_version=1,
-                            wake_inbox_seq=1,
-                            cancel_seq=0,
-                            start_input_message_id=sp.message_id,
-                            root_session_id=root_id,
-                            depth=child_depth,
-                            reply_to_session_id=reply_to,
-                            reply_result_kind=sp.result_kind,
-                            reply_to_item_id=sp.message_id,
-                        ))
-                    else:
-                        queued.append(child_target)
+                    lease_until = database_now + ttl_ms
 
-                await tx.execute(
-                    f"INSERT INTO {self.s} ("
-                    "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
-                    "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
-                    "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
-                    "tenant_id,principal_id,result_route_json,cancel_propagation,"
-                    "next_seq,send_index,execution_state,owner_epoch,owner_node_id,"
-                    "owner_boot_id,owner_lease_until_ms,inbox_version,wake_inbox_seq,"
-                    "wake_pending_count,pending_count,pending_bytes,ready_item_json,"
-                    "created_at,updated_at) VALUES " + ",".join(sess_rows_sql),
-                    tuple(sess_params),
-                )
-                await tx.execute(
-                    f"INSERT INTO {self.q} ("
-                    "session_id,item_id,inbox_version,kind,priority,wake,status,"
-                    "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
-                    "meta_json,request_hash,result_kind,created_at,delivered_at,"
-                    "delivered_seq,delivered_send_index) VALUES " + ",".join(queue_rows_sql),
-                    tuple(queue_params),
-                )
-                if msg_rows_sql:
+                    preclaimed: list[ClaimedBatch] = []
+                    queued: list[TargetRef] = []
+                    sess_rows_sql: list[str] = []
+                    sess_params: list[Any] = []
+                    queue_rows_sql: list[str] = []
+                    queue_params: list[Any] = []
+                    msg_rows_sql: list[str] = []
+                    msg_params: list[Any] = []
+
+                    for idx, sp in enumerate(specs):
+                        is_preclaimed = idx < k
+                        child_target = TargetRef(parent.store_id, sp.session_id)
+                        start_ref = InputRef(parent.store_id, sp.session_id, sp.message_id)
+                        reply_to = sp.reply_to_session_id or parent.session_id
+                        route = self._result_route(
+                            parent,
+                            {"target": parent, "input_ref": start_ref, "result_kind": sp.result_kind},
+                            sp.session_id,
+                        )
+                        content = canonical(sp.body)
+                        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+                        content_bytes = len(content.encode()) + len(meta.encode())
+                        if content_bytes > self.inbox_byte_limit:
+                            raise CapacityError()
+                        req_hash = self.request_hash(child_target, sp.body, "normal")
+                        is_driver = sp.descriptor.kind == "workflow_driver"
+                        merged = self.merge_batch([{
+                            "item_id": sp.message_id, "kind": "user", "priority": "normal",
+                            "content_json": content,
+                        }])
+                        merged_json = canonical(merged)
+                        msg_meta = {"content_encoding": "json", "input_refs": [plain(start_ref)]}
+
+                        ready_item = None if is_preclaimed else canonical({
+                            "item_id": sp.message_id,
+                            "kind": "user",
+                            "priority": "normal",
+                            "wake": 1,
+                            "content_json": content,
+                            "content_bytes": content_bytes,
+                            "meta_json": meta,
+                            "reply_to_session_id": reply_to,
+                            "reply_result_kind": sp.result_kind,
+                            "user_content": merged_json,
+                            "user_seq": None if is_driver else 1,
+                        })
+
+                        execution_state_val = "running" if is_preclaimed else "queued"
+                        send_idx_col = 1 if is_preclaimed else 0
+                        next_seq_col = 1 if is_driver else 2
+                        owner_epoch_col = 1 if is_preclaimed else 0
+                        owner_node_col = node_id if is_preclaimed else None
+                        owner_boot_col = boot_id if is_preclaimed else None
+                        lease_col = lease_until if is_preclaimed else None
+                        wake_pending_col = 0 if is_preclaimed else 1
+
+                        sess_rows_sql.append(
+                            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                        )
+                        sess_params.extend((
+                            sp.session_id, parent.session_id, actor.session_id, root_id, child_depth,
+                            sp.descriptor.kind, canonical(sp.descriptor), sha256_canonical(sp.descriptor),
+                            spec_hashes[sp.session_id],
+                            canonical(sp.creation_call_ref) if sp.creation_call_ref else None,
+                            sp.creation_tool_call_id, sp.message_id,
+                            parent_row["tenant_id"], parent_row["principal_id"],
+                            canonical(route), sp.cancel_propagation,
+                            next_seq_col, send_idx_col, execution_state_val, owner_epoch_col,
+                            owner_node_col, owner_boot_col, lease_col,
+                            1, 1, wake_pending_col, 0, 0, ready_item,
+                            database_now, database_now,
+                        ))
+                        deliv_seq = None if is_driver else 1
+                        queue_rows_sql.append(
+                            "(?,?,1,'user','normal',1,'delivered',?,?,?,?,?,?,NULL,?,?,?,1)"
+                        )
+                        queue_params.extend((
+                            sp.session_id, sp.message_id, reply_to, sp.result_kind,
+                            content, content_bytes, meta, req_hash, database_now,
+                            database_now, deliv_seq,
+                        ))
+                        if not is_driver:
+                            msg_rows_sql.append("(?,?,?,?,?,?,?)")
+                            msg_params.extend((
+                                sp.session_id, 1, "user", merged_json,
+                                canonical(msg_meta), 1, database_now,
+                            ))
+                        if is_preclaimed:
+                            user_row = StoredMessageRow(
+                                session_id=sp.session_id, seq=1, role="user", name=None,
+                                content=merged_json, tool_calls=None, tool_call_id=None,
+                                round_index=0, state=MessageState.ACTIVE, meta=msg_meta,
+                                created_at=database_now, send_index=1,
+                            )
+                            preclaimed.append(ClaimedBatch(
+                                target=child_target,
+                                send_index=1,
+                                message_seq=1 if not is_driver else 0,
+                                input_refs=(start_ref,),
+                                owner_epoch=1,
+                                owner_node_id=node_id,
+                                owner_boot_id=boot_id,
+                                descriptor=sp.descriptor,
+                                tenant_id=parent_row["tenant_id"],
+                                principal_id=parent_row["principal_id"],
+                                parent_session_id=parent.session_id,
+                                user_row=user_row,
+                                result_route=route,
+                                session_updated_at=database_now,
+                                inbox_version=1,
+                                wake_inbox_seq=1,
+                                cancel_seq=0,
+                                start_input_message_id=sp.message_id,
+                                root_session_id=root_id,
+                                depth=child_depth,
+                                reply_to_session_id=reply_to,
+                                reply_result_kind=sp.result_kind,
+                                reply_to_item_id=sp.message_id,
+                            ))
+                        else:
+                            queued.append(child_target)
+
                     await tx.execute(
-                        f"INSERT INTO {self.store.t.messages} ("
-                        "session_id,seq,role,content,meta_json,send_index,created_at) VALUES "
-                        + ",".join(msg_rows_sql),
-                        tuple(msg_params),
+                        f"INSERT INTO {self.s} ("
+                        "session_id,parent_session_id,created_by_session_id,root_session_id,depth,"
+                        "session_kind,descriptor_json,descriptor_hash,creation_identity_hash,"
+                        "creation_call_ref_json,creation_tool_call_id,start_input_message_id,"
+                        "tenant_id,principal_id,result_route_json,cancel_propagation,"
+                        "next_seq,send_index,execution_state,owner_epoch,owner_node_id,"
+                        "owner_boot_id,owner_lease_until_ms,inbox_version,wake_inbox_seq,"
+                        "wake_pending_count,pending_count,pending_bytes,ready_item_json,"
+                        "created_at,updated_at) VALUES " + ",".join(sess_rows_sql),
+                        tuple(sess_params),
                     )
+                    await tx.execute(
+                        f"INSERT INTO {self.q} ("
+                        "session_id,item_id,inbox_version,kind,priority,wake,status,"
+                        "reply_to_session_id,reply_result_kind,content_json,content_bytes,"
+                        "meta_json,request_hash,result_kind,created_at,delivered_at,"
+                        "delivered_seq,delivered_send_index) VALUES " + ",".join(queue_rows_sql),
+                        tuple(queue_params),
+                    )
+                    if msg_rows_sql:
+                        await tx.execute(
+                            f"INSERT INTO {self.store.t.messages} ("
+                            "session_id,seq,role,content,meta_json,send_index,created_at) VALUES "
+                            + ",".join(msg_rows_sql),
+                            tuple(msg_params),
+                        )
+                    if preclaimed and self._on_local_claim is not None:
+                        registered_claims = [(b.target.session_id, b.owner_epoch) for b in preclaimed]
+                        self._on_local_claim(node_id, boot_id, registered_claims)
                 return CreateManyResult(preclaimed=tuple(preclaimed), queued_targets=tuple(queued))
+            except BaseException:
+                if registered_claims and self._on_local_claim_cancel is not None:
+                    self._on_local_claim_cancel(node_id, boot_id, registered_claims)
+                raise
         except Exception as exc:
             if not is_duplicate_key_error(exc):
                 raise
@@ -1543,6 +1556,7 @@ class RuntimeInputStore:
         now_sql = self._now_sql()
         pt, pi = self._p_text(), self._p_int()
         ttl_ms = int(ttl_s * 1000)
+        registered_claims: list[tuple[str, int]] = []
         try:
             try:
                 async with self.db.transaction() as tx:
@@ -1707,15 +1721,24 @@ class RuntimeInputStore:
                         reply_to_item_id=(ref.message_id if reply_to_sid is not None else None),
                         fold_stats_json=srow["fold_stats_json"],
                     )
+                    if self._on_local_claim is not None:
+                        registered_claims = [(target.session_id, batch.owner_epoch)]
+                        self._on_local_claim(node_id, boot_id, registered_claims)
                 receipt = Receipt(ref, target, ref.message_id, True, "accepted", send_idx, "not_needed")
                 return receipt, batch, False
             except _AcceptSlowPath:
+                if registered_claims and self._on_local_claim_cancel is not None:
+                    self._on_local_claim_cancel(node_id, boot_id, registered_claims)
                 receipt, need_wake = await self.accept(
                     target, body, message_id=message_id, actor=actor, priority=priority,
                     deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
                     wake=wake, reply_route=reply_route, public=public, _with_activation=True,
                 )
                 return receipt, None, need_wake
+            except BaseException:
+                if registered_claims and self._on_local_claim_cancel is not None:
+                    self._on_local_claim_cancel(node_id, boot_id, registered_claims)
+                raise
         except RuntimeRequestError:
             raise
         except (Exception, asyncio.CancelledError) as exc:
@@ -2838,7 +2861,8 @@ class RuntimeInputStore:
                 "THEN 'queued' ELSE 'idle' END,"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
                 "next_seq=CASE WHEN lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?) THEN "
-                "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
+                "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? "
+                "ELSE (CASE WHEN ?>next_seq THEN ? ELSE next_seq END) END,"
                 "pending_tool_seq=CASE WHEN ?=1 THEN pending_tool_seq ELSE NULL END,"
                 "ready_item_json=NULL,"
                 f"{fold_set_clause}"
@@ -2854,6 +2878,7 @@ class RuntimeInputStore:
                     int(has_unconsumed),
                     batch.cancel_seq,
                     effective_next_seq, effective_next_seq, int(write_message),
+                    effective_next_seq, effective_next_seq,
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
                 ),
@@ -2900,7 +2925,8 @@ class RuntimeInputStore:
                 "THEN 'queued' ELSE 'idle' END,"
                 "owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL,"
                 "next_seq=CASE WHEN lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?) THEN "
-                "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? ELSE next_seq END,"
+                "(CASE WHEN ?>next_seq THEN ? ELSE next_seq END)+? "
+                "ELSE (CASE WHEN ?>next_seq THEN ? ELSE next_seq END) END,"
                 "pending_tool_seq=CASE WHEN ?=1 THEN pending_tool_seq ELSE NULL END,"
                 "ready_item_json=NULL,"
                 f"{fold_set_clause}"
@@ -2915,6 +2941,7 @@ class RuntimeInputStore:
                     int(has_unconsumed),
                     batch.cancel_seq,
                     effective_next_seq, effective_next_seq, int(write_message),
+                    effective_next_seq, effective_next_seq,
                     int(keep_pending_tool), *fold_set_params, batch.cancel_seq, batch.cancel_seq,
                     sid, batch.owner_epoch,
                 ),

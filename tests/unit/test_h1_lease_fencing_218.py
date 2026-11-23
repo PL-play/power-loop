@@ -245,6 +245,143 @@ async def test_h1_p0_1_batch_renew_releases_orphan_and_preserves_fusing_and_hot_
         await agent.aclose()
 
 
+async def test_h1_p0_1_workflow_create_many_and_continue_protected_during_commit_to_dispatch(registry_store):
+    """P0-1 rework: workflow create_many and workflow_continue accept_and_claim are protected
+    from batch_renew between DB commit and worker.dispatch_claimed, while a crashed/un-dispatched
+    claiming task still gets released as an orphan once that task finishes."""
+    store, _ = registry_store
+    loop_calls = 0
+
+    def model_fn(_idx, request):
+        nonlocal loop_calls
+        sys_text = str(getattr(request, "system_prompt", "") or "")
+        if sys_text.startswith("WF_LOOP"):
+            loop_calls += 1
+            return LLMResponse(raw_text="step1" if loop_calls == 1 else "done")
+        return LLMResponse(raw_text="main_ack")
+
+    agent = await RunningAgent(
+        store,
+        _ScriptedModel(model_fn),
+        None,
+        AgentLoopConfig(context_budget_tokens=10**9),
+        fuse_local_send=True,
+        capacity=4,
+    ).start()
+    worker = agent.runtime.worker
+    orig_create_many = worker.inputs.create_many
+    orig_accept_and_claim = worker.inputs.accept_and_claim
+    observed: dict[str, list[tuple[str, int, int]]] = {"create_many": [], "workflow_continue": []}
+
+    async def _wrapped_create_many(*args, **kwargs):
+        cm = await orig_create_many(*args, **kwargs)
+        if cm.preclaimed:
+            # Real batch_renew right after create_many committed, BEFORE workflow runner dispatches.
+            await worker.batch_renew()
+            for b in cm.preclaimed:
+                assert b.target.session_id not in worker._active
+                row = await store._db.fetchone(
+                    f"SELECT owner_epoch,owner_lease_until_ms FROM {store.t.sessions} WHERE session_id=?",
+                    (b.target.session_id,),
+                )
+                observed["create_many"].append(
+                    (b.target.session_id, int(row["owner_epoch"]), int(row["owner_lease_until_ms"]))
+                )
+        return cm
+
+    async def _wrapped_accept_and_claim(*args, **kwargs):
+        receipt, batch, activate = await orig_accept_and_claim(*args, **kwargs)
+        if batch is not None and kwargs.get("kind") == "workflow_continue":
+            # Real batch_renew right after workflow_continue committed, BEFORE runner dispatches.
+            await worker.batch_renew()
+            assert batch.target.session_id not in worker._active
+            row = await store._db.fetchone(
+                f"SELECT owner_epoch,owner_lease_until_ms FROM {store.t.sessions} WHERE session_id=?",
+                (batch.target.session_id,),
+            )
+            observed["workflow_continue"].append(
+                (batch.target.session_id, int(row["owner_epoch"]), int(row["owner_lease_until_ms"]))
+            )
+        return receipt, batch, activate
+
+    worker.inputs.create_many = _wrapped_create_many
+    worker.inputs.accept_and_claim = _wrapped_accept_and_claim
+    try:
+        spec = {
+            "name": "h1-p01-wf",
+            "input": "go",
+            "root": {
+                "type": "loop",
+                "id": "L",
+                "max_iterations": 3,
+                "continue_nodes": ["LOOP"],
+                "body": {
+                    "type": "sequence",
+                    "id": "S",
+                    "steps": [
+                        {
+                            "type": "agent",
+                            "id": "LOOP",
+                            "spec": {"name": "LOOP", "system_prompt": "WF_LOOP", "tools": []},
+                        },
+                        {
+                            "type": "agent",
+                            "id": "STEP2",
+                            "spec": {"name": "STEP2", "system_prompt": "WF_STEP2", "tools": []},
+                        },
+                    ],
+                },
+                "until": {"ref": "LOOP", "op": "eq", "value": "done"},
+            },
+        }
+        handle = await agent.runtime.client.workflow(
+            agent.target, spec, message_id="wf-h1-p01", actor=agent.actor,
+        )
+        res = await asyncio.wait_for(handle.wait(), 10.0)
+        assert res.status == "completed", res
+        assert res.results["LOOP"].text == "done"
+
+        # 1. Both workflow paths were hit and kept positive leases through batch_renew!
+        assert len(observed["create_many"]) >= 1
+        assert all(ep == 1 and lease > 0 for _, ep, lease in observed["create_many"])
+        cm_sids = {sid for sid, _, _ in observed["create_many"]}
+
+        assert len(observed["workflow_continue"]) == 1
+        wc_sid, wc_epoch, wc_lease = observed["workflow_continue"][0]
+        assert wc_sid in cm_sids and wc_epoch == 2 and wc_lease > 0
+
+        # 2. A claiming task that exits WITHOUT calling dispatch_claimed MUST become a
+        #    true orphan and have its lease zeroed by the next batch_renew!
+        worker.inputs.accept_and_claim = orig_accept_and_claim
+        abandoned = await agent.runtime.client.create_session(
+            agent.descriptor, actor=agent.actor, options={"session_id": "h1-p01-abandoned"},
+        )
+
+        async def _claim_and_die():
+            _, b, _ = await worker.inputs.accept_and_claim(
+                abandoned, "orphan task", message_id="m_die", actor=agent.actor,
+                node_id=agent.runtime.node_id, boot_id=agent.runtime.boot_id,
+                ttl_s=60.0,
+            )
+            assert b is not None
+            return b
+
+        dead_task = asyncio.create_task(_claim_and_die())
+        abandoned_batch = await dead_task
+        assert dead_task.done()
+        await worker.batch_renew()
+        ab_row = await store._db.fetchone(
+            f"SELECT owner_lease_until_ms,owner_epoch FROM {store.t.sessions} WHERE session_id=?",
+            (abandoned.session_id,),
+        )
+        assert int(ab_row["owner_epoch"]) == abandoned_batch.owner_epoch
+        assert int(ab_row["owner_lease_until_ms"]) == 0
+    finally:
+        worker.inputs.create_many = orig_create_many
+        worker.inputs.accept_and_claim = orig_accept_and_claim
+        await agent.aclose()
+
+
 # ── P0-2: _reclaim_single_session mandatory expiry check + discover <= ──────
 
 
@@ -532,11 +669,25 @@ async def test_h1_p0_4_closed_drain_persists_messages_and_closed_abort_cancels(r
         )
         assert st2.lifecycle == "closed"
         assert st2.cancel_requested is True
+        msgs2_before = await store.load_all_messages(agent2.target.session_id)
+        assert [(m.role, m.seq) for m in msgs2_before] == [("user", 1), ("assistant", 2)]
+
         abort_continue.set()
         res2 = await asyncio.wait_for(send_task2, 5)
         assert res2.status == "cancelled"
+        assert res2.result_seq is None
         msgs2 = await store.load_all_messages(agent2.target.session_id)
+        # Closed + abort MUST block post-cancel tool message insertion (no seq=3 tool row)
+        assert [(m.role, m.seq) for m in msgs2] == [("user", 1), ("assistant", 2)]
         assert all(m.content != "GHOST_SHOULD_NOT_COMPLETE" for m in msgs2)
+        srow2 = await store._db.fetchone(
+            f"SELECT lifecycle,execution_state,cancel_seq,next_seq FROM {store.t.sessions} WHERE session_id=?",
+            (agent2.target.session_id,),
+        )
+        assert srow2["lifecycle"] == "closed"
+        assert srow2["execution_state"] == "idle"
+        assert int(srow2["cancel_seq"]) == 1
+        assert int(srow2["next_seq"]) == 3
     finally:
         abort_continue.set()
         await agent2.aclose()

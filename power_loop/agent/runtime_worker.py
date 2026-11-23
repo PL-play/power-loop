@@ -111,6 +111,8 @@ class RuntimeWorker:
             runtime.store,
             hooks_provider=lambda: self.runtime.hooks,
             hook_timeout_s=runtime.hook_timeout_s,
+            on_local_claim=self._note_local_claim,
+            on_local_claim_cancel=self._unnote_local_claim,
         )
         self._subscriptions, self._listeners = [], []
         self._wake_subscription = None
@@ -119,6 +121,7 @@ class RuntimeWorker:
         self._pending = {}
         self._active = {}
         self._fusing: dict[str, int] = {}
+        self._pending_claims: dict[tuple[str, int], asyncio.Task | None] = {}
         self._drivers = set()
         self._tasks = set()
         self._capacity = asyncio.Semaphore(runtime.capacity)
@@ -231,10 +234,36 @@ class RuntimeWorker:
         else:
             self._fusing[sid] = count
 
+    def _note_local_claim(
+        self, node_id: str, boot_id: str, claims: list[tuple[str, int]],
+    ) -> None:
+        r = self.runtime
+        if node_id != r.node_id or boot_id != r.boot_id:
+            return
+        task = asyncio.current_task()
+        for sid, epoch in claims:
+            key = (str(sid), int(epoch))
+            self._pending_claims[key] = task
+            if task is not None:
+                def _cleanup(_t, _k=key, _owner=task):
+                    if self._pending_claims.get(_k) is _owner:
+                        self._pending_claims.pop(_k, None)
+                task.add_done_callback(_cleanup)
+
+    def _unnote_local_claim(
+        self, node_id: str, boot_id: str, claims: list[tuple[str, int]],
+    ) -> None:
+        r = self.runtime
+        if node_id != r.node_id or boot_id != r.boot_id:
+            return
+        for sid, epoch in claims:
+            self._pending_claims.pop((str(sid), int(epoch)), None)
+
     def dispatch_claimed(self, batch) -> None:
         """Schedule a locally fused accept_and_claim or pre-claimed batch without re-claiming."""
         sid = batch.target.session_id
         self._active[sid] = None
+        self._pending_claims.pop((sid, int(batch.owner_epoch)), None)
         task = asyncio.create_task(
             self._run_session(sid, preclaimed_batch=batch),
             context=contextvars.Context(),
@@ -342,16 +371,23 @@ class RuntimeWorker:
                     )
                 ctx.stop.cancel(row.get("cancel_reason") or "cancelled")
         # Slow path (P0-1): expire orphan running leases owned by this (node_id, boot_id)
-        # that are absent from local active/fusing sets or have a mismatched owner_epoch.
+        # that are absent from local active/fusing/pending-claim sets or have a mismatched owner_epoch.
         for row in rows:
             sid = str(row["session_id"])
+            epoch = int(row["owner_epoch"])
             if sid in self._fusing:
                 continue
+            pending_key = (sid, epoch)
+            if pending_key in self._pending_claims:
+                pending_task = self._pending_claims[pending_key]
+                if pending_task is None or not pending_task.done():
+                    continue
+                self._pending_claims.pop(pending_key, None)
             if sid in self._active:
                 ctx = self._active[sid]
                 if ctx is None:
                     continue
-                if int(row["owner_epoch"]) == ctx.batch.owner_epoch:
+                if epoch == ctx.batch.owner_epoch:
                     if ctx.finalized or (
                         not ctx.closing
                         and not (ctx.ownership is not None and ctx.ownership.released)
@@ -361,7 +397,7 @@ class RuntimeWorker:
                 sid,
                 node_id=r.node_id,
                 boot_id=r.boot_id,
-                owner_epoch=int(row["owner_epoch"]),
+                owner_epoch=epoch,
             )
         return rows
 
@@ -1367,6 +1403,7 @@ class RuntimeWorker:
         self._closing = True
         self.runtime.client._accepting = False
         self._pending.clear()
+        self._pending_claims.clear()
         if self.runtime.timer_driver is not None:
             await self.runtime.timer_driver.stop()
         if self._started:
