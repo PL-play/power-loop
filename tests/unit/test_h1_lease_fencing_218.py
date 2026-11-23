@@ -693,6 +693,126 @@ async def test_h1_p0_4_closed_drain_persists_messages_and_closed_abort_cancels(r
         await agent2.aclose()
 
 
+class _FixedRecallMemory:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def recall(self, *, messages, session_id, budget_tokens=1500):
+        return [{"content": self._text}]
+
+    async def remember(self, *, snapshot, session_id):
+        return None
+
+
+@pytest.mark.parametrize(
+    ("record_mode", "inflight"),
+    [
+        ("metadata", "abort"),
+        ("metadata", "drain"),
+        ("off", "abort"),
+    ],
+)
+async def test_h1_p0_4_hook_audit_assistant_respects_closed_abort_and_drain(
+    registry_store, record_mode, inflight,
+):
+    """P0-4 rework: assistant messages carrying hook_injected audit metadata must enforce the
+    same closed+abort vs closed+drain boundary at the DB transaction level as append_message_fenced."""
+    store, _ = registry_store
+    assistant_paused = asyncio.Event()
+    release_append = asyncio.Event()
+    paused_once = False
+    seen_memory_injected = False
+
+    def model_fn(idx, request):
+        nonlocal seen_memory_injected
+        if idx == 0:
+            if "recalled-secret-memory" in str(getattr(request, "messages", request)):
+                seen_memory_injected = True
+            return LLMResponse(
+                raw_text="calling tool after memory recall",
+                tool_calls=[{
+                    "id": "tc_audit_p04",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "{}"},
+                }],
+            )
+        return LLMResponse(raw_text="audit_drained_ok")
+
+    hooks = AgentHooks()
+
+    async def on_message_append(ctx):
+        nonlocal paused_once
+        if not paused_once and ctx.message.get("role") == "assistant":
+            paused_once = True
+            assistant_paused.set()
+            await asyncio.wait_for(release_append.wait(), 5)
+
+    hooks.register(HookPoint.MESSAGE_APPEND, on_message_append)
+
+    agent = await RunningAgent(
+        store,
+        _ScriptedModel(model_fn),
+        _single_tool_registry("echo", lambda: "echo_ok"),
+        AgentLoopConfig(
+            context_budget_tokens=10**9,
+            memory=_FixedRecallMemory("recalled-secret-memory"),
+            record_hook_events=record_mode,
+        ),
+        hooks=hooks,
+    ).start()
+    try:
+        sid = agent.target.session_id
+        send_task = asyncio.create_task(agent.send("hello with memory"))
+        await asyncio.wait_for(assistant_paused.wait(), 5)
+
+        st = await agent.runtime.client.set_lifecycle(
+            agent.target, "closed", actor=agent.actor, inflight=inflight, reason=f"close_{inflight}",
+        )
+        assert st.lifecycle == "closed"
+        assert st.cancel_requested is (inflight == "abort")
+
+        msgs_before = await store.load_all_messages(sid)
+        assert [(m.role, m.seq) for m in msgs_before] == [("user", 1)]
+
+        release_append.set()
+        res = await asyncio.wait_for(send_task, 5)
+        assert seen_memory_injected is True
+
+        msgs_after = await store.load_all_messages(sid)
+        hook_events = await store.list_hook_events(sid)
+        srow = await store._db.fetchone(
+            f"SELECT lifecycle,execution_state,cancel_seq,next_seq FROM {store.t.sessions} WHERE session_id=?",
+            (sid,),
+        )
+        assert srow["lifecycle"] == "closed"
+        assert srow["execution_state"] == "idle"
+
+        if inflight == "abort":
+            assert res.status == "cancelled"
+            assert res.result_seq is None
+            assert [(m.role, m.seq) for m in msgs_after] == [("user", 1)]
+            assert hook_events == []
+            assert int(srow["cancel_seq"]) == 1
+            assert int(srow["next_seq"]) == 2
+        else:
+            assert res.status == "completed"
+            assert res.final_text == "audit_drained_ok"
+            assert [(m.role, m.seq) for m in msgs_after] == [
+                ("user", 1), ("assistant", 2), ("tool", 3), ("assistant", 4),
+            ]
+            assert res.result_seq == 4
+            assert msgs_after[-1].content == "audit_drained_ok"
+            assert int(srow["cancel_seq"]) == 0
+            assert int(srow["next_seq"]) == 5
+            assert len(hook_events) >= 1
+            assistant_seqs = {m.seq for m in msgs_after if m.role == "assistant"}
+            assert any(ev.message_seq == 2 for ev in hook_events)
+            assert all(ev.message_seq in assistant_seqs for ev in hook_events)
+    finally:
+        release_append.set()
+        await agent.aclose()
+
+
 # ── P0-5: upsert_repaired_projection locking, fencing & fold invalidation ──
 
 

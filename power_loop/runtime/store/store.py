@@ -603,6 +603,51 @@ class SessionStore:
         lease.require_owned()
         return " AND owner_epoch=? AND execution_state='running'", (lease.epoch,)
 
+    @staticmethod
+    def _closed_abort_guard(expected_cancel_seq: int | None) -> tuple[str, tuple[Any, ...]]:
+        if expected_cancel_seq is not None:
+            return (
+                " AND (lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?))",
+                (int(expected_cancel_seq),),
+            )
+        return (
+            " AND (lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_by IS NULL))",
+            (),
+        )
+
+    @staticmethod
+    def _row_is_closed_aborted(row: Mapping[str, Any], expected_cancel_seq: int | None) -> bool:
+        if row["lifecycle"] == "closing":
+            return True
+        if row["lifecycle"] == "closed":
+            if expected_cancel_seq is not None:
+                return int(row["cancel_seq"]) > int(expected_cancel_seq)
+            return row["cancel_by"] is not None
+        return False
+
+    async def _raise_if_closed_aborted_tx(
+        self,
+        tx,
+        session_id: str,
+        owner_epoch: int | None,
+        expected_cancel_seq: int | None,
+    ) -> None:
+        if owner_epoch is None:
+            return
+        diag = await tx.fetchone(
+            f"SELECT lifecycle,cancel_seq,cancel_by,cancel_reason,owner_epoch,execution_state "
+            f"FROM {self.t.sessions} WHERE session_id=?",
+            (session_id,),
+        )
+        if (
+            diag is not None
+            and int(diag["owner_epoch"]) == int(owner_epoch)
+            and diag["execution_state"] == "running"
+            and self._row_is_closed_aborted(diag, expected_cancel_seq)
+        ):
+            from power_loop.contracts.errors import CancellationRequested
+            raise CancellationRequested(diag.get("cancel_reason") or "cancelled")
+
     def _state_update(self, session_id, sets, values, *, condition='', condition_values=()):
         """Declare an ordinary mutation with its owner condition in the DML."""
         guard, lease_arguments = self._lease_write_guard(session_id)
@@ -726,22 +771,13 @@ class SessionStore:
             if boundary_cancel_seq is not None
             else (int(holding.cancel_seq) if holding.cancel_seq is not None else None)
         )
-        if expected_cancel_seq is not None:
-            lifecycle_guard = " AND (lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_seq=?))"
-            base_values = (
-                session_id, seq, role, _nul_safe(name), _nul_safe(content),
-                calls_json, stored_call_id, round_index,
-                MessageState.ACTIVE.value, meta_json, stored_send, now,
-                session_id, int(owner_epoch), expected_cancel_seq,
-            )
-        else:
-            lifecycle_guard = " AND (lifecycle IN ('open','suspended') OR (lifecycle='closed' AND cancel_by IS NULL))"
-            base_values = (
-                session_id, seq, role, _nul_safe(name), _nul_safe(content),
-                calls_json, stored_call_id, round_index,
-                MessageState.ACTIVE.value, meta_json, stored_send, now,
-                session_id, int(owner_epoch),
-            )
+        lifecycle_guard, lifecycle_params = self._closed_abort_guard(expected_cancel_seq)
+        base_values = (
+            session_id, seq, role, _nul_safe(name), _nul_safe(content),
+            calls_json, stored_call_id, round_index,
+            MessageState.ACTIVE.value, meta_json, stored_send, now,
+            session_id, int(owner_epoch), *lifecycle_params,
+        )
         base_sql = (
             f"INSERT INTO {self.t.messages} ("
             "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
@@ -778,15 +814,6 @@ class SessionStore:
             rc = await self._db.execute(locked_stmt, vals)
             return rc, None
 
-        def _is_closed_aborted(row_dict: Mapping[str, Any]) -> bool:
-            if row_dict["lifecycle"] == "closing":
-                return True
-            if row_dict["lifecycle"] == "closed":
-                if expected_cancel_seq is not None:
-                    return int(row_dict["cancel_seq"]) > expected_cancel_seq
-                return row_dict["cancel_by"] is not None
-            return False
-
         rc, row_id = await _run_insert(sql, values)
         boundary_row: dict[str, Any] | None = None
         if rc == 0:
@@ -803,7 +830,7 @@ class SessionStore:
             ):
                 raise SessionLeaseLost(session_id)
             boundary_row = dict(diag)
-            if _is_closed_aborted(boundary_row):
+            if self._row_is_closed_aborted(boundary_row, expected_cancel_seq):
                 if holding.active:
                     holding.piggyback_boundary = boundary_row
                     holding.piggyback_verified = False
@@ -813,19 +840,9 @@ class SessionStore:
                 raise SessionLeaseLost(session_id)
             rc2, row_id = await _run_insert(base_sql, base_values)
             if rc2 == 0:
-                diag2 = await self._db.fetchone(
-                    f"SELECT lifecycle,cancel_seq,cancel_by,cancel_reason,owner_epoch,execution_state "
-                    f"FROM {self.t.sessions} WHERE session_id=?",
-                    (session_id,),
+                await self._raise_if_closed_aborted_tx(
+                    self._db, session_id, int(owner_epoch), expected_cancel_seq,
                 )
-                if (
-                    diag2 is not None
-                    and int(diag2["owner_epoch"]) == int(owner_epoch)
-                    and diag2["execution_state"] == "running"
-                    and _is_closed_aborted(diag2)
-                ):
-                    from power_loop.contracts.errors import CancellationRequested
-                    raise CancellationRequested(diag2.get("cancel_reason") or "cancelled")
                 raise SessionLeaseLost(session_id)
 
         if holding.active:
@@ -914,6 +931,18 @@ class SessionStore:
             params.append(pending_seq)
         mysql = self._db.dialect.name == "mysql"
         expected = holding.next_seq
+        expected_cancel_seq = (
+            int(boundary_cancel_seq)
+            if boundary_cancel_seq is not None
+            else (int(holding.cancel_seq) if holding.cancel_seq is not None else None)
+        )
+        from ..session_ownership import current_ownership
+        active_lease = holding.ownership if holding.ownership is not None else current_ownership(self, session_id)
+        close_guard, close_params = (
+            self._closed_abort_guard(expected_cancel_seq)
+            if active_lease is not None
+            else ("", ())
+        )
 
         committed, lease_lost, claim_changed = False, False, False
         prior = send_reads.take_state(self, session_id)
@@ -936,7 +965,8 @@ class SessionStore:
                     next_seq_cond = " AND next_seq<=?" if holding.ownership is not None else " AND next_seq=?"
                     statement, arguments, guarded = self._state_update(session_id,
                         ['next_seq=?', *fast_sets], (expected+1, *fast_params),
-                        condition=next_seq_cond+guard, condition_values=(expected,))
+                        condition=next_seq_cond+guard+close_guard,
+                        condition_values=(expected, *close_params))
                     if mysql:
                         matched = await tx.execute(statement, arguments) == 1
                     else:
@@ -947,11 +977,24 @@ class SessionStore:
                     if matched:
                         seq, state_written = expected, True
                     elif guarded:
+                        await self._raise_if_closed_aborted_tx(
+                            tx, session_id,
+                            active_lease.epoch if active_lease is not None else None,
+                            expected_cancel_seq,
+                        )
                         raise SessionLeaseLost(session_id)
                 if seq is not None:
                     pass
                 elif mysql:
                     st = await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
+                    if (
+                        active_lease is not None
+                        and int(st["owner_epoch"]) == int(active_lease.epoch)
+                        and st["execution_state"] == "running"
+                        and self._row_is_closed_aborted(st, expected_cancel_seq)
+                    ):
+                        from power_loop.contracts.errors import CancellationRequested
+                        raise CancellationRequested(st.get("cancel_reason") or "cancelled")
                     seq = int(st["next_seq"])
                     if pending_tool_calls and st["pending_tool_seq"] is not None:
                         raise ValueError("pending_tool_calls_exist")
@@ -963,9 +1006,16 @@ class SessionStore:
                         extra_params.append(now)
                         touched = now
                     statement, arguments, guarded = self._state_update(session_id,
-                        ['next_seq=next_seq+1', *extra_sets], extra_params, condition=guard)
+                        ['next_seq=next_seq+1', *extra_sets], extra_params,
+                        condition=guard+close_guard, condition_values=close_params)
                     st = await tx.fetchone(statement+f' RETURNING next_seq,{signal_columns}', arguments)
                     if st is None:
+                        if guarded:
+                            await self._raise_if_closed_aborted_tx(
+                                tx, session_id,
+                                active_lease.epoch if active_lease is not None else None,
+                                expected_cancel_seq,
+                            )
                         if pending_tool_calls and await tx.fetchone(
                                 f"SELECT 1 AS present FROM {self.t.sessions} WHERE session_id=?", (session_id,)):
                             raise ValueError("pending_tool_calls_exist")
@@ -1010,9 +1060,15 @@ class SessionStore:
                         fin_params.append(now)
                         touched = now
                     statement, arguments, guarded = self._state_update(session_id,
-                        ['next_seq=?', *fin_sets], (seq+1, *fin_params))
+                        ['next_seq=?', *fin_sets], (seq+1, *fin_params),
+                        condition=close_guard, condition_values=close_params)
                     changed = await tx.execute(statement, arguments)
                     if guarded and changed != 1:
+                        await self._raise_if_closed_aborted_tx(
+                            tx, session_id,
+                            active_lease.epoch if active_lease is not None else None,
+                            expected_cancel_seq,
+                        )
                         raise SessionLeaseLost(session_id)
                 elif pending_tool_calls and state_written is None:
                     await tx.execute(
