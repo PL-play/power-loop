@@ -205,6 +205,7 @@ class DurableExecutor:
         self._journal_lock = asyncio.Lock()
         self._pending_creates: list[_PendingLeafCreate] = []
         self._flush_scheduled = False
+        self._flush_tasks: set[asyncio.Task[None]] = set()
         if resident_waiter is not None:
             self._waiter_q, self._waiter_sig, self._subtree_stopped_flag = resident_waiter
         else:
@@ -242,6 +243,7 @@ class DurableExecutor:
             raise CapacityError()
 
     def _coordinates(self, request):
+        raw_attempt = request.attempt
         offset = self.plan.get("attempt_offsets", {}).get(request.node_path, 0)
         if offset:
             request = replace(request, attempt=request.attempt + offset)
@@ -250,10 +252,23 @@ class DurableExecutor:
             body = self.plan.get("body_overrides", {}).get(request.node_path, request.body)
         if body != request.body:
             request = replace(request, body=body)
-        request_hash = sha256_canonical(plain(request))
-        sid = request.session_id or "ses_" + sha256_canonical([
+        hash_payload = plain(request)
+        hash_body = hash_payload.pop("hash_body", None)
+        if hash_body is not None:
+            hash_payload["body"] = hash_body
+        request_hash = sha256_canonical(hash_payload)
+        resume_sid: str | None = None
+        if request.session_id is None and request.continuation == 0 and raw_attempt == 1 and self.plan:
+            route_key = canonical([request.node_path, request.iteration_path])
+            resume_sid = (self.plan.get("resume_sessions") or {}).get(route_key)
+        is_continuation = (
+            request.session_id is not None
+            or resume_sid is not None
+            or request.continuation > 0
+        )
+        sid = request.session_id or resume_sid or "ses_" + sha256_canonical([
             "workflow_node", self.driver.store_id, self.driver.session_id, self.run_id,
-            request.node_path, request.iteration_path,
+            request.node_path, request.iteration_path, request.attempt,
         ])[:56]
         target = TargetRef(self.driver.store_id, sid)
         start = InputRef(
@@ -268,7 +283,7 @@ class DurableExecutor:
             self.driver, self.run_id, request.node_path, request.iteration_path,
             request.attempt, request.continuation,
         )
-        return request, target, start, key, request_hash
+        return request, target, start, key, request_hash, is_continuation
 
     def _descriptor(self, request):
         from power_loop.runtime.execution_roles import role_tools
@@ -342,6 +357,87 @@ class DurableExecutor:
             "late_results": [],
         }
 
+    async def _cancel_leaf_if_needed(self, target: TargetRef) -> None:
+        if (
+            not self.ctx.shutdown_interrupted
+            and not (self.ctx.ownership is not None and self.ctx.ownership.lost)
+            and self.ctx.stop.reason != "worker shutdown"
+            and not self._subtree_stopped_flag[0]
+            and self.ctx.cancel_by != "subtree"
+        ):
+            await self.client.cancel(
+                target,
+                actor=self.actor,
+                scope="subtree",
+                reason="workflow branch stopped",
+                cancel_by="subtree",
+            )
+
+    async def _cancel_aborted_leaf_creates(
+        self,
+        items: list[_PendingLeafCreate],
+        preclaimed_by_sid: dict[str, Any],
+    ) -> None:
+        """Cancel leaves whose caller future was cancelled during ``create_many`` / journal."""
+        can_cancel = (
+            not self.ctx.shutdown_interrupted
+            and not (self.ctx.ownership is not None and self.ctx.ownership.lost)
+            and self.ctx.stop.reason != "worker shutdown"
+            and not getattr(self.client, "_closed", False)
+        )
+        for item in items:
+            preclaimed_batch = preclaimed_by_sid.get(item.target.session_id)
+            try:
+                if can_cancel:
+                    try:
+                        await self.client.cancel(
+                            item.target,
+                            actor=self.actor,
+                            scope="subtree",
+                            reason="workflow branch stopped",
+                            cancel_by="subtree",
+                        )
+                    except RuntimeRequestError:
+                        pass
+                if preclaimed_batch is not None:
+                    try:
+                        await self.port.final(
+                            replace(preclaimed_batch, cancel_by="subtree"),
+                            consumed=preclaimed_batch.input_refs,
+                            status="cancelled",
+                            final_text="",
+                            error="workflow branch stopped",
+                            error_code="cancelled",
+                        )
+                    except SessionLeaseLost:
+                        pass
+            finally:
+                if preclaimed_batch is not None:
+                    self.worker._unnote_local_claim(
+                        preclaimed_batch.owner_node_id,
+                        preclaimed_batch.owner_boot_id,
+                        [(preclaimed_batch.target.session_id, preclaimed_batch.owner_epoch)],
+                    )
+
+    async def aclose(self) -> None:
+        """Cancel any unstarted pending creates and drain all active flush tasks."""
+        pending = list(self._pending_creates)
+        self._pending_creates.clear()
+        self._flush_scheduled = False
+        for item in pending:
+            if not item.future.done():
+                item.future.cancel()
+        while self._flush_tasks:
+            tasks = list(self._flush_tasks)
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
     async def _enqueue_leaf_create(
         self, key: str, request, target: TargetRef, start: InputRef,
         request_hash: str, descriptor: RuntimeDescriptor,
@@ -368,8 +464,15 @@ class DurableExecutor:
         ))
         if not self._flush_scheduled:
             self._flush_scheduled = True
-            asyncio.create_task(self._flush_pending_creates())
-        return await fut
+            task = asyncio.create_task(self._flush_pending_creates())
+            self._flush_tasks.add(task)
+            task.add_done_callback(self._flush_tasks.discard)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                await self._cancel_leaf_if_needed(target)
+            raise
 
     async def _flush_pending_creates(self) -> None:
         # Yield once so all parallel/foreach branches scheduled in this event-loop tick coalesce
@@ -377,7 +480,7 @@ class DurableExecutor:
         await asyncio.sleep(0)
         while self._journal_lock.locked():
             await asyncio.sleep(0)
-        batch_items = list(self._pending_creates)
+        batch_items = [item for item in self._pending_creates if not item.future.cancelled()]
         self._pending_creates.clear()
         self._flush_scheduled = False
         if not batch_items:
@@ -406,11 +509,19 @@ class DurableExecutor:
                 parent_owner_epoch=self.ctx.batch.owner_epoch,
                 parent_cancel_seq=self.ctx.batch.cancel_seq,
             )
+            preclaimed_by_sid = {b.target.session_id: b for b in cm.preclaimed}
+            cancelled_items = [item for item in batch_items if item.future.cancelled()]
+            live_items = [item for item in batch_items if not item.future.cancelled()]
+            cancelled_sids = {item.target.session_id for item in cancelled_items}
+
             for b in cm.preclaimed:
-                self.worker.dispatch_claimed(b)
-            spec_by_sid = {item.target.session_id: item for item in batch_items}
+                if b.target.session_id not in cancelled_sids:
+                    self.worker.dispatch_claimed(b)
+            spec_by_sid = {item.target.session_id: item for item in live_items}
             for qt in cm.queued_targets:
-                it = spec_by_sid[qt.session_id]
+                it = spec_by_sid.get(qt.session_id)
+                if it is None:
+                    continue
                 await self.client._notify(qt, it.start.message_id, it.start, ["work", "activation"])
                 if self.client.wake_transport is not None:
                     try:
@@ -418,7 +529,7 @@ class DurableExecutor:
                     except Exception:
                         pass
             if cm.already_created:
-                for item in batch_items:
+                for item in live_items:
                     await self.client._notify(
                         item.target, item.start.message_id, item.start, ["work", "activation"],
                     )
@@ -427,18 +538,24 @@ class DurableExecutor:
                             await self.client.wake_transport.publish_wake(item.target.session_id)
                         except Exception:
                             pass
+            if cancelled_items:
+                await self._cancel_aborted_leaf_creates(cancelled_items, preclaimed_by_sid)
         except BaseException as exc:
             for item in batch_items:
                 if not item.future.done():
                     item.future.set_exception(exc)
             return
 
+        if not live_items:
+            return
+
         # Fixed order: session+start committed above, journal committed below.
         accepted_items: list[tuple[_PendingLeafCreate, dict[str, Any]]] = []
+        late_cancelled: list[_PendingLeafCreate] = []
         async with self._journal_lock:
             assert self._nodes is not None
             extra = 0
-            for item in batch_items:
+            for item in live_items:
                 existing = self._nodes.get(item.key)
                 if existing is not None:
                     if existing["request_hash"] != item.request_hash:
@@ -447,7 +564,9 @@ class DurableExecutor:
                                 RuntimeRequestError("request_conflict", "workflow dispatch input changed")
                             )
                     else:
-                        if not item.future.done():
+                        if item.future.cancelled():
+                            late_cancelled.append(item)
+                        elif not item.future.done():
                             item.future.set_result(existing)
                     continue
                 try:
@@ -477,10 +596,17 @@ class DurableExecutor:
                     return
                 for it, ent in accepted_items:
                     self._publish_node(it.key, ent)
-                    if not it.future.done():
+                    if it.future.cancelled():
+                        late_cancelled.append(it)
+                    elif not it.future.done():
                         it.future.set_result(ent)
 
-    async def _send_leaf_continuation(self, target: TargetRef, start: InputRef, body: Any) -> None:
+        for item in late_cancelled:
+            await self._cancel_leaf_if_needed(item.target)
+
+    async def _send_leaf_continuation(
+        self, target: TargetRef, start: InputRef, body: Any, *, max_rounds: int | None = None,
+    ) -> None:
         """Original-leaf continuation via standard accept/accept_and_claim(kind='workflow_continue')."""
         r = self.worker.runtime
         reply_route = {"target": self.driver, "result_kind": "workflow_node_result"}
@@ -497,13 +623,13 @@ class DurableExecutor:
                 target, body, message_id=start.message_id, actor=self.actor,
                 node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
                 kind="workflow_continue", reply_route=reply_route, public=False,
-                can_execute=self.worker._capable,
+                can_execute=self.worker._capable, max_rounds=max_rounds,
             )
         else:
             receipt, activate = await self.port.accept(
                 target, body, message_id=start.message_id, actor=self.actor,
                 kind="workflow_continue", reply_route=reply_route, public=False,
-                _with_activation=True,
+                max_rounds=max_rounds, _with_activation=True,
             )
         if batch is not None:
             self.worker.dispatch_claimed(batch)
@@ -646,7 +772,7 @@ class DurableExecutor:
                         await self._redeliver_missing_node_result(target, start, res)
 
     async def run_agent(self, request, *, allow_start=True):
-        request, target, start, key, request_hash = self._coordinates(request)
+        request, target, start, key, request_hash, is_continuation = self._coordinates(request)
         async with self._journal_lock:
             await self._load_nodes()
             assert self._nodes is not None
@@ -660,12 +786,13 @@ class DurableExecutor:
 
         if saved is None:
             descriptor = self._descriptor(request)
-            if request.session_id is None and request.attempt == 1 and request.continuation == 0:
+            if not is_continuation:
                 saved = await self._enqueue_leaf_create(
                     key, request, target, start, request_hash, descriptor,
                 )
             else:
-                await self._send_leaf_continuation(target, start, request.body)
+                cont_max_rounds = request.spec.get("max_rounds") if request.continuation > 0 else None
+                await self._send_leaf_continuation(target, start, request.body, max_rounds=cont_max_rounds)
                 async with self._journal_lock:
                     saved = self._nodes.get(key)
                     if saved is not None and saved["request_hash"] != request_hash:
@@ -700,20 +827,7 @@ class DurableExecutor:
                 # with cancel_by='subtree' (child_wake=0 -> NEVER ghost-rewakes finished Driver!).
                 # If the Driver itself was already cancelled with scope='subtree', RuntimeInputStore.cancel
                 # already stopped all active leaves in 1 atomic DB transaction (0 redundant SQL!).
-                if (
-                    not self.ctx.shutdown_interrupted
-                    and not (self.ctx.ownership is not None and self.ctx.ownership.lost)
-                    and self.ctx.stop.reason != "worker shutdown"
-                    and not self._subtree_stopped_flag[0]
-                    and self.ctx.cancel_by != "subtree"
-                ):
-                    await self.client.cancel(
-                        target,
-                        actor=self.actor,
-                        scope="subtree",
-                        reason="workflow branch stopped",
-                        cancel_by="subtree",
-                    )
+                await self._cancel_leaf_if_needed(target)
                 raise
 
         assert self._nodes is not None
@@ -958,12 +1072,19 @@ async def _prepare_explicit(worker, ctx, saved, origin, options, *, requeue_ids:
     plan = plan_continuation(spec, options["node_id"])
     entries = await journal.nodes(port.store, port.db, ctx.session_id)
     offsets: dict[str, int] = {}
+    resume_sessions: dict[str, tuple[int, str]] = {}
     for entry in entries:
         if entry["path"] in plan.invalidated:
-            offsets[entry["path"]] = max(offsets.get(entry["path"], 0), int(entry["attempt"]))
+            attempt = int(entry["attempt"])
+            offsets[entry["path"]] = max(offsets.get(entry["path"], 0), attempt)
+            route_key = canonical([entry["path"], entry["iteration"]])
+            prev = resume_sessions.get(route_key)
+            if prev is None or attempt >= prev[0]:
+                resume_sessions[route_key] = (attempt, entry["session_id"])
     revision = int(saved.get("execution_revision", 0)) + 1
     continuation = {
         "attempt_offsets": offsets,
+        "resume_sessions": {k: v[1] for k, v in resume_sessions.items()},
         "body_overrides": {options["node_id"]: options["message"]},
         "prior_usage": (saved.get("result") or {}).get("usage") or {},
         "invalidated": sorted(plan.invalidated),
@@ -1204,6 +1325,7 @@ async def _execute_driver_graph(
         stopped.cancel()
         graph.cancel()
         await asyncio.gather(stopped, graph, return_exceptions=True)
+        await executor.aclose()
 
     if not aborted_early:
         await executor._consume_results()

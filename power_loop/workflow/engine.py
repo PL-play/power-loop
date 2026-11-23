@@ -151,6 +151,7 @@ class NodeRequest:
     body: str
     continuation: int = 0
     session_id: str | None = None
+    hash_body: str | None = None
 
 
 class Executor(Protocol):
@@ -398,7 +399,10 @@ class WorkflowEngine:
 
         async with admit(self._cancel):
             for attempt in range(1, attempts + 1):
-                request = NodeRequest(self._run_id, node.id, route, attempt, asdict(spec), body, session_id=previous)
+                request = NodeRequest(
+                    self._run_id, node.id, route, attempt, asdict(spec), body,
+                    session_id=previous if attempt == 1 else None,
+                )
                 raw = await self._executor.run_agent(request, allow_start=not self._budget or self._budget.can_spawn())
                 record_usage(raw)
                 # Unknown actions are never automatically retried.
@@ -433,6 +437,7 @@ class WorkflowEngine:
                         session_id=raw["session_id"],
                         spec=asdict(replace(spec, max_rounds=cont.extra_rounds)),
                         body=_continuation_prompt(remaining, index, cont.max_continuations),
+                        hash_body=_continuation_prompt([], index, cont.max_continuations),
                     ),
                     allow_start=not self._budget or self._budget.can_spawn(),
                 )

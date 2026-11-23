@@ -170,6 +170,24 @@ class ClaimedBatch:
     reclaimed_cancelled: bool = False
     reclaimed_next_round_index: int = 0
     reclaimed_pending_tool_seq: int | None = None
+    max_rounds_override: int | None = None
+
+
+def _extract_max_rounds_override(rows) -> int | None:
+    override: int | None = None
+    for row in rows:
+        raw_meta = row.get("meta_json")
+        if not raw_meta:
+            continue
+        try:
+            parsed = json.loads(raw_meta)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            val = parsed.get("max_rounds")
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 1:
+                override = val
+    return override
 
 
 @dataclass(frozen=True)
@@ -1204,7 +1222,8 @@ class RuntimeInputStore:
     # ── Accept (Standard 2-SQL Fast Path + Slow Diagnostic Path) ─────────────
 
     def _validate_accept_args(
-        self, target, body, *, message_id, priority, kind, wake, reply_route, public
+        self, target, body, *, message_id, priority, kind, wake, reply_route, public,
+        max_rounds: int | None = None,
     ):
         if priority not in {"normal", "urgent"}:
             raise RuntimeRequestError("invalid_options", "priority")
@@ -1212,20 +1231,32 @@ class RuntimeInputStore:
             raise RuntimeRequestError("invalid_options", "reserved message_id prefix")
         if kind not in _VALID_INPUT_KINDS or (public and kind not in _PUBLIC_INPUT_KINDS):
             raise RuntimeRequestError("invalid_options", "kind")
+        if max_rounds is not None:
+            if public or not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
+                raise RuntimeRequestError("invalid_options", "max_rounds")
         self.check_store(target)
         ref = InputRef(target.store_id, target.session_id, message_id)
         reply_to_sid, reply_rk = self._parse_reply_route(reply_route)
         content = canonical(body)
-        meta = canonical({"accepted_protocol": PROTOCOL_VERSION})
+        meta_dict: dict[str, Any] = {"accepted_protocol": PROTOCOL_VERSION}
+        if max_rounds is not None:
+            meta_dict["max_rounds"] = max_rounds
+        meta = canonical(meta_dict)
         content_bytes = len(content.encode()) + len(meta.encode())
-        digest = self.request_hash(target, body, priority)
+        if max_rounds is None:
+            digest = self.request_hash(target, body, priority)
+        else:
+            digest = sha256_canonical([
+                PROTOCOL_VERSION, target.store_id, target.session_id, body, priority,
+                {"max_rounds": max_rounds},
+            ])
         wake_int = 1 if wake else 0
         return ref, digest, content, meta, content_bytes, wake_int, reply_to_sid, reply_rk
 
     async def accept(
         self, target, body, *, message_id, actor, priority="normal", deadline_ms=None,
         kind="user", result_kind=None, wake: bool = True, reply_route: dict | None = None,
-        public: bool = True, _with_activation: bool = False,
+        public: bool = True, max_rounds: int | None = None, _with_activation: bool = False,
     ) -> Receipt:
         """Accept an input into ``follow_up_queue`` (2 control SQL on the fast path).
 
@@ -1237,6 +1268,7 @@ class RuntimeInputStore:
             self._validate_accept_args(
                 target, body, message_id=message_id, priority=priority,
                 kind=kind, wake=wake, reply_route=reply_route, public=public,
+                max_rounds=max_rounds,
             )
         )
         now_sql = self._now_sql()
@@ -1531,6 +1563,7 @@ class RuntimeInputStore:
         ttl_s: float = 30.0, priority: str = "normal", deadline_ms: int | None = None,
         kind: str = "user", result_kind: str | None = None, wake: bool = True,
         reply_route: dict | None = None, public: bool = True, can_execute=None,
+        max_rounds: int | None = None,
     ) -> tuple[Receipt, ClaimedBatch | None, bool]:
         """Fused 1-tx accept + claim when idle & empty inbox; transparent fallback to ``accept()``.
 
@@ -1543,13 +1576,15 @@ class RuntimeInputStore:
             self._validate_accept_args(
                 target, body, message_id=message_id, priority=priority,
                 kind=kind, wake=wake, reply_route=reply_route, public=public,
+                max_rounds=max_rounds,
             )
         )
         if not wake:
             receipt, need_wake = await self.accept(
                 target, body, message_id=message_id, actor=actor, priority=priority,
                 deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
-                wake=False, reply_route=reply_route, public=public, _with_activation=True,
+                wake=False, reply_route=reply_route, public=public,
+                max_rounds=max_rounds, _with_activation=True,
             )
             return receipt, None, need_wake
 
@@ -1720,6 +1755,7 @@ class RuntimeInputStore:
                         reply_result_kind=reply_rk,
                         reply_to_item_id=(ref.message_id if reply_to_sid is not None else None),
                         fold_stats_json=srow["fold_stats_json"],
+                        max_rounds_override=max_rounds,
                     )
                     if self._on_local_claim is not None:
                         registered_claims = [(target.session_id, batch.owner_epoch)]
@@ -1732,7 +1768,8 @@ class RuntimeInputStore:
                 receipt, need_wake = await self.accept(
                     target, body, message_id=message_id, actor=actor, priority=priority,
                     deadline_ms=deadline_ms, kind=kind, result_kind=result_kind,
-                    wake=wake, reply_route=reply_route, public=public, _with_activation=True,
+                    wake=wake, reply_route=reply_route, public=public,
+                    max_rounds=max_rounds, _with_activation=True,
                 )
                 return receipt, None, need_wake
             except BaseException:
@@ -2045,6 +2082,7 @@ class RuntimeInputStore:
                     reply_to_item_id=reply_item_id,
                     fold_stats_json=srow["fold_stats_json"],
                     reclaimed_cancelled=bool(batch_cancel_by is not None and not active_rows),
+                    max_rounds_override=_extract_max_rounds_override(rows),
                 )
                 context["batch"] = batch
                 return batch
@@ -4144,7 +4182,7 @@ class RuntimeInputStore:
                     )
 
                 qrows = await tx.fetchall(
-                    f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
+                    f"SELECT item_id,reply_to_session_id,reply_result_kind,meta_json FROM {self.q} "
                     "WHERE session_id=? AND delivered_send_index=? AND status='delivered' ORDER BY id ASC",
                     (sid, cur_send_index),
                 )
@@ -4220,6 +4258,7 @@ class RuntimeInputStore:
             ),
             reclaimed_next_round_index=next_round_idx,
             reclaimed_pending_tool_seq=reclaimed_pending_tool_seq,
+            max_rounds_override=_extract_max_rounds_override(qrows),
         )
 
     async def reclaim_running(

@@ -347,7 +347,7 @@ async def test_failure_policy_uses_new_attempt_and_keeps_usage(registry_store, p
         nodes = await store._db.fetchall(
             f"SELECT session_id FROM {store.t.sessions} WHERE descriptor_json LIKE '%workflow_node%'",
         )
-        assert len(nodes) == (2 if policy == "fallback" else 1)
+        assert len(nodes) == (2 if policy in ("retry", "fallback") else 1)
         assert len({n["session_id"] for n in nodes}) == len(nodes)
     finally:
         await runner.aclose()

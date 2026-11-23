@@ -367,7 +367,7 @@ async def test_real_graph_keeps_attempt_and_iteration_entries(registry_store, ki
         assert len(saved["nodes"]) == 2 and all(entry["result"] is not None for entry in saved["nodes"])
         if kind == "retry":
             assert sorted(entry["attempt"] for entry in saved["nodes"]) == [1, 2]
-            assert len({entry["session_id"] for entry in saved["nodes"]}) == 1
+            assert len({entry["session_id"] for entry in saved["nodes"]}) == 2
         else:
             assert len({str(entry["iteration"]) for entry in saved["nodes"]}) == 2
             assert len({entry["session_id"] for entry in saved["nodes"]}) == 2

@@ -87,6 +87,8 @@ class _SessionExecution:
         self.options = RequestOptions(**{
             k: v for k, v in option_values.items() if k in RequestOptions.__dataclass_fields__
         })
+        if batch.max_rounds_override is not None:
+            self.options = replace(self.options, max_rounds=batch.max_rounds_override)
 
     @property
     def send_index(self):
