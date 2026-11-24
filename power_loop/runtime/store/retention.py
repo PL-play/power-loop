@@ -108,22 +108,34 @@ async def _delete_active_terminal_inbox(store, tx, *, cutoff_ms: int, limit: int
 
 
 async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: int, session_id: str | None) -> int:
-    """Clean expired project_messages already superseded by a compact_to_send cutoff."""
+    """Clean expired project_messages superseded by the reader-selected latest compact row.
+
+    Mirrors ``SessionStore.latest_project_compact`` (``ORDER BY send_index DESC LIMIT 1``):
+    keeps the highest-``send_index`` compact row and only deletes non-compact rows covered
+    by THAT row's ``compact_to_send`` plus strictly older compact rows (``send_index < latest``).
+    """
     if limit <= 0:
         return 0
-    sub_where = "kind='compact' AND compact_to_send IS NOT NULL"
+    sub_where = "kind='compact'"
     sub_params: list = []
     if session_id is not None:
         sub_where += " AND session_id=?"
         sub_params.append(session_id)
+    tbl = store.t.project_messages
     rows = await tx.fetchall(
-        f"SELECT p.id FROM {store.t.project_messages} p "
-        f"JOIN (SELECT session_id, MAX(compact_to_send) AS max_compact_to, MAX(id) AS max_compact_id "
-        f"FROM {store.t.project_messages} WHERE {sub_where} GROUP BY session_id) c "
-        "ON c.session_id=p.session_id "
+        f"SELECT p.id FROM {tbl} p "
+        f"JOIN ("
+        f"SELECT c1.session_id, c1.send_index AS latest_compact_send, "
+        f"c1.compact_to_send AS latest_compact_to "
+        f"FROM {tbl} c1 "
+        f"JOIN (SELECT session_id, MAX(send_index) AS max_send FROM {tbl} "
+        f"WHERE {sub_where} GROUP BY session_id) m "
+        "ON m.session_id=c1.session_id AND m.max_send=c1.send_index "
+        "WHERE c1.kind='compact' AND c1.compact_to_send IS NOT NULL"
+        ") c ON c.session_id=p.session_id "
         "WHERE p.created_at<? AND ("
-        "(p.kind<>'compact' AND p.send_index<=c.max_compact_to) "
-        "OR (p.kind='compact' AND p.id<c.max_compact_id)) "
+        "(p.kind<>'compact' AND p.send_index<=c.latest_compact_to) "
+        "OR (p.kind='compact' AND p.send_index<c.latest_compact_send)) "
         "ORDER BY p.id ASC LIMIT ?",
         (*sub_params, cutoff_ms, limit),
     )
@@ -132,7 +144,7 @@ async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: in
     ids = tuple(row['id'] for row in rows)
     marks = ','.join('?' for _ in ids)
     return await tx.execute(
-        f"DELETE FROM {store.t.project_messages} WHERE id IN ({marks}) AND created_at<?",
+        f"DELETE FROM {tbl} WHERE id IN ({marks}) AND created_at<?",
         (*ids, cutoff_ms),
     )
 

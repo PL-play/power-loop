@@ -269,6 +269,7 @@ async def test_h8_tool_context_pruning_and_pairs_batch_fetch():
     assert len(state["archive"]["groups"]) == 256
 
     # Verify _pairs uses single batch get_messages_by_seqs instead of N+1 get_message calls.
+
     store = await SessionStore.open(":memory:")
     try:
         sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
@@ -462,6 +463,7 @@ def test_h8_context_window_probe_logger_and_skill_section_error_propagation(monk
 
 @pytest.mark.asyncio
 async def test_h8_claim_monotonic_timestamp_and_pipeline_image_rounds_cleanup():
+
     store = await SessionStore.open(":memory:")
     try:
         port = RuntimeInputStore(store)
@@ -547,6 +549,7 @@ async def test_h8_shutdown_timeout_cancelled_in_final_not_marked_internal_error(
     """When shutdown times out while a send is inside final(), CancelledError/StoreError
     must NOT be converted into failed/internal_error.
     """
+
     store = await SessionStore.open(":memory:")
     entered_final = asyncio.Event()
     block_final = asyncio.Event()
@@ -602,6 +605,7 @@ async def test_h8_stateful_loop_projection_write_does_not_swallow_session_lease_
 
         async def close(self):
             pass
+
 
     store = await SessionStore.open(":memory:")
     try:
@@ -731,12 +735,13 @@ async def test_h8_rework1_runtime_worker_drivers_discarded_on_non_normal_paths()
     try:
         driver_desc = replace(DESCRIPTOR, kind="workflow_driver", definition_ref="wf-drv-r1@215")
         factory = RegistryRuntimeFactory()
-        factory.register(
-            "wf-drv-r1@215",
-            lambda _d, _c: ExecutionEnvironment(
+
+        async def _build_r1(_d, _c):
+            return ExecutionEnvironment(
                 _DummyLLM(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9),
-            ),
-        )
+            )
+
+        factory.register("wf-drv-r1@215", _build_r1)
 
         # 1) External coordinator path: idle, incapable, and acquire=None early returns.
         coord = MemorySessionOwnershipCoordinator()
@@ -776,7 +781,11 @@ async def test_h8_rework1_runtime_worker_drivers_discarded_on_non_normal_paths()
 
         orig_run_driver = wf_runner.run_driver
 
+        boom_called = 0
+
         async def _boom_driver(_worker, _ctx, _env):
+            nonlocal boom_called
+            boom_called += 1
             raise RuntimeRequestError("workflow_failed", "simulated driver failure")
 
         wf_runner.run_driver = _boom_driver  # type: ignore[assignment]
@@ -784,6 +793,7 @@ async def test_h8_rework1_runtime_worker_drivers_discarded_on_non_normal_paths()
             await rt_fail.worker._run_session_owned(drv_err.session_id)
         finally:
             wf_runner.run_driver = orig_run_driver  # type: ignore[assignment]
+        assert boom_called == 1
         assert drv_err.session_id not in rt_fail.worker._drivers
     finally:
         await store.close()
@@ -873,3 +883,174 @@ def test_h8_rework1_task_tables_compat_import_for_host_tests():
 
     assert task_schema.TASK_TABLES == ()
     assert not hasattr(task_schema, "task_tables_ddl")
+
+
+# ── Rework 2 regression tests (closing both rework-1 review blockers) ────────
+
+
+@pytest.mark.asyncio
+async def test_h8_rework2_projection_retention_keeps_reader_latest_compact_and_uncovered_sends(registry_store):
+    """Rework 2 (three-DB):
+    1) Write sends 1..4, then compact(send_index=4, compact_to_send=4), then backfilled
+       compact(send_index=2, compact_to_send=2) with higher row id. After +31d projection
+       purge on an active session, latest_project_compact must STILL be send_index=4 / compact_to_send=4
+       (covering sends 1..4) and newer sends (>4) remain readable.
+    2) Reverse coverage: compact(send_index=3, compact_to_send=3) followed by
+       compact(send_index=4, compact_to_send=2). Reader selects send_index=4 (cursor=2), so
+       sends 3 & 4 (uncovered by cursor 2) must be preserved and readable via load_project_messages(after=2).
+    """
+    from power_loop.runtime.store.retention import DAY_MS
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+
+    # Case A: exact reviewer counterexample — out-of-order compact backfill with higher id.
+    s_a = await target(port, "h8-r2-proj-a")
+    for si in range(1, 6):
+        await store.upsert_project_message(
+            s_a.session_id, send_index=si, kind="project", content=f"send-{si}",
+        )
+    await store.upsert_project_message(
+        s_a.session_id, send_index=4, kind="compact", content="summary-1-4", compact_to_send=4,
+    )
+    await store.upsert_project_message(
+        s_a.session_id, send_index=2, kind="compact", content="summary-1-2", compact_to_send=2,
+    )
+
+    future_now = now_ms() + 31 * DAY_MS
+    await store.purge_expired_page(now=future_now, limit=100, categories=("projections",))
+
+    latest_a = await store.latest_project_compact(s_a.session_id)
+    assert latest_a is not None
+    assert latest_a.send_index == 4
+    assert latest_a.compact_to_send == 4
+    assert latest_a.content == "summary-1-4"
+    after_a = await store.load_project_messages(s_a.session_id, after_send_index=latest_a.compact_to_send)
+    assert [r.send_index for r in after_a] == [5]
+    all_a = await store.load_project_messages(s_a.session_id)
+    assert [r.send_index for r in all_a if r.kind == "compact"] == [4]
+
+    # Case B: higher-send_index compact has smaller compact_to_send -> must not delete sends 3..4.
+    s_b = await target(port, "h8-r2-proj-b")
+    for si in range(1, 5):
+        await store.upsert_project_message(
+            s_b.session_id, send_index=si, kind="project", content=f"b-send-{si}",
+        )
+    await store.upsert_project_message(
+        s_b.session_id, send_index=3, kind="compact", content="b-summary-1-3", compact_to_send=3,
+    )
+    await store.upsert_project_message(
+        s_b.session_id, send_index=4, kind="compact", content="b-summary-1-2", compact_to_send=2,
+    )
+
+    await store.purge_expired_page(now=future_now, limit=100, categories=("projections",))
+
+    latest_b = await store.latest_project_compact(s_b.session_id)
+    assert latest_b is not None
+    assert latest_b.send_index == 4
+    assert latest_b.compact_to_send == 2
+    after_b = await store.load_project_messages(s_b.session_id, after_send_index=latest_b.compact_to_send)
+    assert [r.send_index for r in after_b if r.kind == "project"] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_h8_rework2_full_pending_queue_does_not_leak_driver_ids():
+    """Rework 2: when worker._pending is full (1,024 items), un-enqueued workflow_driver IDs
+    from periodic_tick recovery or _run_session_owned requeue must NOT accumulate in _drivers;
+    while a successfully enqueued workflow_driver still stays in _drivers for priority dispatch.
+    """
+    from power_loop.agent.runtime_store import FinalBatch
+
+    store = await SessionStore.open(":memory:")
+    try:
+        driver_desc = replace(DESCRIPTOR, kind="workflow_driver", definition_ref="wf-r2-full@215")
+        factory = RegistryRuntimeFactory()
+
+        async def _build_env(_d, _c):
+            return ExecutionEnvironment(
+                _DummyLLM(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9),
+            )
+
+        factory.register("wf-r2-full@215", _build_env)
+        rt = Runtime(store=store, factory=factory, node_id="n-r2", boot_id="b-r2")
+        worker = rt.worker
+
+        # 1) Fill _pending to cap (1,024) and recover 4 distinct queued workflow_drivers via periodic_tick.
+        for i in range(1024):
+            worker._pending[f"filler-{i}"] = 1
+
+        orig_discover = worker.inputs.discover_queued
+        orig_expired = worker.inputs.discover_expired_leases
+        orig_recover = worker.inputs.recover
+
+        async def _no_queued(limit=32):
+            return []
+
+        worker.inputs.discover_queued = _no_queued  # type: ignore[method-assign]
+        try:
+            for idx in range(4):
+                sid = f"drv-overflow-{idx}"
+
+                async def _one_expired(limit=32, _sid=sid):
+                    return [{"session_id": _sid, "session_kind": "workflow_driver", "owner_epoch": 1}]
+
+                async def _recovered_queued(t, **_kw):
+                    return FinalBatch(execution_state="queued", results=())
+
+                worker.inputs.discover_expired_leases = _one_expired  # type: ignore[method-assign]
+                worker.inputs.recover = _recovered_queued  # type: ignore[method-assign]
+                await worker.periodic_tick(limit=32)
+        finally:
+            worker.inputs.discover_queued = orig_discover  # type: ignore[method-assign]
+            worker.inputs.discover_expired_leases = orig_expired  # type: ignore[method-assign]
+            worker.inputs.recover = orig_recover  # type: ignore[method-assign]
+
+        assert len(worker._pending) == 1024
+        assert len(worker._active) == 0
+        assert worker._overflow is True
+        assert worker._drivers == set()
+
+        # 2) _run_session_owned requeue path when _pending is full -> must also discard un-enqueued ID.
+        drv_requeue = await worker.inputs.create_session(driver_desc, actor=ACTOR)
+        await worker.inputs.accept(drv_requeue, "go", message_id="m-req-full", actor=ACTOR)
+
+        import power_loop.workflow.runner as wf_runner
+
+        orig_run_driver = wf_runner.run_driver
+
+        driver_calls = 0
+
+        async def _requeue_driver(_w, _ctx, _env):
+            nonlocal driver_calls
+            driver_calls += 1
+            return FinalBatch(execution_state="queued", results=())
+
+        wf_runner.run_driver = _requeue_driver  # type: ignore[assignment]
+        try:
+            await worker._run_session_owned(drv_requeue.session_id)
+        finally:
+            wf_runner.run_driver = orig_run_driver  # type: ignore[assignment]
+        assert driver_calls == 1
+        assert drv_requeue.session_id not in worker._pending
+        assert drv_requeue.session_id not in worker._drivers
+
+        # 3) When _pending has room, a requeued workflow_driver IS enqueued AND retained in _drivers.
+        worker._pending.clear()
+        drv_room = await worker.inputs.create_session(driver_desc, actor=ACTOR)
+        await worker.inputs.accept(drv_room, "go", message_id="m-req-room", actor=ACTOR)
+
+        async def _requeue_driver_room(_w, _ctx, _env):
+            nonlocal driver_calls
+            driver_calls += 1
+            return FinalBatch(execution_state="queued", results=())
+
+        wf_runner.run_driver = _requeue_driver_room  # type: ignore[assignment]
+        try:
+            await worker._run_session_owned(drv_room.session_id)
+        finally:
+            wf_runner.run_driver = orig_run_driver  # type: ignore[assignment]
+        assert driver_calls == 2
+        assert drv_room.session_id in worker._pending
+        assert drv_room.session_id in worker._drivers
+    finally:
+        await store.close()
