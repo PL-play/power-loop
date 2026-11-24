@@ -1,4 +1,7 @@
 """One private shell process, stopped through its original backend target."""
+import codecs
+import os
+import select
 import shlex
 import subprocess
 import threading
@@ -21,45 +24,110 @@ class _BoundedStreamReader:
         self._max_bytes = max(1, int(max_bytes))
         self._head_budget = self._max_bytes // 2
         self._tail_budget = self._max_bytes - self._head_budget
+        self._lock = threading.Lock()
         self._head: list[str] = []
         self._head_bytes = 0
         self._tail: deque[tuple[str, int]] = deque()
         self._tail_bytes = 0
         self.truncated = False
         self.omitted_bytes = 0
+        self.eof = stream is None
+        self._stop_event = threading.Event()
+        self._eof_event = threading.Event()
+        if self.eof:
+            self._eof_event.set()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
         if self._stream is not None:
             self._thread.start()
 
-    def _run(self) -> None:
-        try:
-            while True:
-                chunk = self._stream.read(4096)
-                if not chunk:
-                    break
-                raw = chunk.encode("utf-8", errors="replace")
-                size = len(raw)
-                if not self.truncated and self._head_bytes + size <= self._head_budget:
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _append_text(self, chunk: str) -> None:
+        if not chunk:
+            return
+        raw = chunk.encode("utf-8", errors="replace")
+        size = len(raw)
+        with self._lock:
+            if not self.truncated and self._head_bytes < self._head_budget:
+                remaining_head = self._head_budget - self._head_bytes
+                if size <= remaining_head:
                     self._head.append(chunk)
                     self._head_bytes += size
-                    continue
-                if size > self._tail_budget:
-                    dropped = size - self._tail_budget
-                    chunk = raw[-self._tail_budget :].decode("utf-8", errors="ignore")
-                    size = len(chunk.encode("utf-8"))
-                    self.omitted_bytes += dropped
-                    self.truncated = True
-                self._tail.append((chunk, size))
-                self._tail_bytes += size
-                while self._tail_bytes > self._tail_budget and len(self._tail) > 1:
-                    _, dropped_size = self._tail.popleft()
-                    self._tail_bytes -= dropped_size
-                    self.omitted_bytes += dropped_size
-                    self.truncated = True
+                    return
+                head_text = raw[:remaining_head].decode("utf-8", errors="ignore")
+                head_len = len(head_text.encode("utf-8"))
+                if head_len:
+                    self._head.append(head_text)
+                    self._head_bytes += head_len
+                raw = raw[head_len:]
+                chunk = raw.decode("utf-8", errors="replace")
+                size = len(raw)
+                if not size:
+                    return
+            if size > self._tail_budget:
+                dropped = size - self._tail_budget
+                chunk = raw[-self._tail_budget :].decode("utf-8", errors="ignore")
+                size = len(chunk.encode("utf-8"))
+                self.omitted_bytes += dropped
+                self.truncated = True
+            self._tail.append((chunk, size))
+            self._tail_bytes += size
+            while self._tail_bytes > self._tail_budget and len(self._tail) > 1:
+                _, dropped_size = self._tail.popleft()
+                self._tail_bytes -= dropped_size
+                self.omitted_bytes += dropped_size
+                self.truncated = True
+
+    def _run_fd(self, fd: int) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        while not self._stop_event.is_set():
+            try:
+                events = poller.poll(50)
+            except (OSError, ValueError):
+                break
+            if not events:
+                continue
+            try:
+                data = os.read(fd, 16384)
+            except OSError:
+                break
+            if not data:
+                tail_text = decoder.decode(b"", final=True)
+                self._append_text(tail_text)
+                self.eof = True
+                self._eof_event.set()
+                return
+            self._append_text(decoder.decode(data, final=False))
+
+    def _run(self) -> None:
+        fd: int | None = None
+        fileno = getattr(self._stream, "fileno", None)
+        if callable(fileno):
+            try:
+                fd = fileno()
+            except (OSError, ValueError):
+                fd = None
+        if fd is not None:
+            self._run_fd(fd)
+            return
+        try:
+            while not self._stop_event.is_set():
+                chunk = self._stream.read(4096)
+                if not chunk:
+                    self.eof = True
+                    self._eof_event.set()
+                    return
+                self._append_text(chunk)
         except (OSError, ValueError):
             pass
+
+    def wait_eof(self, timeout: float | None = None) -> bool:
+        return self._eof_event.wait(timeout=timeout)
 
     def join(self, timeout: float | None = None) -> bool:
         if not self._thread.is_alive():
@@ -68,11 +136,20 @@ class _BoundedStreamReader:
         return not self._thread.is_alive()
 
     def text(self) -> str:
-        head = "".join(self._head)
-        tail = "".join(chunk for chunk, _ in self._tail)
-        if not self.truncated:
-            return head + tail
-        return f"{head}\n... ({self.omitted_bytes} bytes omitted) ...\n{tail}"
+        with self._lock:
+            head = "".join(self._head)
+            tail = "".join(chunk for chunk, _ in self._tail)
+            if not self.truncated:
+                return head + tail
+            return f"{head}\n... ({self.omitted_bytes} bytes omitted) ...\n{tail}"
+
+
+def _stop_readers(readers: tuple[_BoundedStreamReader, ...], timeout: float = 0.2) -> None:
+    for reader in readers:
+        reader.stop()
+    deadline = time.monotonic() + timeout
+    for reader in readers:
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _close_process_streams(process) -> None:
@@ -96,7 +173,7 @@ def drain_original(process, *, readers: tuple[_BoundedStreamReader, ...] = ()):
         deadline = time.monotonic() + 2
         for reader in readers:
             remaining = max(0.0, deadline - time.monotonic())
-            if not reader.join(timeout=remaining):
+            if not reader.wait_eof(timeout=remaining) or not reader.join(timeout=max(0.0, deadline - time.monotonic())):
                 raise subprocess.TimeoutExpired("original producer pipes", 2)
     except subprocess.TimeoutExpired as exc:
         from power_loop.runtime.task_runtime import mark_unconfirmed_resource
@@ -104,6 +181,7 @@ def drain_original(process, *, readers: tuple[_BoundedStreamReader, ...] = ()):
         raise RuntimeError("original_shell_stop_unconfirmed") from exc
     finally:
         if readers:
+            _stop_readers(readers)
             _close_process_streams(process)
 
 
@@ -157,19 +235,26 @@ def execute(command, timeout=None, **kwargs):
                     raise RuntimeError("original_shell_stop_unconfirmed")
                 token.raise_if_cancelled()
                 raise TimeoutError("background shell timed out")
-            try:
-                wait_s = min(0.1, max(0.0, deadline - time.monotonic()))
-                process.wait(timeout=wait_s)
-                drain_deadline = time.monotonic() + 2
+            wait_s = min(0.05, max(0.0, deadline - time.monotonic()))
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=wait_s)
+                except subprocess.TimeoutExpired:
+                    continue
+            if all(reader.eof for reader in readers):
                 for reader in readers:
-                    reader.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+                    reader.join(timeout=0.2)
                 return _truncate_chars(
                     f"exit_code={process.returncode}\n{stdout_reader.text()}{stderr_reader.text()}"
                 )
-            except subprocess.TimeoutExpired:
-                continue
+            for reader in readers:
+                if not reader.eof:
+                    reader.wait_eof(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+                    break
     finally:
         if process.poll() is None:
             process.request_stop()
             drain_original(process, readers=readers)
-        _close_process_streams(process)
+        else:
+            _stop_readers(readers)
+            _close_process_streams(process)

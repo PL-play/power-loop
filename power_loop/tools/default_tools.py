@@ -168,7 +168,16 @@ def _read_text(fp: Path, *, max_bytes: int | None = TEXT_FILE_MAX_BYTES) -> str:
             f"File is too large to read as text ({size} bytes > {max_bytes} bytes): {_display_path(fp)}. "
             "Use read_file with offset/limit for previews or grep/glob for targeted search."
         )
-    data = fp.read_bytes()
+    if max_bytes is not None:
+        with fp.open("rb") as fh:
+            data = fh.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(
+                f"File is too large to read as text (>{max_bytes} bytes): {_display_path(fp)}. "
+                "Use read_file with offset/limit for previews or grep/glob for targeted search."
+            )
+    else:
+        data = fp.read_bytes()
     if _looks_binary(data):
         raise ValueError(f"Refusing to read binary-looking file as text: {_display_path(fp)}")
     return data.decode("utf-8", errors="replace")
@@ -529,9 +538,61 @@ class BashSession:
         ).start()
 
     @staticmethod
-    def _enqueue_line(q: queue.Queue[str], line: str, stop_event: threading.Event) -> None:
-        for offset in range(0, len(line), _BASH_READER_MAX_LINE_BYTES):
-            chunk = line[offset : offset + _BASH_READER_MAX_LINE_BYTES]
+    def _utf8_split_index(buf: bytes | bytearray, max_bytes: int, *, final: bool = False) -> int:
+        """Largest byte offset ``<= max_bytes`` that does not split a multi-byte UTF-8 character."""
+        total = len(buf)
+        if final and total <= max_bytes:
+            return total
+        end = min(total, max_bytes)
+        if end < total:
+            # Step back over continuation bytes (10xxxxxx) at the boundary.
+            while end > 0 and (buf[end] & 0xC0) == 0x80:
+                end -= 1
+        # Verify the last codepoint starting before ``end`` is complete within ``buf[:end]``.
+        if end > 0:
+            lead = end - 1
+            steps = 0
+            while lead > 0 and steps < 3 and (buf[lead] & 0xC0) == 0x80:
+                lead -= 1
+                steps += 1
+            first = buf[lead]
+            if first < 0x80:
+                expected = 1
+            elif 0xC0 <= first < 0xE0:
+                expected = 2
+            elif 0xE0 <= first < 0xF0:
+                expected = 3
+            elif 0xF0 <= first < 0xF8:
+                expected = 4
+            else:
+                expected = 1
+            if lead + expected > end:
+                end = lead
+        if end == 0:
+            # Defensive fallback for malformed leading bytes when max_bytes is tiny.
+            return min(total, max_bytes)
+        return end
+
+    @classmethod
+    def _enqueue_line(cls, q: queue.Queue[str], line: str, stop_event: threading.Event) -> None:
+        if not line:
+            return
+        if len(line) * 4 <= _BASH_READER_MAX_LINE_BYTES:
+            chunks = [line]
+        else:
+            encoded = line.encode("utf-8", errors="replace")
+            if len(encoded) <= _BASH_READER_MAX_LINE_BYTES:
+                chunks = [line]
+            else:
+                chunks = []
+                start = 0
+                total = len(encoded)
+                while start < total:
+                    window = encoded[start : start + _BASH_READER_MAX_LINE_BYTES + 4]
+                    step = cls._utf8_split_index(window, _BASH_READER_MAX_LINE_BYTES, final=True)
+                    chunks.append(encoded[start : start + step].decode("utf-8"))
+                    start += step
+        for chunk in chunks:
             while not stop_event.is_set():
                 try:
                     q.put(chunk, timeout=0.05)
@@ -547,7 +608,7 @@ class BashSession:
         q: queue.Queue[str] | None = None,
         stop_event: threading.Event | None = None,
     ) -> None:
-        buf = ""
+        buf = bytearray()
         fd = self._master_fd if fd is None else fd
         q = self._q if q is None else q
         stop_event = self._reader_stop if stop_event is None else stop_event
@@ -561,21 +622,25 @@ class BashSession:
                     break
                 if not data:
                     break
-                buf += data.decode("utf-8", errors="replace")
+                buf.extend(data)
                 while not stop_event.is_set():
-                    idx_n = buf.find("\n")
-                    idx_r = buf.find("\r")
+                    idx_n = buf.find(b"\n")
+                    idx_r = buf.find(b"\r")
                     if idx_n == -1 and idx_r == -1:
                         break
                     cut = min(i for i in (idx_n, idx_r) if i != -1)
-                    line, buf = buf[:cut], buf[cut + 1 :]
-                    if line:
-                        self._enqueue_line(q, line, stop_event)
+                    raw_line = bytes(buf[:cut])
+                    del buf[: cut + 1]
+                    if raw_line:
+                        self._enqueue_line(q, raw_line.decode("utf-8", errors="replace"), stop_event)
                 while len(buf) >= _BASH_READER_MAX_LINE_BYTES and not stop_event.is_set():
-                    chunk, buf = buf[:_BASH_READER_MAX_LINE_BYTES], buf[_BASH_READER_MAX_LINE_BYTES:]
-                    self._enqueue_line(q, chunk, stop_event)
+                    cut = self._utf8_split_index(buf, _BASH_READER_MAX_LINE_BYTES)
+                    raw_chunk = bytes(buf[:cut])
+                    del buf[:cut]
+                    if raw_chunk:
+                        self._enqueue_line(q, raw_chunk.decode("utf-8", errors="replace"), stop_event)
             if buf and not stop_event.is_set():
-                self._enqueue_line(q, buf, stop_event)
+                self._enqueue_line(q, bytes(buf).decode("utf-8", errors="replace"), stop_event)
         except Exception:
             pass
 
@@ -1228,15 +1293,31 @@ def run_glob(pattern: str, path: str = ".", max_results: int = 100, include_hidd
         return f"Error: {e}"
 
 
-def _allowed_read_roots(base: Path) -> tuple[Path, ...]:
+def _grep_scope_root(base: Path) -> Path | None:
+    """Return the single authorized root that ``_grep_with_python`` must stay within.
+
+    Searching inside ``workspace_dir`` stays strictly within ``workspace_dir`` (symlinks
+    pointing into another authorized root such as ``read_only_roots`` or ``home_rw_allowlist``
+    are NOT followed). Explicitly targeting an authorized ``read_only_root`` or
+    ``home_rw_allowlist`` entry scopes the search to that specific root.
+    """
     runtime_env = get_runtime_env()
-    if runtime_env.workspace_dir is not None:
-        roots = [runtime_env.workspace_dir.resolve()]
-        if runtime_env.home_dir is not None:
-            roots.extend(root.resolve() for root in runtime_env.home_rw_allowlist)
-        roots.extend(root.resolve() for root in runtime_env.read_only_roots)
-        return tuple(dict.fromkeys(roots))
-    return (base.parent.resolve() if base.is_file() else base.resolve(),)
+    anchor = base.parent.resolve() if base.is_symlink() else base.resolve()
+    if runtime_env.workspace_dir is None:
+        return anchor.parent if (not base.is_symlink() and base.is_file()) else anchor
+
+    candidates: list[Path] = []
+    for root in runtime_env.read_only_roots:
+        candidates.append(root.resolve())
+    candidates.append(runtime_env.workspace_dir.resolve())
+    if runtime_env.home_dir is not None:
+        for root in runtime_env.home_rw_allowlist:
+            candidates.append(root.resolve())
+
+    matching = [root for root in dict.fromkeys(candidates) if anchor.is_relative_to(root)]
+    if not matching:
+        return None
+    return max(matching, key=lambda root: len(root.parts))
 
 
 def _grep_with_python(
@@ -1250,7 +1331,9 @@ def _grep_with_python(
 ) -> str:
     flags = 0 if case_sensitive else re.IGNORECASE
     compiled = re.compile(re.escape(pattern) if literal else pattern, flags)
-    allowed_roots = _allowed_read_roots(base)
+    scope_root = _grep_scope_root(base)
+    if scope_root is None:
+        return ""
     roots = [base] if base.is_file() else []
     if base.is_dir():
         for root, dirs, files in os.walk(base):
@@ -1268,7 +1351,7 @@ def _grep_with_python(
     for fp in roots:
         try:
             resolved = fp.resolve()
-            if not any(resolved.is_relative_to(root) for root in allowed_roots):
+            if not resolved.is_relative_to(scope_root):
                 continue
             st = resolved.stat()
             if not stat.S_ISREG(st.st_mode) or st.st_size > TEXT_FILE_MAX_BYTES:

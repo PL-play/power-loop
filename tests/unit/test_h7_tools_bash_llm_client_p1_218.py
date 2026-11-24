@@ -7,6 +7,7 @@ import asyncio
 import importlib.metadata
 import io
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -195,6 +196,127 @@ def test_h7_p1_21_background_shell_cancel_stops_process_and_closes_streams(tmp_p
     while time.monotonic() < deadline and _proc_state(child_pid) is not None:
         time.sleep(0.05)
     assert _proc_state(child_pid) is None
+
+
+def test_h7_p1_21_background_shell_parent_exits_child_holds_pipe_timeout_cancel_and_output(
+    tmp_path: Path,
+) -> None:
+    """Rework 1: parent shell prints 'ready' and exits while a child holds stdout open."""
+    fake_loop = SimpleNamespace(_runtime_worker_context=SimpleNamespace(session_id="s_bg_pipe", send_index=1))
+
+    # 1) Short-lived child leaves process group & holds stdout open briefly (< timeout):
+    #    must return exit_code=0 WITH 'ready' preserved.
+    loop_tok = set_current_loop(cast(Any, fake_loop))
+    cancel_tok = set_current_cancel_token(CancellationToken())
+    try:
+        with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path)):
+            out = background_shell.execute("echo ready; setsid sleep 0.25 &", timeout=2.0)
+        assert out.startswith("exit_code=0\n")
+        assert "ready" in out
+    finally:
+        reset_current_cancel_token(cancel_tok)
+        reset_current_loop(loop_tok)
+
+    # 2) Long-lived child leaves process group & holds stdout open past timeout (0.7s):
+    #    must time out near 0.7s and kill the holder, NOT return empty exit_code=0 after 4s!
+    fake_loop2 = SimpleNamespace(_runtime_worker_context=SimpleNamespace(session_id="s_bg_pipe", send_index=2))
+    loop_tok = set_current_loop(cast(Any, fake_loop2))
+    cancel_tok = set_current_cancel_token(CancellationToken())
+    try:
+        t0 = time.monotonic()
+        with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path)):
+            with pytest.raises(TimeoutError, match="background shell timed out"):
+                background_shell.execute("echo ready; setsid sleep 5 &", timeout=0.7)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 2.2, f"timeout took too long: {elapsed:.2f}s"
+    finally:
+        reset_current_cancel_token(cancel_tok)
+        reset_current_loop(loop_tok)
+
+    # 3) Parent exits, child leaves process group & holds stdout open, cancel_token.cancel() stops promptly.
+    pidfile = tmp_path / "bg_holder.pid"
+    cancel_token = CancellationToken()
+    fake_loop3 = SimpleNamespace(_runtime_worker_context=SimpleNamespace(session_id="s_bg_pipe", send_index=3))
+    exc_box: list[BaseException] = []
+
+    def _run_cancel() -> None:
+        lt = set_current_loop(cast(Any, fake_loop3))
+        ct = set_current_cancel_token(cancel_token)
+        try:
+            with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path)):
+                background_shell.execute(
+                    f"echo ready; setsid sh -c 'echo $$ > {pidfile}; exec sleep 30' &",
+                    timeout=10.0,
+                )
+        except BaseException as exc:
+            exc_box.append(exc)
+        finally:
+            reset_current_cancel_token(ct)
+            reset_current_loop(lt)
+
+    t = threading.Thread(target=_run_cancel, daemon=True)
+    t.start()
+    wait_deadline = time.monotonic() + 5.0
+    while time.monotonic() < wait_deadline and not (pidfile.exists() and pidfile.read_text().strip()):
+        time.sleep(0.02)
+    assert pidfile.exists() and pidfile.read_text().strip()
+    holder_pid = int(pidfile.read_text().strip())
+
+    t0 = time.monotonic()
+    cancel_token.cancel("stop_pipe_holder")
+    t.join(timeout=2.5)
+    assert not t.is_alive()
+    assert time.monotonic() - t0 < 2.5
+    assert len(exc_box) == 1 and isinstance(exc_box[0], power_loop.CancellationRequested)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and _proc_state(holder_pid) is not None:
+        time.sleep(0.05)
+    assert _proc_state(holder_pid) is None
+
+
+def test_h7_p1_21_bash_reader_and_enqueue_enforce_utf8_byte_budget_losslessly() -> None:
+    """Rework 2: multi-byte CJK/emoji text without newlines must chunk strictly <= 16 KiB UTF-8 bytes
+    with zero character corruption."""
+    text = ("汉" * 16384) + ("🚀" * 1000)  # 49,152 + 4,000 = 53,152 UTF-8 bytes, no newlines
+
+    # 1) Direct _enqueue_line check
+    q: queue.Queue[str] = queue.Queue()
+    stop = threading.Event()
+    dt.BashSession._enqueue_line(q, text, stop)
+    chunks: list[str] = []
+    while not q.empty():
+        chunks.append(q.get_nowait())
+    assert len(chunks) >= 4
+    assert all(len(c.encode("utf-8")) <= dt._BASH_READER_MAX_LINE_BYTES for c in chunks)
+    assert "".join(chunks) == text
+    assert "\ufffd" not in "".join(chunks)
+
+    # 2) Full _reader path over a real pipe (4096-byte os.read chunks splitting 3-byte/4-byte UTF-8 chars)
+    r_fd, w_fd = os.pipe()
+    q2: queue.Queue[str] = queue.Queue()
+    stop2 = threading.Event()
+    sess = dt.BashSession.__new__(dt.BashSession)
+    reader_thread = threading.Thread(target=sess._reader, args=(r_fd, q2, stop2), daemon=True)
+    reader_thread.start()
+    try:
+        raw = text.encode("utf-8")
+        for i in range(0, len(raw), 4096):
+            os.write(w_fd, raw[i : i + 4096])
+        os.close(w_fd)
+        w_fd = -1
+        reader_thread.join(timeout=5.0)
+        assert not reader_thread.is_alive()
+    finally:
+        if w_fd >= 0:
+            os.close(w_fd)
+        os.close(r_fd)
+    pipe_chunks: list[str] = []
+    while not q2.empty():
+        pipe_chunks.append(q2.get_nowait())
+    assert len(pipe_chunks) >= 4
+    assert all(len(c.encode("utf-8")) <= dt._BASH_READER_MAX_LINE_BYTES for c in pipe_chunks)
+    assert "".join(pipe_chunks) == text
+    assert "\ufffd" not in "".join(pipe_chunks)
 
 
 def _proc_state(pid: int) -> str | None:
@@ -636,6 +758,60 @@ def test_h7_p1_23_grep_with_python_blocks_symlink_escape_and_skips_oversized(
     with runtime_env_context(RuntimeEnv(workspace_dir=ws)):
         direct_out = dt._grep_with_python("CANARY_SECRET_VALUE", escape_link, None, 50, True, True, False)
         assert direct_out == ""
+
+
+def test_h7_p1_23_grep_workspace_does_not_follow_symlinks_to_other_authorized_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rework 3: workspace grep must NOT follow symlinks into another authorized root
+    (read_only_roots or home_rw_allowlist), while explicit grep on that root still works."""
+    ws = tmp_path / "workspace"
+    ro = tmp_path / "shared_ro"
+    home = tmp_path / "home"
+    cache = home / ".cache"
+    outside = tmp_path / "outside"
+    for d in (ws, ro, cache, outside):
+        d.mkdir(parents=True)
+
+    (ws / "ws_file.txt").write_text("TOKEN_WS_ONLY\n", encoding="utf-8")
+    (ro / "ro_doc.txt").write_text("TOKEN_IN_RO_ROOT\n", encoding="utf-8")
+    (cache / "cache_doc.txt").write_text("TOKEN_IN_HOME_CACHE\n", encoding="utf-8")
+    (outside / "out.txt").write_text("TOKEN_OUTSIDE\n", encoding="utf-8")
+
+    # Symlinks inside workspace pointing to OTHER authorized roots (and outside)
+    os.symlink(ro / "ro_doc.txt", ws / "link_to_ro.txt")
+    os.symlink(cache / "cache_doc.txt", ws / "link_to_cache.txt")
+    # Symlink inside read_only_root pointing back into workspace or outside
+    os.symlink(ws / "ws_file.txt", ro / "link_to_ws.txt")
+    os.symlink(outside / "out.txt", ro / "link_to_outside.txt")
+
+    def _no_rg(*args: Any, **kwargs: Any) -> Any:
+        raise FileNotFoundError("rg unavailable")
+
+    monkeypatch.setattr(dt.subprocess, "run", _no_rg)
+    env = RuntimeEnv(workspace_dir=ws, home_dir=home, read_only_roots=(ro,))
+    with runtime_env_context(env):
+        # 1) Recursive grep from workspace must NOT leak files from ro or home/.cache via symlinks.
+        ws_ro_out = dt.run_grep("TOKEN_IN_RO_ROOT", path=".")
+        assert ws_ro_out.startswith("No matches")
+        assert "ro_doc.txt" not in ws_ro_out and "link_to_ro.txt" not in ws_ro_out
+
+        ws_cache_out = dt.run_grep("TOKEN_IN_HOME_CACHE", path=".")
+        assert ws_cache_out.startswith("No matches")
+        assert "cache_doc.txt" not in ws_cache_out and "link_to_cache.txt" not in ws_cache_out
+
+        # Direct _grep_with_python on workspace symlink pointing to ro must also skip it.
+        assert dt._grep_with_python("TOKEN_IN_RO_ROOT", ws / "link_to_ro.txt", None, 50, True, True, False) == ""
+
+        # 2) Explicit grep targeting read_only_root or @home/.cache works within that root,
+        #    and does NOT escape that root into workspace or outside via symlinks.
+        explicit_ro = dt.run_grep("TOKEN_IN_RO_ROOT", path=str(ro))
+        assert "ro_doc.txt:1:TOKEN_IN_RO_ROOT" in explicit_ro
+        assert "ws_file.txt" not in dt.run_grep("TOKEN_WS_ONLY", path=str(ro))
+        assert "out.txt" not in dt.run_grep("TOKEN_OUTSIDE", path=str(ro))
+
+        explicit_cache = dt.run_grep("TOKEN_IN_HOME_CACHE", path="@home/.cache")
+        assert "cache_doc.txt:1:TOKEN_IN_HOME_CACHE" in explicit_cache
 
 
 def test_h7_p1_23_edit_apply_patch_and_guard_excerpt_reject_oversized_file(
