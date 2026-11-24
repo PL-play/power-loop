@@ -6854,7 +6854,8 @@ class RuntimeInputStore:
                         child_by_id = {c["session_id"]: c for c in direct_children}
                         undeliv = await tx.fetchall(
                             f"SELECT id,session_id,item_id,delivered_send_index,terminal_status,"
-                            "cancel_by,result_json,result_send_index,result_seq,error_code,error_detail "
+                            "cancel_by,result_json,result_send_index,result_seq,error_code,error_detail,"
+                            "reply_to_session_id,reply_result_kind "
                             f"FROM {self.q} WHERE session_id IN ({d_ph}) "
                             "AND result_delivery_error='session_closed' ORDER BY id ASC",
                             tuple(direct_ids),
@@ -6870,11 +6871,23 @@ class RuntimeInputStore:
                             )
                             c_row = child_by_id[c_sid]
                             c_route = json.loads(c_row["result_route_json"]) if c_row.get("result_route_json") else None
-                            c_result_kind = (
-                                c_route.get("result_kind")
-                                if isinstance(c_route, dict) and c_route.get("result_kind") in _VALID_RESULT_KINDS
-                                else "agent_result"
-                            )
+                            urow_rk = urow.get("reply_result_kind")
+                            if isinstance(c_route, dict) and c_route.get("result_kind") == "workflow_node_result":
+                                if (
+                                    urow.get("reply_to_session_id") is not None
+                                    and urow_rk == "workflow_node_result"
+                                ):
+                                    c_result_kind = "workflow_node_result"
+                                else:
+                                    c_result_kind = (
+                                        urow_rk if urow_rk in _VALID_RESULT_KINDS else "agent_result"
+                                    )
+                            elif isinstance(c_route, dict) and c_route.get("result_kind") in _VALID_RESULT_KINDS:
+                                c_result_kind = c_route["result_kind"]
+                            else:
+                                c_result_kind = (
+                                    urow_rk if urow_rk in _VALID_RESULT_KINDS else "agent_result"
+                                )
                             orig_txt = ""
                             if urow["result_json"]:
                                 try:

@@ -1464,3 +1464,250 @@ async def test_h4_p1_2_same_tree_rebind_retargets_direct_parent_and_preserves_sh
     finally:
         await client.aclose()
         await transport.aclose()
+
+
+async def test_h4_p1_2_rebind_replay_undelivered_preserves_original_result_kind(registry_store):
+    """P1-2 rework 3: rebind replay_undelivered preserves agent_result vs workflow_node_result on workflow leaves."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12rp-main"})
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        leaf_desc = replace(DESCRIPTOR, config={"workflow_node": "n1"})
+
+        # Case A: Workflow leaf settles a PUBLIC agent_result input after old driver closes ->
+        #         rebind_children(replay_undelivered=True) MUST replay as agent_result (NOT workflow_node_result)!
+        cm_drv1 = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12rp-drv1",
+                message_id="rp-drv1-start",
+                body={"text": "wf1"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv1_b = cm_drv1.preclaimed[0]
+        drv1 = drv1_b.target
+        new_parent1 = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12rp-newp1"})
+
+        cm_leaf1 = await port.create_many(
+            parent=drv1,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12rp-leaf1",
+                message_id="rp-leaf1-start",
+                body={"text": "init"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv1_b.owner_epoch,
+            parent_cancel_seq=drv1_b.cancel_seq,
+        )
+        leaf1_init = cm_leaf1.preclaimed[0]
+        leaf1 = leaf1_init.target
+        await port.final(leaf1_init, final_text="init ok")
+
+        # Public send with ordinary agent_result route targeting drv1; claim, then close drv1 before final.
+        pub_rcpt = await client.send(
+            leaf1, "public task", message_id="rp-pub-1", actor=ACTOR,
+            reply_route={"target": drv1, "result_kind": "agent_result"},
+        )
+        leaf1_pub = await port.claim(leaf1, node_id="n1", boot_id="b1")
+        assert leaf1_pub is not None
+        await port.set_lifecycle(drv1, "closed", actor=ACTOR, inflight="abort", subtree="none")
+        fin_pub = await port.final(leaf1_pub, final_text="public undelivered answer")
+        assert fin_pub.result_delivery_error == "session_closed"
+
+        rb1 = await port.rebind_children(
+            drv1, new_parent1, child_targets=[leaf1], replay_undelivered=True, actor=ACTOR,
+        )
+        assert rb1.replayed_results == 1
+        np1_rows = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (new_parent1.session_id,),
+        )
+        assert len(np1_rows) == 1
+        assert np1_rows[0]["kind"] == "agent_result"
+        assert np1_rows[0]["result_kind"] == "agent_result"
+        cleared1 = await store._db.fetchone(
+            f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (leaf1.session_id, pub_rcpt.message_id),
+        )
+        assert cleared1 is not None and cleared1["result_delivery_error"] is None
+
+        # Case B: Workflow leaf settles a genuine INTERNAL workflow_node_result input after old driver closes ->
+        #         rebind_children(replay_undelivered=True) MUST preserve workflow_node_result!
+        cm_drv2 = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12rp-drv2",
+                message_id="rp-drv2-start",
+                body={"text": "wf2"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv2_b = cm_drv2.preclaimed[0]
+        drv2 = drv2_b.target
+        new_drv2 = await client.create_session(drv_desc, actor=ACTOR, options={"session_id": "p12rp-newdrv2"})
+
+        cm_leaf2 = await port.create_many(
+            parent=drv2,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12rp-leaf2",
+                message_id="rp-leaf2-start",
+                body={"text": "internal step"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv2_b.owner_epoch,
+            parent_cancel_seq=drv2_b.cancel_seq,
+        )
+        leaf2_b = cm_leaf2.preclaimed[0]
+        leaf2 = leaf2_b.target
+        await port.set_lifecycle(drv2, "closed", actor=ACTOR, inflight="abort", subtree="none")
+        fin_int = await port.final(leaf2_b, final_text="internal undelivered answer")
+        assert fin_int.result_delivery_error == "session_closed"
+
+        rb2 = await port.rebind_children(
+            drv2, new_drv2, child_targets=[leaf2], replay_undelivered=True, actor=ACTOR,
+        )
+        assert rb2.replayed_results == 1
+        np2_rows = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (new_drv2.session_id,),
+        )
+        assert len(np2_rows) == 1
+        assert np2_rows[0]["kind"] == "workflow_node_result"
+        assert np2_rows[0]["result_kind"] == "workflow_node_result"
+        cleared2 = await store._db.fetchone(
+            f"SELECT result_delivery_error FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (leaf2.session_id, "rp-leaf2-start"),
+        )
+        assert cleared2 is not None and cleared2["result_delivery_error"] is None
+    finally:
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_h4_p1_4_truncated_cursor_advances_every_page_for_scheduler_budget(registry_store):
+    """P1-4 rework 3: single-session multi-page truncation emits strictly advancing cursors matching scheduler checks."""
+    import json
+    from dataclasses import asdict
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+
+    s1 = await target(port, "p14-sched-single")
+    for i in range(15):
+        await store.append_message(s1.session_id, role="user", content=f"msg-{i}")
+    assert await store.close_if_idle(s1.session_id) == "closed"
+
+    future_ms = 2**62
+    batch = 5
+    max_rows = 10
+
+    async def _run_scheduler_day(start_after: str | None) -> tuple[int, str | None, bool]:
+        """Mirror scheduler/app/jobs.py:276-298 exact page acceptance & budget enforcement."""
+        fetched_total = 0
+        deleted_total = 0
+        cur_after = start_after
+        hit_tail = False
+        while fetched_total < max_rows and deleted_total < max_rows:
+            candidate_limit = min(batch, max_rows - fetched_total)
+            delete_limit = min(batch, max_rows - deleted_total)
+            raw_page = await store.purge_expired_page(
+                future_ms,
+                limit=delete_limit,
+                candidate_limit=candidate_limit,
+                after_session_id=cur_after,
+            )
+            # Round-trip through JSON just like agent HTTP response -> scheduler httpx client.
+            page = json.loads(json.dumps(asdict(raw_page)))
+            deleted_vals = list(page["deleted"].values())
+            scanned, fetched, next_after = page["scanned"], page["fetched"], page["next_after"]
+            assert not any(type(c) is not int or c < 0 for c in deleted_vals)
+            assert sum(deleted_vals) <= delete_limit
+            assert 0 <= scanned <= fetched <= candidate_limit
+            if next_after is not None:
+                assert isinstance(next_after, str) and next_after
+                assert next_after != cur_after, f"scheduler rejects repeated cursor: {next_after!r}"
+                assert scanned > 0
+            deleted_total += sum(deleted_vals)
+            fetched_total += fetched
+            cur_after = next_after
+            if cur_after is None:
+                hit_tail = True
+                break
+        return deleted_total, cur_after, hit_tail
+
+    # Day 1: budget=10, batch=5 -> deletes exactly 10 messages (2 confirmed pages), stops at budget.
+    day1_deleted, day1_cursor, day1_tail = await _run_scheduler_day(None)
+    assert day1_deleted == 10
+    assert day1_cursor is not None
+    assert day1_tail is False
+    remaining_msgs = await store._db.fetchall(
+        f"SELECT id FROM {store.t.messages} WHERE session_id=?", (s1.session_id,),
+    )
+    assert len(remaining_msgs) == 5, f"expected 5 msgs remaining after day 1, got {len(remaining_msgs)}"
+
+    # Day 2: resumes from day1_cursor -> deletes remaining 5 messages + 1 session row = 6, reaches tail.
+    day2_deleted, day2_cursor, day2_tail = await _run_scheduler_day(day1_cursor)
+    assert day2_deleted == 6
+    assert day2_cursor is None
+    assert day2_tail is True
+    assert await store.get_session(s1.session_id) is None
+
+    # Raw-cursor mode multi-page truncation on a single session also strictly advances every page.
+    s_raw = await target(port, "p14-sched-raw")
+    for i in range(11):
+        await store.append_message(s_raw.session_id, role="user", content=f"raw-{i}")
+    assert await store.close_if_idle(s_raw.session_id) == "closed"
+    raw_cursor: str | None = "p14-sched-r"
+    raw_seen: set[str] = set()
+    raw_total = 0
+    for _ in range(10):
+        pg = await store.purge_expired_page(
+            future_ms, limit=5, candidate_limit=5, after_session_id=raw_cursor,
+        )
+        raw_total += sum(pg.deleted.values())
+        if pg.next_after is None:
+            raw_cursor = None
+            break
+        assert pg.next_after != raw_cursor
+        assert pg.next_after not in raw_seen
+        raw_seen.add(pg.next_after)
+        raw_cursor = pg.next_after
+    assert raw_cursor is None
+    assert raw_total == 12
+    assert await store.get_session(s_raw.session_id) is None

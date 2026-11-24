@@ -44,45 +44,56 @@ _RAW_EXCLUSIVE_PREFIX = '\x1fsid:gt:'
 _RAW_INCLUSIVE_PREFIX = '\x1fsid:ge:'
 
 
-def _encode_cursor(lifecycle: str, updated_at: int, session_id: str, *, inclusive: bool = False) -> str:
-    prefix = _INCLUSIVE_CURSOR_PREFIX if inclusive else _CURSOR_PREFIX
-    return f'{prefix}{lifecycle}:{int(updated_at)}:{session_id}'
+def _encode_cursor(
+    lifecycle: str, updated_at: int, session_id: str, *, inclusive: bool = False, step: int = 1,
+) -> str:
+    if inclusive:
+        return f'{_INCLUSIVE_CURSOR_PREFIX}{int(step)}:{lifecycle}:{int(updated_at)}:{session_id}'
+    return f'{_CURSOR_PREFIX}{lifecycle}:{int(updated_at)}:{session_id}'
 
 
-def _encode_raw_cursor(session_id: str, *, inclusive: bool = False) -> str:
-    prefix = _RAW_INCLUSIVE_PREFIX if inclusive else _RAW_EXCLUSIVE_PREFIX
-    return f'{prefix}{session_id}'
+def _encode_raw_cursor(session_id: str, *, inclusive: bool = False, step: int = 1) -> str:
+    if inclusive:
+        return f'{_RAW_INCLUSIVE_PREFIX}{int(step)}:{session_id}'
+    return f'{_RAW_EXCLUSIVE_PREFIX}{session_id}'
 
 
-def _decode_cursor(token: str) -> tuple[str, int, str, bool] | None:
+def _decode_cursor(token: str) -> tuple[str, int, str, bool, int] | None:
     if token.startswith(_INCLUSIVE_CURSOR_PREFIX):
-        inclusive = True
         body = token[len(_INCLUSIVE_CURSOR_PREFIX):]
-    elif token.startswith(_CURSOR_PREFIX):
-        inclusive = False
+        parts = body.split(':', 3)
+        if len(parts) != 4 or parts[1] not in _LIFECYCLE_ORDER:
+            return None
+        try:
+            step = int(parts[0])
+            ts = int(parts[2])
+        except ValueError:
+            return None
+        if step < 1:
+            return None
+        return parts[1], ts, parts[3], True, step
+    if token.startswith(_CURSOR_PREFIX):
         body = token[len(_CURSOR_PREFIX):]
-    else:
-        return None
-    parts = body.split(':', 2)
-    if len(parts) != 3 or parts[0] not in _LIFECYCLE_ORDER:
-        return None
-    try:
-        return parts[0], int(parts[1]), parts[2], inclusive
-    except ValueError:
-        return None
+        parts = body.split(':', 2)
+        if len(parts) != 3 or parts[0] not in _LIFECYCLE_ORDER:
+            return None
+        try:
+            return parts[0], int(parts[1]), parts[2], False, 0
+        except ValueError:
+            return None
+    return None
 
 
 async def _fetch_lifecycle_candidates(
     store, *, eligibility_cutoff: int, limit: int,
     lifecycles: tuple[str, ...], after_session_id: str | None = None,
     session_id: str | None = None,
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool, int]:
     """Scan idle expired candidate sessions via ``idx_sessions_lifecycle``.
 
     Index columns: ``(lifecycle, execution_state, updated_at, session_id)``.
-    Supports both structured lifecycle cursors (``lc:<lifecycle>:<updated_at>:<session_id>``
-    and inclusive resume cursors ``lci:...``) produced by ``purge_expired_page`` and raw
-    ``session_id`` cursors for backward compatibility.
+    Supports structured lifecycle cursors (exclusive and monotonic-step inclusive resume cursors)
+    produced by ``purge_expired_page`` as well as raw ``session_id`` cursors.
     """
     if session_id is not None:
         row = await store._db.fetchone(
@@ -90,16 +101,24 @@ async def _fetch_lifecycle_candidates(
             "WHERE session_id=? AND execution_state='idle' AND updated_at<?",
             (session_id, eligibility_cutoff),
         )
-        return ([dict(row)] if row is not None else []), False
+        return ([dict(row)] if row is not None else []), False, 0
 
     if after_session_id is not None:
         parsed = _decode_cursor(after_session_id)
         if parsed is None:
-            # Backward-compatible raw session_id cursor, plus explicit sid:gt:/sid:ge: tokens
+            # Backward-compatible raw session_id cursor, plus explicit \x1fsid:gt:/\x1fsid:ge: tokens
             # emitted by purge_expired_page so arbitrary printable session_ids never collide.
+            raw_step = 0
             if after_session_id.startswith(_RAW_INCLUSIVE_PREFIX):
-                raw_sid = after_session_id[len(_RAW_INCLUSIVE_PREFIX):]
-                cmp_op = '>='
+                body = after_session_id[len(_RAW_INCLUSIVE_PREFIX):]
+                step_s, sep, rem_sid = body.partition(':')
+                if sep and step_s.isdigit() and int(step_s) >= 1 and rem_sid:
+                    raw_step = int(step_s)
+                    raw_sid = rem_sid
+                    cmp_op = '>='
+                else:
+                    raw_sid = after_session_id
+                    cmp_op = '>'
             elif after_session_id.startswith(_RAW_EXCLUSIVE_PREFIX):
                 raw_sid = after_session_id[len(_RAW_EXCLUSIVE_PREFIX):]
                 cmp_op = '>'
@@ -113,10 +132,10 @@ async def _fetch_lifecycle_candidates(
                 f"AND updated_at<? AND session_id{cmp_op}? ORDER BY session_id ASC LIMIT ?",
                 (*lifecycles, eligibility_cutoff, raw_sid, limit),
             )
-            return [dict(r) for r in rows], False
-        start_lc, start_ts, start_sid, start_inclusive = parsed
+            return [dict(r) for r in rows], False, raw_step
+        start_lc, start_ts, start_sid, start_inclusive, cursor_step = parsed
     else:
-        start_lc, start_ts, start_sid, start_inclusive = None, None, None, False
+        start_lc, start_ts, start_sid, start_inclusive, cursor_step = None, None, None, False, 0
 
     collected: list[dict] = []
     started = start_lc is None
@@ -145,7 +164,7 @@ async def _fetch_lifecycle_candidates(
                 (lc, eligibility_cutoff, need),
             )
         collected.extend(dict(r) for r in rows)
-    return collected, True
+    return collected, True, cursor_step
 
 
 async def purge_expired(store, now, *, limit, retention_days, session_id=None, categories=None,
@@ -163,7 +182,7 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
     eligibility_cutoff = max(cutoff.values())
     lifecycles = _LIFECYCLE_ORDER if 'inbox' in wanted else ('closed', 'closing')
     scan_limit = remaining if candidate_limit is None else candidate_limit
-    candidates, use_lifecycle_cursor = await _fetch_lifecycle_candidates(
+    candidates, use_lifecycle_cursor, cursor_step = await _fetch_lifecycle_candidates(
         store,
         eligibility_cutoff=eligibility_cutoff,
         limit=scan_limit,
@@ -254,10 +273,16 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                                 store._forget_appended(sid)
         if remaining == 0 and not session_deleted:
             # Current session was truncated by the row allowance: do NOT advance `last` past it;
-            # return an inclusive cursor so the next page re-enters this session cleanly.
+            # return a strictly advancing inclusive cursor (monotonic step) so callers such as
+            # scheduler progress checks confirm forward progress while re-entering this session.
+            next_step = cursor_step + 1
             truncated_cursor = (
-                _encode_cursor(candidate['lifecycle'], candidate['updated_at'], sid, inclusive=True)
-                if use_lifecycle_cursor else _encode_raw_cursor(sid, inclusive=True)
+                _encode_cursor(
+                    candidate['lifecycle'], candidate['updated_at'], sid,
+                    inclusive=True, step=next_step,
+                )
+                if use_lifecycle_cursor
+                else _encode_raw_cursor(sid, inclusive=True, step=next_step)
             )
             break
         last = (
