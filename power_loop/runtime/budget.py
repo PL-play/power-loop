@@ -112,19 +112,21 @@ def trim_history(
         # Walk back to find the matching assistant(tool_calls).
         tid = messages[tail_start - 1].get("tool_call_id")
         extended = tail_start - 1
+        matched = False
         while extended > sys_end:
             extended -= 1
             role = messages[extended].get("role")
             if role == "assistant" and messages[extended].get("tool_calls"):
                 # Check if any of its tool_calls match this tool_call_id.
                 tcs = messages[extended].get("tool_calls") or []
-                if any(tc.get("id") == tid for tc in tcs):
+                if any(isinstance(tc, dict) and tc.get("id") == tid for tc in tcs):
                     tail_start = extended
+                    matched = True
                     break
             elif role == "user":
                 # We hit a user boundary without finding the pair — stop.
                 break
-        else:
+        if not matched:
             break  # safety: cannot find pair, stop extending
 
     # Build result: system + trimmed body + tail.

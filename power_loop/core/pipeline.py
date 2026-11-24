@@ -1584,11 +1584,17 @@ class AgentPipeline:
         return bool(rt is not None and async_capable_for(rt.definition, tool_args))
 
     @staticmethod
-    def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future, Any]]) -> None:
+    async def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future | None, Any]]) -> None:
+        tasks: list[asyncio.Future] = []
         for task, _ in pre.values():
+            if task is None:
+                continue
             if not task.done():
                 task.cancel()
+            tasks.append(task)
         pre.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def execute_tool(
         self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True,
@@ -2126,6 +2132,7 @@ class AgentPipeline:
             # 每次烧满一个 max_tokens（conv-213：两轮各约 8 分钟、产出为零）。
             # 所以这里不重试，而是把「你被截断了，拆小再来」作为一条 user 消息落进历史——
             # 改变了输入，模型才有可能给出不一样的输出。
+            truncated = False
             if not tool_calls:
                 reason = _finish_reason(response)
                 cap = self.config.max_tokens
@@ -2140,29 +2147,38 @@ class AgentPipeline:
                 truncated = (reason in _TRUNCATION_FINISH_REASONS
                              or (bool(cap) and out_tokens >= int(cap))
                              or think_only)
-                if truncated and self._truncated_streak < _TRUNCATED_MAX_RETRIES:
-                    self._truncated_streak += 1
+                if assistant_text and not truncated:
+                    self._truncated_streak = 0
+                if truncated:
+                    if self._truncated_streak < _TRUNCATED_MAX_RETRIES:
+                        self._truncated_streak += 1
+                        logger.warning(
+                            "%s at round %d (finish_reason=%r, "
+                            "completion_tokens=%d/%s) streak=%d/%d — nudging to write smaller "
+                            "(session=%s)",
+                            "think-only response (no text, no tool call)" if think_only
+                            else "truncated LLM response",
+                            round_idx, reason, out_tokens, cap, self._truncated_streak,
+                            _TRUNCATED_MAX_RETRIES, self.session_id,
+                        )
+                        await self._append_message(
+                            {"role": "user",
+                             "content": _THINK_ONLY_NOTICE if think_only else _TRUNCATION_NOTICE},
+                            round_index=round_idx)
+                        self._emit(AgentEventType.ROUND_COMPLETED,
+                                   RoundCompletedPayload(round_index=round_idx, has_tools=False),
+                                   round_index=round_idx)
+                        await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
+                            round_index=round_idx, messages=self.history,
+                            has_tools=False, response_text=assistant_text))
+                        await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
+                        continue
                     logger.warning(
-                        "%s at round %d (finish_reason=%r, "
-                        "completion_tokens=%d/%s) streak=%d/%d — nudging to write smaller "
-                        "(session=%s)",
+                        "%s persisted after %d retries at round %d — closing send (session=%s)",
                         "think-only response (no text, no tool call)" if think_only
                         else "truncated LLM response",
-                        round_idx, reason, out_tokens, cap, self._truncated_streak,
-                        _TRUNCATED_MAX_RETRIES, self.session_id,
+                        self._truncated_streak, round_idx, self.session_id,
                     )
-                    await self._append_message(
-                        {"role": "user",
-                         "content": _THINK_ONLY_NOTICE if think_only else _TRUNCATION_NOTICE},
-                        round_index=round_idx)
-                    self._emit(AgentEventType.ROUND_COMPLETED,
-                               RoundCompletedPayload(round_index=round_idx, has_tools=False),
-                               round_index=round_idx)
-                    await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
-                        round_index=round_idx, messages=self.history,
-                        has_tools=False, response_text=assistant_text))
-                    await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
-                    continue
 
             # ── No tools → completed (unless a follow-up is waiting) ──
             if not tool_calls:
@@ -2174,7 +2190,9 @@ class AgentPipeline:
                 # of real work collapsing to a blank final answer. Retry a bounded number
                 # of times (each retry advances round_idx, so max_rounds still caps it),
                 # then fall through to close the send rather than spin.
-                if not assistant_text:
+                # Note: truncated / think-only exhaustion is handled above and must NOT
+                # cascade into empty-response retries.
+                if not assistant_text and not truncated:
                     self._empty_response_streak += 1
                     if self._empty_response_streak <= _EMPTY_RESPONSE_MAX_RETRIES:
                         logger.warning(
@@ -2300,220 +2318,255 @@ class AgentPipeline:
             _pre: dict[int, tuple[asyncio.Future | None, ToolBeforeCtx]] = {}
             _pre_skip: dict[int, Any] = {}                       # TOOL_BEFORE 判 SKIP 的 hoisted 调用
             _pre_sem: asyncio.Semaphore | None = None
-            for i, tool_call in enumerate(tool_calls):
-                if _tool_stop is not None and _tool_stop.done():
-                    await self._stop_tool_batch(tool_calls, i, _pre, _tool_stop.result(), round_idx)
-                if _is_cancelled(self.cancel_token):
-                    self._cancel_pre_tasks(_pre)
-                    await self._finalize("cancelled")
-                    return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx + 1)
-
-                call_id = str(tool_call.get("id") or "")
-                tool_name = _tool_call_name(tool_call)
-                tool_args = _tool_call_args(tool_call)
-
-                # An urgent message is waiting → don't START anything new this batch. Calls
-                # already running finish normally; the next round's drain delivers the message.
-                if self._steer_pending() and i not in _pre and i not in _pre_skip and not skip_batch:
-                    await self._resolve_skipped_tool_calls(
-                        [tool_call], reason=self.STEER_SKIP_REASON, round_idx=round_idx)
-                    self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
-                        where="between_tools", action="skip", round_index=round_idx,
-                        tool_name=tool_name, tool_call_id=call_id, skipped=1),
-                        round_index=round_idx)
-                    continue
-
-                # Batch skip
-                if skip_batch:
-                    await self._append_message(
-                        {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": batch_ctx.output},
-                        round_index=round_idx,
-                    )
-                    continue
-
-                pre_task: asyncio.Future | None = None
-                if i in _pre_skip:
-                    tb_ctx = _pre_skip.pop(i)
-                    await self._append_message(
-                        {"role": "tool", "tool_call_id": call_id, "name": tb_ctx.tool_name,
-                         "content": tb_ctx.output},
-                        round_index=round_idx,
-                    )
-                    continue
-                if i in _pre:
-                    pre_task, tb_ctx = _pre.pop(i)
-                    tool_name = tb_ctx.tool_name
-                    tool_args = tb_ctx.tool_args
-                else:
-                    # ── Hook: TOOL_BEFORE ──
-                    tb_ctx = ToolBeforeCtx(
-                        round_index=round_idx,
-                        tool_call=tool_call,
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                    )
-                    try:
-                        await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
-                    except ControlledLoopStop as stop:
-                        await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
-                    tool_name = tb_ctx.tool_name
-                    tool_args = tb_ctx.tool_args
+            _active_work: asyncio.Future | None = None
+            try:
+                for i, tool_call in enumerate(tool_calls):
+                    _active_work = None
                     if _tool_stop is not None and _tool_stop.done():
                         await self._stop_tool_batch(tool_calls, i, _pre, _tool_stop.result(), round_idx)
+                    if _is_cancelled(self.cancel_token):
+                        await self._cancel_pre_tasks(_pre)
+                        await self._finalize("cancelled")
+                        return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx + 1)
 
-                    if tb_ctx.directive == HookDirective.SKIP:
+                    call_id = str(tool_call.get("id") or "")
+                    tool_name = _tool_call_name(tool_call)
+                    tool_args = _tool_call_args(tool_call)
+
+                    # An urgent message is waiting → don't START anything new this batch. Calls
+                    # already running finish normally; the next round's drain delivers the message.
+                    if self._steer_pending() and i not in _pre and i not in _pre_skip and not skip_batch:
+                        await self._resolve_skipped_tool_calls(
+                            [tool_call], reason=self.STEER_SKIP_REASON, round_idx=round_idx)
+                        self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
+                            where="between_tools", action="skip", round_index=round_idx,
+                            tool_name=tool_name, tool_call_id=call_id, skipped=1),
+                            round_index=round_idx)
+                        continue
+
+                    # Batch skip
+                    if skip_batch:
                         await self._append_message(
-                            {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": tb_ctx.output},
+                            {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": batch_ctx.output},
                             round_index=round_idx,
                         )
                         continue
 
-                    self._emit(AgentEventType.TOOL_CALL_STARTED,
-                               ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
-                               round_index=round_idx)
-
-                    if i in _eligible and any(j > i for j in _eligible):
-                        # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
-                        # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
-                        _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
-                        pre_task = self._start_tool(tool_name, tool_args, _pre_sem,
-                                                    tool_call_id=call_id, tool_stop=_tool_stop)
-                        for j in _eligible:
-                            if _tool_stop is not None and _tool_stop.done():
-                                break
-                            if j <= i or j in _pre or j in _pre_skip:
-                                continue
-                            tc_j = tool_calls[j]
-                            tb_j = ToolBeforeCtx(
-                                round_index=round_idx, tool_call=tc_j,
-                                tool_name=_tool_call_name(tc_j), tool_args=_tool_call_args(tc_j),
-                            )
-                            try:
-                                await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_j)
-                            except ControlledLoopStop as stop:
-                                _pre[i] = (pre_task, tb_ctx)
-                                await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
-                            if _tool_stop is not None and _tool_stop.done():
-                                break
-                            if tb_j.directive == HookDirective.SKIP:
-                                _pre_skip[j] = tb_j
-                                continue
-                            self._emit(AgentEventType.TOOL_CALL_STARTED,
-                                       ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
-                                                              tool_call_id=str(tc_j.get("id") or "")),
-                                       round_index=round_idx)
-                            _pre[j] = (self._start_tool(tb_j.tool_name, tb_j.tool_args, _pre_sem,
-                                tool_call_id=str(tc_j.get("id") or ""), tool_stop=_tool_stop), tb_j)
-
-                # ── Business logic: execute tool ──
-                failed = False
-                _stopped = False
-                _work = pre_task
-                try:
-                    if not self.cancel_token.is_never or _tool_stop is not None:
-                        # design/124 §8.4: race the call against a stop.
-                        if _work is None:
-                            _work = self._start_tool(tool_name, tool_args,
-                                                     tool_call_id=call_id, tool_stop=_tool_stop)
-                        _res, _why = await self._race(_work, tool_stop=_tool_stop)
-                        if _why == "done":
-                            output, failed = _res
-                        else:
-                            outcome = await self._settle_stopped_tool(_work, self._interrupt_mode(tool_name))
-                            output, failed = outcome.stop_note + outcome.output, outcome.failed
-                            _stopped = True
+                    pre_task: asyncio.Future | None = None
+                    if i in _pre_skip:
+                        tb_ctx = _pre_skip.pop(i)
+                        await self._append_message(
+                            {"role": "tool", "tool_call_id": call_id, "name": tb_ctx.tool_name,
+                             "content": tb_ctx.output},
+                            round_index=round_idx,
+                        )
+                        continue
+                    if i in _pre:
+                        pre_task, tb_ctx = _pre.pop(i)
+                        _active_work = pre_task
+                        tool_name = tb_ctx.tool_name
+                        tool_args = tb_ctx.tool_args
                     else:
-                        output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
-                except ControlledLoopStop as stop:
-                    _pre[i] = (_work, tb_ctx)
-                    await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx)
-                except Exception as exc:
-                    # ── Hook: TOOL_ERROR ──
-                    from power_loop.contracts.errors import SessionBusy, SessionLeaseLost
-                    from power_loop.runtime.native_returns import NativeReturnPending
-                    if isinstance(exc, (NativeReturnPending, SessionLeaseLost, SessionBusy, CancellationRequested)):
-                        raise
-                    err_ctx = ToolErrorCtx(
-                        round_index=round_idx,
-                        tool_call=tool_call,
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        error=exc,
-                        error_message=str(exc),
-                    )
-                    await self.hooks.run_typed_async(HookPoint.TOOL_ERROR, err_ctx)
-                    if err_ctx.directive == HookDirective.SKIP:
-                        output = err_ctx.output or f"Error: {exc}"
-                    elif err_ctx.directive == HookDirective.SHORT_CIRCUIT:
+                        # ── Hook: TOOL_BEFORE ──
+                        tb_ctx = ToolBeforeCtx(
+                            round_index=round_idx,
+                            tool_call=tool_call,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                        )
                         try:
-                            # count=False: this is a retry of the SAME logical tool
-                            # call, already counted on the first dispatch.
-                            if _tool_stop is None:
-                                _work = None
-                                output, failed = await self.execute_tool(
-                                    tool_name, tool_args, count=False, tool_call_id=call_id
-                                )
-                            else:
-                                _work = self._start_tool(tool_name, tool_args, count=False,
-                                                         tool_call_id=call_id, tool_stop=_tool_stop)
-                                _res, _why = await self._race(_work, tool_stop=_tool_stop)
-                                if _why == "done":
-                                    output, failed = _res
-                                else:
-                                    outcome = await self._settle_stopped_tool(
-                                        _work, self._interrupt_mode(tool_name))
-                                    output, failed = outcome.stop_note + outcome.output, outcome.failed
-                                    _stopped = True
+                            await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
                         except ControlledLoopStop as stop:
-                            _pre[i] = (_work, tb_ctx)
-                            await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx)
-                        except Exception as retry_exc:
-                            if isinstance(retry_exc, (SessionLeaseLost, SessionBusy, CancellationRequested)):
-                                raise
-                            output = f"Error (retry failed): {retry_exc}"
+                            await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
+                        tool_name = tb_ctx.tool_name
+                        tool_args = tb_ctx.tool_args
+                        if _tool_stop is not None and _tool_stop.done():
+                            await self._stop_tool_batch(tool_calls, i, _pre, _tool_stop.result(), round_idx)
+
+                        if tb_ctx.directive == HookDirective.SKIP:
+                            await self._append_message(
+                                {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": tb_ctx.output},
+                                round_index=round_idx,
+                            )
+                            continue
+
+                        self._emit(AgentEventType.TOOL_CALL_STARTED,
+                                   ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
+                                   round_index=round_idx)
+
+                        if i in _eligible and any(j > i for j in _eligible):
+                            # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
+                            # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
+                            _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
+                            pre_task = self._start_tool(tool_name, tool_args, _pre_sem,
+                                                        tool_call_id=call_id, tool_stop=_tool_stop)
+                            _active_work = pre_task
+                            for j in _eligible:
+                                if _tool_stop is not None and _tool_stop.done():
+                                    break
+                                if self._steer_pending():
+                                    break
+                                if j <= i or j in _pre or j in _pre_skip:
+                                    continue
+                                tc_j = tool_calls[j]
+                                tb_j = ToolBeforeCtx(
+                                    round_index=round_idx, tool_call=tc_j,
+                                    tool_name=_tool_call_name(tc_j), tool_args=_tool_call_args(tc_j),
+                                )
+                                try:
+                                    await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_j)
+                                except ControlledLoopStop as stop:
+                                    _pre[i] = (pre_task, tb_ctx)
+                                    _active_work = None
+                                    await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
+                                if _tool_stop is not None and _tool_stop.done():
+                                    break
+                                if tb_j.directive == HookDirective.SKIP:
+                                    _pre_skip[j] = tb_j
+                                    continue
+                                self._emit(AgentEventType.TOOL_CALL_STARTED,
+                                           ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
+                                                                  tool_call_id=str(tc_j.get("id") or "")),
+                                           round_index=round_idx)
+                                _pre[j] = (self._start_tool(tb_j.tool_name, tb_j.tool_args, _pre_sem,
+                                    tool_call_id=str(tc_j.get("id") or ""), tool_stop=_tool_stop), tb_j)
+
+                    # ── Business logic: execute tool ──
+                    failed = False
+                    _stopped = False
+                    _work = pre_task
+                    _active_work = _work
+                    try:
+                        if not self.cancel_token.is_never or _tool_stop is not None:
+                            # design/124 §8.4: race the call against a stop.
+                            if _work is None:
+                                _work = self._start_tool(tool_name, tool_args,
+                                                         tool_call_id=call_id, tool_stop=_tool_stop)
+                                _active_work = _work
+                            _res, _why = await self._race(_work, tool_stop=_tool_stop)
+                            if _why == "done":
+                                output, failed = _res
+                            else:
+                                outcome = await self._settle_stopped_tool(_work, self._interrupt_mode(tool_name))
+                                output, failed = outcome.stop_note + outcome.output, outcome.failed
+                                _stopped = True
+                        else:
+                            output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
+                    except ControlledLoopStop as stop:
+                        _pre[i] = (_work, tb_ctx)
+                        _active_work = None
+                        await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx)
+                    except Exception as exc:
+                        # ── Hook: TOOL_ERROR ──
+                        from power_loop.contracts.errors import SessionBusy, SessionLeaseLost
+                        from power_loop.runtime.native_returns import NativeReturnPending
+                        if isinstance(exc, (NativeReturnPending, SessionLeaseLost, SessionBusy, CancellationRequested)):
+                            raise
+                        err_ctx = ToolErrorCtx(
+                            round_index=round_idx,
+                            tool_call=tool_call,
+                            tool_name=tool_name,
+                            tool_args=tool_args,
+                            error=exc,
+                            error_message=str(exc),
+                        )
+                        await self.hooks.run_typed_async(HookPoint.TOOL_ERROR, err_ctx)
+                        if err_ctx.directive == HookDirective.SKIP:
+                            output = err_ctx.output or f"Error: {exc}"
+                        elif err_ctx.directive == HookDirective.SHORT_CIRCUIT:
+                            try:
+                                # count=False: this is a retry of the SAME logical tool
+                                # call, already counted on the first dispatch.
+                                if not self.cancel_token.is_never or _tool_stop is not None:
+                                    if _is_cancelled(self.cancel_token):
+                                        _work = None
+                                        _active_work = None
+                                        output = (
+                                            f"[stopped: 用户要求停止（{self.cancel_token.reason}），"
+                                            "重试调用已中止。]"
+                                        )
+                                        failed = False
+                                        _stopped = True
+                                    else:
+                                        _work = self._start_tool(tool_name, tool_args, count=False,
+                                                                 tool_call_id=call_id, tool_stop=_tool_stop)
+                                        _active_work = _work
+                                        _res, _why = await self._race(_work, tool_stop=_tool_stop)
+                                        if _why == "done":
+                                            output, failed = _res
+                                        else:
+                                            outcome = await self._settle_stopped_tool(
+                                                _work, self._interrupt_mode(tool_name))
+                                            output, failed = outcome.stop_note + outcome.output, outcome.failed
+                                            _stopped = True
+                                else:
+                                    _work = None
+                                    _active_work = None
+                                    output, failed = await self.execute_tool(
+                                        tool_name, tool_args, count=False, tool_call_id=call_id
+                                    )
+                            except ControlledLoopStop as stop:
+                                _pre[i] = (_work, tb_ctx)
+                                _active_work = None
+                                await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx)
+                            except Exception as retry_exc:
+                                if isinstance(
+                                    retry_exc,
+                                    (NativeReturnPending, SessionLeaseLost, SessionBusy, CancellationRequested),
+                                ):
+                                    raise
+                                output = f"Error (retry failed): {retry_exc}"
+                                failed = True
+                        else:
+                            output = f"Error: {exc}"
                             failed = True
-                    else:
-                        output = f"Error: {exc}"
-                        failed = True
+                    finally:
+                        if _active_work is not None and _active_work.done():
+                            _active_work = None
 
-                # ── Hook: TOOL_AFTER ──
-                ta_ctx = await self._after_tool(tool_call, tb_ctx, output, failed, round_idx)
-                output = ta_ctx.output
-                failed = ta_ctx.failed
+                    # ── Hook: TOOL_AFTER ──
+                    ta_ctx = await self._after_tool(tool_call, tb_ctx, output, failed, round_idx)
+                    output = ta_ctx.output
+                    failed = ta_ctx.failed
 
-                from power_loop.runtime.tool_contracts import has_capability
-                if not failed and has_capability(self.tool_registry.get(tool_name), "task.progress.v1"):
-                    used_todo = True
-                    self.rounds_since_todo = 0
+                    from power_loop.runtime.tool_contracts import has_capability
+                    if not failed and has_capability(self.tool_registry.get(tool_name), "task.progress.v1"):
+                        used_todo = True
+                        self.rounds_since_todo = 0
 
-                await self._record_tool_result(call_id, tb_ctx, output, failed, round_idx)
-                if _tool_stop is not None and _tool_stop.done():
-                    await self._stop_tool_batch(tool_calls, i + 1, _pre, _tool_stop.result(), round_idx)
+                    await self._record_tool_result(call_id, tb_ctx, output, failed, round_idx)
+                    if _tool_stop is not None and _tool_stop.done():
+                        await self._stop_tool_batch(tool_calls, i + 1, _pre, _tool_stop.result(), round_idx)
 
-                if _stopped:
-                    # design/124 §8.4: the run was stopped mid-tool — this call is settled; the
-                    # rest of the batch never starts (the host's abort_pending resolves them),
-                    # concurrent siblings are cancelled, the run ends cancelled.
-                    self._cancel_pre_tasks(_pre)
-                    self._emit(AgentEventType.LOOP_CANCELLED,
-                               LoopCancelledPayload(reason=self.cancel_token.reason,
-                                                    round_index=round_idx),
-                               round_index=round_idx)
-                    await self._finalize("cancelled")
-                    return self._make_result(
-                        "cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]",
-                        rounds=round_idx + 1)
+                    if _stopped:
+                        # design/124 §8.4: the run was stopped mid-tool — this call is settled; the
+                        # rest of the batch never starts (the host's abort_pending resolves them),
+                        # concurrent siblings are cancelled, the run ends cancelled.
+                        await self._cancel_pre_tasks(_pre)
+                        self._emit(AgentEventType.LOOP_CANCELLED,
+                                   LoopCancelledPayload(reason=self.cancel_token.reason,
+                                                        round_index=round_idx),
+                                   round_index=round_idx)
+                        await self._finalize("cancelled")
+                        return self._make_result(
+                            "cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]",
+                            rounds=round_idx + 1)
 
-                # TOOL_AFTER BREAK → stop remaining tools. Still resolve them so
-                # the next round's request isn't an invalid sequence (assistant
-                # with tool_calls that have no matching tool responses).
-                if ta_ctx.directive == HookDirective.BREAK:
-                    self._cancel_pre_tasks(_pre)
-                    await self._resolve_skipped_tool_calls(
-                        tool_calls[i + 1 :], reason="tool.after hook stopped the batch",
-                        round_idx=round_idx,
-                    )
-                    break
+                    # TOOL_AFTER BREAK → stop remaining tools. Still resolve them so
+                    # the next round's request isn't an invalid sequence (assistant
+                    # with tool_calls that have no matching tool responses).
+                    if ta_ctx.directive == HookDirective.BREAK:
+                        await self._cancel_pre_tasks(_pre)
+                        await self._resolve_skipped_tool_calls(
+                            tool_calls[i + 1 :], reason="tool.after hook stopped the batch",
+                            round_idx=round_idx,
+                        )
+                        break
+            finally:
+                if _active_work is not None:
+                    _pre[-1] = (_active_work, None)  # type: ignore[assignment]
+                if _pre:
+                    await self._cancel_pre_tasks(_pre)
 
             # 🔴 截断提示只能补在**所有 tool 结果都落完之后**。
             # 补在 assistant(tool_calls) 与它的 tool 结果之间，会造出
@@ -2558,36 +2611,56 @@ class AgentPipeline:
         # ── Hit max rounds ──
         await self._append_message({
             "role": "user",
-            "content": f"You have reached the maximum of {self.config.max_rounds} rounds. "
+            "content": f"You have reached the maximum of {round_idx} rounds. "
                        f"Summarize what you accomplished and what remains.",
-        })
-        self._emit(AgentEventType.STATUS_CHANGED, HitRoundLimitStatusPayload(max_rounds=int(self.config.max_rounds)))
+        }, round_index=round_idx)
+        self._emit(
+            AgentEventType.STATUS_CHANGED,
+            HitRoundLimitStatusPayload(max_rounds=round_idx),
+            round_index=round_idx,
+        )
 
-        max_rounds = int(self.config.max_rounds)
         # Honor cancellation before the (billable) summary call.
         if _is_cancelled(self.cancel_token):
-            await self._finalize("cancelled")
-            return self._make_result("cancelled", final_text="[cancelled by user]", rounds=max_rounds)
+            await self._finalize("cancelled", rounds=round_idx)
+            return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx)
         # Route through call_llm so the final summary gets the same retry / timeout /
         # cancellation handling, per-loop model, and stream events as every other
         # call — instead of an unguarded llm.complete that could hang, ignore a
         # cancel, or crash the run on a transient error.
         try:
-            final_resp = await self.call_llm(
-                max_rounds,
+            _summary_call = self.call_llm(
+                round_idx,
                 messages=self.history,
                 system_prompt=self.system_prompt,
-                tools=self.runtime_tools,
+                tools=None,
                 max_tokens=int(self.config.max_tokens or 8000),
                 temperature=float(self.config.temperature or 0),
             )
+            if not self.cancel_token.is_never:
+                _summary_work = asyncio.ensure_future(_summary_call)
+                final_resp, _why = await self._race(_summary_work)
+                if _why != "done":
+                    _summary_work.cancel()
+                    with contextlib.suppress(BaseException):
+                        await _summary_work
+                    raise CancellationRequested(self.cancel_token.reason)
+            else:
+                final_resp = await _summary_call
         except CancellationRequested as exc:
-            self._emit(AgentEventType.LOOP_CANCELLED,
-                       LoopCancelledPayload(reason=exc.reason, round_index=max_rounds))
-            await self._finalize("cancelled")
-            return self._make_result("cancelled", final_text=f"[cancelled: {exc.reason}]", rounds=max_rounds)
+            self._emit(
+                AgentEventType.LOOP_CANCELLED,
+                LoopCancelledPayload(reason=exc.reason, round_index=round_idx),
+                round_index=round_idx,
+            )
+            await self._finalize("cancelled", rounds=round_idx)
+            return self._make_result("cancelled", final_text=f"[cancelled: {exc.reason}]", rounds=round_idx)
         except (LLMRetryExhausted, LLMTimeout) as exc:
-            reason = "timeout" if isinstance(exc, LLMTimeout) else "retry_exhausted"
+            reason = (
+                "timeout" if isinstance(exc, LLMTimeout)
+                else "non_retryable" if isinstance(exc, LLMNonRetryable)
+                else "retry_exhausted"
+            )
             inner = getattr(exc, "last_error", exc)
             from power_loop.runtime.task_runtime import current_session_send
             binding = current_session_send(session_id=self.session_id)
@@ -2596,19 +2669,23 @@ class AgentPipeline:
             self._emit(AgentEventType.LLM_DEGRADED, LlmDegradedPayload(
                 reason=reason, attempts=getattr(exc, "attempts", 0),
                 error_type=type(inner).__name__, error_message=str(inner)[:500]),
-                round_index=max_rounds)
+                round_index=round_idx)
             msg = f"[degraded: LLM {reason} — {type(inner).__name__}: {str(inner)[:200]}]"
-            await self._append_message({"role": "assistant", "content": msg}, round_index=max_rounds)
-            await self._finalize("degraded", final_text=msg, rounds=max_rounds)
-            return self._make_result("degraded", final_text=msg, rounds=max_rounds)
+            await self._append_message({"role": "assistant", "content": msg}, round_index=round_idx)
+            await self._finalize("degraded", final_text=msg, rounds=round_idx)
+            return self._make_result("degraded", final_text=msg, rounds=round_idx)
         final_text = (getattr(final_resp, "raw_text", "") or getattr(final_resp, "content_text", "") or "").strip()
-        self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)))
+        self._emit(
+            AgentEventType.USAGE_UPDATED,
+            UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)),
+            round_index=round_idx,
+        )
         # Persist the wrap-up summary as the assistant turn before finalizing (M-stateful-loop-2):
         # the success branch returned it to the caller but never recorded it, so the next send's
         # history had a dangling "summarize…" user prompt with no answer. Mirrors the degraded branch.
         if final_text:
-            await self._append_message(self._assistant_message(final_resp, final_text), round_index=max_rounds)
+            await self._append_message(self._assistant_message(final_resp, final_text), round_index=round_idx)
         await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
-                             rounds=int(self.config.max_rounds))
+                             rounds=round_idx)
         return self._make_result("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
-                                 rounds=int(self.config.max_rounds))
+                                 rounds=round_idx)

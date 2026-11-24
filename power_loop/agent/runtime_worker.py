@@ -80,7 +80,7 @@ class _SessionExecution:
         # claim/factory or a non-LLM path has not established that consumption fact.
         self.consumed: list[InputRef] | None = None
         self.wake_pending = False
-        self.urgent_hint = False
+        self.urgent_event = asyncio.Event()
         self.cancel_hint = False
         self.output: asyncio.Queue = asyncio.Queue(maxsize=256)
         option_values = descriptor.config.get("child_options", descriptor.config)
@@ -89,6 +89,17 @@ class _SessionExecution:
         })
         if batch.max_rounds_override is not None:
             self.options = replace(self.options, max_rounds=batch.max_rounds_override)
+
+    @property
+    def urgent_hint(self) -> bool:
+        return self.urgent_event.is_set()
+
+    @urgent_hint.setter
+    def urgent_hint(self, value: bool) -> None:
+        if value:
+            self.urgent_event.set()
+        else:
+            self.urgent_event.clear()
 
     @property
     def send_index(self):
@@ -1281,6 +1292,7 @@ class RuntimeWorker:
                     diag["lifecycle"] == "closing"
                     or int(diag["cancel_seq"]) > batch.cancel_seq
                 ):
+                    ctx.cancel_hint = False
                     ctx.stop.cancel(diag.get("cancel_reason") or "cancelled")
                     return []
                 if (
@@ -1288,12 +1300,15 @@ class RuntimeWorker:
                     and diag["lifecycle"] == "open"
                     and int(diag["wake_inbox_seq"]) > last_wake_seq[0]
                 ):
+                    ctx.urgent_hint = False
+                    ctx.cancel_hint = False
                     result_msgs = await _drain_all()
                     if not result_msgs:
                         last_wake_seq[0] = int(diag["wake_inbox_seq"])
                         holding.wake_inbox_seq = last_wake_seq[0]
                     return result_msgs
-                return []
+                if not ctx.urgent_hint and not ctx.cancel_hint:
+                    return []
 
             # 0-tool / final boundary: 0 SQL unless an urgent or cancel hint arrived!
             if final:

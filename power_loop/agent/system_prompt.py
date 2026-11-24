@@ -379,6 +379,12 @@ class SystemPromptBuilder:
         """Return current section names in order."""
         return list(self._sections.keys())
 
+    def clone(self) -> SystemPromptBuilder:
+        """Return a shallow copy of this builder preserving all sections and overrides."""
+        cloned = SystemPromptBuilder(use_defaults=False)
+        cloned._sections = OrderedDict(self._sections)
+        return cloned
+
 
 # ---------------------------------------------------------------------------
 # Convenience defaults (backward-compatible)
@@ -475,15 +481,12 @@ def build_agent_system_prompt(
     If *builder* is ``None`` a default builder with all sections is used.
     *extra* is appended at the end.
     """
-    b = builder if builder is not None else SystemPromptBuilder()
+    source = builder if builder is not None else SystemPromptBuilder()
     if extra and extra.strip():
-        b = SystemPromptBuilder(use_defaults=False)
-        # Copy sections from source builder
-        for name in (builder or SystemPromptBuilder()).section_names():
-            section = BUILTIN_SECTIONS.get(name)
-            if section:
-                b.add(name, section)
+        b = source.clone()
         b.add("extra", extra.strip())
+    else:
+        b = source
     return b.build(ctx)
 
 

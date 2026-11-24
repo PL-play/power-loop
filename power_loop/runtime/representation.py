@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
@@ -98,13 +98,18 @@ def resolve_send_projections(
             if prev is None or int(r.id or 0) >= int(prev.id or 0):
                 by_kind[r.kind] = r
 
-        if "seed" in by_kind:
-            resolved[si] = [by_kind["seed"]]
-            continue
-
+        seed_row = by_kind.get("seed")
         u_row = by_kind.get("user")
         p_row = by_kind.get("project")
         rep_row = by_kind.get("repaired")
+
+        if seed_row is not None and not (
+            rep_row is not None
+            and rep_row.id is not None
+            and int(rep_row.id) > int(seed_row.id or 0)
+        ):
+            resolved[si] = [seed_row]
+            continue
 
         max_normal_id = max(
             int(u_row.id or 0) if u_row is not None else 0,
@@ -128,7 +133,20 @@ def resolve_send_projections(
             )
             if not replace_turn and u_row is not None:
                 selected.append(u_row)
-            selected.append(rep_row)
+            effective_rep = rep_row
+            if not replace_turn and not rep_msgs and p_row is not None and rep_content.get("folded_on_400"):
+                p_content = p_row.content if isinstance(p_row.content, dict) else {}
+                p_final = p_content.get("final_text")
+                if isinstance(p_final, str) and p_final.strip():
+                    rep_text = rep_row.rendered_text or str(rep_content.get("text") or "")
+                    if p_final.strip() not in rep_text:
+                        merged_text = f"{rep_text}\n{p_final.strip()}" if rep_text else p_final.strip()
+                        effective_rep = replace(
+                            rep_row,
+                            rendered_text=merged_text,
+                            content={**rep_content, "text": merged_text},
+                        )
+            selected.append(effective_rep)
         else:
             if u_row is not None:
                 selected.append(u_row)

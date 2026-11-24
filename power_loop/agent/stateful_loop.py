@@ -183,9 +183,6 @@ class _SessionSync:
     # + on release). The store is the truth (``inbox_counts``); this only backs the sync
     # ``pending_follow_up_count`` and registry cleanup.
     pending_hint: int = 0
-    # Set while a ``steer``-mode item waits undelivered (design/124 §7 interrupt points and
-    # waiting tools await it); cleared when the inbox is claimed.
-    steer: asyncio.Event = field(default_factory=asyncio.Event)
     refs: weakref.WeakValueDictionary = field(default_factory=weakref.WeakValueDictionary)
     users: int = 0
     # 运行中追加的轮数（6.46，extend_rounds）：正在跑的这个 send 在下一轮开始时把它加到轮数上限上。
@@ -674,13 +671,6 @@ class _ExecutionLoop:
             return False
         entry.round_bonus += int(rounds)
         return True
-
-    def steer_event(self, session_id: str) -> asyncio.Event:
-        """Set while an urgent inbox item for the session is undelivered; the tool batch
-        starts nothing new until the next round delivers it."""
-        return _session_sync(session_id).steer
-
-
 
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Drive ``coro`` to completion on the loop's dedicated sync event loop.
@@ -1176,6 +1166,11 @@ class _ExecutionLoop:
         history = _render_batch_history(history)
         history, hist_seqs, hist_ords, dropped_seqs, synthesized = align_tool_calls(
             history, hist_seqs, hist_ords)
+        if with_history:
+            historical_end_idx = next(
+                (idx for idx, s in enumerate(hist_seqs) if s is not None),
+                len(history),
+            )
         if dropped_seqs and config.repair_corrupt_history:
             await store.deactivate_messages(sid, dropped_seqs)
         sink.init_history_seqs(hist_seqs, hist_ords)
@@ -1211,13 +1206,19 @@ class _ExecutionLoop:
                         return []
                     return await boundary(final=force)
 
+                worker_ctx = getattr(self, "_runtime_worker_context", None)
+                steer_event = (
+                    getattr(worker_ctx, "urgent_event", None)
+                    if worker_ctx is not None
+                    else None
+                )
                 pipeline = AgentPipeline(
                     llm=self.llm, config=runtime_config, tool_registry=effective_registry,
                     hooks=self._runner.hooks, bus=self._runner.event_bus, ctx=get_ctx(),
                     session_id=sid, stop_event=stop,
                     sink=sink, store=store, drain_follow_ups=_drain,
                     drain_follow_ups_final=lambda: _drain(force=True),
-                    steer_event=_session_sync(sid, owner=self).steer,
+                    steer_event=steer_event,
                 )
                 pipeline.send_index = current_send_index
                 pipeline._historical_end_idx = historical_end_idx

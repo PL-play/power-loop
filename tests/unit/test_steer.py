@@ -3,7 +3,8 @@
 - urgent input received during the model call does not cut it; the next round carries the input;
 - a non-urgent input does not interrupt anything;
 - a flag that can never be cleared can't spin the loop;
-- urgent input does not skip tools; the current model/tool round finishes intact.
+- urgent input interrupts between tools in a multi-tool batch (skipping unstarted calls);
+  in-flight tools finish intact.
 """
 
 from __future__ import annotations
@@ -309,11 +310,31 @@ async def test_urgent_input_does_not_interrupt_a_running_abort_mode_tool(store, 
 
 
 @pytest.mark.asyncio
-async def test_urgent_input_preserves_all_tools_in_the_current_round(store, runtime_agent) -> None:
+async def test_urgent_input_skips_unstarted_tools_in_the_current_round(store, runtime_agent) -> None:
+    bus = AgentEventBus()
+    interrupted = _events(bus, AgentEventType.STEER_INTERRUPTED)
     probe = _Probe()
+    fast_called = False
+    def _mark_fast(**kw: Any) -> str:
+        nonlocal fast_called
+        fast_called = True
+        return "fast result"
+
+    reg = _registry(probe, interrupt="finish")
+    reg.register(
+        ToolDefinition(
+            name="fast",
+            description="fast",
+            input_schema={"type": "object", "properties": {}},
+            pricing=Free("test_fixture"),
+        ),
+        _mark_fast,
+        overwrite=True,
+    )
+
     llm = _LLM([_calls("slow", "fast"), "ok"])
-    loop = await runtime_agent(model=llm, store=store,
-                             registry=_registry(probe, interrupt="finish"),
+    loop = await runtime_agent(model=llm, store=store, event_bus=bus,
+                             registry=reg,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=3,
                                                     context_budget_tokens=10**9))
     sid = loop.target.session_id
@@ -323,9 +344,11 @@ async def test_urgent_input_preserves_all_tools_in_the_current_round(store, runt
     probe.release.set()
     res = await asyncio.wait_for(run, 5)
     assert res.status == "completed"
+    assert not fast_called
     tool_rows = [r for r in await store.load_active_messages(sid) if r.role == "tool"]
     assert tool_rows[0].content == "slow tool real result"
-    assert tool_rows[1].content == "fast result"
+    assert tool_rows[1].content.startswith("[skipped:")
+    assert any(e.get("where") == "between_tools" and e.get("tool_name") == "fast" for e in interrupted)
     assert any("wait" in str(m.get("content")) for m in llm.calls[1])
 
 
