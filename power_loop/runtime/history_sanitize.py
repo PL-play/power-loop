@@ -312,8 +312,9 @@ def sanitize_request_messages(messages: list[LoopMessage], *, strict: bool = Fal
         elif role == "tool":
             raw_tcid = str(msg.get("tool_call_id") or "").strip()
             remap_queue = pending_remap.get(raw_tcid)
-            if remap_queue:
-                msg["tool_call_id"] = remap_queue.popleft()
+            if not remap_queue:
+                continue
+            msg["tool_call_id"] = remap_queue.popleft()
         else:
             pending_remap = {}
         normalized.append(msg)
@@ -467,6 +468,91 @@ def _assistant_plain_text(content: Any) -> str:
     return ""
 
 
+def fold_tool_rounds_with_messages(
+    messages: list[LoopMessage],
+    *,
+    current_send_index: int,
+    historical_end_idx: int | None = None,
+) -> tuple[list[LoopMessage], dict[int, str], dict[int, list[LoopMessage]], str]:
+    """Line 3 (per-send_index): Fold historical tool rounds attributed to their ORIGINAL ``send_index``.
+
+    Returns ``(cleaned, folded_by_send, folded_messages_by_send, cur_folded_text)``.
+    Never squashes multiple historical turns into ``send_index - 1`` (Probe 10)!
+    Messages before ``historical_end_idx`` with structured ``tool_calls`` are folded into
+    ``folded_by_send[orig_send_index]`` using each message's ``_source_send_index`` (preserving
+    ``send_index=0``, non-tool ``assistant`` final text, and original ``user`` instructions in
+    ``folded_messages_by_send[orig_send_index]``).
+    If no historical structured tool rounds exist, falls back to folding active-turn tool rounds
+    into ``cur_folded_text`` (for ``current_send_index``).
+    """
+    hist_boundary = historical_end_idx if historical_end_idx is not None else 0
+    assistant_parts_by_send: dict[int, list[str]] = {}
+    turn_messages_by_send: dict[int, list[LoopMessage]] = {}
+    folded_sends: set[int] = set()
+    out: list[LoopMessage] = []
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        in_hist = i < hist_boundary
+        if in_hist:
+            raw_si = m.get("_source_send_index")
+            role = m.get("role")
+            if role == "assistant":
+                src_si = int(raw_si) if raw_si is not None else max(1, current_send_index - 1)
+                if m.get("tool_calls"):
+                    tcs = m.get("tool_calls") or []
+                    call_names = {
+                        str(tc.get("id")): (tc.get("function") or {}).get("name") or tc.get("name") or "tool"
+                        for tc in tcs
+                        if isinstance(tc, dict) and tc.get("id")
+                    }
+                    parts: list[str] = []
+                    lead = _assistant_plain_text(m.get("content"))
+                    if lead:
+                        parts.append(lead)
+                    j = i + 1
+                    while j < len(messages) and messages[j].get("role") == "tool":
+                        tm = messages[j]
+                        tname = tm.get("name") or call_names.get(str(tm.get("tool_call_id") or ""), "tool")
+                        snippet = str(tm.get("content") or "").replace("\n", " ")[:120]
+                        parts.append(f"[folded_tool:{tname}] {snippet}")
+                        j += 1
+                    ftxt = "\n".join(parts) or "[folded_tool_round]"
+                    folded_sends.add(src_si)
+                    assistant_parts_by_send.setdefault(src_si, []).append(ftxt)
+                    folded_msg: LoopMessage = {"role": "assistant", "content": ftxt, "_source_send_index": src_si}
+                    turn_messages_by_send.setdefault(src_si, []).append(folded_msg)
+                    out.append(folded_msg)
+                    i = j
+                    continue
+                final_part = _assistant_plain_text(m.get("content"))
+                if final_part:
+                    assistant_parts_by_send.setdefault(src_si, []).append(final_part)
+                turn_messages_by_send.setdefault(src_si, []).append(m)
+            elif raw_si is not None:
+                turn_messages_by_send.setdefault(int(raw_si), []).append(m)
+        out.append(m)
+        i += 1
+
+    if folded_sends:
+        cleaned = sanitize_llm_messages(out, strip_reasoning=True)
+        folded_by_send = {
+            si: "\n".join(assistant_parts_by_send[si])
+            for si in sorted(folded_sends)
+        }
+        folded_messages_by_send = {
+            si: sanitize_llm_messages(turn_messages_by_send[si], strip_reasoning=True)
+            for si in sorted(folded_sends)
+            if turn_messages_by_send.get(si)
+        }
+        return cleaned, folded_by_send, folded_messages_by_send, ""
+
+    cleaned, _hist_txt, cur_txt = fold_older_tool_rounds_for_retry(
+        messages, historical_end_idx=historical_end_idx
+    )
+    return cleaned, {}, {}, cur_txt
+
+
 def fold_tool_rounds_by_send_index(
     messages: list[LoopMessage],
     *,
@@ -482,56 +568,9 @@ def fold_tool_rounds_by_send_index(
     If no historical structured tool rounds exist, falls back to folding active-turn tool rounds
     into ``cur_folded_text`` (for ``current_send_index``).
     """
-    hist_boundary = historical_end_idx if historical_end_idx is not None else 0
-    assistant_parts_by_send: dict[int, list[str]] = {}
-    folded_sends: set[int] = set()
-    out: list[LoopMessage] = []
-    i = 0
-    while i < len(messages):
-        m = messages[i]
-        in_hist = i < hist_boundary
-        if in_hist and m.get("role") == "assistant":
-            raw_si = m.get("_source_send_index")
-            src_si = int(raw_si) if raw_si is not None else max(1, current_send_index - 1)
-            if m.get("tool_calls"):
-                tcs = m.get("tool_calls") or []
-                call_names = {
-                    str(tc.get("id")): (tc.get("function") or {}).get("name") or tc.get("name") or "tool"
-                    for tc in tcs
-                    if isinstance(tc, dict) and tc.get("id")
-                }
-                parts: list[str] = []
-                lead = _assistant_plain_text(m.get("content"))
-                if lead:
-                    parts.append(lead)
-                j = i + 1
-                while j < len(messages) and messages[j].get("role") == "tool":
-                    tm = messages[j]
-                    tname = tm.get("name") or call_names.get(str(tm.get("tool_call_id") or ""), "tool")
-                    snippet = str(tm.get("content") or "").replace("\n", " ")[:120]
-                    parts.append(f"[folded_tool:{tname}] {snippet}")
-                    j += 1
-                ftxt = "\n".join(parts) or "[folded_tool_round]"
-                folded_sends.add(src_si)
-                assistant_parts_by_send.setdefault(src_si, []).append(ftxt)
-                out.append({"role": "assistant", "content": ftxt, "_source_send_index": src_si})
-                i = j
-                continue
-            final_part = _assistant_plain_text(m.get("content"))
-            if final_part:
-                assistant_parts_by_send.setdefault(src_si, []).append(final_part)
-        out.append(m)
-        i += 1
-
-    if folded_sends:
-        cleaned = sanitize_llm_messages(out, strip_reasoning=True)
-        folded_by_send = {
-            si: "\n".join(assistant_parts_by_send[si])
-            for si in sorted(folded_sends)
-        }
-        return cleaned, folded_by_send, ""
-
-    cleaned, _hist_txt, cur_txt = fold_older_tool_rounds_for_retry(
-        messages, historical_end_idx=historical_end_idx
+    cleaned, folded_by_send, _folded_msgs_by_send, cur_txt = fold_tool_rounds_with_messages(
+        messages,
+        current_send_index=current_send_index,
+        historical_end_idx=historical_end_idx,
     )
-    return cleaned, {}, cur_txt
+    return cleaned, folded_by_send, cur_txt

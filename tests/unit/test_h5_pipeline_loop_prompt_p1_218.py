@@ -182,6 +182,36 @@ def test_h5_p1_7_missing_and_cross_turn_duplicate_and_suffix_collision_ids() -> 
     assert len(set(all_call_ids)) == 5
 
 
+def test_h5_p1_7_orphan_spoofing_dedup_id_does_not_steal_real_result() -> None:
+    # Reviewer counterexample: two calls with id 'x', results ['x'->first-real, 'x_dedup_1'->orphan, 'x'->second-real].
+    # Orphan MUST be dropped and both real results preserved in order.
+    messages = [
+        {"role": "user", "content": "run"},
+        {"role": "assistant", "content": "", "tool_calls": [_tc("x", "p1"), _tc("x", "p2")]},
+        {"role": "tool", "tool_call_id": "x", "name": "p1", "content": "first-real"},
+        {"role": "tool", "tool_call_id": "x_dedup_1", "name": "p2", "content": "orphan"},
+        {"role": "tool", "tool_call_id": "x", "name": "p2", "content": "second-real"},
+    ]
+    out = sanitize_request_messages(messages)
+    assert_valid_request(out)
+    call_ids = [tc["id"] for tc in out[1]["tool_calls"]]
+    tool_rows = [m for m in out if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_rows] == call_ids
+    assert [m["content"] for m in tool_rows] == ["first-real", "second-real"]
+
+    # Same protection when an orphan tries to spoof a generated missing-id ('repaired_1_0').
+    messages_missing = [
+        {"role": "user", "content": "run"},
+        {"role": "assistant", "content": "", "tool_calls": [_tc(None, "p1")]},
+        {"role": "tool", "tool_call_id": "repaired_1_0", "name": "p1", "content": "spoofed-orphan"},
+        {"role": "tool", "tool_call_id": None, "name": "p1", "content": "real-missing"},
+    ]
+    out2 = sanitize_request_messages(messages_missing)
+    assert_valid_request(out2)
+    tool_rows2 = [m for m in out2 if m["role"] == "tool"]
+    assert [m["content"] for m in tool_rows2] == ["real-missing"]
+
+
 # ── P1-8: trim_history orphan tool boundary termination ───────────────────────
 
 
@@ -383,6 +413,94 @@ async def test_h5_p1_9_normal_priority_does_not_skip_second_tool(runtime_agent) 
         await store.close()
 
 
+@pytest.mark.asyncio
+async def test_h5_p1_9_urgent_blocks_queued_concurrent_tool_waiting_on_semaphore(runtime_agent) -> None:
+    # Reviewer counterexample: 3 async_capable tools with concurrency=2.
+    # Tools one & two fill the semaphore; urgent arrives before releasing them.
+    # Tool three (queued in _pre waiting on semaphore) MUST NOT invoke its handler and MUST be skipped.
+    bus = AgentEventBus()
+    steer_events: list[dict[str, Any]] = []
+    bus.subscribe(AgentEventType.STEER_INTERRUPTED, lambda e: steer_events.append(dict(e.payload or {})))
+
+    entered = {"one": asyncio.Event(), "two": asyncio.Event()}
+    release = asyncio.Event()
+    called: list[str] = []
+
+    async def make_one(**kw: Any) -> str:
+        called.append("one")
+        entered["one"].set()
+        await release.wait()
+        return "res_one"
+
+    async def make_two(**kw: Any) -> str:
+        called.append("two")
+        entered["two"].set()
+        await release.wait()
+        return "res_two"
+
+    async def make_three(**kw: Any) -> str:
+        called.append("three")
+        return "res_three_should_not_run"
+
+    reg = ToolRegistry()
+    for name, fn in (("one", make_one), ("two", make_two), ("three", make_three)):
+        reg.register(
+            ToolDefinition(
+                name=name,
+                description=name,
+                input_schema={"type": "object", "properties": {}},
+                async_capable=True,
+                pricing=Free("test_fixture"),
+            ),
+            fn,
+        )
+
+    llm = _ScriptedLLM(
+        steps=[
+            LLMResponse(
+                raw_text="",
+                tool_calls=[_tc("c1", "one"), _tc("c2", "two"), _tc("c3", "three")],
+                token_usage=USAGE,
+            ),
+            LLMResponse(raw_text="saw urgent after queued skip", token_usage=USAGE),
+        ]
+    )
+    store = await SessionStore.open(":memory:")
+    try:
+        agent = await runtime_agent(
+            model=llm,
+            store=store,
+            registry=reg,
+            event_bus=bus,
+            config=AgentLoopConfig(
+                system_prompt="S",
+                max_rounds=4,
+                tool_batch_concurrency=2,
+                context_budget_tokens=10**9,
+            ),
+        )
+        run = asyncio.create_task(agent.send("run three"))
+        await asyncio.wait_for(asyncio.gather(entered["one"].wait(), entered["two"].wait()), 5)
+        await agent.runtime.client.send(
+            agent.target, "URGENT_STOP_QUEUED", priority="urgent", message_id="urg-sem-1", actor=agent.actor
+        )
+        release.set()
+        res = await asyncio.wait_for(run, 5)
+        assert res.status == "completed"
+        assert res.final_text == "saw urgent after queued skip"
+        assert called == ["one", "two"] or set(called) == {"one", "two"}
+        assert "three" not in called
+        tool_rows = [r for r in await store.load_active_messages(agent.target.session_id) if r.role == "tool"]
+        by_name = {r.name: r.content for r in tool_rows}
+        assert by_name["one"] == "res_one"
+        assert by_name["two"] == "res_two"
+        assert (by_name["three"] or "").startswith("[skipped:")
+        assert any(e.get("tool_name") == "three" and e.get("where") == "between_tools" for e in steer_events)
+        assert any("URGENT_STOP_QUEUED" in str(m.get("content")) for m in llm.requests[1].messages)
+    finally:
+        await store.close()
+
+
 # ── P1-10: concurrent task leak prevention & TOOL_ERROR retry cancel/NativeReturn ──
 
 
@@ -574,6 +692,69 @@ async def test_h5_p1_10_serial_tool_error_short_circuit_retry_honors_cancel_and_
     pipeline2 = _build_pipeline(llm2, registry=reg2, hooks=hooks)
     with pytest.raises(NativeReturnPending):
         await pipeline2.run([{"role": "user", "content": "run"}])
+
+
+@pytest.mark.asyncio
+async def test_h5_p1_10_cancelled_retry_with_cleanup_exception_leaves_no_unretrieved_task_exception() -> None:
+    # Reviewer counterexample: serial tool fails attempt 1, TOOL_ERROR SHORT_CIRCUIT retries,
+    # retry is cancelled under interrupt="abort", and its cleanup raises RuntimeError.
+    # Must return cancelled AND never trigger loop exception handler ("Task exception was never retrieved").
+    import gc
+
+    loop = asyncio.get_running_loop()
+    prev_handler = loop.get_exception_handler()
+    unhandled: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, ctx: unhandled.append(dict(ctx)))
+    try:
+        retry_started = asyncio.Event()
+        attempts = 0
+
+        async def flaky_bad_cleanup(**kw: Any) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient_first")
+            retry_started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise RuntimeError("tool cleanup failed") from None
+            return "never"
+
+        reg = ToolRegistry()
+        reg.register(
+            ToolDefinition(
+                name="flaky_cleanup",
+                description="flaky_cleanup",
+                input_schema={"type": "object", "properties": {}},
+                interrupt="abort",
+                pricing=Free("test_fixture"),
+            ),
+            flaky_bad_cleanup,
+        )
+        hooks = AgentHooks()
+        hooks.register(
+            HookPoint.TOOL_ERROR,
+            lambda ctx: setattr(ctx, "directive", HookDirective.SHORT_CIRCUIT),
+            name="t.retry_cleanup",
+        )
+        tok = CancellationToken()
+        llm = _ScriptedLLM(
+            steps=[LLMResponse(raw_text="", tool_calls=[_tc("c1", "flaky_cleanup")], token_usage=USAGE)]
+        )
+        pipeline = _build_pipeline(llm, registry=reg, hooks=hooks, cancel_token=tok)
+
+        task = asyncio.create_task(pipeline.run([{"role": "user", "content": "run"}]))
+        await asyncio.wait_for(retry_started.wait(), 5)
+        tok.cancel("abort during retry")
+        res = await asyncio.wait_for(task, 5)
+        assert res.status == "cancelled"
+        # Force GC of finished tasks so asyncio would report any unretrieved exception immediately.
+        gc.collect()
+        await asyncio.sleep(0)
+        assert unhandled == [], f"Unexpected unhandled loop exceptions: {unhandled}"
+    finally:
+        loop.set_exception_handler(prev_handler)
 
 
 # ── P1-11: truncation exhaustion isolation & hit_round_limit fixes ────────────
@@ -859,6 +1040,68 @@ async def test_h5_p1_12_e2e_http_400_fold_with_aligned_boundary_and_reload(runti
         turn3_text = "\n".join(str(m.get("content") or "") for m in calls_seen[-1])
         assert "SEED_FINAL_REPLY_0" in turn3_text
         assert "TURN1_FINAL_REPLY" in turn3_text
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_h5_p1_12_seed_context_http_400_preserves_user_instruction_folded_tool_and_final_answer(
+    runtime_agent,
+) -> None:
+    # Reviewer counterexample: client.seed_context writes send_index=0 with user instruction,
+    # tool call, tool result, and final answer. Send 1 hits HTTP 400 -> retry succeeds -> Send 2
+    # reloads repaired projection and MUST still see user instruction + folded tool + final answer.
+    class _Format400Error(Exception):
+        status_code = 400
+
+        def __init__(self) -> None:
+            super().__init__("invalid tool_call_id messages format")
+
+    calls_seen: list[list[dict[str, Any]]] = []
+    attempt = 0
+
+    async def scripted(req: LLMRequest) -> LLMResponse:
+        nonlocal attempt
+        attempt += 1
+        calls_seen.append([dict(m) for m in req.messages])
+        if attempt == 1:
+            raise _Format400Error()
+        return LLMResponse(raw_text=f"reply_{attempt}", token_usage=USAGE)
+
+    llm = _ScriptedLLM(steps=[scripted, scripted, scripted])
+    store = await SessionStore.open(":memory:")
+    try:
+        agent = await runtime_agent(
+            model=llm,
+            store=store,
+            registry=ToolRegistry(),
+            config=AgentLoopConfig(system_prompt="SYS", max_rounds=4, context_budget_tokens=10**9),
+        )
+        await agent.runtime.client.seed_context(
+            agent.target,
+            [
+                {"role": "user", "content": "SEED_ORIGINAL_USER_INSTRUCTION"},
+                {"role": "assistant", "content": "", "tool_calls": [_tc("s0", "probe")]},
+                {"role": "tool", "tool_call_id": "s0", "name": "probe", "content": "seed_tool_out"},
+                {"role": "assistant", "content": "SEED_FINAL_ANSWER"},
+            ],
+            actor=agent.actor,
+        )
+        res1 = await agent.send("first live question")
+        assert res1.status == "completed" and res1.final_text == "reply_2"
+        res2 = await agent.send("second live question")
+        assert res2.status == "completed" and res2.final_text == "reply_3"
+        assert len(calls_seen) == 3
+
+        for idx, msgs in enumerate(calls_seen):
+            joined = "\n".join(str(m.get("content") or "") for m in msgs)
+            assert "SEED_ORIGINAL_USER_INSTRUCTION" in joined, f"call {idx} lost user instruction: {msgs}"
+            assert "SEED_FINAL_ANSWER" in joined, f"call {idx} lost final answer: {msgs}"
+        # Both retry (call 1) and next send reload (call 2) carry folded tool summary without raw tool rows.
+        for idx in (1, 2):
+            joined = "\n".join(str(m.get("content") or "") for m in calls_seen[idx])
+            assert "[folded_tool:probe] seed_tool_out" in joined
+            assert all(m.get("role") != "tool" and not m.get("tool_calls") for m in calls_seen[idx])
     finally:
         await store.close()
 

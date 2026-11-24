@@ -307,6 +307,18 @@ def _round_usage_payload(*, round_index: int, max_rounds: int, usage: dict[str, 
     )
 
 
+_STEER_SKIPPED = object()
+
+
+def _consume_task_exception(task: asyncio.Future[Any]) -> None:
+    """Retrieve a finished task's exception so cancelled/timed-out cleanup errors never leak."""
+    if not task.cancelled():
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+
 @dataclass
 class _ToolOutcome:
     output: str
@@ -643,7 +655,11 @@ class AgentPipeline:
             for w in waiters.values():
                 w.cancel()
             work.cancel()
-            await asyncio.wait({work}, timeout=5)
+            done_cancel, _ = await asyncio.wait({work}, timeout=5)
+            if work in done_cancel:
+                _consume_task_exception(work)
+            else:
+                work.add_done_callback(_consume_task_exception)
             raise
         for w in waiters.values():
             if w not in done:
@@ -660,6 +676,7 @@ class AgentPipeline:
         self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore | None = None,
         *, tool_call_id: str | None = None, count: bool = True,
         tool_stop: asyncio.Future[ControlledLoopStop] | None = None,
+        check_steer: bool = False,
     ) -> asyncio.Future:
         """Run one tool call as its own task with its OWN stop token (a child of the run's —
         design/124 §8.2), exposed to the handler as the current cancel token. Stopping the run
@@ -667,9 +684,11 @@ class AgentPipeline:
         tok = self.cancel_token.child()
         assistant_seq = getattr(self.sink, "persisted_assistant_seq", None)
 
-        async def invoke() -> tuple[str, bool] | None:
+        async def invoke() -> Any:
             if tool_stop is not None and tool_stop.done():
                 return None
+            if check_steer and self._steer_pending():
+                return _STEER_SKIPPED
             task = asyncio.current_task()
             assert task is not None
             self._tool_tokens[task] = tok
@@ -686,7 +705,7 @@ class AgentPipeline:
             finally:
                 self._tool_tokens.pop(task, None)
 
-        async def _run() -> tuple[str, bool] | None:
+        async def _run() -> Any:
             if sem is None:
                 return await invoke()
             async with sem:
@@ -706,19 +725,30 @@ class AgentPipeline:
                  else f"用户要求停止（{self.cancel_token.reason}）")
         if mode == "abort":
             work.cancel()
-            await asyncio.wait({work}, timeout=pol.abort_tool_s)
+            done, _ = await asyncio.wait({work}, timeout=pol.abort_tool_s)
+            if work in done:
+                _consume_task_exception(work)
+            else:
+                work.add_done_callback(_consume_task_exception)
             return _ToolOutcome(f"[stopped: {label}，这个调用已中止，结果没有产生。]", False)
         grace = pol.subtask_s if mode == "background" else pol.finish_tool_s
         done, _ = await asyncio.wait({work}, timeout=grace)
         if work in done and not work.cancelled():
             stop_note = f"[stopped: {label}；这个调用在停止前收了尾，下面是它交回的结果]\n"
             try:
-                out, failed = work.result()
+                res = work.result()
             except Exception as exc:  # noqa: BLE001
                 return _ToolOutcome(f"Error: {exc}", True, stop_note=stop_note)
+            if res is None or res is _STEER_SKIPPED:
+                return _ToolOutcome(f"[stopped: {label}，这个调用未启动。]", False)
+            out, failed = res
             return _ToolOutcome(out, failed, returned=not failed, stop_note=stop_note)
         work.cancel()
-        await asyncio.wait({work}, timeout=pol.abort_tool_s)
+        done_abort, _ = await asyncio.wait({work}, timeout=pol.abort_tool_s)
+        if work in done_abort:
+            _consume_task_exception(work)
+        else:
+            work.add_done_callback(_consume_task_exception)
         return _ToolOutcome(f"[stopped: {label}；这个调用 {grace:.0f} 秒内没有结束，已强制中止，"
                             "结果不完整或没有。]", False)
 
@@ -770,7 +800,7 @@ class AgentPipeline:
                     raise stop  # The serial call raised directly in the loop.
                 if work.done():
                     result = None if work.cancelled() else work.result()
-                    if result is None:
+                    if result is None or result is _STEER_SKIPPED:
                         return None
                     output, failed = result
                     return _ToolOutcome(output, failed, returned=not failed)
@@ -1268,7 +1298,7 @@ class AgentPipeline:
                            round_index=round_index, stream_id="main")
 
         from power_loop.runtime.history_sanitize import (
-            fold_tool_rounds_by_send_index,
+            fold_tool_rounds_with_messages,
             sanitize_request_messages,
         )
         from power_loop.runtime.retry import request_repair_kind
@@ -1482,10 +1512,12 @@ class AgentPipeline:
                     if kind == "format":
                         hist_end = getattr(self, "_historical_end_idx", None)
                         cur_si = int(self.send_index or 1)
-                        folded_msgs, folded_by_send, cur_folded = fold_tool_rounds_by_send_index(
-                            pre_sanitize_messages,
-                            current_send_index=cur_si,
-                            historical_end_idx=hist_end,
+                        folded_msgs, folded_by_send, folded_msgs_by_send, cur_folded = (
+                            fold_tool_rounds_with_messages(
+                                pre_sanitize_messages,
+                                current_send_index=cur_si,
+                                historical_end_idx=hist_end,
+                            )
                         )
                         if self.store is not None and self.session_id:
                             from power_loop.runtime.session_ownership import current_ownership
@@ -1498,16 +1530,20 @@ class AgentPipeline:
                             )
                             if folded_by_send:
                                 for orig_si, f_text in sorted(folded_by_send.items()):
+                                    rep_content: dict[str, Any] = {
+                                        "folded_on_400": True,
+                                        "scope": "historical",
+                                        "orig_send_index": orig_si,
+                                        "text": f_text,
+                                    }
+                                    turn_msgs = folded_msgs_by_send.get(orig_si)
+                                    if turn_msgs:
+                                        rep_content["messages"] = turn_msgs
                                     await self.store.upsert_repaired_projection(
                                         self.session_id,
                                         send_index=orig_si,
                                         rendered_text=f_text,
-                                        content={
-                                            "folded_on_400": True,
-                                            "scope": "historical",
-                                            "orig_send_index": orig_si,
-                                            "text": f_text,
-                                        },
+                                        content=rep_content,
                                         ownership=ownership,
                                     )
                             elif cur_folded:
@@ -2398,8 +2434,10 @@ class AgentPipeline:
                             # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
                             # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
                             _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
-                            pre_task = self._start_tool(tool_name, tool_args, _pre_sem,
-                                                        tool_call_id=call_id, tool_stop=_tool_stop)
+                            pre_task = self._start_tool(
+                                tool_name, tool_args, _pre_sem,
+                                tool_call_id=call_id, tool_stop=_tool_stop, check_steer=True,
+                            )
                             _active_work = pre_task
                             for j in _eligible:
                                 if _tool_stop is not None and _tool_stop.done():
@@ -2421,6 +2459,8 @@ class AgentPipeline:
                                     await self._stop_tool_batch(tool_calls, i, _pre, stop, round_idx, signal=_tool_stop)
                                 if _tool_stop is not None and _tool_stop.done():
                                     break
+                                if self._steer_pending():
+                                    break
                                 if tb_j.directive == HookDirective.SKIP:
                                     _pre_skip[j] = tb_j
                                     continue
@@ -2428,12 +2468,16 @@ class AgentPipeline:
                                            ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
                                                                   tool_call_id=str(tc_j.get("id") or "")),
                                            round_index=round_idx)
-                                _pre[j] = (self._start_tool(tb_j.tool_name, tb_j.tool_args, _pre_sem,
-                                    tool_call_id=str(tc_j.get("id") or ""), tool_stop=_tool_stop), tb_j)
+                                _pre[j] = (self._start_tool(
+                                    tb_j.tool_name, tb_j.tool_args, _pre_sem,
+                                    tool_call_id=str(tc_j.get("id") or ""),
+                                    tool_stop=_tool_stop, check_steer=True,
+                                ), tb_j)
 
                     # ── Business logic: execute tool ──
                     failed = False
                     _stopped = False
+                    _steer_skipped = False
                     _work = pre_task
                     _active_work = _work
                     try:
@@ -2445,7 +2489,10 @@ class AgentPipeline:
                                 _active_work = _work
                             _res, _why = await self._race(_work, tool_stop=_tool_stop)
                             if _why == "done":
-                                output, failed = _res
+                                if _res is _STEER_SKIPPED:
+                                    _steer_skipped = True
+                                else:
+                                    output, failed = _res
                             else:
                                 outcome = await self._settle_stopped_tool(_work, self._interrupt_mode(tool_name))
                                 output, failed = outcome.stop_note + outcome.output, outcome.failed
@@ -2523,6 +2570,20 @@ class AgentPipeline:
                     finally:
                         if _active_work is not None and _active_work.done():
                             _active_work = None
+
+                    if _steer_skipped:
+                        await self._resolve_skipped_tool_calls(
+                            [tool_call], reason=self.STEER_SKIP_REASON, round_idx=round_idx,
+                        )
+                        self._emit(
+                            AgentEventType.STEER_INTERRUPTED,
+                            SteerInterruptedPayload(
+                                where="between_tools", action="skip", round_index=round_idx,
+                                tool_name=tool_name, tool_call_id=call_id, skipped=1,
+                            ),
+                            round_index=round_idx,
+                        )
+                        continue
 
                     # ── Hook: TOOL_AFTER ──
                     ta_ctx = await self._after_tool(tool_call, tb_ctx, output, failed, round_idx)
