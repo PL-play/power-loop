@@ -693,12 +693,12 @@ class WorkflowEngine:
             elif (
                 node.on_error == "continue"
                 and (
-                    (r is not None and r.status not in {"completed", "skipped"} and not self._is_tolerated(r))
+                    (r is not None and r.status not in {"completed", "skipped"})
                     or bscope.iter_broken
                     or any(not self._is_tolerated(fr) for fr in bscope.failed_results)
                 )
             ):
-                if r is not None and r.status not in {"completed", "skipped"} and not self._is_tolerated(r):
+                if r is not None and r.status not in {"completed", "skipped"}:
                     self._mark_tolerated(r)
                     self._errors.append(f"parallel branch {r.node_id}: {r.status}")
                 elif bscope.iter_broken:

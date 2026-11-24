@@ -1181,6 +1181,51 @@ async def test_h6_p1_15_nested_foreach_inner_continue_isolates_iterations():
     assert len(step1_errors) == 2, res.errors
 
 
+async def test_h6_p1_15_parallel_continue_leaf_with_continue_on_error_records_error_and_not_ok():
+    """P1-15 rework 3: Parallel(continue) still records failure and ok=False for continue_on_error leaf."""
+    ex = _StubForeachExec(fail_bodies={"bad-body"})
+    spec = WorkflowSpec.from_json({
+        "name": "parallel-continue-leaf-coe",
+        "root": {
+            "type": "sequence",
+            "steps": [
+                {
+                    "type": "parallel",
+                    "on_error": "continue",
+                    "branches": [
+                        {
+                            "type": "agent",
+                            "id": "bad",
+                            "input": "bad-body",
+                            "continue_on_error": True,
+                            "spec": {"name": "bad", "system_prompt": "p"},
+                        },
+                        {
+                            "type": "agent",
+                            "id": "good",
+                            "input": "good-body",
+                            "spec": {"name": "good", "system_prompt": "p"},
+                        },
+                    ],
+                },
+                {
+                    "type": "agent",
+                    "id": "tail",
+                    "input": "tail-body",
+                    "spec": {"name": "tail", "system_prompt": "p"},
+                },
+            ],
+        },
+    })
+    res = await WorkflowEngine(ex, run_id="r-pcoe", driver_sid="drv").run(spec)
+    assert res.status == "completed"
+    assert res.ok is False
+    assert "parallel branch bad: failed" in res.errors
+    assert res.results["bad"].status == "failed"
+    assert res.results["good"].status == "completed"
+    assert res.results["tail"].status == "completed"
+
+
 async def test_h6_p1_15_serial_foreach_continue_sequence_skips_step2_every_item():
     """P1-15 rework: Foreach(parallel=False, on_error='continue') skips step2 on every failed step1 and records all errors."""
     ex = _StubForeachExec(fail_bodies={"s1-a", "s1-b"})
