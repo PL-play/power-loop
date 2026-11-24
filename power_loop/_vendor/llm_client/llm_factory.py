@@ -9,6 +9,7 @@ model utilities, but adapted to zrag's `LLMService` Protocol.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -48,10 +49,33 @@ class ExactAsyncOpenAI(AsyncOpenAI):
     def __init__(self, *args, **options):
         client = options.get('http_client') or DefaultAsyncHttpxClient()
         options['http_client'] = configure_http_client(client)
+        options.setdefault('max_retries', 0)
         super().__init__(*args, **options)
 
     def _make_sse_decoder(self):
         return ExactSSEDecoder()
+
+
+@contextlib.asynccontextmanager
+async def _closing_stream(stream: Any) -> AsyncIterator[Any]:
+    if hasattr(stream, "__aenter__") and hasattr(stream, "__aexit__"):
+        async with stream as entered:
+            yield entered
+        return
+    try:
+        yield stream
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            res = close()
+            if inspect.isawaitable(res):
+                await res
+        else:
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                res = aclose()
+                if inspect.isawaitable(res):
+                    await res
 
 
 _PROXY_ENV_KEYS = (
@@ -173,6 +197,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             base_url=self._cfg.base_url,
             api_key=self._cfg.api_key,
             timeout=self._cfg.timeout_s,
+            max_retries=0,
             http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
         )
         return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
@@ -663,63 +688,61 @@ class OpenAICompatibleChatLLMService(LLMService):
             )
 
             try:
-                async for event in stream:
-                    delta_text = ""
-                    delta_think = ""
-                    last_event = event
-                    delta_tool_calls: Any = None
-                    aggregated_tool_calls: list[dict[str, Any]] = []
-                    delta = None
-                    choices = getattr(event, "choices", None)
-                    if isinstance(choices, list) and choices:
-                        choice0 = choices[0]
-                        delta = getattr(choice0, "delta", None)
-                    elif isinstance(choices, tuple) and choices:
-                        choice0 = choices[0]
-                        delta = getattr(choice0, "delta", None)
-                    else:
-                        # Some providers emit non-content events with empty choices.
-                        delta = getattr(event, "delta", None)
-                        if delta is None and hasattr(event, "model_dump"):
-                            try:
-                                dumped = event.model_dump()
-                                if isinstance(dumped, dict):
-                                    dumped_choices = dumped.get("choices")
-                                    if isinstance(dumped_choices, list) and dumped_choices:
-                                        choice0 = dumped_choices[0]
-                                        if isinstance(choice0, dict):
-                                            delta = choice0.get("delta")
-                            except Exception as exc:
-                                logger.error("[llm:stream] failed to extract delta from model_dump: %s", exc)
-
-                    try:
-                        delta_text, delta_think = _extract_delta_text_and_think(delta)
-                        delta_tool_calls = _extract_delta_tool_calls(delta)
-                        aggregated_tool_calls = _merge_tool_calls_delta(delta_tool_calls)
-                    except Exception as e:
+                async with _closing_stream(stream) as active_stream:
+                    async for event in active_stream:
                         delta_text = ""
                         delta_think = ""
-                        delta_tool_calls = None
-                        aggregated_tool_calls = [tool_call_store[k] for k in tool_call_order]
-                        logger.error("[llm:stream] failed to extract delta: %s", e)
-                    response_metrics.add(event)
-                    extracted = response_metrics.snapshot()
-                    if extracted['usage'] is not None:
-                        final_usage = LLMTokenUsage(**extracted['usage'])
-                        self._last_usage = dict(extracted['usage'])
+                        last_event = event
+                        delta_tool_calls: Any = None
+                        aggregated_tool_calls: list[dict[str, Any]] = []
+                        delta = None
+                        choices = getattr(event, "choices", None)
+                        if isinstance(choices, list) and choices:
+                            choice0 = choices[0]
+                            delta = getattr(choice0, "delta", None)
+                        elif isinstance(choices, tuple) and choices:
+                            choice0 = choices[0]
+                            delta = getattr(choice0, "delta", None)
+                        else:
+                            # Some providers emit non-content events with empty choices.
+                            delta = getattr(event, "delta", None)
+                            if delta is None and hasattr(event, "model_dump"):
+                                try:
+                                    dumped = event.model_dump()
+                                    if isinstance(dumped, dict):
+                                        dumped_choices = dumped.get("choices")
+                                        if isinstance(dumped_choices, list) and dumped_choices:
+                                            choice0 = dumped_choices[0]
+                                            if isinstance(choice0, dict):
+                                                delta = choice0.get("delta")
+                                except Exception as exc:
+                                    logger.error("[llm:stream] failed to extract delta from model_dump: %s", exc)
 
-                    if delta_text or delta_think or delta_tool_calls:
-                        if delta_text:
-                            aggregated_text += str(delta_text)
-                        yield LLMStreamChunk(
-                            delta_text=delta_text,
-                            think=delta_think,
-                            delta_tool_calls=delta_tool_calls,
-                            tool_calls=aggregated_tool_calls,
-                            token_usage=None,
-                            raw_event=event,
-                            is_final=False,
-                        )
+                        try:
+                            delta_text, delta_think = _extract_delta_text_and_think(delta)
+                            delta_tool_calls = _extract_delta_tool_calls(delta)
+                            aggregated_tool_calls = _merge_tool_calls_delta(delta_tool_calls)
+                        except Exception as e:
+                            delta_text = ""
+                            delta_think = ""
+                            delta_tool_calls = None
+                            aggregated_tool_calls = [tool_call_store[k] for k in tool_call_order]
+                            logger.error("[llm:stream] failed to extract delta: %s", e)
+                        if response_metrics.should_inspect(event):
+                            response_metrics.add(event)
+
+                        if delta_text or delta_think or delta_tool_calls:
+                            if delta_text:
+                                aggregated_text += str(delta_text)
+                            yield LLMStreamChunk(
+                                delta_text=delta_text,
+                                think=delta_think,
+                                delta_tool_calls=delta_tool_calls,
+                                tool_calls=aggregated_tool_calls,
+                                token_usage=None,
+                                raw_event=event,
+                                is_final=False,
+                            )
                 break
             except Exception as e:
                 if not resume_enabled or restart_count >= max_restarts:
@@ -749,6 +772,9 @@ class OpenAICompatibleChatLLMService(LLMService):
                 continue
 
         extracted = response_metrics.snapshot()
+        if extracted['usage'] is not None:
+            final_usage = LLMTokenUsage(**extracted['usage'])
+            self._last_usage = dict(extracted['usage'])
         # Final chunk carries best-effort usage + last raw event so callers can inspect finish_reason, tool_calls, etc.
         yield LLMStreamChunk(
             delta_text="",
@@ -758,7 +784,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             token_usage=final_usage,
             raw_event=last_event,
             provider_cost=ProviderCost(**extracted['cost']) if extracted['cost'] is not None else None,
-            response_metrics=response_metrics.snapshot(),
+            response_metrics=extracted,
             is_final=True,
         )
 

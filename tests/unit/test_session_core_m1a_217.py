@@ -53,7 +53,7 @@ pytestmark = [pytest.mark.unit]
 
 
 def test_version_stable_api_and_workflow_import():
-    assert power_loop.__version__ == "14.0.1"
+    assert power_loop.__version__ == "14.1.0"
     for sym in ("WakeTransport", "InMemoryWakeTransport", "DatabasePollingWakeTransport", "result_message_id"):
         assert sym in power_loop.STABLE_API
         assert sym in power_loop.__all__

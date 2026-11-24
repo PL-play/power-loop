@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import functools
 import json
 import re
 from dataclasses import asdict, dataclass, fields
@@ -11,6 +12,18 @@ from typing import Protocol
 
 from ._vendor.llm_client.interface import LLMTokenUsage
 from ._vendor.llm_client.usage_normalization import normalize_usage
+
+_DEFAULT_USAGE_ROOTS = frozenset(
+    ('usage', 'x_openai_usage', 'x_usage', 'usage_metadata', 'usageMetadata', 'message')
+)
+_DEFAULT_COST_ROOTS = frozenset(('usage', 'x_openai_usage', 'x_usage', 'data'))
+
+
+def _path_root(path) -> str | None:
+    if not isinstance(path, str) or not path:
+        return None
+    root = path.replace('[', '.').replace(']', '').split('.', 1)[0]
+    return root or None
 
 
 class ResponseExtractionError(ValueError):
@@ -146,14 +159,8 @@ class DefaultCostExtractor:
         return None
 
 
-def compile_extractor(code):
-    """Trusted host extension; deliberately unavailable in the admin editor.
-
-    The snippet declares extract(response). Imports, loops, private attributes,
-    arbitrary builtins and mutation of the original response are unavailable.
-    """
-    if not isinstance(code, str) or len(code) > 16000:
-        raise ResponseExtractionError('invalid extractor code size')
+@functools.lru_cache(maxsize=128)
+def _compile_extractor_cached(code: str):
     tree = ast.parse(code)
     nodes = list(ast.walk(tree))
     if len(nodes) > 1000 or any(isinstance(n, (ast.Import, ast.ImportFrom, ast.While, ast.For,
@@ -171,6 +178,21 @@ def compile_extractor(code):
     if not callable(function):
         raise ResponseExtractionError('code must declare extract(response)')
     return function
+
+
+def compile_extractor(code):
+    """Trusted host extension; deliberately unavailable in the admin editor.
+
+    The snippet declares extract(response). Imports, loops, private attributes,
+    arbitrary builtins and mutation of the original response are unavailable.
+    """
+    if not isinstance(code, str) or len(code) > 16000:
+        raise ResponseExtractionError('invalid extractor code size')
+    return _compile_extractor_cached(code)
+
+
+compile_extractor.cache_info = _compile_extractor_cached.cache_info  # type: ignore[attr-defined]
+compile_extractor.cache_clear = _compile_extractor_cached.cache_clear  # type: ignore[attr-defined]
 
 
 class FieldTokenUsageExtractor:
@@ -206,6 +228,42 @@ class ResponseMetrics:
                 raise ResponseExtractionError('invalid extraction error policy')
         self.usage_extractor = usage_extractor
         self.cost_extractor = cost_extractor
+        self._watch_roots = self._compute_watch_roots()
+
+    def _compute_watch_roots(self) -> frozenset[str] | None:
+        roots: set[str] = set()
+        usage_rule = self.config.get('usage') or {}
+        if self.usage_extractor is not None or usage_rule.get('code'):
+            return None
+        if usage_rule.get('paths'):
+            for path in usage_rule['paths'].values():
+                root = _path_root(path)
+                if root:
+                    roots.add(root)
+        else:
+            roots.update(_DEFAULT_USAGE_ROOTS)
+
+        cost_rule = self.config.get('cost') or {}
+        if self.cost_extractor is not None or cost_rule.get('code'):
+            return None
+        if cost_rule.get('amount_path'):
+            for key in ('amount_path', 'currency_path'):
+                root = _path_root(cost_rule.get(key))
+                if root:
+                    roots.add(root)
+        else:
+            roots.update(_DEFAULT_COST_ROOTS)
+        return frozenset(roots)
+
+    def should_inspect(self, response) -> bool:
+        if self._watch_roots is None:
+            return True
+        if isinstance(response, dict):
+            return any(response.get(key) is not None for key in self._watch_roots)
+        extra = getattr(response, 'model_extra', None)
+        if isinstance(extra, dict) and any(extra.get(key) is not None for key in self._watch_roots):
+            return True
+        return any(getattr(response, key, None) is not None for key in self._watch_roots)
 
     def extract_usage(self, response):
         rule = self.config.get('usage') or {}
@@ -260,7 +318,12 @@ class ResponseMetricAccumulator:
         self.errors = []
         self.sources = {}
 
+    def should_inspect(self, response) -> bool:
+        return self.parser.should_inspect(response)
+
     def add(self, response):
+        if not self.parser.should_inspect(response):
+            return
         try:
             value = self.parser.inspect(response)
         except Exception as exc:

@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from power_loop.core.agent_context import get_ctx
+from power_loop.core.agent_context import get_ctx, get_current_cancel_token
 from power_loop.runtime.env import get_runtime_env, safe_path
 from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.process_control import bind_shell_control, stop_shell_target
@@ -110,6 +111,11 @@ def _truncate_chars(text: str, limit: int | None = None) -> str:
 # _truncate_lines' 30+170 display window, so capping here never changes the rendered output.
 _BASH_HEAD_KEEP = 256
 _BASH_TAIL_KEEP = 2048
+_BASH_QUEUE_MAXSIZE = 256
+_BASH_READER_MAX_LINE_BYTES = 16 * 1024
+_BASH_HEAD_MAX_BYTES = 512 * 1024
+_BASH_TAIL_MAX_BYTES = 1536 * 1024
+_BASH_CANCEL_POLL_S = 0.1
 
 
 def _truncate_lines(lines: list[str], head: int = 30, tail: int = 170) -> str:
@@ -191,7 +197,7 @@ def _guard_excerpt(fp: Path, anchor: str | None) -> str:
     try:
         if not fp.exists():
             return ""
-        text = _read_text(fp, max_bytes=None)
+        text = _read_text(fp, max_bytes=TEXT_FILE_MAX_BYTES)
     except Exception:  # noqa: BLE001 — 现场读不到就退回纯报错，绝不能让闸本身抛
         return ""
     if anchor:
@@ -472,7 +478,8 @@ class BashSession:
         self._cwd = cwd
         self._backend: ShellBackend = backend or DEFAULT_SHELL_BACKEND
         self._proc: subprocess.Popen[str] | None = None
-        self._q: queue.Queue[str] = queue.Queue()
+        self._q: queue.Queue[str] = queue.Queue(maxsize=_BASH_QUEUE_MAXSIZE)
+        self._reader_stop = threading.Event()
         self._master_fd: int | None = None
         self._lock = threading.Lock()
         self._start()
@@ -513,16 +520,41 @@ class BashSession:
             raise
         os.close(slave_fd)
         self._master_fd = master_fd
-        self._q = queue.Queue()
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._q = queue.Queue(maxsize=_BASH_QUEUE_MAXSIZE)
+        self._reader_stop = threading.Event()
+        threading.Thread(
+            target=self._reader,
+            args=(master_fd, self._q, self._reader_stop),
+            daemon=True,
+        ).start()
 
-    def _reader(self) -> None:
+    @staticmethod
+    def _enqueue_line(q: queue.Queue[str], line: str, stop_event: threading.Event) -> None:
+        for offset in range(0, len(line), _BASH_READER_MAX_LINE_BYTES):
+            chunk = line[offset : offset + _BASH_READER_MAX_LINE_BYTES]
+            while not stop_event.is_set():
+                try:
+                    q.put(chunk, timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
+            if stop_event.is_set():
+                return
+
+    def _reader(
+        self,
+        fd: int | None = None,
+        q: queue.Queue[str] | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         buf = ""
-        fd = self._master_fd
+        fd = self._master_fd if fd is None else fd
+        q = self._q if q is None else q
+        stop_event = self._reader_stop if stop_event is None else stop_event
         if fd is None:
             return
         try:
-            while True:
+            while not stop_event.is_set():
                 try:
                     data = os.read(fd, 4096)
                 except OSError:
@@ -530,7 +562,7 @@ class BashSession:
                 if not data:
                     break
                 buf += data.decode("utf-8", errors="replace")
-                while True:
+                while not stop_event.is_set():
                     idx_n = buf.find("\n")
                     idx_r = buf.find("\r")
                     if idx_n == -1 and idx_r == -1:
@@ -538,42 +570,64 @@ class BashSession:
                     cut = min(i for i in (idx_n, idx_r) if i != -1)
                     line, buf = buf[:cut], buf[cut + 1 :]
                     if line:
-                        self._q.put(line)
-            if buf:
-                self._q.put(buf)
+                        self._enqueue_line(q, line, stop_event)
+                while len(buf) >= _BASH_READER_MAX_LINE_BYTES and not stop_event.is_set():
+                    chunk, buf = buf[:_BASH_READER_MAX_LINE_BYTES], buf[_BASH_READER_MAX_LINE_BYTES:]
+                    self._enqueue_line(q, chunk, stop_event)
+            if buf and not stop_event.is_set():
+                self._enqueue_line(q, buf, stop_event)
         except Exception:
             pass
 
-    def _drain_until(self, sentinel: str, timeout: int, idle_timeout: float = 5.0) -> tuple[list[str], str | None]:
-        # Bound in-memory accumulation (default-tools-4): the displayed output keeps only
-        # head+tail (via _truncate_lines), so a command emitting millions of lines must not buffer
-        # them all. Keep the first _BASH_HEAD_KEEP fully + the last _BASH_TAIL_KEEP in a ring,
-        # dropping the middle (both bounds comfortably exceed _truncate_lines' 30+170 window).
+    def _drain_until(
+        self,
+        sentinel: str,
+        timeout: int,
+        idle_timeout: float = 5.0,
+        cancel_token: Any = None,
+    ) -> tuple[list[str], str | None, bool]:
+        # Bound in-memory accumulation (default-tools-4 / P1-21): keep head+tail within both
+        # line and byte caps so multi-MB single-line or multi-million-line outputs stay bounded.
         from power_loop.runtime.bash_capture import current_bash_capture
 
         capture = current_bash_capture.get()
         head: list[str] = []
-        tail: deque[str] = deque(maxlen=_BASH_TAIL_KEEP)
+        head_bytes = 0
+        tail: deque[tuple[str, int]] = deque()
+        tail_bytes = 0
         dropped = 0
         exit_code: str | None = None
+        cancelled = False
         deadline = time.monotonic() + timeout
 
         def _accumulate(line: str) -> None:
-            nonlocal dropped
+            nonlocal dropped, head_bytes, tail_bytes
             if capture is not None:
                 capture.write_line(line)
-            if len(head) < _BASH_HEAD_KEEP:
+            line_bytes = len(line.encode("utf-8", errors="replace"))
+            if len(head) < _BASH_HEAD_KEEP and head_bytes + line_bytes <= _BASH_HEAD_MAX_BYTES:
                 head.append(line)
+                head_bytes += line_bytes
                 return
-            if len(tail) == _BASH_TAIL_KEEP:
+            if len(tail) >= _BASH_TAIL_KEEP:
+                _, evicted_bytes = tail.popleft()
+                tail_bytes -= evicted_bytes
                 dropped += 1
-            tail.append(line)
+            tail.append((line, line_bytes))
+            tail_bytes += line_bytes
+            while tail_bytes > _BASH_TAIL_MAX_BYTES and len(tail) > 1:
+                _, evicted_bytes = tail.popleft()
+                tail_bytes -= evicted_bytes
+                dropped += 1
 
         while True:
+            if cancel_token is not None and cancel_token.is_cancelled():
+                cancelled = True
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            wait = min(remaining, idle_timeout)
+            wait = min(remaining, idle_timeout, _BASH_CANCEL_POLL_S)
             try:
                 raw_line = self._q.get(timeout=wait)
             except queue.Empty:
@@ -589,7 +643,10 @@ class BashSession:
                 break
             _accumulate(line)
 
-        while not self._q.empty() and exit_code is None:
+        while not cancelled and not self._q.empty() and exit_code is None:
+            if cancel_token is not None and cancel_token.is_cancelled():
+                cancelled = True
+                break
             try:
                 line = _clean_terminal_line(self._q.get_nowait())
             except queue.Empty:
@@ -602,7 +659,7 @@ class BashSession:
             _accumulate(line)
 
         middle = [f"... ({dropped} line(s) omitted) ..."] if dropped else []
-        return head + middle + list(tail), exit_code
+        return head + middle + [line for line, _ in tail], exit_code, cancelled
 
     def execute(self, command: str, timeout: int = 120) -> str:
         env = get_runtime_env()
@@ -613,6 +670,10 @@ class BashSession:
         if policy_err:
             return policy_err
 
+        cancel_token = get_current_cancel_token()
+        if cancel_token is not None and cancel_token.is_cancelled():
+            return "exit_code=? (cancelled)\n(no output)"
+
         touch = getattr(self._backend, "touch", None)
         if touch is not None:
             try:
@@ -621,14 +682,16 @@ class BashSession:
                 logger.warning("shell backend touch failed", exc_info=True)
 
         with self._lock:
+            if cancel_token is not None and cancel_token.is_cancelled():
+                return "exit_code=? (cancelled)\n(no output)"
             if self._proc is None or self._proc.poll() is not None:
                 self._start()
 
             assert self._proc is not None and self._proc.stdin is not None
             sentinel = f"{SENTINEL_PREFIX}{uuid.uuid4().hex}___"
             # Tag every process this command starts (children inherit the env, the shell itself
-            # doesn't), so a timeout can kill them where they run. Killing only the local client
-            # is not enough under a sandbox backend: the command keeps running in the container.
+            # doesn't), so a timeout or cancellation can kill them where they run. Killing only
+            # the local client is not enough under a sandbox backend.
             tag = uuid.uuid4().hex
             full_cmd = f"export {_FG_TAG_VAR}={tag}\n{command}\nprintf '\\n{sentinel} %s\\n' $?\n"
             try:
@@ -638,33 +701,58 @@ class BashSession:
                 self._restart_locked()
                 return "Error: Bash session crashed and was restarted. Please retry the command."
 
-            lines, exit_code = self._drain_until(sentinel, timeout=timeout)
-            timed_out = exit_code is None
-            if timed_out:
+            lines, exit_code, cancelled = self._drain_until(sentinel, timeout=timeout, cancel_token=cancel_token)
+            timed_out = exit_code is None and not cancelled
+            if cancelled or timed_out:
                 stopped = stop_shell_target(self._control_target, tag, variable=_FG_TAG_VAR, grace_s=0)
                 if not stopped.confirmed:
                     lines.append("Process stop unconfirmed: " + str(stopped.error))
                 self._restart_locked()
 
         header = f"exit_code={exit_code or '?'}"
-        if timed_out:
+        if cancelled:
+            header += " (cancelled; bash session was restarted)"
+        elif timed_out:
             header += f" (timed out after {timeout}s; bash session was restarted)"
         body = _truncate_lines(lines) if lines else "(no output)"
         return _truncate_chars(f"{header}\n{body}")
 
-    def _restart_locked(self) -> None:
+    def _stop_proc_locked(self) -> None:
+        self._reader_stop.set()
         if self._master_fd is not None:
             try:
                 os.close(self._master_fd)
             except OSError:
                 pass
             self._master_fd = None
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        if proc.stdin is not None:
             try:
-                self._proc.wait(timeout=3)
+                proc.stdin.close()
+            except OSError:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=1)
             except Exception:
-                self._proc.kill()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+
+    def _restart_locked(self) -> None:
+        self._stop_proc_locked()
         self._start()
 
     def restart(self) -> str:
@@ -678,19 +766,7 @@ class BashSession:
 
     def close(self) -> None:
         with self._lock:
-            if self._master_fd is not None:
-                try:
-                    os.close(self._master_fd)
-                except OSError:
-                    pass
-                self._master_fd = None
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=3)
-                except Exception:
-                    self._proc.kill()
-            self._proc = None
+            self._stop_proc_locked()
 
 
 # Process-global cache of persistent shells, keyed by backend.session_key. Bounded
@@ -771,7 +847,7 @@ def run_bash(command: str | None = None, restart: bool = False, timeout: int = 1
             if capture.error:
                 return f'Error: complete bash capture failed ({capture.error}); command may have executed.\n{result}'
             if capture.lines:
-                return result.split('\n', 1)[0] + '\n' + capture.path.read_text(encoding='utf-8')
+                return result.split('\n', 1)[0] + '\n' + capture.read_text()
             return result
     return bash.execute(command, timeout=timeout)
 
@@ -884,7 +960,7 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         if kind == "unread":
             return (f"Error: File has not been read yet. Use read_file first before modifying: "
                     f"{_display_path(fp)}") + _guard_excerpt(fp, old_text)
-        raw_content = _read_text(fp, max_bytes=None)
+        raw_content = _read_text(fp, max_bytes=TEXT_FILE_MAX_BYTES)
         if kind == "stale":
             _probe = _normalize_to_lf(_split_bom(raw_content)[1])
             _hits = _probe.count(_normalize_to_lf(old_text))
@@ -1062,7 +1138,7 @@ def run_apply_patch(path: str, patch: str) -> str:
         read_err = _check_read_state(fp)
         if read_err:
             return read_err
-        raw_content = _read_text(fp, max_bytes=None)
+        raw_content = _read_text(fp, max_bytes=TEXT_FILE_MAX_BYTES)
         bom, content = _split_bom(raw_content)
         original_ending = _detect_line_ending(content)
         normalized = _normalize_to_lf(content)
@@ -1152,6 +1228,17 @@ def run_glob(pattern: str, path: str = ".", max_results: int = 100, include_hidd
         return f"Error: {e}"
 
 
+def _allowed_read_roots(base: Path) -> tuple[Path, ...]:
+    runtime_env = get_runtime_env()
+    if runtime_env.workspace_dir is not None:
+        roots = [runtime_env.workspace_dir.resolve()]
+        if runtime_env.home_dir is not None:
+            roots.extend(root.resolve() for root in runtime_env.home_rw_allowlist)
+        roots.extend(root.resolve() for root in runtime_env.read_only_roots)
+        return tuple(dict.fromkeys(roots))
+    return (base.parent.resolve() if base.is_file() else base.resolve(),)
+
+
 def _grep_with_python(
     pattern: str,
     base: Path,
@@ -1163,6 +1250,7 @@ def _grep_with_python(
 ) -> str:
     flags = 0 if case_sensitive else re.IGNORECASE
     compiled = re.compile(re.escape(pattern) if literal else pattern, flags)
+    allowed_roots = _allowed_read_roots(base)
     roots = [base] if base.is_file() else []
     if base.is_dir():
         for root, dirs, files in os.walk(base):
@@ -1179,8 +1267,15 @@ def _grep_with_python(
     results: list[str] = []
     for fp in roots:
         try:
-            data = fp.read_bytes()
-            if _looks_binary(data):
+            resolved = fp.resolve()
+            if not any(resolved.is_relative_to(root) for root in allowed_roots):
+                continue
+            st = resolved.stat()
+            if not stat.S_ISREG(st.st_mode) or st.st_size > TEXT_FILE_MAX_BYTES:
+                continue
+            with resolved.open("rb") as fh:
+                data = fh.read(TEXT_FILE_MAX_BYTES + 1)
+            if len(data) > TEXT_FILE_MAX_BYTES or _looks_binary(data):
                 continue
             text = data.decode("utf-8", errors="replace")
         except (OSError, UnicodeDecodeError):

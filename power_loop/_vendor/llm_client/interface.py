@@ -265,7 +265,7 @@ class LLMResponse:
     content_text: str = ""
     think: str = ""
     json_data: dict[str, Any] = field(default_factory=dict)
-    token_usage: LLMTokenUsage = field(default_factory=LLMTokenUsage)
+    token_usage: LLMTokenUsage | None = field(default_factory=LLMTokenUsage)
     parse_error: str | None = None
     debug: dict[str, Any] = field(default_factory=dict)
     # Best-effort extracted tool calls (if any). Providers may expose this on raw_message/raw_completion.
@@ -400,7 +400,7 @@ class LLMResponse:
 
         parts = [
             f"ok={self.ok}",
-            f"token_usage={self.token_usage.as_dict()}",
+            f"token_usage={self.token_usage.as_dict() if self.token_usage is not None else None}",
             f"has_raw_message={self.raw_message is not None}",
             f"has_raw_completion={self.raw_completion is not None}",
             f"tool_calls={len(self.tool_calls) or len(self.get_tool_calls())}",
