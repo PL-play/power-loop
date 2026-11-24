@@ -793,6 +793,7 @@ class RuntimeInputStore:
         while remaining:
             k = min(len(remaining), max(0, int(free_slots))) if can_execute else 0
             registered_claims: list[tuple[str, int]] = []
+            claim_started = time.monotonic()
             try:
                 try:
                     async with self.db.transaction() as tx:
@@ -828,7 +829,6 @@ class RuntimeInputStore:
                                 f"child depth exceeds max {self.store.max_spawn_depth}",
                             )
                         lease_until = database_now + ttl_ms
-                        claim_started = time.monotonic()
 
                         preclaimed: list[ClaimedBatch] = []
                         queued: list[TargetRef] = []

@@ -77,7 +77,8 @@ async def _delete_active_terminal_inbox(store, tx, *, cutoff_ms: int, limit: int
         "OR (f.status='delivered' AND f.terminal_status IS NULL AND f.delivered_at<? "
         "AND (s.session_id IS NULL OR f.delivered_send_index<s.send_index "
         "OR (f.delivered_send_index=s.send_index AND s.execution_state<>'running')))) "
-        "AND (s.session_id IS NULL OR NOT (s.session_kind='workflow_driver' AND s.start_input_message_id=f.item_id))"
+        "AND (s.session_id IS NULL OR NOT (s.session_kind='workflow_driver' "
+        "AND s.lifecycle IN ('open','suspended') AND s.start_input_message_id=f.item_id))"
     )
     params: list = [cutoff_ms, cutoff_ms]
     if session_id is not None:
@@ -97,7 +98,11 @@ async def _delete_active_terminal_inbox(store, tx, *, cutoff_ms: int, limit: int
         f"DELETE FROM {store.t.follow_up_queue} "
         f"WHERE id IN ({marks}) AND ("
         "(terminal_status IS NOT NULL AND completed_at<?) "
-        "OR (status='delivered' AND terminal_status IS NULL AND delivered_at<?))",
+        "OR (status='delivered' AND terminal_status IS NULL AND delivered_at<?)) "
+        f"AND NOT EXISTS (SELECT 1 FROM {store.t.sessions} s "
+        f"WHERE s.session_id={store.t.follow_up_queue}.session_id "
+        "AND s.session_kind='workflow_driver' AND s.lifecycle IN ('open','suspended') "
+        f"AND s.start_input_message_id={store.t.follow_up_queue}.item_id)",
         (*ids, cutoff_ms, cutoff_ms),
     )
 
@@ -133,10 +138,19 @@ async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: in
 
 
 async def _delete_orphan_shared_state(store, tx, *, cutoff_ms: int, limit: int, session_id: str | None) -> int:
-    """Clean expired ``shared:*`` rows in session_runtime_state with no owning session row."""
+    """Clean expired session-scoped ``shared:*`` rows with no owning session row.
+
+    Host-owned blackboards (``session_id LIKE 'blackboard:%'``) never have a
+    matching ``sessions`` row and are managed by the host via ``StoreBlackboard.delete()``,
+    so they are explicitly preserved.
+    """
     if limit <= 0:
         return 0
-    where = "r.state_key LIKE 'shared:%' AND r.updated_at<? AND s.session_id IS NULL"
+    where = (
+        "r.state_key LIKE 'shared:%' "
+        "AND r.session_id NOT LIKE 'blackboard:%' "
+        "AND r.updated_at<? AND s.session_id IS NULL"
+    )
     params: list = [cutoff_ms]
     if session_id is not None:
         where += " AND r.session_id=?"
@@ -154,7 +168,7 @@ async def _delete_orphan_shared_state(store, tx, *, cutoff_ms: int, limit: int, 
     return await tx.execute(
         f"DELETE FROM {store.t.session_runtime_state} "
         f"WHERE (session_id,state_key) IN ({marks}) "
-        "AND state_key LIKE 'shared:%' AND updated_at<? "
+        "AND state_key LIKE 'shared:%' AND session_id NOT LIKE 'blackboard:%' AND updated_at<? "
         f"AND NOT EXISTS (SELECT 1 FROM {store.t.sessions} s WHERE s.session_id={store.t.session_runtime_state}.session_id)",
         (*values, cutoff_ms),
     )
@@ -349,6 +363,7 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                     driver_params: tuple = ()
                     if (
                         state['session_kind'] == 'workflow_driver'
+                        and state['lifecycle'] in ('open', 'suspended')
                         and state['start_input_message_id'] is not None
                     ):
                         driver_clause = ' AND item_id<>?'
@@ -358,8 +373,8 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                         "session_id=? AND ("
                         "(terminal_status IS NOT NULL AND completed_at<?) "
                         "OR (status='delivered' AND terminal_status IS NULL AND delivered_at<? "
-                        "AND (delivered_send_index<? OR (delivered_send_index=? AND ?<>'running'))"
-                        f'{driver_clause}))',
+                        "AND (delivered_send_index<? OR (delivered_send_index=? AND ?<>'running')))"
+                        f"){driver_clause}",
                         (sid, cutoff['inbox'], cutoff['inbox'], cur_si, cur_si, execution_state, *driver_params),
                         remaining,
                     )

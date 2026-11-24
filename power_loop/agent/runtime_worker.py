@@ -570,11 +570,15 @@ class RuntimeWorker:
                 finally:
                     self._end_fuse(sid)
                 if recovered is None:
+                    if sid not in self._pending and sid not in self._active:
+                        self._drivers.discard(sid)
                     continue
                 reclaimed.append(recovered)
                 await self._notify_results(recovered)
                 if recovered.execution_state == "queued":
                     self._activate(sid)
+                elif sid not in self._pending and sid not in self._active:
+                    self._drivers.discard(sid)
             else:
                 self._begin_fuse(sid)
                 try:
@@ -1131,13 +1135,19 @@ class RuntimeWorker:
             # A normal final reports its pending snapshot; real new notifications
             # bridge the interval after that snapshot and before active.pop. After
             # pop the ordinary dispatcher waits on the same session lock for aclose.
+            requeued = False
             if driver_requeue:
+                requeued = True
                 self._activate(sid)
             elif normal_final is not None and ctx is not None and ctx.consumed is not None:
                 if normal_final.execution_state == "queued" or ctx.wake_pending:
+                    requeued = True
                     self._activate(sid)
             elif batch is not None and await self._has_pending(sid):
+                requeued = True
                 self._activate(sid)
+            if not requeued and sid not in self._pending:
+                self._drivers.discard(sid)
 
     def _capable(self, descriptor):
         """Cheap, synchronous capability decision used before any owner is written.

@@ -25,11 +25,12 @@ from power_loop import (
     LLMService,
     RegistryRuntimeFactory,
     Runtime,
+    RuntimeRequestError,
     SessionStore,
     ToolDefinition,
     ToolRegistry,
 )
-from power_loop.agent.runtime_store import RuntimeInputStore
+from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
 from power_loop.agent.system_prompt import build_skill_section
 from power_loop.contracts.errors import SessionLeaseLost
 from power_loop.contrib._redact import DEFAULT_VALUE_PATTERNS, resolve_redact, sanitize
@@ -631,3 +632,244 @@ async def test_h8_stateful_loop_projection_write_does_not_swallow_session_lease_
             )
     finally:
         await store.close()
+
+
+# ── Rework 1 regression tests (closing all 5 independent-review blockers) ────
+
+
+class _DummyLLM(LLMService):
+    async def complete(self, request, **kwargs):
+        return LLMResponse(raw_text="ok")
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_h8_rework1_open_workflow_cancelled_start_input_and_blackboard_preserved(registry_store):
+    """Rework 1:
+    1) Open workflow_driver's cancelled (void/cancelled) start input must be preserved by BOTH
+       regular purge_expired_page and supplementary active cleanup even when sessions.updated_at is aged >30d.
+       Once the workflow_driver is closed and expired, its start input can be purged cleanly.
+    2) Host-owned StoreBlackboard rows (session_id='blackboard:<id>') must NEVER be wiped by
+       orphan shared:* cleanup, while non-blackboard orphaned shared:* rows are still purged.
+    """
+    from power_loop import InputRef, StoreBlackboard
+    from power_loop.runtime.store.retention import DAY_MS
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    driver_desc = replace(DESCRIPTOR, kind="workflow_driver", definition_ref="wf-h8-r1@215")
+    driver = await port.create_session(driver_desc, actor=ACTOR)
+    start_id = "inp-wf-start-cancelled"
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET start_input_message_id=? WHERE session_id=?",
+        (start_id, driver.session_id),
+    )
+    await port.accept(driver, "run workflow", message_id=start_id, actor=ACTOR)
+    # Cancel unclaimed start input -> session is open/idle, start input is void/cancelled.
+    await port.cancel(
+        InputRef(store.store_id, driver.session_id, start_id),
+        reason="user_cancelled",
+        actor=ACTOR,
+    )
+
+    srow = await store._db.fetchone(
+        f"SELECT lifecycle, execution_state FROM {store.t.sessions} WHERE session_id=?",
+        (driver.session_id,),
+    )
+    qrow = await store._db.fetchone(
+        f"SELECT status, terminal_status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (driver.session_id, start_id),
+    )
+    assert srow["lifecycle"] == "open" and srow["execution_state"] == "idle"
+    assert qrow["status"] == "void" and qrow["terminal_status"] == "cancelled"
+
+    # Host-owned blackboard entry (no matching sessions row) + orphaned non-blackboard shared:* row.
+    board = StoreBlackboard(store)
+    await board.post("host-board-r1", text="host managed note", author="host")
+    await store.set_shared_state("h8-r1-orphan-session", "k_orphan", {"stale": True})
+
+    # Advance clock +31 days without refreshing sessions.updated_at (hits regular + supplementary paths).
+    future_now = now_ms() + 31 * DAY_MS
+    page = await store.purge_expired_page(now=future_now, limit=100)
+    assert page.deleted.get("inbox", 0) == 0
+
+    still_start = await store._db.fetchone(
+        f"SELECT item_id, terminal_status FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (driver.session_id, start_id),
+    )
+    assert still_start is not None and still_start["terminal_status"] == "cancelled"
+
+    entries = await board.read("host-board-r1")
+    assert len(entries) == 1 and entries[0].text == "host managed note"
+    assert await store.get_shared_state("h8-r1-orphan-session", "k_orphan") is None
+
+    # Once the workflow_driver is closed and aged, its expired start input CAN be purged.
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET lifecycle='closed' WHERE session_id=?",
+        (driver.session_id,),
+    )
+    page_closed = await store.purge_expired_page(now=future_now, limit=100)
+    assert page_closed.deleted.get("inbox", 0) >= 1
+    gone_start = await store._db.fetchone(
+        f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+        (driver.session_id, start_id),
+    )
+    assert gone_start is None
+    assert len(await board.read("host-board-r1")) == 1
+
+
+@pytest.mark.asyncio
+async def test_h8_rework1_runtime_worker_drivers_discarded_on_non_normal_paths():
+    """Rework 1: _drivers must discard workflow_driver IDs on external-coordinator early returns
+    (idle / incapable / acquire=None) AND on driver execution failure paths settled via _final_failed.
+    """
+    from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
+
+    store = await SessionStore.open(":memory:")
+    try:
+        driver_desc = replace(DESCRIPTOR, kind="workflow_driver", definition_ref="wf-drv-r1@215")
+        factory = RegistryRuntimeFactory()
+        factory.register(
+            "wf-drv-r1@215",
+            lambda _d, _c: ExecutionEnvironment(
+                _DummyLLM(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9),
+            ),
+        )
+
+        # 1) External coordinator path: idle, incapable, and acquire=None early returns.
+        coord = MemorySessionOwnershipCoordinator()
+        rt_ext = Runtime(store=store, factory=factory, coordinator=coord, node_id="n-ext", boot_id="b-ext")
+        port = rt_ext.worker.inputs
+        drv_idle = await port.create_session(driver_desc, actor=ACTOR)
+        await rt_ext.worker._run_session_owned(drv_idle.session_id)
+        assert drv_idle.session_id not in rt_ext.worker._drivers
+
+        incapable_desc = replace(DESCRIPTOR, kind="workflow_driver", definition_ref="wf-missing-ref@215")
+        drv_incap = await port.create_session(incapable_desc, actor=ACTOR)
+        await port.accept(drv_incap, "go", message_id="m-incap", actor=ACTOR)
+        await rt_ext.worker._run_session_owned(drv_incap.session_id)
+        assert drv_incap.session_id not in rt_ext.worker._drivers
+
+        drv_busy = await port.create_session(driver_desc, actor=ACTOR)
+        await port.accept(drv_busy, "go", message_id="m-busy", actor=ACTOR)
+        held = await coord.acquire(
+            (store.store_id, drv_busy.session_id),
+            owner_id="other/node",
+            ttl_s=30.0,
+            on_lost=lambda: None,
+        )
+        assert held is not None
+        try:
+            await rt_ext.worker._run_session_owned(drv_busy.session_id)
+            assert drv_busy.session_id not in rt_ext.worker._drivers
+        finally:
+            await coord.release(held)
+
+        # 2) Driver execution raising RuntimeRequestError -> settled via _final_failed -> discarded.
+        rt_fail = Runtime(store=store, factory=factory, node_id="n-fail", boot_id="b-fail")
+        drv_err = await rt_fail.worker.inputs.create_session(driver_desc, actor=ACTOR)
+        await rt_fail.worker.inputs.accept(drv_err, "boom", message_id="m-boom", actor=ACTOR)
+
+        import power_loop.workflow.runner as wf_runner
+
+        orig_run_driver = wf_runner.run_driver
+
+        async def _boom_driver(_worker, _ctx, _env):
+            raise RuntimeRequestError("workflow_failed", "simulated driver failure")
+
+        wf_runner.run_driver = _boom_driver  # type: ignore[assignment]
+        try:
+            await rt_fail.worker._run_session_owned(drv_err.session_id)
+        finally:
+            wf_runner.run_driver = orig_run_driver  # type: ignore[assignment]
+        assert drv_err.session_id not in rt_fail.worker._drivers
+    finally:
+        await store.close()
+
+
+def test_h8_rework1_owned_process_poll_after_close_no_typeerror(tmp_path):
+    """Rework 1: closing OwnedProcess before child exit must not cause poll()/wait()/returncode to raise TypeError."""
+    from power_loop.runtime.process_control import OwnedProcess
+
+    proc = OwnedProcess(["/bin/true"], cwd=str(tmp_path), env=dict(os.environ))
+    proc.close()
+    proc.process.wait(timeout=5)
+    rc = proc.poll()
+    assert isinstance(rc, int)
+    assert proc.wait(timeout=1) == rc
+    assert proc.returncode == rc
+    assert proc._control is None and proc._result_fd is None
+
+
+@pytest.mark.asyncio
+async def test_h8_rework1_create_many_samples_claim_clock_before_transaction():
+    """Rework 1: create_many must sample claimed_at_mono BEFORE entering the DB transaction,
+    not after reading parent_row/_db_now inside the transaction.
+    """
+    from contextlib import asynccontextmanager
+
+    from power_loop.agent.runtime_store import ChildSpec
+
+    store = await SessionStore.open(":memory:")
+    try:
+        port = RuntimeInputStore(store)
+        parent = await target(port, "h8-r1-cm-parent")
+        orig_tx = store._db.transaction
+        after_parent_fetch_mono: list[float] = []
+
+        @asynccontextmanager
+        async def _slow_tx(*args, **kwargs):
+            async with orig_tx(*args, **kwargs) as tx:
+                orig_fetchone = tx.fetchone
+
+                async def _delayed_fetchone(sql, params=()):
+                    row = await orig_fetchone(sql, params)
+                    if "_db_now" in sql:
+                        await asyncio.sleep(0.06)
+                        after_parent_fetch_mono.append(time.monotonic())
+                    return row
+
+                tx.fetchone = _delayed_fetchone  # type: ignore[method-assign]
+                yield tx
+
+        store._db.transaction = _slow_tx  # type: ignore[method-assign]
+        try:
+            spec = ChildSpec(
+                session_id="h8-r1-cm-child-1",
+                descriptor=DESCRIPTOR,
+                message_id="m-child-1",
+                body="hello child",
+                result_kind="agent_result",
+                cancel_propagation="linked",
+            )
+            cm_res = await port.create_many(
+                parent=parent,
+                actor=ACTOR,
+                specs=[spec],
+                free_slots=1,
+                can_execute=True,
+                node_id="n-cm",
+                boot_id="b-cm",
+                ttl_s=30.0,
+            )
+            preclaimed = cm_res.preclaimed
+        finally:
+            store._db.transaction = orig_tx  # type: ignore[method-assign]
+
+        assert len(preclaimed) == 1
+        assert len(after_parent_fetch_mono) == 1
+        claimed_mono = preclaimed[0].claimed_at_mono
+        assert claimed_mono is not None
+        assert claimed_mono <= after_parent_fetch_mono[0] - 0.05
+    finally:
+        await store.close()
+
+
+def test_h8_rework1_task_tables_compat_import_for_host_tests():
+    """Rework 1: TASK_TABLES stays importable as an empty tuple until agent/tests drops top-level imports."""
+    from power_loop.runtime.store import task_schema
+
+    assert task_schema.TASK_TABLES == ()
+    assert not hasattr(task_schema, "task_tables_ddl")

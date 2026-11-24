@@ -17,6 +17,8 @@ from .session_native_ddl import INDEXES
 
 TASK_SCHEMA_VERSION = 18
 TASK_PROTOCOL_VERSION = 43
+# Retained as an empty tuple for host test compatibility until agent/tests drops top-level imports.
+TASK_TABLES: tuple[str, ...] = ()
 
 
 async def verify_task_schema(db: Database, prefix: str) -> None:

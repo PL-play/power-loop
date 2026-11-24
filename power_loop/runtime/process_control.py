@@ -134,12 +134,21 @@ class OwnedProcess:
             if self._collected or self.process.returncode is None:
                 return
             fd, self._result_fd = self._result_fd, None
-            try:
-                data = os.read(fd, 128)
-                self._exitcode = int(data) if data else self.process.returncode
-            finally:
-                os.close(fd)
+            if fd is None:
+                self._exitcode = self.process.returncode
                 self._collected = True
+            else:
+                try:
+                    data = os.read(fd, 128)
+                    self._exitcode = int(data) if data else self.process.returncode
+                except OSError:
+                    self._exitcode = self.process.returncode
+                finally:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self._collected = True
         self.request_stop()
 
     @property
@@ -173,6 +182,9 @@ class OwnedProcess:
 
     def close(self):
         """Close control/result descriptors and process stdio streams idempotently."""
+        proc = getattr(self, 'process', None)
+        if proc is not None and getattr(self, '_lock', None) is not None and proc.poll() is not None:
+            self._collect()
         lock = getattr(self, '_lock', None)
         if lock is not None:
             with lock:
@@ -191,7 +203,6 @@ class OwnedProcess:
                     os.close(fd)
                 except OSError:
                     pass
-        proc = getattr(self, 'process', None)
         if proc is not None:
             for stream in (getattr(proc, 'stdin', None), getattr(proc, 'stdout', None), getattr(proc, 'stderr', None)):
                 if stream is not None:
