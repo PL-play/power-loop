@@ -12,6 +12,6 @@ async def notify(hooks, point, values, *, timeout_s=1.0):
         return
     try:
         async with asyncio.timeout(timeout_s):
-            await hooks.run_async(point, HookContext(values))
+            await hooks.run_typed_async(point, HookContext(values))
     except Exception:
         log.exception("execution notification failed: %s", point)

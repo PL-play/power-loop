@@ -1811,7 +1811,7 @@ async def run_recall_send(send_index: int | None = None, seq: int | None = None,
                           char_offset: int | None = None, char_limit: int | None = None) -> str:
     """Re-expand one past send the send-context projection summarized.
 
-    When ``AgentLoopConfig.history_projector`` is set, finished sends appear in context as a
+    When ``AgentLoopConfig.representation`` projects finished sends into terse summaries,
     compact projected summary while their FULL detail stays in ``pl_messages`` (the immutable
     audit). This returns that send's original messages — assistant text, tool calls (by name)
     and their results — read-only, current session, by the ``send_index`` (the ``#N`` the

@@ -382,32 +382,13 @@ async def test_hot_tail_protects_newest_calls_at_level_one_only():
         await store.close()
 
 
-async def test_legacy_state_key_is_adopted_and_old_group_ids_recall():
-    store = await SessionStore.open(':memory:')
-    try:
-        sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
-        rows = await _send_rows(store, sid, ['bash', 'bash'])
-        seqs = [r.seq for r in rows if r.role == 'tool']
-        from power_loop.runtime.tool_context import TOOL_CONTEXT_STATE_KEY
-        legacy = {'groups': {'gOLD': {'send_index': 1, 'members': [
-            {'send_index': 1, 'seq': s, 'call_id': f'c{i}', 'name': 'bash'} for i, s in enumerate(seqs)]}}}
-        await store.set_runtime_state(sid, TOOL_CONTEXT_STATE_KEY, {'operations': {}, 'attempts': {}, 'archive_v2': legacy})
-        assert json.loads(await recall_group(store, sid, 1, 'gOLD'))['count'] == 2
-        engine = ToolContextEngine(config=ToolContextConfig(), store=store, owner_session_id=sid,
-                                   owner_send_index=2, llm=None, model='test', registry=create_default_tool_registry(bind=False))
-        await engine.start()
-        assert 'archive_v2' not in engine.state and 'gOLD' in engine.state['archive']['groups']
-        restored = json.loads(await recall_group(store, sid, 1, 'gOLD', item=1))
-        assert restored['result'] == 'r' * 400
-    finally:
-        await store.close()
-
-
-def test_retired_policy_field_is_ignored_and_defaults():
+def test_unknown_policy_field_fails_closed_and_defaults():
     from power_loop.contracts.context_policy import ToolContextPolicy
-    policy = ToolContextPolicy().override({'between_sends': 'archive', 'insend_fuse': 'truncate'})
+    policy = ToolContextPolicy().override({'insend_fuse': 'truncate'})
     assert policy.insend_fuse == 'truncate' and policy.general == 'rule'
     assert ToolContextPolicy().strategy('insend_fuse') == 'rule'
+    with pytest.raises(TypeError):
+        ToolContextPolicy().override({'between_sends': 'archive'})
     with pytest.raises(TypeError):
         ToolContextConfig(schema_version=2)
 

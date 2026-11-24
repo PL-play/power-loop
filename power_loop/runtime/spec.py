@@ -252,7 +252,7 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
     import copy
     context_fields = (
         "representation", "fold_strategy", "max_context_rows", "context_budget_tokens",
-        "context_checkpoint_tokens", "insend_distill_tokens", "insend_distill_batch",
+        "context_checkpoint_tokens", "insend_distill_tokens",
         "insend_distill_hot_tail", "insend_distill_keep_tools", "tool_result_max_chars",
         "microcompact_enabled", "microcompact_size_limit", "microcompact_hot_tail",
         "microcompact_spill_dir", "context_strategy", "context_cut_tokens",
@@ -277,7 +277,7 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
             )
 
     # The host factory may adjust context/model settings, not widen delegation.
-    return replace(child_config, delegation_policy=getattr(parent_config, "delegation_policy", "legacy"))
+    return replace(child_config, delegation_policy="single_level")
 
 
 

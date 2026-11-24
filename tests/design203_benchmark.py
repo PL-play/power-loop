@@ -28,7 +28,6 @@ from power_loop import (
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.schema import _STORE_TABLES
-from power_loop.runtime.store.task_schema import TASK_TABLES
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 
@@ -213,7 +212,7 @@ async def run(args):
     finally:
         if store._db.dialect.name != 'sqlite':
             await store._db.execute(f'DROP VIEW IF EXISTS {prefix}usage_rounds')
-            for table in (*TASK_TABLES, *_STORE_TABLES, 'schema_migrations'):
+            for table in (*_STORE_TABLES, 'schema_migrations'):
                 await store._db.execute(f'DROP TABLE IF EXISTS {prefix}{table}')
         await store.close()
 

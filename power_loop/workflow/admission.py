@@ -77,28 +77,6 @@ async def admit(stop=None):
         lease.release()
 
 
-@asynccontextmanager
-async def idle():
-    """Host-only: release slots while the entire leaf is idle after its send ends.
-
-    Do not use inside individual parallel tools: sibling tools may still run.
-    """
-    lease = CURRENT.get()
-    if lease is None or lease.owner_task is not asyncio.current_task() or not lease.held:
-        yield
-        return
-    lease.release()
-    started = monotonic()
-    completed = False
-    try:
-        yield
-        completed = True
-    finally:
-        lease.idle_s += monotonic() - started
-        if completed:
-            await lease.acquire()
-
-
 def count_metric(name: str, value: float = 1):
     lease = CURRENT.get()
     if lease is not None:

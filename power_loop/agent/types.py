@@ -97,8 +97,6 @@ class AgentLoopConfig:
     #: Plain in-send fuse, used only WITHOUT ``tool_context`` (with it, the tool-context fuse
     #: ``trigger_tokens``/``target_tokens``/``hot_tail`` is the single fuse).
     insend_distill_tokens: int | None = None
-    #: Deprecated compatibility field; does not limit the number of distilled calls.
-    insend_distill_batch: int = 10
     insend_distill_hot_tail: int = 8
     #: 6.27.0 这些工具的**调用参数永不瘦身**（结果照旧）。给「模型自己说的话」用：send_message /
     #: post_update 这类工具的参数就是模型的发言，瘦成占位符后模型会照着占位符的样子再发一遍
@@ -161,7 +159,7 @@ class AgentLoopConfig:
     subagent_config_factory: Callable[[AgentSpec, AgentLoopConfig], AgentLoopConfig] | None = None
     #: Host-only delegation policy. single_level allows main/workflow nodes to
     #: delegate, but delegated agents cannot create another workflow or agent.
-    delegation_policy: str = "legacy"
+    delegation_policy: str = "single_level"
 
     # ── Microcompact (large tool-output spill-to-disk) ──
     #
@@ -248,8 +246,8 @@ class AgentLoopConfig:
         return mt
 
     def __post_init__(self) -> None:
-        if self.delegation_policy not in ("legacy", "single_level"):
-            raise ValueError("delegation_policy must be legacy or single_level")
+        if self.delegation_policy != "single_level":
+            raise ValueError("delegation_policy must be single_level")
         self._validate_context_config()
         # record_hook_events is a closed enum; normalize case and reject typos loudly (consistent
         # with the file's loud-config convention) rather than silently capturing nothing.

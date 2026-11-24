@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from power_loop.contracts.context_policy import (
-    LEGACY_FIELDS,
     ToolContextPolicy,
     Trigger,
     contains_preserve_marker,
@@ -116,8 +115,8 @@ class ToolContextEngine:
 
     async def start(self) -> None:
         self.state = await self.store.get_runtime_state(self.sid, TOOL_CONTEXT_STATE_KEY, self.state)
-        from power_loop.runtime.tool_archive import adopt_legacy_state
-        adopt_legacy_state(self.state)
+        from power_loop.runtime.tool_archive import prune_tool_context_state
+        prune_tool_context_state(self.state, current_send_index=self.send_index)
         snapshots = self.state.setdefault('send_policies', {})
         send_key = str(self.send_index)
         effective = {}
@@ -125,18 +124,18 @@ class ToolContextEngine:
             effective[definition.name] = asdict(definition.context_policy or ToolContextPolicy())
         for name, patch in self.config.overrides.items():
             effective[name] = {**effective.get(name, {}), **patch}
-        effective = {name: {k: v for k, v in patch.items() if k not in LEGACY_FIELDS}
-                     for name, patch in effective.items()}
         snapshot = snapshots.get(send_key)
         if snapshot is None:
             snapshot = {'capacity': {k: getattr(self.config, k) for k in CAPACITY_FIELDS}, 'overrides': effective, 'rule_version': self.config.rule_version,
                         'model_identity': self.model_identity, 'model': self.model}
             snapshots[send_key] = snapshot
+            prune_tool_context_state(self.state, current_send_index=self.send_index)
             await self._save()
         else:
             # A resumed send keeps the rules it started with. A snapshot from an earlier release
             # may lack capacity fields (or carry retired ones): missing fields use current config.
-            effective = {name: {k: v for k, v in patch.items() if k not in LEGACY_FIELDS}
+            valid_fields = set(ToolContextPolicy.__dataclass_fields__)
+            effective = {name: {k: v for k, v in patch.items() if k in valid_fields}
                          for name, patch in snapshot['overrides'].items()}
         self._implementation_matches = (snapshot['rule_version'] == self.config.rule_version
             and snapshot['model_identity'] == self.model_identity and snapshot['model'] == self.model)
@@ -149,6 +148,8 @@ class ToolContextEngine:
                           'model_identity': self.model_identity})[:7], 16)
 
     async def _save(self) -> None:
+        from power_loop.runtime.tool_archive import prune_tool_context_state
+        prune_tool_context_state(self.state, current_send_index=None)
         await self.store.set_runtime_state(self.sid, TOOL_CONTEXT_STATE_KEY, self.state)
 
     def policy(self, source: ToolSource) -> ToolContextPolicy:

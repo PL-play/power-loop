@@ -9,10 +9,10 @@ from power_loop.core.agent_context import get_session_id
 
 
 def finite_delegation(loop) -> bool:
-    policy = getattr(getattr(loop, "config", None), "delegation_policy", "legacy")
-    if policy not in ("legacy", "single_level"):
+    policy = getattr(getattr(loop, "config", None), "delegation_policy", "single_level")
+    if policy != "single_level":
         raise ValueError("invalid_delegation_policy")
-    return policy == "single_level"
+    return True
 
 
 def role_from_facts(parent_session_id: str | None, session_kind: str, config) -> str:

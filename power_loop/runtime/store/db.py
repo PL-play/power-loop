@@ -49,10 +49,6 @@ class Transaction(Protocol):
 
     async def fetchall(self, sql: str, params: Params = ()) -> list[Row]: ...
 
-    async def execute_flag(self, sql: str, params: Params = ()) -> bool | None:
-        """Conditional UPDATE's flag, or None on no match, in one statement."""
-        ...
-
     async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
         """Conditional UPDATE returning (rowcount, lastrowid) for MySQL LAST_INSERT_ID bitpacking."""
         ...

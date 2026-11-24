@@ -299,11 +299,6 @@ class _Tx:
         self.note(sql)
         return await self.tx.execute(sql, params)
 
-    async def execute_flag(self, sql, params=()):
-        await self.begin_meter(sql)
-        self.note(sql)
-        return await self.tx.execute_flag(sql, params)
-
     async def execute_packed(self, sql, params=()):
         await self.begin_meter(sql)
         self.note(sql)

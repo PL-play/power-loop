@@ -14,18 +14,73 @@ from power_loop.runtime.tool_context import TOOL_CONTEXT_STATE_KEY, ToolSource, 
 
 #: Sub-key of the runtime state that holds patches, groups and fuse events.
 ARCHIVE_KEY = 'archive'
-_LEGACY_ARCHIVE_KEY = 'archive_v2'
-
-
-def adopt_legacy_state(state: dict) -> None:
-    """Move state written under the earlier sub-key; issued group ids stay recallable."""
-    legacy = state.pop(_LEGACY_ARCHIVE_KEY, None)
-    if legacy is not None and ARCHIVE_KEY not in state:
-        state[ARCHIVE_KEY] = legacy
+_MAX_SEND_POLICIES = 32
+_MAX_OPERATIONS = 256
+_MAX_PATCHES = 256
+_MAX_EVENTS = 64
+_MAX_GROUPS = 256
 
 
 def _archive(state: dict) -> dict:
-    return state.get(ARCHIVE_KEY) or state.get(_LEGACY_ARCHIVE_KEY) or {}
+    return state.get(ARCHIVE_KEY) or {}
+
+
+def prune_tool_context_state(state: dict, *, current_send_index: int | None = None) -> None:
+    """Bound persisted ``tool_context.v1`` state by pruning superseded sends and capping caches."""
+    snapshots = state.get('send_policies')
+    if isinstance(snapshots, dict) and len(snapshots) > _MAX_SEND_POLICIES:
+        keep_key = str(current_send_index) if current_send_index is not None else None
+        def _send_sort_key(k: str) -> tuple[int, int | str]:
+            try:
+                return (1, int(k))
+            except (TypeError, ValueError):
+                return (0, str(k))
+        ordered = sorted(snapshots.keys(), key=_send_sort_key)
+        keep = set(ordered[-_MAX_SEND_POLICIES:])
+        if keep_key is not None and keep_key in snapshots:
+            keep.add(keep_key)
+        for k in list(snapshots.keys()):
+            if k not in keep:
+                del snapshots[k]
+    ops = state.get('operations')
+    if isinstance(ops, dict) and len(ops) > _MAX_OPERATIONS:
+        excess = len(ops) - _MAX_OPERATIONS
+        for k in list(ops.keys())[:excess]:
+            del ops[k]
+    archive = state.get(ARCHIVE_KEY)
+    if not isinstance(archive, dict):
+        return
+    if current_send_index is not None:
+        patches = archive.get('patches')
+        if isinstance(patches, dict):
+            for k, p in list(patches.items()):
+                if isinstance(p, dict) and p.get('send_index') != current_send_index:
+                    del patches[k]
+        exposures = archive.get('exposures')
+        if isinstance(exposures, dict):
+            prefix = f'{current_send_index}:'
+            for k in list(exposures.keys()):
+                if not str(k).startswith(prefix):
+                    del exposures[k]
+        view_groups = archive.get('view_groups')
+        if isinstance(view_groups, list):
+            archive['view_groups'] = [
+                g for g in view_groups
+                if isinstance(g, dict) and g.get('send_index') == current_send_index
+            ]
+    patches = archive.get('patches')
+    if isinstance(patches, dict) and len(patches) > _MAX_PATCHES:
+        excess = len(patches) - _MAX_PATCHES
+        for k in list(patches.keys())[:excess]:
+            del patches[k]
+    events = archive.get('events')
+    if isinstance(events, list) and len(events) > _MAX_EVENTS:
+        archive['events'] = events[-_MAX_EVENTS:]
+    groups = archive.get('groups')
+    if isinstance(groups, dict) and len(groups) > _MAX_GROUPS:
+        excess = len(groups) - _MAX_GROUPS
+        for k in list(groups.keys())[:excess]:
+            del groups[k]
 
 
 def slim_arguments(source: ToolSource, registered=None) -> str:
@@ -95,7 +150,6 @@ async def _derive(engine, source, trigger, level, raw_arguments=None):
 
 async def _commit(engine, patch):
     previous = copy.deepcopy(engine.state)
-    adopt_legacy_state(engine.state)
     engine.state.setdefault(ARCHIVE_KEY, {}).update(patch)
     try:
         await engine._save()
@@ -213,6 +267,8 @@ async def _pairs(engine, pipeline):
     cache = getattr(engine, '_archive_raw_cache', None)
     if cache is None:
         cache = engine._archive_raw_cache = {}
+    matched = []
+    missing_seqs: set[int] = set()
     for i, row in enumerate(pipeline.history):
         if i >= len(seqs) or seqs[i] is None:
             continue
@@ -222,25 +278,37 @@ async def _pairs(engine, pipeline):
         elif row.get('role') == 'tool' and str(row.get('tool_call_id')) in pending:
             ai, call = pending.pop(str(row['tool_call_id']))
             call_seq, result_seq = seqs[ai], seqs[i]
-            for seq in (call_seq, result_seq):
-                if seq not in cache:
-                    cache[seq] = await engine.store.get_message(engine.sid, seq)
-            raw_call, raw_result = cache[call_seq], cache[result_seq]
-            if (raw_call is None or raw_result is None or raw_result.send_index != pipeline.send_index
-                    or raw_call.send_index != pipeline.send_index or not isinstance(raw_result.content, str)):
+            matched.append((ai, i, call, call_seq, result_seq))
+            if call_seq not in cache:
+                missing_seqs.add(call_seq)
+            if result_seq not in cache:
+                missing_seqs.add(result_seq)
+    if missing_seqs:
+        batch_loader = getattr(engine.store, 'get_messages_by_seqs', None)
+        if callable(batch_loader):
+            loaded = await batch_loader(engine.sid, sorted(missing_seqs))
+            for seq in missing_seqs:
+                cache[seq] = loaded.get(seq)
+        else:
+            for seq in sorted(missing_seqs):
+                cache[seq] = await engine.store.get_message(engine.sid, seq)
+    for ai, i, call, call_seq, result_seq in matched:
+        raw_call, raw_result = cache[call_seq], cache[result_seq]
+        if (raw_call is None or raw_result is None or raw_result.send_index != pipeline.send_index
+                or raw_call.send_index != pipeline.send_index or not isinstance(raw_result.content, str)):
+            continue
+        original = next((c for c in raw_call.tool_calls or [] if c.get('id') == call.get('id')), None)
+        if original is None or raw_result.tool_call_id != call.get('id'):
+            continue
+        try:
+            fn = original['function']
+            args = json.loads(fn['arguments'])
+            if not isinstance(args, dict):
                 continue
-            original = next((c for c in raw_call.tool_calls or [] if c.get('id') == call.get('id')), None)
-            if original is None or raw_result.tool_call_id != call.get('id'):
-                continue
-            try:
-                fn = original['function']
-                args = json.loads(fn['arguments'])
-                if not isinstance(args, dict):
-                    continue
-            except (KeyError, ValueError, TypeError):
-                continue
-            yield ai, i, call_seq, ToolSource(engine.sid, pipeline.send_index, result_seq,
-                str(call['id']), fn['name'], args, raw_result.content)
+        except (KeyError, ValueError, TypeError):
+            continue
+        yield ai, i, call_seq, ToolSource(engine.sid, pipeline.send_index, result_seq,
+            str(call['id']), fn['name'], args, raw_result.content)
 
 
 async def prepare_history(engine, pipeline, trigger, *, target_tokens=None, level=1):

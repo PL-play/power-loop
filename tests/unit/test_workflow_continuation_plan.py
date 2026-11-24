@@ -1,10 +1,8 @@
 """Dependency closure is computed before any continuation can affect execution."""
-from dataclasses import replace
-
 import pytest
 
 from power_loop.runtime.spec import AgentSpec
-from power_loop.workflow.continuation import plan_continuation, replay_results
+from power_loop.workflow.continuation import plan_continuation
 from power_loop.workflow.engine import WorkflowRunError
 from power_loop.workflow.result import AgentResult
 from power_loop.workflow.spec import (
@@ -48,13 +46,6 @@ def test_closure_covers_sequence_tail_and_ancestors_without_invalidating_paralle
     assert plan.target_path == (0, 0, 1)
     assert plan.to_dict()["reasons"]["dev"] == ["target"]
     assert "sequence" in plan.to_dict()["reasons"]["review"]
-    old = {name: result(name) for name in ["prefix", "dev", "review", "independent", "assemble"]}
-    original = dict(old)
-    invalidated = set()
-    invalidated.update(plan.invalidated)
-    replay = replay_results(design, plan, old)
-    assert invalidated == plan.invalidated and set(replay) == {"prefix", "independent"}
-    assert old == original and old["dev"].text == "original"
     assert plan == plan_continuation(design, "dev")
     plan.to_dict()["invalidated"].clear()
     assert "dev" in plan.invalidated  # inspection cannot change the frozen decision
@@ -152,25 +143,6 @@ def test_foreach_target_requires_an_iteration_even_under_nested_containers(neste
         plan_continuation(spec(root), "dev")
 
 
-@pytest.mark.parametrize("status", ["completed", "skipped", "failed", "cancelled", "context_checkpoint", "hit_round_limit", "pending", "running"])
-def test_unaffected_terminal_evidence_is_preserved_without_retrying_its_side_effects(status):
-    design = spec(parallel(agent("dev"), agent("other")))
-    old = {"dev": result("dev"), "other": result("other", status), "outside": result("outside")}
-    replay = replay_results(design, plan_continuation(design, "dev"), old)
-    assert set(replay) == ({"other"} if status not in ("pending", "running") else set())
-    if replay:
-        assert replay["other"] is old["other"]
-
-
-@pytest.mark.parametrize("kind", ["loop", "foreach"])
-def test_replayed_aggregates_exclude_body_results_atomically(kind):
-    aggregate = (LoopNode(type="loop", id="aggregate", body=agent("body"), until={"ref": "body.ok"}) if kind == "loop" else
-                 ForeachNode(type="foreach", id="aggregate", as_var="item", items=(1,), body=agent("body")))
-    design = spec(parallel(agent("dev"), aggregate))
-    old = {name: result(name) for name in ("dev", "aggregate", "body")}
-    assert set(replay_results(design, plan_continuation(design, "dev"), old)) == {"aggregate"}
-
-
 def test_parser_still_rejects_explicit_parallel_sibling_dependencies():
     from power_loop.workflow.spec import WorkflowSpecError
     design = spec(parallel(agent("source"), agent("other", inputs_from=("source",))))
@@ -193,13 +165,8 @@ def test_new_deep_edge_expands_a_container_already_marked_by_its_descendant():
     assert plan_continuation(design, "source").invalidated == {"source", "loop", "prefix", "dev"}
 
 
-def test_plan_covers_fallback_defaults_and_nested_aggregate_replay():
-    inner = ForeachNode(type="foreach", id="map", as_var="item", items=(1,), body=agent("body"))
-    outer = LoopNode(type="loop", id="loop", until={"ref": "outside.ready"}, body=inner)
-    design = spec(parallel(agent("dev"), outer, agent("outside")))
-    old = {name: result(name) for name in ("dev", "loop", "map", "body", "outside")}
-    assert set(replay_results(design, plan_continuation(design, "dev"), old)) == {"loop", "outside"}
-    changed = replace(design, root=parallel(agent("dev"), BranchNode(type="branch", on="dev.choice", cases={}, default=agent("default"))))
+def test_plan_covers_fallback_defaults():
+    changed = spec(parallel(agent("dev"), BranchNode(type="branch", on="dev.choice", cases={}, default=agent("default"))))
     assert plan_continuation(changed, "dev").invalidated == {"dev", "default"}
 
 
@@ -210,10 +177,3 @@ def test_changed_foreach_body_dependency_invalidates_all_iterations_and_prefixes
     plan = plan_continuation(design, "source")
     assert plan.invalidated == {"source", "map", "prefix", "consumer", "tail"}
     assert "independent" not in plan.invalidated
-
-
-def test_missing_foreach_aggregate_never_replays_an_individual_iteration_result():
-    mapped = ForeachNode(type="foreach", id="map", as_var="item", items=(1, 2), body=agent("body"))
-    design = spec(parallel(agent("dev"), mapped))
-    old = {"dev": result("dev"), "body": result("body")}
-    assert not replay_results(design, plan_continuation(design, "dev"), old)

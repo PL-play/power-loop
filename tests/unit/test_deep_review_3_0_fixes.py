@@ -11,11 +11,10 @@ import pytest
 
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.types import AgentLoopConfig
-from power_loop.runtime.history_projector import DefaultDeterministicProjector
+from power_loop.runtime.fold import LLMSummaryFold
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.store.types import ProjectMessageRow
-from tests.unit.test_history_projection_loop import _projector_loop
 from tests.unit.test_stateful_loop import _echo_registry, _Scripted
 
 pytestmark = pytest.mark.unit
@@ -96,9 +95,16 @@ async def test_fold_gate_does_not_fold_below_token_budget(runtime_agent) -> None
     async with await SessionStore.open(":memory:") as store:
         # keep_last_sends=2 with 4 short sends → a foldable span [1,2] EXISTS, but the rendered prefix
         # is far below max_tokens(8000) × trigger_ratio → nothing should fold.
-        proj = await _projector_loop(
-            runtime_agent, store, _Scripted([LLMResponse(raw_text=f"d{i}") for i in range(1, 5)]),
-            DefaultDeterministicProjector(keep_last_sends=2), max_tokens=8000,
+        proj = await runtime_agent(
+            model=_Scripted([LLMResponse(raw_text=f"d{i}") for i in range(1, 5)]),
+            store=store,
+            config=AgentLoopConfig(
+                system_prompt="S",
+                max_rounds=3,
+                max_tokens=8000,
+                representation=ProjectedRepresentation(),
+                fold_strategy=LLMSummaryFold(keep_last_sends=2),
+            ),
         )
         sid = proj.target.session_id
         for i in range(1, 5):

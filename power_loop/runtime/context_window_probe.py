@@ -29,7 +29,7 @@ TIMEOUT_S = 600.0
 LENGTH_WORDS = ("context", "too long", "too many tokens", "maximum", "length", "exceed", "上下文", "超出", "过长")
 CHECK = "context_window"
 
-log = logging.getLogger("admin.context_window_check")
+log = logging.getLogger(__name__)
 
 
 def _request(units: int) -> Any:

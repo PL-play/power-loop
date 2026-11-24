@@ -437,7 +437,7 @@ def build_skill_section(skills_dir: str | None, *, tool_registry=None) -> str:
             )
         )
         return section or ""
-    except Exception:
+    except FileNotFoundError:
         return ""
 
 

@@ -8,9 +8,9 @@ import pytest
 
 from power_loop.runtime.notes import (
     DEFAULT_NOTES_POLICY,
+    NoteMemory,
     NotesFullError,
     NotesPolicy,
-    SQLiteNoteMemory,
     add_note_checked,
     render_notes,
     update_note_checked,
@@ -163,7 +163,7 @@ async def test_render_budget_elides_oldest_unpinned_first(store: SessionStore) -
 
 async def test_recall_injects_system_message(store: SessionStore) -> None:
     await store.add_note(SID, "remember the milk")
-    provider = SQLiteNoteMemory(store)
+    provider = NoteMemory(store)
     msgs = await provider.recall(messages=[], session_id=SID)
     assert len(msgs) == 1
     assert msgs[0]["role"] == "system"
@@ -172,13 +172,13 @@ async def test_recall_injects_system_message(store: SessionStore) -> None:
 
 
 async def test_recall_empty_session_returns_nothing(store: SessionStore) -> None:
-    provider = SQLiteNoteMemory(store)
+    provider = NoteMemory(store)
     assert await provider.recall(messages=[], session_id=SID) == []
     assert await provider.recall(messages=[], session_id=None) == []
 
 
 async def test_remember_is_noop(store: SessionStore) -> None:
-    provider = SQLiteNoteMemory(store)
+    provider = NoteMemory(store)
     assert await provider.remember(snapshot=object(), session_id=SID) is None
 
 
@@ -257,7 +257,7 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore, runti
             system_prompt="S",
             max_rounds=3,
             context_budget_tokens=10**9,
-            memory=SQLiteNoteMemory(store),
+            memory=NoteMemory(store),
         ))
     sid = loop.target.session_id
     r1 = await loop.send("remember the codename")

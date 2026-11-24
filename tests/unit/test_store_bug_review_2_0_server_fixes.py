@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 import pytest
 
 from power_loop.runtime.store.schema import _STORE_TABLES
-from power_loop.runtime.store.task_schema import TASK_TABLES
 from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
 from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
@@ -31,7 +30,7 @@ MYSQL_DSN = os.environ.get(
 )
 
 
-_ALL_TABLES = tuple(dict.fromkeys((*_STORE_TABLES, *(n for n in TASK_TABLES if n != 'task_store'))))
+_ALL_TABLES = tuple(dict.fromkeys(_STORE_TABLES))
 
 
 def _reachable(dsn: str, default_port: int) -> bool:
@@ -112,7 +111,7 @@ async def test_pg_concurrent_first_boot_provisioning_converges():
         assert row["c"] == 1
     finally:
         await stores[0]._db.execute(f"DROP VIEW IF EXISTS {prefix}usage_rounds")
-        for name in (*TASK_TABLES, *_STORE_TABLES, 'schema_migrations'):
+        for name in (*_STORE_TABLES, 'schema_migrations'):
             await stores[0]._db.execute(f'DROP TABLE IF EXISTS {prefix}{name}')
         await asyncio.gather(*(s.close() for s in stores))
 

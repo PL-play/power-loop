@@ -93,9 +93,13 @@ class AgentEventBus:
         self._handlers[event_type].sort(key=lambda h: (h.priority, h.order))
 
     def unsubscribe(self, handler: EventHandler) -> None:
-        self._global_handlers = [h for h in self._global_handlers if h.handler is not handler]
+        self._global_handlers = [
+            h for h in self._global_handlers if h.handler is not handler and h.handler != handler
+        ]
         for etype, handlers in list(self._handlers.items()):
-            self._handlers[etype] = [h for h in handlers if h.handler is not handler]
+            self._handlers[etype] = [
+                h for h in handlers if h.handler is not handler and h.handler != handler
+            ]
             if not self._handlers[etype]:
                 self._handlers.pop(etype, None)
 

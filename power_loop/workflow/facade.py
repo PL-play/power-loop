@@ -507,16 +507,10 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                 if action == "logs":
                     value = await _read_logs(loop, selected, actor, options)
                 elif action == "cancel":
-                    if entry is None:
-                        value = plain(await client.cancel(
-                            selected, actor=actor, scope="subtree",
-                            reason=options.get("reason", "cancelled"),
-                        ))
-                    else:
-                        value = plain(await client.cancel(
-                            selected, actor=actor, scope="subtree",
-                            reason=options.get("reason", "cancelled"),
-                        ))
+                    value = plain(await client.cancel(
+                        selected, actor=actor, scope="subtree",
+                        reason=options.get("reason", "cancelled"),
+                    ))
                 else:
                     if entry is None:
                         raise WorkflowToolInputError("workflow_node_required")

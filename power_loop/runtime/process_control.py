@@ -171,6 +171,35 @@ class OwnedProcess:
                 if time.monotonic() >= bound:
                     raise
 
+    def close(self):
+        """Close control/result descriptors and process stdio streams idempotently."""
+        lock = getattr(self, '_lock', None)
+        if lock is not None:
+            with lock:
+                control_fd, self._control = getattr(self, '_control', None), None
+                result_fd, self._result_fd = getattr(self, '_result_fd', None), None
+        else:
+            control_fd = getattr(self, '_control', None)
+            result_fd = getattr(self, '_result_fd', None)
+            if hasattr(self, '_control'):
+                self._control = None
+            if hasattr(self, '_result_fd'):
+                self._result_fd = None
+        for fd in (control_fd, result_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        proc = getattr(self, 'process', None)
+        if proc is not None:
+            for stream in (getattr(proc, 'stdin', None), getattr(proc, 'stdout', None), getattr(proc, 'stderr', None)):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+
     def drain_stopped_output(self, timeout=1):
         """One bounded final collection after the original producer has exited.
 
@@ -188,6 +217,4 @@ class OwnedProcess:
             self._collect()
             return output
         finally:
-            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
-                if stream is not None:
-                    stream.close()
+            self.close()

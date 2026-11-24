@@ -329,11 +329,6 @@ class SessionStore:
     def schema_version(self) -> int:
         return self._schema_version
 
-    @property
-    def has_message_ids(self) -> bool:
-        from .task_schema import TASK_SCHEMA_VERSION
-        return self.schema_version == TASK_SCHEMA_VERSION and self.store_id is not None
-
     # ── maintenance (optional capability; no-op on backends that lack it) ──────
     async def purge_expired(self, now: int, *, limit: int = 1000,
                             retention_days: dict[str, float] | None = None,
@@ -539,11 +534,6 @@ class SessionStore:
         if changes is not None:
             changes.model_versions = changes.versions
 
-    async def background_changed_during_model(self, session_id):
-        changes = change_signals.reader(self, session_id)
-        return (changes is not None and changes.versions[1] != changes.model_versions[1]
-                and bool(await self.poll_background_updates(session_id)))
-
     async def signal_changes(self, tx, session_id, kind):
         from ..session_ownership import require_current_ownership
         require_current_ownership(self)
@@ -740,7 +730,7 @@ class SessionStore:
             return MessageRef(self.store_id, session_id, *reads.assistant_ref) if reads.assistant_ref is not None else None
         row = await self._db.fetchone(f"SELECT * FROM {self.t.messages} WHERE session_id=? "
             "AND role='assistant' AND send_index=? ORDER BY seq DESC LIMIT 1", (session_id, send_index))
-        value = None if row is None else (int(row["id"]) if self.has_message_ids else None,
+        value = None if row is None else (int(row["id"]),
             int(row["seq"]), row["role"], row["tool_call_id"], row["send_index"], row["round_index"])
         if reads is not None:
             reads.assistant_send_index, reads.assistant_ref = send_index, value
@@ -762,9 +752,6 @@ class SessionStore:
                           row["send_index"], row["round_index"])
 
     async def message_by_id(self, session_id: str, message_id: int | str) -> MessageRow | None:
-
-        if not self.has_message_ids:
-            raise ValueError("message_ids_unsupported: legacy schema")
         row = await self._db.fetchone(f"SELECT * FROM {self.t.messages} WHERE session_id=? AND id=?",
                                      (session_id, integer_id(message_id)))
         return _row_to_message(row) if row else None
@@ -859,7 +846,7 @@ class SessionStore:
 
         async def _run_insert(stmt, vals):
             locked_stmt = stmt + lock_suffix
-            if dialect != "mysql" and self.has_message_ids:
+            if dialect != "mysql":
                 row = await self._db.fetchone(locked_stmt + " RETURNING id", vals)
                 return (1, int(row["id"])) if row is not None else (0, None)
             rc = await self._db.execute(locked_stmt, vals)
@@ -1091,10 +1078,7 @@ class SessionStore:
                     calls_json, stored_call_id, round_index,
                     MessageState.ACTIVE.value, _dumps(meta or {}), stored_send, now,
                 )
-                if not self.has_message_ids:
-                    await tx.execute(insert, values)
-                    row_id = None
-                elif self._db.dialect.name == "mysql":
+                if self._db.dialect.name == "mysql":
                     await tx.execute(insert, values)
                     snapshot = await tx.fetchone(f"SELECT LAST_INSERT_ID() AS id,{signal_columns} "
                                                  f"FROM {self.t.sessions} WHERE session_id=?", (session_id,))
@@ -1508,6 +1492,25 @@ class SessionStore:
             f"SELECT * FROM {self.t.messages} WHERE session_id=? AND seq=?", (session_id, seq)
         )
         return _row_to_message(row) if row else None
+
+    async def get_messages_by_seqs(self, session_id: str, seqs: Sequence[int]) -> dict[int, MessageRow]:
+        """Batch-fetch messages by seq for one session (eliminates N+1 get_message loops)."""
+        unique = sorted({int(s) for s in seqs})
+        if not unique:
+            return {}
+        out: dict[int, MessageRow] = {}
+        chunk_size = 500
+        for i in range(0, len(unique), chunk_size):
+            chunk = unique[i:i + chunk_size]
+            marks = ",".join("?" for _ in chunk)
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.messages} WHERE session_id=? AND seq IN ({marks})",
+                (session_id, *chunk),
+            )
+            for row in rows:
+                msg = _row_to_message(row)
+                out[msg.seq] = msg
+        return out
 
     async def get_assistant_tool_calls(
         self, session_id: str, seq: int, *, send_index: int,
@@ -2633,17 +2636,6 @@ def _logical_order_key(m: MessageRow) -> tuple[int, int]:
         if ord_val is not None:
             return (int(ord_val), m.seq)
     return (m.seq, m.seq)
-
-
-def _row_to_timer(row: Row) -> TimerRow:
-    return TimerRow(
-        session_id=row["session_id"], timer_id=int(row["timer_id"]), due_at=int(row["due_at"]),
-        note=row["note"], status=row["status"],
-        interval_s=(int(row["interval_s"]) if row["interval_s"] is not None else None),
-        fire_count=int(row["fire_count"]),
-        last_fired_at=(int(row["last_fired_at"]) if row["last_fired_at"] is not None else None),
-        created_at=int(row["created_at"]), updated_at=int(row["updated_at"]),
-    )
 
 
 def _row_to_stats(row: Row) -> SessionStatsRow:

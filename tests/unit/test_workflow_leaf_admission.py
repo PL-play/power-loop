@@ -3,7 +3,6 @@ import asyncio
 import pytest
 
 from power_loop.workflow import WorkflowSpec
-from power_loop.workflow.admission import idle
 from power_loop.workflow.engine import WorkflowEngine
 
 
@@ -40,27 +39,6 @@ async def test_leaf_fairness_and_legacy_branch_semantics(scope, order):
     result = await WorkflowEngine(Executor(), run_id="test", driver_sid="driver").run(graph(scope))
     assert result.status == "completed"
     assert calls == order
-
-
-@pytest.mark.asyncio
-async def test_idle_settlement_releases_capacity():
-    other = asyncio.Event()
-
-    class Executor:
-        async def run_agent(self, spec, *args, **kwargs):
-            if spec.node_path == "dev":
-                async with idle():
-                    await other.wait()
-            if spec.node_path == "other":
-                other.set()
-            return {"status": "completed", "final_text": "ok"}
-
-    result = await asyncio.wait_for(
-        WorkflowEngine(Executor(), run_id="test", driver_sid="driver").run(graph("leaf")), 2
-    )
-    assert result.status == "completed"
-
-
 
 
 @pytest.mark.asyncio

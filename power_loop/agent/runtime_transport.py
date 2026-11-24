@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -289,11 +290,14 @@ class WakeTransport(ABC):
 class InMemoryWakeTransport(WakeTransport):
     """Default 0-SQL single-process wake transport for embedded SDK mode."""
 
-    def __init__(self) -> None:
+    _MAX_HISTORY = 1000
+
+    def __init__(self, *, max_history: int = _MAX_HISTORY) -> None:
         self._wake_handlers: list[WakeCallback] = []
         self._cancel_handlers: list[CancelCallback] = []
-        self.published_wakes: list[tuple[str, str]] = []
-        self.published_cancels: list[tuple[str, str]] = []
+        cap = max(1, int(max_history))
+        self.published_wakes: deque[tuple[str, str]] = deque(maxlen=cap)
+        self.published_cancels: deque[tuple[str, str]] = deque(maxlen=cap)
         self._closed = False
 
     async def publish_wake(self, session_id: str, *, reason: str = "accept") -> None:
@@ -324,6 +328,8 @@ class InMemoryWakeTransport(WakeTransport):
         self._closed = True
         self._wake_handlers.clear()
         self._cancel_handlers.clear()
+        self.published_wakes.clear()
+        self.published_cancels.clear()
 
 
 class DatabasePollingWakeTransport(WakeTransport):

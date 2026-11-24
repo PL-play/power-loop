@@ -201,12 +201,11 @@ from power_loop.contracts.hook_contexts import (
     ToolsBatchAfterCtx,
     ToolsBatchBeforeCtx,
 )
-from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint
 from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
 from power_loop.contracts.protocols import (
     EventBusProtocol,
     HookManagerProtocol,
-    ToolArgsValidator,
 )
 from power_loop.contracts.tools import ToolDefinition, ToolResult, validate_tool_args
 from power_loop.core.agent_context import get_effective_tools
@@ -214,7 +213,6 @@ from power_loop.core.events import AgentEventBus
 from power_loop.core.execution_context import ExecutionContext, bind_host_context, get_execution_context
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pass_turn import PASS_TURN_TOOL, pass_progress, request_pass
-from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.blackboard import (
@@ -251,7 +249,6 @@ from power_loop.runtime.notes import (
     NoteMemory,
     NotesFullError,
     NotesPolicy,
-    SQLiteNoteMemory,
     render_notes,
 )
 from power_loop.runtime.provider import (
@@ -474,7 +471,6 @@ __all__ = [
 	"NotesPolicy",
 	"NotesFullError",
 	"NoteMemory",
-	"SQLiteNoteMemory",
 	"DEFAULT_NOTES_POLICY",
 	"render_notes",
 	"MemoryRecalledCtx",
@@ -504,13 +500,9 @@ __all__ = [
 	"AgentHooks",
 	"AgentPipeline",
 	"AgentRunner",
-	"PhaseContext",
-	"PhaseResult",
-	"phase",
 	"HookContext",
 	"HookDirective",
 	"HookPoint",
-	"HookResult",
 	"BaseHookCtx",
 	"CompactAfterCtx",
 	"CompactBeforeCtx",
@@ -561,7 +553,6 @@ __all__ = [
 	"ToolHandlerResult",
 	"EventBusProtocol",
 	"HookManagerProtocol",
-	"ToolArgsValidator",
 	"get_effective_tools",
 	"ToolDefinition",
 	"ToolResult",

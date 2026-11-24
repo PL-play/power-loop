@@ -53,7 +53,7 @@ from power_loop.contracts.hook_contexts import (
     ToolsBatchAfterCtx,
     ToolsBatchBeforeCtx,
 )
-from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint
 from power_loop.contracts.messages import (
     AgentMessage,
     AssistantMessage,
@@ -63,7 +63,7 @@ from power_loop.contracts.messages import (
     ToolResultMessage,
     UserMessage,
 )
-from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
+from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
 
 __all__ = [
@@ -79,7 +79,6 @@ __all__ = [
     "HookContext",
     "HookDirective",
     "HookPoint",
-    "HookResult",
     "BaseHookCtx",
     "CompactAfterCtx",
     "CompactBeforeCtx",
@@ -128,7 +127,6 @@ __all__ = [
     "ToolHandlerResult",
     "EventBusProtocol",
     "HookManagerProtocol",
-    "ToolArgsValidator",
     "ToolDefinition",
     "validate_tool_args",
 ]

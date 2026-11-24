@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 ROLES = ("main", "workflow", "workflow_node", "subagent")
 
@@ -173,38 +173,23 @@ def snapshot(handler, definition):
     contract = implementation.runtime_contract
     if type(contract) is not ToolRuntimeContract:
         raise ToolContractError("invalid_tool_runtime_contract")
-    return (
-        _json(asdict(contract)),
-        _json(
-            {
-                "definition": definition.to_openai_tool(),
-                "pricing": ({"rule_id": definition.pricing.rule_id, "version": definition.pricing.version()}
-                            if definition.pricing is not None else None),
-                "required": definition.required_params,
-                "interrupt": definition.interrupt,
-                "usage_hint": definition.usage_hint,
-                "background_hint": definition.background_hint,
-                "async_capable": definition.async_capable
-                if type(definition.async_capable) is bool
-                else sorted(definition.async_capable),
-            }
-        ),
-        implementation,
-    )
+    return (contract, definition, implementation)
 
 
 def resolve(registered):
     """Only a capability frozen at actual registration can be used later."""
     if registered is None or getattr(registered, "runtime_binding", None) is None:
         return None
-    current = snapshot(registered.handler, registered.definition)
+    binding = registered.runtime_binding
+    implementation = _implementation(registered.handler)
     if (
-        current is None
-        or current[:2] != registered.runtime_binding[:2]
-        or current[2] is not registered.runtime_binding[2]
+        implementation is None
+        or implementation is not binding[2]
+        or registered.definition is not binding[1]
+        or implementation.runtime_contract != binding[0]
     ):
         raise ToolContractError("tool_runtime_binding_changed")
-    return _implementation(registered.handler)
+    return implementation
 
 
 def validate_registration(registry, name, expected):

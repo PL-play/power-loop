@@ -128,8 +128,6 @@ class RuntimeWorker:
             on_local_claim_cancel=self._unnote_local_claim,
         )
         self._subscriptions, self._listeners = [], []
-        self._wake_subscription = None
-        self._wake_listener = None
         self._bindings = []
         self._pending = {}
         self._active = {}
@@ -139,7 +137,6 @@ class RuntimeWorker:
         self._closing_release_tasks: set[asyncio.Task] = set()
         self._drivers = set()
         self._tasks = set()
-        self._capacity = asyncio.Semaphore(runtime.capacity)
         self._wake = asyncio.Event()
         self._started, self._closing, self._closed = False, False, False
         self._lifecycle_lock = asyncio.Lock()
@@ -150,6 +147,15 @@ class RuntimeWorker:
         # registry; an incapable node simply leaves the session for a capable one.
         self.capability_missing = set()
         self.shutdown_result = ShutdownResult(True)
+
+    _MAX_CAPABILITY_MISSING = 256
+
+    def _note_capability_missing(self, ref) -> None:
+        if ref in self.capability_missing:
+            return
+        if len(self.capability_missing) >= self._MAX_CAPABILITY_MISSING:
+            self.capability_missing.pop()
+        self.capability_missing.add(ref)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -826,9 +832,14 @@ class RuntimeWorker:
             # The claim installed the fence; build the local handle from it. Per-ownership
             # process caches are cleared so no seq/index survives a change of owner.
             if external_ownership is None:
+                claim_mono = (
+                    batch.claimed_at_mono
+                    if batch.claimed_at_mono is not None
+                    else time.monotonic()
+                )
                 ownership = SessionOwnership(
                     (store.store_id, sid), r.node_id + "/" + r.boot_id,
-                    time.monotonic() + r.session_lease_ttl_s, lambda: None,
+                    claim_mono + r.session_lease_ttl_s, lambda: None,
                     epoch=batch.owner_epoch,
                     node_id=r.node_id, boot_id=r.boot_id, installs_fence=True,
                 )
@@ -897,7 +908,7 @@ class RuntimeWorker:
                     code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
                     self.last_error = {"code": code, "message": str(exc)[:500],
                                        "definition_ref": descriptor.definition_ref}
-                    self.capability_missing.add(descriptor.definition_ref)
+                    self._note_capability_missing(descriptor.definition_ref)
                     ctx.finalizing = True
                     try:
                         await self.inputs.release_claim(batch, _on_committed=_mark_finalized)
@@ -937,6 +948,8 @@ class RuntimeWorker:
                     _mark_finalized()
                     await self._notify_results(final_batch)
                     driver_requeue = final_batch.execution_state == "queued"
+                    if not driver_requeue:
+                        self._drivers.discard(sid)
                     batch = None
                     return
                 if descriptor.kind == "background":
@@ -976,6 +989,9 @@ class RuntimeWorker:
                         if not ctx.finalized:
                             ctx.finalizing = False
                     await self._notify_results(final_batch)
+                    if final_batch.execution_state == "queued":
+                        self._activate(sid)
+                    batch = None
                     return
                 bus = env.event_bus if env.event_bus is not None else AgentEventBus()
 
@@ -1065,10 +1081,18 @@ class RuntimeWorker:
             log.warning("session send stopped for %s: %s", sid, exc)
             if batch is not None:
                 await self._final_failed(batch, exc.code, str(exc), ctx=ctx, before_notify=_flush_output)
+        except asyncio.CancelledError:
+            if ctx is not None and ctx.shutdown_interrupted:
+                batch = None
+            raise
         except Exception:
-            log.exception("session send failed for %s", sid)
-            if batch is not None:
-                await self._final_failed(batch, "internal_error", "session send raised", ctx=ctx, before_notify=_flush_output)
+            if ctx is not None and ctx.shutdown_interrupted:
+                log.warning("session send interrupted by shutdown timeout for %s", sid)
+                batch = None
+            else:
+                log.exception("session send failed for %s", sid)
+                if batch is not None and not (ctx is not None and ctx.finalized):
+                    await self._final_failed(batch, "internal_error", "session send raised", ctx=ctx, before_notify=_flush_output)
         finally:
             try:
                 if renewal is not None:
@@ -1123,7 +1147,7 @@ class RuntimeWorker:
         the input pending for a capable node instead of acquiring and then failing it.
         """
         if descriptor.kind not in {"agent", "background", "workflow_driver"}:
-            self.capability_missing.add(descriptor.definition_ref)
+            self._note_capability_missing(descriptor.definition_ref)
             return False
         try:
             capable = self._can_build(descriptor)
@@ -1131,13 +1155,13 @@ class RuntimeWorker:
             code = exc.code if isinstance(exc, RuntimeRequestError) else "resource_unavailable"
             self.last_error = {"code": code, "message": str(exc)[:500],
                                "definition_ref": descriptor.definition_ref}
-            self.capability_missing.add(descriptor.definition_ref)
+            self._note_capability_missing(descriptor.definition_ref)
             return False
         if not capable:
             self.last_error = {"code": "capability_unavailable",
                                "message": "factory rejected descriptor",
                                "definition_ref": descriptor.definition_ref}
-            self.capability_missing.add(descriptor.definition_ref)
+            self._note_capability_missing(descriptor.definition_ref)
         return capable
 
     @staticmethod
@@ -1529,11 +1553,6 @@ class RuntimeWorker:
                 except Exception:
                     log.warning("graceful_release failed during shutdown", exc_info=True)
             await self.drain_closing_releases()
-            if self._wake_subscription is not None:
-                await self._wake_subscription.aclose()
-            if self._wake_listener is not None:
-                self._wake_listener.cancel()
-                await asyncio.gather(self._wake_listener, return_exceptions=True)
             for sub in self._subscriptions:
                 await sub.aclose()
             await asyncio.gather(self._dispatcher, *self._listeners,

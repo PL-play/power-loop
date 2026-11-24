@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import time
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -172,6 +173,7 @@ class ClaimedBatch:
     reclaimed_next_round_index: int = 0
     reclaimed_pending_tool_seq: int | None = None
     max_rounds_override: int | None = None
+    claimed_at_mono: float | None = None
 
 
 def _extract_max_rounds_override(rows) -> int | None:
@@ -362,8 +364,8 @@ class RuntimeInputStore:
                 })
                 try:
                     async with asyncio.timeout(self.hook_timeout_s):
-                        hr = await hooks.run_async(HookPoint.TURN_REPAIR, ctx)
-                    hook_rec = hr.context.values.get("recovered")
+                        await hooks.run_typed_async(HookPoint.TURN_REPAIR, ctx)
+                    hook_rec = ctx.values.get("recovered")
                     if isinstance(hook_rec, dict):
                         recovered.update({str(k): str(v) for k, v in hook_rec.items()})
                 except Exception:
@@ -826,6 +828,7 @@ class RuntimeInputStore:
                                 f"child depth exceeds max {self.store.max_spawn_depth}",
                             )
                         lease_until = database_now + ttl_ms
+                        claim_started = time.monotonic()
 
                         preclaimed: list[ClaimedBatch] = []
                         queued: list[TargetRef] = []
@@ -943,6 +946,7 @@ class RuntimeInputStore:
                                     root_session_id=root_id,
                                     depth=child_depth,
                                     reply_to_session_id=reply_to,
+                                    claimed_at_mono=claim_started,
                                     reply_result_kind=sp.result_kind,
                                     reply_to_item_id=sp.message_id,
                                 ))
@@ -1678,6 +1682,7 @@ class RuntimeInputStore:
         now_sql = self._now_sql()
         pt, pi = self._p_text(), self._p_int()
         ttl_ms = int(ttl_s * 1000)
+        claim_started = time.monotonic()
         registered_claims: list[tuple[str, int]] = []
         try:
             try:
@@ -1843,6 +1848,7 @@ class RuntimeInputStore:
                         root_session_id=str(srow["root_session_id"]),
                         depth=int(srow["depth"]),
                         reply_to_session_id=reply_to_sid,
+                        claimed_at_mono=claim_started,
                         reply_result_kind=reply_rk,
                         reply_to_item_id=(ref.message_id if reply_to_sid is not None else None),
                         fold_stats_json=srow["fold_stats_json"],
@@ -1890,6 +1896,7 @@ class RuntimeInputStore:
             raise RuntimeRequestError("invalid_options", "ttl_s")
         now_sql = self._now_sql()
         ttl_ms = int(ttl_s * 1000)
+        claim_started = time.monotonic()
         context: dict[str, Any] = {}
         try:
             async with self.db.transaction() as tx:
@@ -1955,7 +1962,7 @@ class RuntimeInputStore:
                     # 1-SQL (2 SQL on MySQL) pre-staged cross-container child claim!
                     if srow["ready_item_json"] and srow["q_id"] is None and srow["pending_tool_seq"] is None:
                         return self._build_prestaged_batch(
-                            target, srow, descriptor, node_id, boot_id,
+                            target, srow, descriptor, node_id, boot_id, claimed_at_mono=claim_started,
                         )
                     rows = [
                         {
@@ -2015,7 +2022,7 @@ class RuntimeInputStore:
                     # Optimization 6: 1-SQL Claim for pre-staged cross-container child!
                     if srow["ready_item_json"] and srow["pending_tool_seq"] is None:
                         return self._build_prestaged_batch(
-                            target, srow, descriptor, node_id, boot_id,
+                            target, srow, descriptor, node_id, boot_id, claimed_at_mono=claim_started,
                         )
                     send_idx_tmp = int(srow["send_index"])
                     is_drv_tmp = srow["session_kind"] == "workflow_driver"
@@ -2184,6 +2191,7 @@ class RuntimeInputStore:
                     fold_stats_json=srow["fold_stats_json"],
                     reclaimed_cancelled=bool(batch_cancel_by is not None and not active_rows),
                     max_rounds_override=_extract_max_rounds_override(rows),
+                    claimed_at_mono=claim_started,
                 )
                 context["batch"] = batch
                 return batch
@@ -2200,6 +2208,7 @@ class RuntimeInputStore:
 
     def _build_prestaged_batch(
         self, target: TargetRef, srow, descriptor: RuntimeDescriptor, node_id: str, boot_id: str,
+        *, claimed_at_mono: float | None = None,
     ) -> ClaimedBatch:
         ready = json.loads(srow["ready_item_json"])
         ref = InputRef(target.store_id, target.session_id, ready["item_id"])
@@ -2244,6 +2253,7 @@ class RuntimeInputStore:
             reply_to_item_id=(ready["item_id"] if ready.get("reply_to_session_id") else None),
             fold_stats_json=srow["fold_stats_json"],
             reclaimed_cancelled=bool(srow["cancel_by"] is not None),
+            claimed_at_mono=claimed_at_mono,
         )
 
     async def release_claim(self, batch: ClaimedBatch, *, _on_committed=None):
@@ -2277,6 +2287,7 @@ class RuntimeInputStore:
             lifecycle = str(state["lifecycle"])
             is_driver = state["session_kind"] == "workflow_driver"
             id_ph = ",".join("?" for _ in ids)
+            settled_via_final = False
             if lifecycle in ("closing", "closed"):
                 eff_cb = state["cancel_by"] or "removed"
                 eff_reason = state["cancel_reason"] or "cancelled"
@@ -2301,6 +2312,7 @@ class RuntimeInputStore:
                 if changed != 1:
                     raise SessionLeaseLost(batch.target.session_id)
             elif lifecycle == "open" and int(state["cancel_seq"]) > batch.cancel_seq:
+                settled_via_final = True
                 await self._final_tx(
                     tx, batch, batch.input_refs, "cancelled", "", {}, None,
                     state["cancel_reason"] or "cancelled", "cancelled",
@@ -2342,11 +2354,12 @@ class RuntimeInputStore:
                 )
                 if changed != 1:
                     raise SessionLeaseLost(batch.target.session_id)
-            await tx.execute(
-                f"DELETE FROM {self.store.t.messages} WHERE session_id=? AND seq=? "
-                "AND role='user' AND send_index=?",
-                (batch.target.session_id, batch.message_seq, batch.send_index),
-            )
+            if not settled_via_final:
+                await tx.execute(
+                    f"DELETE FROM {self.store.t.messages} WHERE session_id=? AND seq=? "
+                    "AND role='user' AND send_index=?",
+                    (batch.target.session_id, batch.message_seq, batch.send_index),
+                )
         if _on_committed is not None:
             _on_committed()
         for c_target, p_sid, r_res, r_kind, r_reason in undeliverable_out:
@@ -4171,6 +4184,7 @@ class RuntimeInputStore:
         self.check_store(target)
         now_sql = self._now_sql()
         ttl_ms = int(ttl_s * 1000)
+        claim_started = time.monotonic()
         sid = target.session_id
         expiry_cond = f"AND owner_lease_until_ms<={now_sql}"
         epoch_cond = (
@@ -4433,6 +4447,7 @@ class RuntimeInputStore:
             reply_to_session_id=reply_to_sid,
             reply_result_kind=reply_rk,
             reply_to_item_id=reply_item_id,
+            claimed_at_mono=claim_started,
             fold_stats_json=srow["fold_stats_json"],
             is_reclaimed=True,
             reclaimed_has_assistant=has_assistant,

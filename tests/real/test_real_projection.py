@@ -26,7 +26,7 @@ from power_loop.core.agent_context import (
     set_session_id,
 )
 from power_loop.runtime.fold import _SUMMARY_PROMPT, LLMSummaryFold
-from power_loop.runtime.history_projector import DefaultDeterministicProjector
+from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
 from power_loop.tools.default_tools import run_recall_send
 from tests.real._llm import make_llm
@@ -63,7 +63,7 @@ async def test_real_projection_compaction_and_recall(runtime_agent, monkeypatch)
     monkeypatch.setattr(llm, "complete", complete)
     try:
         store = await SessionStore.open(":memory:")
-        projector = DefaultDeterministicProjector()
+        projector = ProjectedRepresentation()
         loop = await runtime_agent(
             model=llm, store=store,
             config=AgentLoopConfig(

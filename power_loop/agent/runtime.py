@@ -175,7 +175,7 @@ class Runtime:
     async def open_session(self, descriptor, *, actor):
         self.client._require_open()
         if descriptor.kind != "agent":
-            raise RuntimeRequestError("capability_unavailable", descriptor.kind + " is not enabled in P2")
+            raise RuntimeRequestError("capability_unavailable", f"unsupported root session kind: {descriptor.kind}")
         if actor.session_id is not None:
             raise RuntimeRequestError("forbidden", "host identity required to open a root session")
         return await self.client.create_session(descriptor, actor=actor)

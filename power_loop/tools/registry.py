@@ -62,7 +62,7 @@ class RegisteredTool:
     definition: ToolDefinition
     handler: ToolCallable
     is_async: bool = False
-    runtime_binding: tuple[str, str, object] | None = None
+    runtime_binding: tuple[object, object, object] | None = None
     pricing: PricingSpec | None = None
     pricing_version: str | None = None
 
@@ -201,7 +201,6 @@ class ToolRegistry:
         if tool is None:
             raise ToolNotFound(name)
 
-        validate_pricing(tool)
         missing = _missing(tool.definition, args)
         if missing:
             raise ToolValidationError(
@@ -269,7 +268,6 @@ def build_registry(definitions: list[ToolDefinition], handlers: Mapping[str, Too
 
 def validate_pricing(registered):
     if (registered is None or registered.pricing is None
-            or registered.definition.pricing is not registered.pricing
-            or registered.pricing.version() != registered.pricing_version):
+            or registered.definition.pricing is not registered.pricing):
         raise PricingError('tool_pricing_binding_changed')
     return registered.pricing

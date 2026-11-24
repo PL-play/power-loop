@@ -1022,11 +1022,13 @@ class AgentPipeline:
             caps = caps.for_model(self.config.model)
         blind = caps is not None and getattr(caps, "supports_image_input", None) is not True
         for m in self.history:
-            r = rounds.get(id(m))
+            mid = id(m)
+            r = rounds.get(mid)
             if r is None:
                 continue
             c = m.get("content")
             if not isinstance(c, list) or not any(isinstance(b, dict) and b.get("type") == "attachment" for b in c):
+                rounds.pop(mid, None)
                 continue
             if round_index - int(r) < keep_rounds:
                 continue
@@ -1048,6 +1050,7 @@ class AgentPipeline:
                 else:
                     new_blocks.append(b)
             m["content"] = new_blocks
+            rounds.pop(mid, None)
         if n:
             logger.info("image retention: retired %d image block(s) older than %d round(s) (round %d)",
                         n, keep_rounds, round_index)
@@ -1423,7 +1426,7 @@ class AgentPipeline:
                             attempt=attempt, model=model_name, usage=dict(reported["usage"]),
                             cost_amount=reported["cost_amount"], response_id=reported["response_id"],
 ), round_index=round_index, stream_id="main")
-                except (Exception, asyncio.CancelledError) as exc:
+                except Exception as exc:
                     logging.getLogger(__name__).warning("Response observer failed: %s", type(exc).__name__)
                 estimated = usage is None or getattr(usage, "prompt_tokens", None) is None
                 if estimated:
@@ -1471,7 +1474,7 @@ class AgentPipeline:
                 try:
                     self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
                                round_index=round_index, stream_id="main")
-                except (Exception, asyncio.CancelledError) as exc:
+                except Exception as exc:
                     logger.warning("Stream completion observer failed: %s", type(exc).__name__)
 
         async def _initial_call():
@@ -1915,6 +1918,10 @@ class AgentPipeline:
                 if drained_count or await self._runtime_work_after_model():
                     # 停的这一刻有刚折进来的新输入：不撤销停，留痕交给宿主（另起一轮处理）
                     self._pass_state["new_input_after_pass"] = True
+                if _is_cancelled(self.cancel_token):
+                    await self._finalize("cancelled")
+                    return self._make_result("cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]",
+                                             rounds=round_idx)
                 await self._finalize("pass_turn")
                 return self._make_result("completed", rounds=round_idx)
 
@@ -2270,6 +2277,11 @@ class AgentPipeline:
                 round_ended = False
                 if self._drain_follow_ups_final is not None:
                     drained = await self._drain_follow_ups_final()
+                    if _is_cancelled(self.cancel_token):
+                        await self._finalize("cancelled")
+                        return self._make_result(
+                            "cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]", rounds=round_idx,
+                        )
                     if drained:
                         # Close THIS (no-tools) round in the event stream + usage before steering
                         # reopens the loop — else the round is left unterminated and its per-round
@@ -2283,6 +2295,12 @@ class AgentPipeline:
                         await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
                         round_ended = True
                         if await self._append_drained(drained, round_index=round_idx):
+                            if _is_cancelled(self.cancel_token):
+                                await self._finalize("cancelled")
+                                return self._make_result(
+                                    "cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]",
+                                    rounds=round_idx,
+                                )
                             continue
                 if not round_ended:
                     self._emit(AgentEventType.ROUND_COMPLETED,

@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 import pytest
 
 from power_loop.runtime.store.schema import _STORE_TABLES
-from power_loop.runtime.store.task_schema import TASK_TABLES
 from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
 from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
@@ -46,7 +45,7 @@ pytestmark = [
 ]
 
 
-_DATA_TABLES = tuple(dict.fromkeys((*_STORE_TABLES, *(n for n in TASK_TABLES if n != 'task_store'))))
+_DATA_TABLES = tuple(dict.fromkeys(_STORE_TABLES))
 
 
 @pytest.fixture

@@ -10,45 +10,9 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
-from power_loop.agent.follow_up import (
-    FOLLOW_UP_MESSAGE_NAME,
-    format_follow_up_user_message,
-    merge_follow_up_inputs,
-)
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
-
-
-def test_format_follow_up_user_message_wraps_body() -> None:
-    msg = format_follow_up_user_message("  focus on feelings  ")
-    assert msg["role"] == "user"
-    assert msg["name"] == FOLLOW_UP_MESSAGE_NAME
-    assert msg["content"] == "<follow_up>\nfocus on feelings\n</follow_up>"
-
-
-def test_merge_follow_up_inputs_empty_returns_none() -> None:
-    assert merge_follow_up_inputs([]) is None
-    assert merge_follow_up_inputs(["", "   "]) is None
-
-
-def test_merge_follow_up_inputs_joins_multiple_strings() -> None:
-    merged = merge_follow_up_inputs(["first", "second"])
-    assert merged is not None
-    assert merged["name"] == FOLLOW_UP_MESSAGE_NAME
-    assert "first\n\nsecond" in merged["content"]
-
-
-def test_merge_follow_up_inputs_accepts_loop_messages() -> None:
-    merged = merge_follow_up_inputs(
-        [
-            {"role": "user", "content": "alpha"},
-            format_follow_up_user_message("beta"),
-        ]
-    )
-    assert merged is not None
-    assert "alpha" in merged["content"]
-    assert "beta" in merged["content"]
 
 
 class _GateLLM(LLMService):
@@ -297,60 +261,3 @@ async def test_empty_activation_and_busy_append_do_not_start_duplicate_execution
     llm.release_first.set()
     assert (await send_task).status == "completed"
     assert len(llm.calls) == 2
-
-
-# ── multimodal steering (design/75) ──────────────────────────────────────────
-#
-# Steering an in-flight loop used to DROP any image in it: the in-process queue keeps the
-# original object, but merge flattened content with json.dumps, so the image survived only as
-# a serialized blob of text. Same user photo, visible when the session happened to be idle and
-# invisible when it happened to be busy.
-
-_IMG = {"type": "attachment",
-        "attachment": {"path": "/w/a.png", "filename": "a.png", "kind": "image"}}
-
-
-def test_merge_carries_image_blocks_through() -> None:
-    from power_loop.agent.follow_up import merge_follow_up_inputs
-
-    merged = merge_follow_up_inputs(
-        ["先看这个", {"role": "user", "content": [{"type": "text", "text": "这张图哪里不对"}, _IMG]}]
-    )
-    assert isinstance(merged["content"], list)
-    text_block, image_block = merged["content"]
-    assert "先看这个" in text_block["text"] and "这张图哪里不对" in text_block["text"]
-    assert image_block == _IMG
-
-
-def test_merge_keeps_plain_text_as_a_string() -> None:
-    from power_loop.agent.follow_up import merge_follow_up_inputs
-
-    merged = merge_follow_up_inputs(["a", "b"])
-    assert isinstance(merged["content"], str)
-
-
-def test_merge_of_image_only_steering_is_not_dropped() -> None:
-    from power_loop.agent.follow_up import merge_follow_up_inputs
-
-    merged = merge_follow_up_inputs([{"role": "user", "content": [_IMG]}])
-    assert merged is not None
-    assert _IMG in merged["content"]
-
-
-def test_flatten_marks_non_text_instead_of_serializing_it() -> None:
-    from power_loop.agent.follow_up import follow_up_text
-
-    out = follow_up_text({"role": "user", "content": [{"type": "text", "text": "看"}, _IMG]})
-    assert out == "看\n[attachment]"
-
-
-def test_flatten_never_pastes_an_inlined_base64_payload() -> None:
-    # The cross-process queue is a TEXT column, so an image cannot survive it — but dumping the
-    # whole data URL into the steering text is the worst of both worlds.
-    from power_loop.agent.follow_up import follow_up_text
-
-    data_url = "data:image/png;base64," + "A" * 4000
-    out = follow_up_text({"role": "user",
-                          "content": [{"type": "image_url", "image_url": {"url": data_url}}]})
-    assert out == "[image_url]"
-    assert "base64" not in out

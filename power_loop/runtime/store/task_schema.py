@@ -13,15 +13,10 @@ from .schema import (
     provisioning_ddl,
     validate_table_prefix,
 )
-from .session_native_ddl import INDEXES, session_native_ddl
+from .session_native_ddl import INDEXES
 
 TASK_SCHEMA_VERSION = 18
 TASK_PROTOCOL_VERSION = 43
-TASK_TABLES: tuple[str, ...] = ()
-
-
-def task_tables_ddl(name: str, prefix: str) -> list[str]:
-    return session_native_ddl(name, prefix)
 
 
 async def verify_task_schema(db: Database, prefix: str) -> None:

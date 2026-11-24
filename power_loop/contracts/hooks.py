@@ -64,14 +64,7 @@ class HookDirective(str, Enum):
 
 @dataclass
 class HookContext:
-    """Mutable context passed through each hook chain."""
+    """Mutable notification context carrying a values dictionary and optional control directive."""
 
     values: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class HookResult:
-    """Return value from hook execution, carrying both context and control directive."""
-
-    context: HookContext = field(default_factory=HookContext)
     directive: HookDirective = HookDirective.CONTINUE

@@ -78,10 +78,6 @@ class _SqliteTransaction:
     async def fetchall(self, sql: str, params: Params = ()) -> list[Row]:
         return await self._db._fetchall(self._db.dialect.translate(sql), params)
 
-    async def execute_flag(self, sql: str, params: Params = ()) -> bool | None:
-        row = await self.fetchone(sql, params)
-        return bool(row["cancelled"]) if row is not None else None
-
     async def execute_packed(self, sql: str, params: Params = ()) -> tuple[int, int]:
         rc = await self.execute(sql, params)
         return rc, 0

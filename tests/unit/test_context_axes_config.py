@@ -15,7 +15,6 @@ import pytest
 
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.runtime.fold import AgenticFold, LLMSummaryFold
-from power_loop.runtime.history_projector import DefaultDeterministicProjector
 from power_loop.runtime.representation import ProjectedRepresentation
 
 
@@ -27,7 +26,7 @@ def test_default_is_projection_llm_summary():
 
 
 def test_custom_representation_and_fold_axes_are_kept():
-    rep = DefaultDeterministicProjector(keep_last_sends=2)
+    rep = ProjectedRepresentation(version=2)
     fold = AgenticFold(keep_last_sends=3)
     c = AgentLoopConfig(representation=rep, fold_strategy=fold)
     assert c.representation is rep
@@ -46,7 +45,7 @@ def test_removed_legacy_kwargs_are_rejected():
     with pytest.raises(TypeError):
         AgentLoopConfig(compactor=None)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
-        AgentLoopConfig(history_projector=DefaultDeterministicProjector())  # type: ignore[call-arg]
+        AgentLoopConfig(history_projector=ProjectedRepresentation())  # type: ignore[call-arg]
 
 
 def test_max_tokens_must_be_positive():

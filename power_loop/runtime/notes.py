@@ -202,9 +202,3 @@ class NoteMemory:
         session_id: str | None = None,
     ) -> None:
         return None
-
-
-# Backwards-compatible alias. The class was misleadingly named after SQLite even
-# though it is backend-agnostic (it reads from whatever SessionStore is passed).
-# Kept so existing imports (`from power_loop import SQLiteNoteMemory`) keep working.
-SQLiteNoteMemory = NoteMemory

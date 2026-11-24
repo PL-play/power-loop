@@ -42,6 +42,122 @@ _CURSOR_PREFIX = '\x1flc:'
 _INCLUSIVE_CURSOR_PREFIX = '\x1flci:'
 _RAW_EXCLUSIVE_PREFIX = '\x1fsid:gt:'
 _RAW_INCLUSIVE_PREFIX = '\x1fsid:ge:'
+_SUPPLEMENTARY_CURSOR_PREFIX = '\x1fsupp:'
+
+
+def _encode_supplementary_cursor(step: int) -> str:
+    return f'{_SUPPLEMENTARY_CURSOR_PREFIX}{int(step)}'
+
+
+def _decode_supplementary_cursor(token: str) -> int | None:
+    if not token.startswith(_SUPPLEMENTARY_CURSOR_PREFIX):
+        return None
+    raw = token[len(_SUPPLEMENTARY_CURSOR_PREFIX):]
+    if not raw.isdigit() or int(raw) < 1:
+        return None
+    return int(raw)
+
+
+async def _delete_active_terminal_inbox(store, tx, *, cutoff_ms: int, limit: int, session_id: str | None) -> int:
+    """Clean expired terminal follow_up_queue rows even for active open/suspended sessions.
+
+    Safety invariants:
+    - Cleans only settled rows: ``(terminal_status IS NOT NULL AND completed_at < cutoff)``
+      OR completed fast-path rows ``(status='delivered' AND terminal_status IS NULL AND
+      delivered_at < cutoff AND (delivered_send_index < sessions.send_index OR
+      (delivered_send_index = sessions.send_index AND sessions.execution_state <> 'running')))``.
+    - Never deletes ``pending``, ``waiting_continuation``, or currently running inputs.
+    - Protects ``workflow_driver.start_input_message_id``.
+    - Never touches raw ``messages``.
+    """
+    if limit <= 0:
+        return 0
+    where = (
+        "((f.terminal_status IS NOT NULL AND f.completed_at<?) "
+        "OR (f.status='delivered' AND f.terminal_status IS NULL AND f.delivered_at<? "
+        "AND (s.session_id IS NULL OR f.delivered_send_index<s.send_index "
+        "OR (f.delivered_send_index=s.send_index AND s.execution_state<>'running')))) "
+        "AND (s.session_id IS NULL OR NOT (s.session_kind='workflow_driver' AND s.start_input_message_id=f.item_id))"
+    )
+    params: list = [cutoff_ms, cutoff_ms]
+    if session_id is not None:
+        where += " AND f.session_id=?"
+        params.append(session_id)
+    rows = await tx.fetchall(
+        f"SELECT f.id FROM {store.t.follow_up_queue} f "
+        f"LEFT JOIN {store.t.sessions} s ON s.session_id=f.session_id "
+        f"WHERE {where} ORDER BY f.id ASC LIMIT ?",
+        (*params, limit),
+    )
+    if not rows:
+        return 0
+    ids = tuple(row['id'] for row in rows)
+    marks = ','.join('?' for _ in ids)
+    return await tx.execute(
+        f"DELETE FROM {store.t.follow_up_queue} "
+        f"WHERE id IN ({marks}) AND ("
+        "(terminal_status IS NOT NULL AND completed_at<?) "
+        "OR (status='delivered' AND terminal_status IS NULL AND delivered_at<?))",
+        (*ids, cutoff_ms, cutoff_ms),
+    )
+
+
+async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: int, session_id: str | None) -> int:
+    """Clean expired project_messages already superseded by a compact_to_send cutoff."""
+    if limit <= 0:
+        return 0
+    sub_where = "kind='compact' AND compact_to_send IS NOT NULL"
+    sub_params: list = []
+    if session_id is not None:
+        sub_where += " AND session_id=?"
+        sub_params.append(session_id)
+    rows = await tx.fetchall(
+        f"SELECT p.id FROM {store.t.project_messages} p "
+        f"JOIN (SELECT session_id, MAX(compact_to_send) AS max_compact_to, MAX(id) AS max_compact_id "
+        f"FROM {store.t.project_messages} WHERE {sub_where} GROUP BY session_id) c "
+        "ON c.session_id=p.session_id "
+        "WHERE p.created_at<? AND ("
+        "(p.kind<>'compact' AND p.send_index<=c.max_compact_to) "
+        "OR (p.kind='compact' AND p.id<c.max_compact_id)) "
+        "ORDER BY p.id ASC LIMIT ?",
+        (*sub_params, cutoff_ms, limit),
+    )
+    if not rows:
+        return 0
+    ids = tuple(row['id'] for row in rows)
+    marks = ','.join('?' for _ in ids)
+    return await tx.execute(
+        f"DELETE FROM {store.t.project_messages} WHERE id IN ({marks}) AND created_at<?",
+        (*ids, cutoff_ms),
+    )
+
+
+async def _delete_orphan_shared_state(store, tx, *, cutoff_ms: int, limit: int, session_id: str | None) -> int:
+    """Clean expired ``shared:*`` rows in session_runtime_state with no owning session row."""
+    if limit <= 0:
+        return 0
+    where = "r.state_key LIKE 'shared:%' AND r.updated_at<? AND s.session_id IS NULL"
+    params: list = [cutoff_ms]
+    if session_id is not None:
+        where += " AND r.session_id=?"
+        params.append(session_id)
+    rows = await tx.fetchall(
+        f"SELECT r.session_id, r.state_key FROM {store.t.session_runtime_state} r "
+        f"LEFT JOIN {store.t.sessions} s ON s.session_id=r.session_id "
+        f"WHERE {where} ORDER BY r.session_id ASC, r.state_key ASC LIMIT ?",
+        (*params, limit),
+    )
+    if not rows:
+        return 0
+    marks = ','.join('(?,?)' for _ in rows)
+    values = tuple(val for row in rows for val in (row['session_id'], row['state_key']))
+    return await tx.execute(
+        f"DELETE FROM {store.t.session_runtime_state} "
+        f"WHERE (session_id,state_key) IN ({marks}) "
+        "AND state_key LIKE 'shared:%' AND updated_at<? "
+        f"AND NOT EXISTS (SELECT 1 FROM {store.t.sessions} s WHERE s.session_id={store.t.session_runtime_state}.session_id)",
+        (*values, cutoff_ms),
+    )
 
 
 def _encode_cursor(
@@ -182,14 +298,22 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
     eligibility_cutoff = max(cutoff.values())
     lifecycles = _LIFECYCLE_ORDER if 'inbox' in wanted else ('closed', 'closing')
     scan_limit = remaining if candidate_limit is None else candidate_limit
-    candidates, use_lifecycle_cursor, cursor_step = await _fetch_lifecycle_candidates(
-        store,
-        eligibility_cutoff=eligibility_cutoff,
-        limit=scan_limit,
-        lifecycles=lifecycles,
-        after_session_id=after_session_id if candidate_limit is not None else None,
-        session_id=session_id if candidate_limit is None else None,
+    supp_step = (
+        _decode_supplementary_cursor(after_session_id)
+        if candidate_limit is not None and after_session_id is not None
+        else None
     )
+    if supp_step is not None:
+        candidates, use_lifecycle_cursor, cursor_step = [], True, 0
+    else:
+        candidates, use_lifecycle_cursor, cursor_step = await _fetch_lifecycle_candidates(
+            store,
+            eligibility_cutoff=eligibility_cutoff,
+            limit=scan_limit,
+            lifecycles=lifecycles,
+            after_session_id=after_session_id if candidate_limit is not None else None,
+            session_id=session_id if candidate_limit is None else None,
+        )
     counts = {}
     scanned, last = 0, None
     truncated_cursor: str | None = None
@@ -239,7 +363,8 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                         (sid, cutoff['inbox'], cutoff['inbox'], cur_si, cur_si, execution_state, *driver_params),
                         remaining,
                     )
-                    counts['inbox'] = counts.get('inbox', 0) + count
+                    if count:
+                        counts['inbox'] = counts.get('inbox', 0) + count
                     remaining -= count
                 if (
                     remaining > 0
@@ -256,7 +381,8 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                         if category in wanted and remaining > 0:
                             count = await delete_batch(tx, table, keys,
                                 f'session_id=? AND {age_column}<?', (sid, cutoff[category]), remaining)
-                            counts[category] = counts.get(category, 0) + count
+                            if count:
+                                counts[category] = counts.get(category, 0) + count
                             remaining -= count
                     if 'sessions' in wanted and remaining >= 1 and state['updated_at'] < cutoff['sessions']:
                         retained = False
@@ -266,7 +392,8 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
                                 break
                         if not retained:
                             count = await tx.execute(f'DELETE FROM {store.t.sessions} WHERE session_id=?', (sid,))
-                            counts['sessions'] = counts.get('sessions', 0) + count
+                            if count:
+                                counts['sessions'] = counts.get('sessions', 0) + count
                             remaining -= count
                             if count:
                                 session_deleted = True
@@ -296,4 +423,41 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
         next_after = last
     else:
         next_after = None
+
+    # Supplementary bounded cleanup after lifecycle candidates complete:
+    # 1) Active open/suspended sessions' expired terminal follow_up_queue rows
+    # 2) Expired project_messages superseded by compact_to_send
+    # 3) Orphaned shared:* runtime_state rows without an owning session
+    # Never touches active open sessions' raw messages.
+    if next_after is None and remaining > 0:
+        supp_sid = session_id if candidate_limit is None else None
+        supp_deleted = 0
+        async with store._db.transaction() as tx:
+            if 'inbox' in wanted and remaining > 0:
+                count = await _delete_active_terminal_inbox(
+                    store, tx, cutoff_ms=cutoff['inbox'], limit=remaining, session_id=supp_sid,
+                )
+                if count:
+                    counts['inbox'] = counts.get('inbox', 0) + count
+                    supp_deleted += count
+                    remaining -= count
+            if 'projections' in wanted and remaining > 0:
+                count = await _delete_superseded_projections(
+                    store, tx, cutoff_ms=cutoff['projections'], limit=remaining, session_id=supp_sid,
+                )
+                if count:
+                    counts['projections'] = counts.get('projections', 0) + count
+                    supp_deleted += count
+                    remaining -= count
+            if 'runtime' in wanted and remaining > 0:
+                count = await _delete_orphan_shared_state(
+                    store, tx, cutoff_ms=cutoff['runtime'], limit=remaining, session_id=supp_sid,
+                )
+                if count:
+                    counts['runtime'] = counts.get('runtime', 0) + count
+                    supp_deleted += count
+                    remaining -= count
+        if remaining == 0 and supp_deleted > 0 and candidate_limit is not None:
+            next_after = _encode_supplementary_cursor((supp_step or 0) + 1)
+
     return RetentionPage(counts, scanned, fetched, next_after)

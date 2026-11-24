@@ -66,8 +66,10 @@ def sanitize(
     items. When ``value_patterns`` is given, secret-shaped substrings inside string VALUES are
     scrubbed too (key-name redaction alone misses secrets embedded in values — M-observability-6)."""
     if isinstance(value, str):
-        text = value if len(value) <= limit else value[:limit] + f"…(+{len(value) - limit})"
-        return scrub_value_secrets(text, value_patterns) if value_patterns else text
+        # Scrub BEFORE truncating so a secret straddling the truncation boundary cannot
+        # have its tail clipped off and slip past regex matching with a leaked prefix.
+        text = scrub_value_secrets(value, value_patterns) if value_patterns else value
+        return text if len(text) <= limit else text[:limit] + f"…(+{len(text) - limit})"
     if isinstance(value, dict):
         out: dict[Any, Any] = {}
         for k, v in value.items():
@@ -81,4 +83,18 @@ def sanitize(
             sanitize(v, limit, redact_lower, max_list=max_list, value_patterns=value_patterns)
             for v in value[:max_list]
         ]
+    if isinstance(value, tuple):
+        return tuple(
+            sanitize(v, limit, redact_lower, max_list=max_list, value_patterns=value_patterns)
+            for v in value[:max_list]
+        )
+    if isinstance(value, (set, frozenset)):
+        items = [
+            sanitize(v, limit, redact_lower, max_list=max_list, value_patterns=value_patterns)
+            for v in list(value)[:max_list]
+        ]
+        try:
+            return type(value)(items)
+        except TypeError:
+            return items
     return value

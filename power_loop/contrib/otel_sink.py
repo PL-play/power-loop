@@ -32,15 +32,34 @@ logger = logging.getLogger(__name__)
 class OtelSpanBridge:
     """Holds the open spans and the event→span mapping. One per bus."""
 
-    def __init__(self, tracer: Any) -> None:
+    _MAX_OPEN_SPANS = 1024
+
+    def __init__(self, tracer: Any, *, bus: AgentEventBus | None = None, max_open_spans: int = _MAX_OPEN_SPANS) -> None:
         from opentelemetry import trace  # lazy
 
         self._trace = trace
         self._tracer = tracer
+        self._bus = bus
+        self._subscribed_handler: Any = None
+        self._max_open_spans = max(1, int(max_open_spans))
         self._session: dict[str | None, Any] = {}
         self._round: dict[tuple[str | None, int], Any] = {}
         self._call: dict[tuple[str | None, str], Any] = {}
         self._tool: dict[tuple[str | None, str], Any] = {}
+
+    def _put_span(self, store: dict[Any, Any], key: Any, span: Any) -> None:
+        previous = store.pop(key, None)
+        if previous is not None:
+            self._end(previous)
+        while len(store) >= self._max_open_spans:
+            oldest_key = next(iter(store))
+            self._end(store.pop(oldest_key))
+        store[key] = span
+
+    def _end_session_children(self, sid: str | None) -> None:
+        for store in (self._call, self._tool, self._round):
+            for key in [k for k in store if k[0] == sid]:
+                self._end(store.pop(key, None))
 
     def _start(self, name: str, parent: Any, attrs: dict[str, Any]) -> Any:
         ctx = self._trace.set_span_in_context(parent) if parent is not None else None
@@ -61,15 +80,22 @@ class OtelSpanBridge:
         sid = event.session_id
         p = event.payload or {}
         if t is AgentEventType.SESSION_STARTED:
-            self._session[sid] = self._start(
-                "power_loop.session", None, {"session_id": sid or "", "scope": str(p.get("scope") or "")}
+            self._put_span(
+                self._session,
+                sid,
+                self._start(
+                    "power_loop.session", None, {"session_id": sid or "", "scope": str(p.get("scope") or "")}
+                ),
             )
         elif t is AgentEventType.SESSION_ENDED:
+            self._end_session_children(sid)
             self._end(self._session.pop(sid, None))
         elif t is AgentEventType.ROUND_STARTED:
             ri = int(p.get("round_index") or 0)
-            self._round[(sid, ri)] = self._start(
-                "power_loop.round", self._session.get(sid), {"round_index": ri}
+            self._put_span(
+                self._round,
+                (sid, ri),
+                self._start("power_loop.round", self._session.get(sid), {"round_index": ri}),
             )
         elif t is AgentEventType.ROUND_COMPLETED:
             ri = int(p.get("round_index") or 0)
@@ -77,9 +103,13 @@ class OtelSpanBridge:
         elif t is AgentEventType.LLM_CALL_STARTED:
             ri = int(p.get("round_index") or 0)
             parent = self._round.get((sid, ri)) or self._session.get(sid)
-            self._call[(sid, str(p.get("call_id") or ""))] = self._start(
-                "power_loop.llm_call", parent,
-                {"model": str(p.get("model") or ""), "attempt": int(p.get("attempt") or 1)},
+            self._put_span(
+                self._call,
+                (sid, str(p.get("call_id") or "")),
+                self._start(
+                    "power_loop.llm_call", parent,
+                    {"model": str(p.get("model") or ""), "attempt": int(p.get("attempt") or 1)},
+                ),
             )
         elif t is AgentEventType.LLM_CALL_COMPLETED:
             span = self._call.pop((sid, str(p.get("call_id") or "")), None)
@@ -92,8 +122,10 @@ class OtelSpanBridge:
         elif t is AgentEventType.TOOL_CALL_STARTED:
             ri = int(p.get("round_index") or event.round_index or 0)
             parent = self._round.get((sid, ri)) or self._session.get(sid)
-            self._tool[(sid, str(p.get("tool_call_id") or ""))] = self._start(
-                "power_loop.tool_call", parent, {"tool": str(p.get("name") or "")}
+            self._put_span(
+                self._tool,
+                (sid, str(p.get("tool_call_id") or "")),
+                self._start("power_loop.tool_call", parent, {"tool": str(p.get("name") or "")}),
             )
         elif t in (AgentEventType.TOOL_CALL_COMPLETED, AgentEventType.TOOL_CALL_FAILED):
             span = self._tool.pop((sid, str(p.get("tool_call_id") or "")), None)
@@ -118,7 +150,13 @@ class OtelSpanBridge:
                 pass
 
     def close(self) -> None:
-        """End any spans still open (e.g. a session that never emitted SESSION_ENDED)."""
+        """Unsubscribe from the bus and end any spans still open."""
+        if self._bus is not None:
+            try:
+                self._bus.unsubscribe(self._subscribed_handler or self.handle)
+            finally:
+                self._bus = None
+                self._subscribed_handler = None
         for store in (self._call, self._tool, self._round, self._session):
             for span in list(store.values()):
                 self._end(span)
@@ -135,6 +173,8 @@ def attach_otel_sink(bus: AgentEventBus, *, tracer: Any | None = None) -> OtelSp
         raise ImportError(
             "attach_otel_sink needs opentelemetry: pip install 'power-loop[otel]'"
         ) from exc
-    bridge = OtelSpanBridge(tracer or trace.get_tracer("power_loop"))
-    bus.subscribe(None, bridge.handle)
+    bridge = OtelSpanBridge(tracer or trace.get_tracer("power_loop"), bus=bus)
+    handler = bridge.handle
+    bridge._subscribed_handler = handler
+    bus.subscribe(None, handler)
     return bridge

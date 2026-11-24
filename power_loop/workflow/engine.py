@@ -35,7 +35,6 @@ _LOOP_KEY = "\x00loop"
 #: 当前 foreach 迭代自己的结果表（6.46.1）。body 的节点在每次迭代里 id 都一样，并行迭代共用全局结果表时，
 #: 体内的 inputs_from / when / 循环的 until 会读到别的迭代的结果。每个迭代在自己的 task 里开一层，嵌套的迭代再往里叠一层。
 _ITER_SCOPE: ContextVar[ChainMap[str, AgentResult] | None] = ContextVar("pl_wf_iter_scope", default=None)
-_DEFER_STEP: ContextVar[str | None] = ContextVar("pl_wf_defer_task_step", default=None)
 
 
 @dataclass
@@ -114,12 +113,6 @@ def _loop_prompt(lc: dict[str, Any], user_input: str) -> str:
         f"（这一轮的任务输入照旧附在下面）\n{user_input}"
     )
 
-
-#: 重启后在原会话接着跑时给叶子的话（6.46）
-_RESUME_PROMPT = (
-    "进程重启打断了你，你的会话、文件和半成品都还在。先看一眼自己做到哪了（todo、产出文件），"
-    "接着把原来的任务做完，然后照原来的要求给出最终回复。"
-)
 
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w-]*(?:\.[a-zA-Z_]\w*)?)\s*\}\}")
 
@@ -370,7 +363,6 @@ class WorkflowEngine:
             err_scope = _ERROR_SCOPE.get()
             if err_scope is not None:
                 err_scope.failed_results.append(res)
-        await self._emit_step(res)
         return res
 
     def _loop_feedback(self, node_id: str) -> str:
@@ -526,11 +518,6 @@ class WorkflowEngine:
             if err_scope is not None:
                 err_scope.failed_results.append(result)
         return result
-
-    async def _emit_step(self, result):
-        # Leaf results are persisted by the executor. Aggregate results are
-        # deterministic projections, rebuilt from those exact node references.
-        pass
 
     def _add_usage(self, usage):
         for key, value in (usage or {}).items():
@@ -829,8 +816,6 @@ class WorkflowEngine:
                 usage=_sum_usage(leaves),
             )
             self._results[node.id] = agg
-            # Journal the aggregate so resume can skip the whole foreach.
-            await self._emit_step(agg)
             return agg
         return broken or (leaves[-1] if leaves else None)
 

@@ -10,35 +10,10 @@ Goals:
 from __future__ import annotations
 
 import json
-import logging
 import re
 from typing import Any
 
 from .interface import LLMResponse
-
-
-def log_llm_json_result(
-    logger: logging.Logger,
-    result: LLMResponse,
-    *,
-    level: str = "info",
-    prefix: str = "",
-    include_debug: bool = False,
-    max_raw_chars: int = 600,
-    max_content_chars: int = 600,
-) -> None:
-    """
-    Convenience helper to log a result with a consistent format.
-    """
-    msg = (prefix + " " if prefix else "") + result.to_log_str(
-        max_raw_chars=max_raw_chars,
-        max_content_chars=max_content_chars,
-        include_debug=include_debug,
-    )
-    fn = getattr(logger, level, None)
-    if not callable(fn):
-        fn = logger.info
-    fn(msg)
 
 
 def strip_code_fences(text: str) -> str:
@@ -87,44 +62,6 @@ def _try_json_loads(s: str) -> tuple[dict[str, Any] | None, str | None]:
         return None, "parsed_json_is_not_object"
     except Exception as e:
         return None, f"json_decode_error:{e}"
-
-
-def parse_json_from_model_output(raw_text: str) -> tuple[dict[str, Any], str | None]:
-    """
-    Parse JSON from model output with multi-step fallback.
-    Returns (json_data, error_message).
-    """
-    text = (raw_text or "").strip()
-    if not text:
-        return {}, "empty_response"
-
-    # Strategy 1: direct parse
-    obj, err = _try_json_loads(text)
-    if obj is not None:
-        return obj, None
-
-    # Strategy 2: strip code fences
-    cleaned = strip_code_fences(text)
-    if cleaned != text:
-        obj2, err2 = _try_json_loads(cleaned)
-        if obj2 is not None:
-            return obj2, None
-
-    # Strategy 3: extract substring by braces
-    sub = extract_json_substring(cleaned)
-    if sub:
-        obj3, err3 = _try_json_loads(sub)
-        if obj3 is not None:
-            return obj3, None
-
-    # Strategy 4: simple repairs (trailing commas)
-    repaired = re.sub(r",\s*([}\]])", r"\1", sub or cleaned)
-    if repaired and repaired != (sub or cleaned):
-        obj4, err4 = _try_json_loads(repaired)
-        if obj4 is not None:
-            return obj4, None
-
-    return {}, err
 
 
 def parse_json_from_model_output_detailed(raw_text: str) -> LLMResponse:

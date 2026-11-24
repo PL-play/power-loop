@@ -17,13 +17,11 @@ Failure model
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import threading
 import weakref
-from collections import OrderedDict
-from collections.abc import Coroutine, Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -33,16 +31,11 @@ from power_loop.agent.sink import (
     CONTENT_ENCODING_JSON,
     CONTENT_ENCODING_META_KEY,
     SQLiteSink,
-    _encode_content,
-    _meta_with_content_encoding,
-)
-from power_loop.agent.system_prompt import (
-    resolve_runtime_system_prompt,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
-    SessionNotFoundError,
+    SessionLeaseLost,
 )
 from power_loop.core.agent_context import (
     get_ctx,
@@ -53,11 +46,7 @@ from power_loop.core.agent_context import (
 )
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
-from power_loop.core.pass_turn import ensure_pass_turn
-from power_loop.core.pipeline import (
-    AgentPipeline,
-    _tool_call_name,
-)
+from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
@@ -73,7 +62,6 @@ from power_loop.runtime.store.types import (
     MessageRow,
     MessageState,
     ProjectMessageRow,
-    SubagentLifecycle,
 )
 from power_loop.tools.registry import ToolRegistry
 
@@ -81,26 +69,6 @@ if TYPE_CHECKING:
     from power_loop.runtime.representation import Representation
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _SessionCache:
-    """A loop-local, rebuildable accelerator for one session's active window.
-
-    ``rows`` is EXACTLY what ``store.load_active_messages(session_id)`` returns at the moment
-    ``next_seq`` was observed — the DURABLE projection, never the pipeline's mutated working
-    copy (recall placeholders / microcompacted content are re-applied fresh each send, never
-    cached). The validity token is the PAIR ``(next_seq, last_compact_seq)``: a send reuses
-    ``rows`` iff BOTH still match the live ``sessions`` row. ``next_seq`` alone is insufficient
-    — a fold (compaction) reshuffles the OLDER active set into ``compacted_out`` while only
-    bumping ``next_seq`` by the note, so an out-of-band fold during a send could leave a stale
-    delta-extended window whose ``next_seq`` happens to match. ``last_compact_seq`` advances on
-    every fold, so pairing it in makes any fold — this loop's or another writer/process's —
-    invalidate the window. A cold loop with an empty cache reproduces identical behavior."""
-
-    next_seq: int
-    last_compact_seq: int
-    rows: list[MessageRow]
 
 
 @dataclass
@@ -133,38 +101,6 @@ class StatefulResult:
     next_seq: int | None = None
     #: design 217 M1b: deferred double-row ('user'+'project') projection + inline fold_stats_json for Final.
     pending_projection: Any = None
-
-
-class _SyncLoopRunner:
-    """A persistent event loop on a daemon thread that drives the blocking sync API.
-
-    ``send_sync`` / ``follow_up_sync`` / ``close`` must NOT spin a fresh ``asyncio.run`` per
-    call: an asyncpg/aiomysql connection pool binds to the event loop it was created on, so
-    a second ``asyncio.run`` (a new loop) finds the loop's cached store pool bound to the
-    now-closed first loop and raises ``InterfaceError`` / ``Event loop is closed``. One
-    long-lived loop keeps the pool valid for the whole lifetime of the StatefulAgentLoop —
-    matching the legacy synchronous store's "call it as often as you like" contract. (SQLite
-    is loop-agnostic but shares this path for uniformity.)
-    """
-
-    def __init__(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._serve, name="power-loop-sync", daemon=True)
-        self._thread.start()
-
-    def _serve(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def run(self, coro: Coroutine[Any, Any, Any]) -> Any:
-        """Submit a coroutine to the dedicated loop and block until it completes."""
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
-
-    def close(self) -> None:
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5.0)
-        if not self._thread.is_alive():
-            self._loop.close()
 
 
 @dataclass
@@ -242,23 +178,6 @@ def _session_sync(sid: str, *, owner: StatefulAgentLoop | None = None) -> _Sessi
     return entry
 
 
-def _release_session_sync(sid: str, owner: int) -> None:
-    """Drop ``owner``'s claim on ``sid``; delete the entry once nobody holds it and it's idle."""
-    with _SESSION_SYNC_GUARD:
-        entry = _SESSION_SYNC.get(sid)
-        if entry is None:
-            return
-        entry.refs.pop(owner, None)
-        if not entry.refs and not entry.users and not entry.lock.locked() and entry.pending_hint <= 0:
-            del _SESSION_SYNC[sid]
-
-
-def _discard_session_sync(sid: str) -> None:
-    """Forget ``sid`` entirely (the session was physically deleted)."""
-    with _SESSION_SYNC_GUARD:
-        _SESSION_SYNC.pop(sid, None)
-
-
 class _ExecutionLoop:
     """Private executor constructed by RuntimeWorker after a session claim.
 
@@ -323,13 +242,6 @@ class _ExecutionLoop:
             store.max_spawn_depth = max_spawn_depth
         self._owns_store = store is None
         self._store_open_lock = asyncio.Lock()
-        # Dedicated event loop (daemon thread) for the blocking sync API; opened lazily so
-        # the store pool stays bound to ONE loop across send_sync/follow_up_sync/close calls.
-        self._sync_runner: _SyncLoopRunner | None = None
-        self._sync_runner_lock = threading.Lock()
-        # Strong ref to a best-effort store.close() scheduled when sync close() is called
-        # from inside a running loop (keeps the task from being GC'd before it runs).
-        self._orphaned_close_task: asyncio.Future[None] | None = None
         self.config = config if config is not None else AgentLoopConfig()
         if self.config.delegation_policy != "single_level":
             raise ValueError("session runtime requires single_level delegation")
@@ -341,17 +253,7 @@ class _ExecutionLoop:
             event_bus=event_bus, hooks=hooks if hooks is not None else AgentHooks()
         )
         self._register_builtin_hooks()
-        # Session locks/queues are PROCESS-GLOBAL (see _SESSION_SYNC): the guarantee is per
-        # session, not per loop object. This set records which sessions THIS loop has touched, so
-        # aclose() drains only its own and teardown can release its claims.
         self._sync_sids: set[str] = set()
-        self._closing = False
-        # ── per-session active-window cache (rebuildable accelerator; see _SessionCache) ──
-        self._session_cache_size = int(session_cache_size)
-        self._session_cache: OrderedDict[str, _SessionCache] = OrderedDict()
-        self._cache_hits = 0
-        self._cache_misses = 0
-        self._cache_evictions = 0
 
     def _register_builtin_hooks(self) -> None:
         """Register power-loop's default functional hooks on this loop's own
@@ -416,253 +318,6 @@ class _ExecutionLoop:
                 )
         return self.store
 
-    # ── per-session active-window cache helpers ─────────────────────────────
-
-    def _cache_get(self, sid: str, next_seq: int, last_compact_seq: int) -> list[MessageRow] | None:
-        """Return the cached active rows iff the ``(next_seq, last_compact_seq)`` token still
-        matches; else None. The fold counter must match too — a fold reshuffles the older
-        active set, so a matching ``next_seq`` alone can still front a stale window."""
-        if self._session_cache_size <= 0:
-            return None
-        entry = self._session_cache.get(sid)
-        if entry is not None and entry.next_seq == next_seq \
-                and entry.last_compact_seq == last_compact_seq:
-            self._session_cache.move_to_end(sid)  # LRU touch
-            self._cache_hits += 1
-            return entry.rows
-        self._cache_misses += 1
-        return None
-
-    def _cache_put(
-        self, sid: str, next_seq: int, rows: list[MessageRow], last_compact_seq: int
-    ) -> None:
-        if self._session_cache_size <= 0:
-            return
-        self._session_cache[sid] = _SessionCache(
-            next_seq=next_seq, last_compact_seq=last_compact_seq, rows=list(rows)
-        )
-        self._session_cache.move_to_end(sid)
-        while len(self._session_cache) > self._session_cache_size:
-            self._session_cache.popitem(last=False)  # evict LRU
-            self._cache_evictions += 1
-
-    def _cache_append(self, sid: str, row: MessageRow, *, new_next_seq: int) -> None:
-        """Extend a live cache entry with one row the loop itself just appended (keeping the
-        durable projection current without a reload). No-op if there's no live entry.
-
-        CONTIGUITY GUARD: ``row.seq`` is the store's pre-append ``next_seq``, which equals the
-        cached token ONLY if the cache saw every write since it was built. A mismatch means some
-        out-of-band writer advanced the durable ``next_seq`` past our window —
-        ``resume()`` / ``submit_input()`` / ``abort_pending()`` (which append
-        via their own sink), or another loop/process sharing the store. Re-syncing the token
-        then would paper over the gap and let the next ``_cache_get`` HIT a row-missing window
-        (the bug the code review caught); instead we drop the entry so the next send MISSes and
-        full-reloads. This is what makes the validity check sound across ALL writers."""
-        entry = self._session_cache.get(sid)
-        if entry is None:
-            return
-        if entry.next_seq != row.seq:
-            self._cache_invalidate(sid)
-            return
-        entry.rows.append(row)
-        entry.next_seq = new_next_seq
-
-    def _cache_invalidate(self, sid: str) -> None:
-        self._session_cache.pop(sid, None)
-
-    async def _refresh_window_cache_after_send(self, sid: str, store: SessionStore) -> None:
-        """Fold this send's appended tail into the live window entry — UNLESS a fold
-        reshuffled the older active set, in which case drop the entry so the next send
-        full-reloads.
-
-        The fold check compares the durable ``last_compact_seq`` against the entry's, so it
-        fires for ANY fold since the entry was built — this send's own compaction OR an
-        out-of-band one by another writer/process. A bare ``next_seq`` delta-extend would
-        otherwise keep the now-``compacted_out`` rows in the window and, because a fold also
-        advances ``next_seq`` (the note), leave the entry's token matching the live state —
-        so the next send would HIT a corrupt window mixing folded-out rows with the note."""
-        entry = self._session_cache.get(sid)
-        if entry is None:
-            return
-        post_state = await store.state_snapshot(sid)
-        if post_state is None:
-            return
-        if post_state.last_compact_seq != entry.last_compact_seq:
-            self._cache_invalidate(sid)
-        elif post_state.next_seq != entry.next_seq:
-            # Pure append tail (incl. follow-ups drained mid-run): cheap O(delta) extend.
-            delta = await store.load_active_messages(sid, after_seq=entry.next_seq)
-            entry.rows.extend(delta)
-            entry.next_seq = post_state.next_seq
-
-    @property
-    def cache_stats(self) -> dict[str, int]:
-        """Observability for the per-session window cache: hits / misses / evictions /
-        live entry count. (100% misses ⇒ the cache never helps this workload, e.g. spawn /
-        workflow child loops that send once and are discarded.)"""
-        return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "evictions": self._cache_evictions,
-            "entries": len(self._session_cache),
-        }
-
-    # ── lifecycle ─────────────────────────────────────────────────────────
-
-    def close(self) -> None:
-        """Close the underlying store (if owned) and the dedicated sync event loop.
-
-        Synchronous and abrupt: it does NOT wait for in-flight sends or pending async
-        event-bus tasks. Prefer :meth:`aclose` (or ``async with loop:``) for graceful
-        shutdown. When the sync API was used, the store/pool live on the dedicated sync
-        loop and are torn down on it (a fresh ``asyncio.run`` could not close a pool bound
-        to another loop — the bug this avoids); otherwise the close is driven via
-        ``asyncio.run``. Called from inside a running loop it only schedules + warns.
-        """
-        runner = self._sync_runner
-        store = self.store if self._owns_store else None
-        if store is not None:
-            if runner is not None:
-                # Store/pool were opened on the dedicated loop; close them there.
-                runner.run(store.close())
-                self.store = None
-            else:
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    asyncio.run(store.close())
-                    self.store = None
-                else:
-                    logger.warning(
-                        "StatefulAgentLoop.close() called inside a running event loop; "
-                        "use 'await loop.aclose()' for graceful async shutdown"
-                    )
-                    # Keep a strong reference: a bare ensure_future() returns a task nothing
-                    # holds, which the GC can collect mid-flight ('Task was destroyed but it
-                    # is pending') so store.close() never runs and the connection/pool leaks.
-                    self._orphaned_close_task = asyncio.ensure_future(store.close())
-                    self.store = None
-        if runner is not None:
-            runner.close()
-            self._sync_runner = None
-
-    async def aclose(self, *, drain_timeout_s: float = 30.0) -> None:
-        """Graceful, async shutdown: quiesce, then stop.
-
-        1. Flip a closing flag so new :meth:`send`/:meth:`follow_up` raise immediately.
-        2. Wait for every in-flight send to finish by acquiring each per-session lock
-           (a running send holds its lock until its background store writes complete —
-           this is what prevents the ``close()`` race that could close the connection
-           out from under an ``asyncio.to_thread`` write → ``ProgrammingError``).
-        3. Drain pending async event-bus subscriber tasks.
-        4. Checkpoint the WAL and close the store (only if this loop owns it).
-
-        Idempotent and bounded by ``drain_timeout_s`` (per wait phase). Safe to call via
-        ``async with StatefulAgentLoop(...) as loop:``.
-        """
-        self._closing = True
-        # (2) wait for in-flight sends to drain. Acquiring then releasing each lock
-        # blocks until any holder (a running send) finishes; new sends are already
-        # blocked by the closing flag, so no lock can be re-taken behind us.
-        # Only THIS loop's sessions: the locks are shared process-wide now, so waiting on the
-        # whole registry would block teardown on runs belonging to other loops.
-        locks = [_session_sync(sid).lock for sid in list(self._sync_sids)]
-        if locks:
-            async def _wait_idle(lock: asyncio.Lock) -> None:
-                async with lock:
-                    return
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(_wait_idle(lock) for lock in locks)),
-                    timeout=drain_timeout_s,
-                )
-            except asyncio.TimeoutError:  # noqa: UP041 — distinct from builtin on py3.10
-                logger.warning(
-                    "aclose: timed out after %.1fs waiting for in-flight sends to drain",
-                    drain_timeout_s,
-                )
-        # Release this loop's claims on the shared per-session primitives so the registry doesn't
-        # accumulate an entry per session across loop objects. Entries still held by another live
-        # loop (or still locked / holding queued steering) survive.
-        for sid in list(self._sync_sids):
-            _release_session_sync(sid, id(self))
-        self._sync_sids.clear()
-        # (3) let queued async subscribers finish (best-effort, bounded).
-        try:
-            await self.event_bus.drain(timeout=drain_timeout_s)
-        except Exception:  # pragma: no cover - drain must never block teardown
-            logger.warning("aclose: event-bus drain raised; continuing", exc_info=True)
-        # (5) checkpoint + close the owned store (only if it was ever opened).
-        if self._owns_store and self.store is not None:
-            try:
-                await self.store.checkpoint(mode="TRUNCATE")
-            except Exception:  # pragma: no cover - checkpoint is best-effort
-                logger.warning("aclose: WAL checkpoint failed; closing anyway", exc_info=True)
-            await self.store.close()
-
-    async def __aenter__(self) -> StatefulAgentLoop:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await self.aclose()
-
-    def _raise_if_closing(self) -> None:
-        if self._closing:
-            raise RuntimeError("StatefulAgentLoop is closing; no new sends accepted")
-
-    async def close_session(self, session_id: str, *, cascade: bool = True) -> int:
-        """Physically delete the session and (by default) its LINKED subtree."""
-        store = await self._ensure_store()
-        deleted_ids = await store.close_session_tree(session_id, cascade=cascade)
-        # Drop the per-session in-memory bookkeeping for EVERY removed session so a long-lived
-        # loop that cycles through many sessions doesn't leak a Lock/queue/cache entry per id —
-        # for the directly-closed session (C12) AND each cascade-deleted descendant (C4).
-        for sid in {session_id, *deleted_ids}:
-            _discard_session_sync(sid)
-            self._sync_sids.discard(sid)
-            self._cache_invalidate(sid)
-        return len(deleted_ids)
-
-    # ── primary API ───────────────────────────────────────────────────────
-
-    async def new_session(
-        self,
-        *,
-        metadata: dict[str, Any] | None = None,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Create an empty session and return its id.
-
-        Call this before the first :meth:`send`. Keeping session creation
-        explicit makes ownership clear for web handlers, CLIs, background
-        jobs, and tests: every send targets an existing session id.
-        """
-        return await self._create_session(metadata=metadata, system_prompt=system_prompt)
-
-    async def prewarm(self, session_id: str) -> bool:
-        """Pre-load a session's active window into the loop cache so the FIRST :meth:`send`
-        skips its initial reload. Returns ``False`` if the session does not exist.
-
-        Pure optimization for the cold-start/resume case (a freshly-created loop pointed at an
-        existing session): sending without ``prewarm`` is behaviorally identical — it just pays
-        one reload on the first send. Pending tools are aligned as unknown results before new work."""
-        store = await self._ensure_store()
-        if await store.get_session(session_id) is None:
-            return False
-        if self._session_cache_size > 0:
-            state = await store.get_state(session_id)
-            rows = await store.load_active_messages(session_id)
-            if state is not None:
-                self._cache_put(session_id, state.next_seq, rows, state.last_compact_seq)
-        return True
-
-
-
-
-
-
-
     def extend_rounds(self, session_id: str, rounds: int) -> bool:
         """给**正在跑**的会话加轮数（6.46，DeepTalk design/170）：它在下一轮开始时把轮数上限加上 ``rounds``。
         会话没在跑（锁没被占）返回 False——空闲的会话用 follow_up / send 的 max_rounds。"""
@@ -672,77 +327,6 @@ class _ExecutionLoop:
         entry.round_bonus += int(rounds)
         return True
 
-    def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
-        """Drive ``coro`` to completion on the loop's dedicated sync event loop.
-
-        All blocking sync entry points funnel through here so an owned PG/MySQL pool stays
-        bound to a single, long-lived loop (see :class:`_SyncLoopRunner`). Raises if called
-        from within a running event loop — use the async methods (``await loop.send(...)``)
-        in that case.
-        """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            coro.close()  # avoid "coroutine was never awaited"
-            raise RuntimeError(
-                "sync API (send_sync/follow_up_sync) called from within a running event "
-                "loop; await the async method (loop.send / loop.follow_up) instead"
-            )
-        with self._sync_runner_lock:
-            if self._sync_runner is None:
-                self._sync_runner = _SyncLoopRunner()
-        return self._sync_runner.run(coro)
-
-
-
-
-
-
-
-    async def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
-        """Synthesize ``<aborted: reason>`` tool messages for every unresolved
-        tool_call, restoring message-protocol validity. Returns the number of
-        aborted tool_calls.
-        """
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        state = await store.get_state(session_id)
-        if state is None or not state.pending:
-            return 0
-        from .pending_tools import read_pending_tools
-        source, tool_calls = await read_pending_tools(
-            store, store._db, session_id, state.pending, state.next_seq,
-        )
-        if not tool_calls:
-            await store.set_pending(session_id, None)
-            return 0
-        round_index, send_index = source["round_index"], source["send_index"]
-        sink = SQLiteSink(store, session_id)
-        sink._unresolved = {str(tc.get("id") or "") for tc in tool_calls}
-        sink._assistant_seq = source["seq"]
-        for tc in tool_calls:
-            cid = str(tc.get("id") or "")
-            name = _tool_call_name(tc) if "function" in tc or "name" in tc else None
-            await sink.on_message_appended(
-                {
-                    "role": "tool",
-                    "tool_call_id": cid,
-                    "name": name,
-                    "content": f"<aborted: {reason}>",
-                    "send_index": send_index,
-                },
-                round_index=round_index,
-            )
-        if tool_calls:
-            # The <aborted> rows were appended out-of-band of the window cache; drop any live
-            # entry so a later plain send full-reloads instead of serving a row-missing window.
-            self._cache_invalidate(session_id)
-        return len(tool_calls)
-
-    # ── timers (durable wake-ups; fired by runtime.timers.TimerRunner) ────
-
     @property
     def hooks(self):
         return self._runner.hooks
@@ -750,117 +334,6 @@ class _ExecutionLoop:
     @property
     def event_bus(self):
         return self._runner.event_bus
-
-    # ── work in flight: list + stop by id (design/124 §8.1 / §8.4) ────────────────────────
-
-
-
-
-    # ── inspection ────────────────────────────────────────────────────────
-
-    async def get_session_stats(self, session_id: str):
-        """Cumulative accounting for one session (sends / llm_calls /
-        prompt / completion / total tokens), or ``None`` before its first
-        completed send. See ``SessionStatsRow``."""
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        return await store.get_session_stats(session_id)
-
-    async def list_session_stats(self):
-        """Cumulative accounting for every session in this store,
-        most-recently-active first."""
-        store = await self._ensure_store()
-        return await store.list_session_stats()
-
-    async def get_messages(self, session_id: str, *, include_compacted: bool = False) -> list[LoopMessage]:
-        store = await self._ensure_store()
-        rows = (
-            await store.load_all_messages(session_id)
-            if include_compacted
-            else await store.load_active_messages(session_id)
-        )
-        return [_row_to_loop_message(r) for r in rows]
-
-    async def get_pending(self, session_id: str) -> dict[str, Any] | None:
-        """Return only the durable assistant-seq marker; do not hydrate call arrays."""
-        store = await self._ensure_store()
-        state = await store.get_state(session_id)
-        return state.pending if state else None
-
-    async def resolve_system_prompt(self, *, session_id: str | None = None) -> str:
-        """Return the system prompt the pipeline will actually use.
-
-        This mirrors the resolution logic in
-        :meth:`AgentPipeline.__init__`: falls back to
-        ``DEFAULT_AGENT_SYSTEM_PROMPT`` when ``config.system_prompt`` is
-        ``None``, then appends the auto-generated tool catalog when
-        ``config.inject_tool_descriptions`` is enabled.
-
-        Parameters
-        ----------
-        session_id
-            Optional session id.  When provided, the session-level
-            ``system_prompt`` (set via :meth:`new_session`) takes
-            precedence over ``config.system_prompt``, matching the
-            behaviour of :meth:`_create_session`.
-
-        Returns
-        -------
-        str
-            The fully resolved prompt for a :meth:`send` with **no per-call
-            overrides** — base (session/config) + auto-injected tool catalog
-            (full registry) + skill section, via the same
-            ``resolve_runtime_system_prompt`` helper the live pipeline uses.
-
-            A per-call ``send(system_prompt=...)`` or ``send(tools=[...])`` is
-            applied at send time and is NOT reflected here (this previews the
-            no-override case; pass nothing at ``send`` for a byte-identical match).
-        """
-        # Session-level prompt wins over config-level prompt.
-        base: str | None = None
-        if session_id is not None:
-            store = await self._ensure_store()
-            row = await store.get_session(session_id)
-            if row is not None:
-                base = row.system_prompt
-        if base is None or not base.strip():
-            base = self.config.system_prompt
-
-        # Shared assembly — the SAME helper AgentPipeline.__init__ uses — so this
-        # preview is byte-identical to what the LLM actually receives.
-        return resolve_runtime_system_prompt(
-            base,
-            inject_tool_descriptions=self.config.inject_tool_descriptions,
-            tool_catalog_header=self.config.tool_catalog_header,
-            # pipeline 会补上永远在的 pass_turn（design/188）：预览也补，才和模型看到的一样
-            tool_registry=ensure_pass_turn(self.tool_registry) if self.tool_registry is not None else None,
-            skills_dir=self.config.skills_dir,
-        )
-
-    # ── internals ─────────────────────────────────────────────────────────
-
-    async def _create_session(
-        self,
-        *,
-        metadata: dict[str, Any] | None,
-        parent_session_id: str | None = None,
-        spawn_tool_call_id: str | None = None,
-        lifecycle: SubagentLifecycle = SubagentLifecycle.EPHEMERAL,
-        system_prompt: str | None = None,
-    ) -> str:
-        store = await self._ensure_store()
-        return await store.create_session(
-            system_prompt=system_prompt or self.config.system_prompt,
-            config={
-                "max_rounds": self.config.max_rounds,
-                "max_tokens": self.config.max_tokens,
-                "temperature": self.config.temperature,
-            },
-            parent_session_id=parent_session_id,
-            spawn_tool_call_id=spawn_tool_call_id,
-            lifecycle=lifecycle,
-            metadata=metadata,
-        )
 
     @staticmethod
     def _session_busy(sid: str) -> bool:
@@ -877,108 +350,6 @@ class _ExecutionLoop:
             for loop in list(entry.refs.values()):
                 loop._sync_sids.discard(sid)
             del _SESSION_SYNC[sid]
-
-    @contextlib.asynccontextmanager
-    async def _session_guard(self, sid: str):
-        entry = _session_sync(sid, owner=self)
-        self._sync_sids.add(sid)
-        entry.users += 1
-        try:
-            async with entry.lock:
-                yield
-        finally:
-            entry.users -= 1
-            self._release_idle_sync(sid)
-
-
-    async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
-        """Round-boundary drain: claim the inbox and render it as ``<follow_up>`` messages (one
-        per run of same-kind items), each marked for same-transaction delivery."""
-        return await self._runtime_worker.drain_append(self._runtime_worker_context)
-
-    async def _ensure_session_or_raise(self, sid: str) -> None:
-        store = await self._ensure_store()
-        if await store.session_snapshot(sid) is None:
-            raise SessionNotFoundError(sid)
-
-    @staticmethod
-    def _coerce_send_index(raw: Any) -> int | None:
-        """The current send's authoritative index, or None when unallocated/legacy.
-
-        send_index is allocated >= 1 by _persist_user_input and persists across
-        resume()/submit_input()/follow-up (they inherit, never re-bump). 0 is the
-        unallocated/legacy default. A corrupted runtime_state value (non-numeric /
-        inf / nan) must degrade to "unallocated", never crash int()."""
-        try:
-            v = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return v if v >= 1 else None
-
-    async def _current_send_index(self, store: Any, sid: str) -> int | None:
-        """Read the in-flight send index from runtime state (None if unallocated).
-
-        Out-of-band tool appends (submit_input/resume/abort_pending) MUST stamp this
-        onto every row so projection mode partitions them into the active send's
-        ``current_rows`` rather than the legacy (NULL send_index) prefix — otherwise
-        the tool result renders BEFORE its own assistant tool_call and align_tool_calls
-        drops it as an orphan, silently losing the answer."""
-        raw = await store.runtime_snapshot(sid, "send_index", default=0)
-        return self._coerce_send_index(raw)
-
-    async def _persist_user_input(self, sid: str, user_input: str | LoopMessage, *,
-                                  send_meta: Mapping[str, Any] | None = None) -> int:
-        store = await self._ensure_store()
-        inbox = None
-        if isinstance(user_input, dict) and "_inbox" in user_input:
-            # A send fed from the inbox (_send_from_inbox): mark those rows delivered in the same
-            # transaction as this user row, and record which items it carries.
-            user_input = dict(user_input)
-            inbox = user_input.pop("_inbox")
-        role: str
-        content: str | None
-        name: str | None
-        # Encode multimodal (list/dict) content losslessly: JSON in the text column + a meta
-        # marker so the reload path reconstructs the original structure rather than handing the
-        # model a literal JSON string (vision would otherwise silently break). See H6.
-        if isinstance(user_input, str):
-            role, content, name, structured = "user", user_input, None, False
-        else:
-            role = str(user_input.get("role", "user"))
-            content, structured = _encode_content(user_input.get("content"))
-            name = user_input.get("name")
-        meta = _meta_with_content_encoding(None, structured=structured)
-        if inbox:
-            meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
-                                              if k in inbox}}
-        if send_meta:
-            meta = {**(meta or {}), "send": dict(send_meta)}
-        # Allocate the next monotonic SEND index for this session (atomic RMW under the
-        # sessions row lock — never resets, unlike round_index). This is the single
-        # send-begin point (exactly one user row per send; resume()/follow-up drains do
-        # NOT pass through here, so they correctly inherit the in-flight send's index).
-        # Stamped into meta so the transcript can delimit sends authoritatively.
-        send_index = await store.mutate_runtime_state(
-            sid, "send_index", lambda v: int(v or 0) + 1, default=0
-        )
-        seq = await store.append_message(
-            sid, role=role, content=content, name=name, send_index=send_index, meta=meta,
-            inbox=inbox,
-        )
-        # Keep a live cache entry current with the loop's OWN append (no reload): the next
-        # send's next_seq token will then match and reuse the cached window. No-op if this
-        # session isn't cached. The row mirrors what append_message persisted (only
-        # seq/role/content/name/send_index/meta are consumed when rebuilding the working history).
-        self._cache_append(
-            sid,
-            MessageRow(
-                session_id=sid, seq=seq, role=role, name=name, content=content,
-                tool_calls=None, tool_call_id=None, round_index=None,
-                state=MessageState.ACTIVE, meta=meta or {}, created_at=0, send_index=send_index,
-            ),
-            new_next_seq=seq + 1,
-        )
-        return send_index
 
     def _resolve_registry(
         self, tools: Sequence[str] | ToolRegistry | None
@@ -1250,7 +621,7 @@ class _ExecutionLoop:
                     ownership=ownership, stop_event=stop, window=window,
                     existing_fold_stats_json=getattr(batch, "fold_stats_json", None),
                 )
-            except CancellationRequested:
+            except (CancellationRequested, SessionLeaseLost):
                 raise
             except Exception:
                 logger.exception("session projection write failed for %s (continuing)", sid)

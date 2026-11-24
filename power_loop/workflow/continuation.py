@@ -149,19 +149,3 @@ def plan_continuation(spec, node_id):
     invalid = frozenset(nodes[p].id for p in affected if nodes[p].id)
     return ContinuationPlan(node_id, target, frozenset(affected), invalid,
         tuple(sorted((nodes[p].id, tuple(sorted(why))) for p, why in reasons.items() if nodes[p].id)))
-
-
-def replay_results(spec, plan, results):
-    """Retain unaffected terminal evidence, including failures, without rerunning it.
-
-    Targeted repair must not silently retry an unrelated failed side effect.
-    Preserved failures still prevent the workflow from reporting success.
-    """
-    scope_ids = subtree_ids(spec.root)
-    replay = {key: value for key, value in results.items()
-              if key in scope_ids and key not in plan.invalidated and value.status not in ("pending", "running")}
-    for _, node in walk(spec.root):
-        if isinstance(node, ForeachNode) or (isinstance(node, LoopNode) and node.id in replay):
-            for key in subtree_ids(node.body):
-                replay.pop(key, None)
-    return replay

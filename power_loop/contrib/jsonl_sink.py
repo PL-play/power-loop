@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
@@ -53,6 +53,7 @@ class JsonlSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._fh = self.path.open("a", encoding="utf-8")
+        self._unsubscribe: Callable[[], None] | None = None
 
     def write_line(self, line: str) -> None:
         with self._lock:
@@ -81,6 +82,9 @@ class JsonlSink:
         return self.path.with_name(self.path.name + f".{i}")
 
     def close(self) -> None:
+        unsub, self._unsubscribe = self._unsubscribe, None
+        if unsub is not None:
+            unsub()
         with self._lock:
             if not self._fh.closed:
                 self._fh.close()
@@ -124,6 +128,7 @@ def attach_jsonl_sink(
     else:
         for event_type in wanted:
             bus.subscribe(event_type, _handler)
+    sink._unsubscribe = lambda: bus.unsubscribe(_handler)
     return sink
 
 

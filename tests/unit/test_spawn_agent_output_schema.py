@@ -11,9 +11,7 @@ from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.spec import normalize_output_schema, output_response_format
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import (
-    _RAW_TEXT_CAP,
     SPAWN_AGENT_DEFINITION,
-    _format_structured_result,
     register_spawn_agent,
 )
 from tests.runtime_fixture import RunningAgent
@@ -69,16 +67,6 @@ def test_normalize_sanitizes_name_for_native_providers() -> None:
 def test_normalize_rejects_bad_shapes(value: Any, needle: str) -> None:
     with pytest.raises(AgentSpecError, match=needle):
         normalize_output_schema(value)
-
-def test_structured_failure_reasons_and_cap() -> None:
-    out = _format_structured_result('{"other": 1}', LABEL_SCHEMA)
-    assert out == '结构化结果解析失败（缺少必填字段 label），原文：{"other": 1}'
-    out = _format_structured_result('{"label": urgent}', LABEL_SCHEMA)
-    assert out.startswith("结构化结果解析失败（JSON 格式不对）")
-    long = "字" * (_RAW_TEXT_CAP + 500)
-    out = _format_structured_result(long, LABEL_SCHEMA)
-    assert f"原文共 {len(long)} 字" in out
-    assert len(out) < len(long)
 
 def test_output_response_format_strict_default_and_opt_out() -> None:
     rf = output_response_format({"name": "C", "schema": LABEL_SCHEMA})

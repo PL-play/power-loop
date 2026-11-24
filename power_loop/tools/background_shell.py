@@ -157,6 +157,10 @@ def _stop_readers(readers: tuple[_BoundedStreamReader, ...], timeout: float = 0.
 
 
 def _close_process_streams(process) -> None:
+    close = getattr(process, "close", None)
+    if callable(close):
+        close()
+        return
     proc = getattr(process, "process", None)
     if proc is None:
         return

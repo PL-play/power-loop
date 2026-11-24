@@ -39,7 +39,6 @@ INDEXES = {
     ),
     "idx_messages_session_state": ("messages", ("session_id", "state", "seq")),
     "idx_messages_send": ("messages", ("session_id", "send_index", "seq")),
-    "idx_messages_retention": ("messages", ("created_at", "id")),
     "idx_runtime_retention": (
         "session_runtime_state", ("updated_at", "session_id", "state_key")
     ),

@@ -17,7 +17,6 @@ from power_loop.runtime.spec import (
     AgentSpecError,
     normalize_output_schema,
 )
-from power_loop.runtime.structured import StructuredOutputError, parse_structured
 
 DEFAULT_MAX_ROUNDS = 20
 
@@ -143,44 +142,6 @@ async def _handle_spawn_agent(**kwargs: Any) -> str:
         return json.dumps(result, ensure_ascii=False)
     except ValueError as exc:
         return "Error: " + str(exc)
-
-
-def _format_subagent_result(result: dict[str, Any]) -> str:
-    text = result.get("final_text") or "(no output)"
-    status = result.get("status")
-    if status and status != "completed":
-        return f"[sub-agent status={status}]\n{text}"
-    return text
-
-
-#: 解析失败时带回的原文上限：够主 agent 看清子 agent 写了什么，又不把一整篇散文塞回上下文。
-_RAW_TEXT_CAP = 4000
-
-_PARSE_FAILURE_REASONS = {
-    "no_json": "回复里没有 JSON 对象",
-    "invalid_json": "JSON 格式不对",
-    "not_object": "不是 JSON 对象",
-}
-
-
-def _format_structured_result(text: str, schema: dict[str, Any]) -> str:
-    """子 agent 的最终回复 → 解析后的紧凑 JSON；解析不了就带上原因和原文。
-
-    这里的子会话用完即删，没法像 DeepTalk 那样在同一个会话里补一轮修复，失败就交给主 agent 处理。
-    """
-    try:
-        value = parse_structured(text, schema=schema)
-    except StructuredOutputError as exc:
-        reason = exc.reason
-        if reason.startswith("missing_required:"):
-            reason = f"缺少必填字段 {reason.split(':', 1)[1]}"
-        else:
-            reason = _PARSE_FAILURE_REASONS.get(reason, reason)
-        raw = text or "(no output)"
-        if len(raw) > _RAW_TEXT_CAP:
-            raw = raw[:_RAW_TEXT_CAP] + f"…（原文共 {len(text)} 字，后面已截掉）"
-        return f"结构化结果解析失败（{reason}），原文：{raw}"
-    return "结构化结果：" + json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 # ── registration helpers ──────────────────────────────────────────────────
