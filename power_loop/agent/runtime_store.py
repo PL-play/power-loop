@@ -1515,6 +1515,20 @@ class RuntimeInputStore:
                             and row["execution_state"] == "queued"
                             and int(row["wake_pending_count"]) == 1
                         )
+                    # Re-verify actor ancestry and public reply_route under the locked target row
+                    # inside this write transaction so concurrent rebind_children cannot bypass them.
+                    locked_target = await tx.fetchone(
+                        f"SELECT session_id,parent_session_id,depth,tenant_id,principal_id "
+                        f"FROM {self.s} WHERE session_id=?",
+                        (target.session_id,),
+                    )
+                    if locked_target is None:
+                        raise RuntimeRequestError("not_found")
+                    await self._authorize_known(tx, target, actor, locked_target)
+                    if public and reply_to_sid is not None:
+                        await self._validate_public_reply_route(
+                            tx, target, reply_to_sid, actor, target_row=locked_target,
+                        )
                     await tx.execute(
                         f"INSERT INTO {self.q} ("
                         "session_id,item_id,inbox_version,kind,priority,wake,status,"
@@ -2096,7 +2110,17 @@ class RuntimeInputStore:
                     state=MessageState.ACTIVE, meta=message_meta, created_at=db_now,
                     send_index=send_index,
                 )
-                reply_row = next((r for r in rows if r.get("reply_to_session_id")), None)
+                reply_row = (
+                    next(
+                        (
+                            r for r in rows
+                            if r.get("reply_to_session_id")
+                            and r.get("reply_result_kind") == "workflow_node_result"
+                        ),
+                        None,
+                    )
+                    or next((r for r in rows if r.get("reply_to_session_id")), None)
+                )
                 reply_to_sid = reply_row.get("reply_to_session_id") if reply_row is not None else None
                 reply_rk = reply_row.get("reply_result_kind") if reply_row is not None else None
                 reply_item_id = reply_row.get("item_id") if reply_row is not None else None
@@ -3212,11 +3236,23 @@ class RuntimeInputStore:
         # input does not inherit reply_to_session_id from an unconsumed input returned to pending.
         is_human_direct_leaf_chat = False
         if route is not None and route.get("result_kind") == "workflow_node_result":
-            consumed_has_reply_route = False
+            consumed_has_wf_route = False
+            consumed_has_any_route = False
             if not has_unconsumed:
-                consumed_has_reply_route = (
-                    batch.reply_to_session_id is not None
-                    or any(to for to, _ in delivered_routes.values())
+                consumed_has_wf_route = (
+                    (
+                        batch.reply_to_session_id is not None
+                        and batch.reply_result_kind == "workflow_node_result"
+                    )
+                    or any(
+                        to is not None and rk == "workflow_node_result"
+                        for to, rk in delivered_routes.values()
+                    )
+                )
+                consumed_has_any_route = (
+                    consumed_has_wf_route
+                    or batch.reply_to_session_id is not None
+                    or any(to is not None for to, _ in delivered_routes.values())
                 )
             elif consumed_refs:
                 consumed_id_set_chk = {ref.message_id for ref in consumed_refs}
@@ -3225,24 +3261,34 @@ class RuntimeInputStore:
                     and batch.reply_to_item_id is not None
                     and batch.reply_to_item_id in consumed_id_set_chk
                 ):
-                    consumed_has_reply_route = True
-                elif delivered_routes:
-                    consumed_has_reply_route = any(
-                        delivered_routes.get(mid, (None, None))[0] is not None
-                        for mid in consumed_id_set_chk
-                    )
-                else:
-                    c_ids_chk = [ref.message_id for ref in consumed_refs]
-                    c_ph_chk = ",".join("?" for _ in c_ids_chk)
-                    q_has_route = await tx.fetchone(
-                        f"SELECT 1 FROM {self.q} WHERE session_id=? AND item_id IN ({c_ph_chk}) "
-                        "AND reply_to_session_id IS NOT NULL LIMIT 1",
-                        (sid, *c_ids_chk),
-                    )
-                    consumed_has_reply_route = q_has_route is not None
-            if not consumed_has_reply_route:
+                    consumed_has_any_route = True
+                    consumed_has_wf_route = batch.reply_result_kind == "workflow_node_result"
+                if not consumed_has_wf_route:
+                    if delivered_routes:
+                        for mid in consumed_id_set_chk:
+                            to_sid, rk_val = delivered_routes.get(mid, (None, None))
+                            if to_sid is not None:
+                                consumed_has_any_route = True
+                                if rk_val == "workflow_node_result":
+                                    consumed_has_wf_route = True
+                                    break
+                    else:
+                        c_ids_chk = [ref.message_id for ref in consumed_refs]
+                        c_ph_chk = ",".join("?" for _ in c_ids_chk)
+                        q_routes = await tx.fetchall(
+                            f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
+                            f"WHERE session_id=? AND item_id IN ({c_ph_chk}) "
+                            "AND reply_to_session_id IS NOT NULL",
+                            (sid, *c_ids_chk),
+                        )
+                        if q_routes:
+                            consumed_has_any_route = True
+                            consumed_has_wf_route = any(
+                                r["reply_result_kind"] == "workflow_node_result" for r in q_routes
+                            )
+            if not consumed_has_wf_route:
                 route = None
-                is_human_direct_leaf_chat = True
+                is_human_direct_leaf_chat = not consumed_has_any_route
 
         deliver_parent_sid = None
         deliver_res_kind = None
@@ -4267,7 +4313,16 @@ class RuntimeInputStore:
                 state=MessageState.ACTIVE, meta={}, created_at=int(srow["updated_at"]),
                 send_index=cur_send_index,
             )
-        reply_row = next((r for r in qrows if r["reply_to_session_id"]), None)
+        reply_row = (
+            next(
+                (
+                    r for r in qrows
+                    if r["reply_to_session_id"] and r["reply_result_kind"] == "workflow_node_result"
+                ),
+                None,
+            )
+            or next((r for r in qrows if r["reply_to_session_id"]), None)
+        )
         reply_to_sid = reply_row["reply_to_session_id"] if reply_row is not None else None
         reply_rk = reply_row["reply_result_kind"] if reply_row is not None else None
         reply_item_id = reply_row["item_id"] if reply_row is not None else None
@@ -4773,14 +4828,17 @@ class RuntimeInputStore:
                 live_root_sid = str(own_state["root_session_id"]) if own_state["root_session_id"] else None
                 is_closed = own_state["lifecycle"] in ("closing", "closed")
                 is_human_direct_leaf_chat = False
-                if (
-                    rows
-                    and route is not None
-                    and route.get("result_kind") == "workflow_node_result"
-                    and not any(r["reply_to_session_id"] is not None for r in rows)
-                ):
-                    route = None
-                    is_human_direct_leaf_chat = True
+                if rows and route is not None and route.get("result_kind") == "workflow_node_result":
+                    has_wf_route = any(
+                        r["reply_to_session_id"] is not None
+                        and r["reply_result_kind"] == "workflow_node_result"
+                        for r in rows
+                    )
+                    if not has_wf_route:
+                        route = None
+                        is_human_direct_leaf_chat = not any(
+                            r["reply_to_session_id"] is not None for r in rows
+                        )
 
                 deliver_parent_sid = None
                 deliver_res_kind = None
@@ -6652,13 +6710,31 @@ class RuntimeInputStore:
                         node["root_session_id"] = new_root
                         node["depth"] = int(node["depth"]) + depth_delta
 
-                    # Retarget active per-input reply routes on direct children
-                    await tx.execute(
-                        f"UPDATE {self.q} SET reply_to_session_id=? "
-                        f"WHERE session_id IN ({d_ph}) AND reply_to_session_id=? "
-                        "AND status IN ('pending','delivered') AND terminal_status IS NULL",
-                        (tp_sid, *direct_ids, fp_sid),
-                    )
+                    # Retarget active per-input reply routes on the entire moved subtree that
+                    # pointed to from_parent or any stale ancestor above from_parent no longer
+                    # in to_parent's ancestor chain (keeps routes targeting shared ancestors).
+                    async def _ancestors_of(start_row: dict[str, Any]) -> set[str]:
+                        anc: set[str] = {str(start_row["session_id"])}
+                        cur = start_row.get("parent_session_id")
+                        while cur is not None and str(cur) not in anc:
+                            cur_s = str(cur)
+                            anc.add(cur_s)
+                            prow = await tx.fetchone(
+                                f"SELECT parent_session_id FROM {self.s} WHERE session_id=?",
+                                (cur_s,),
+                            )
+                            cur = prow["parent_session_id"] if prow is not None else None
+                        return anc
+
+                    stale_ancestors = sorted((await _ancestors_of(fp)) - (await _ancestors_of(tp)))
+                    if stale_ancestors:
+                        st_ph = ",".join("?" for _ in stale_ancestors)
+                        await tx.execute(
+                            f"UPDATE {self.q} SET reply_to_session_id=? "
+                            f"WHERE session_id IN ({a_ph}) AND reply_to_session_id IN ({st_ph}) "
+                            "AND status IN ('pending','delivered') AND terminal_status IS NULL",
+                            (tp_sid, *all_ids, *stale_ancestors),
+                        )
 
                     # Optional host context rewrite callback across every moved node
                     if rewrite_host_context is not None:

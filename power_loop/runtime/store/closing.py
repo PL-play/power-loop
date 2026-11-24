@@ -90,6 +90,10 @@ async def lock_sessions(
         for ch in direct_children:
             ch_sid = str(ch['session_id'])
             if ch_sid not in discovered:
+                if cascade and ch.get('cancel_propagation') == 'linked':
+                    # A linked child was attached after _discover_linked_tree; retry so it enters
+                    # discovered (and its own linked subtree is discovered & checked for busy).
+                    raise _CloseTreeChanged()
                 unbound_children[ch_sid] = dict(ch)
 
     all_to_lock = {**discovered, **unbound_children}
@@ -143,17 +147,21 @@ async def lock_sessions(
         ph = ','.join('?' for _ in d_ids)
         if lock_unbound_children:
             recheck = await tx.fetchall(
-                f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id IN ({ph})',
+                f'SELECT session_id,cancel_propagation FROM {store.t.sessions} '
+                f'WHERE parent_session_id IN ({ph})',
                 tuple(d_ids),
             )
         else:
             recheck = await tx.fetchall(
-                f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id IN ({ph}) '
-                "AND cancel_propagation='linked'",
+                f'SELECT session_id,cancel_propagation FROM {store.t.sessions} '
+                f"WHERE parent_session_id IN ({ph}) AND cancel_propagation='linked'",
                 tuple(d_ids),
             )
         for r in recheck:
-            if str(r['session_id']) not in locked:
+            r_sid = str(r['session_id'])
+            if r_sid not in locked:
+                raise _CloseTreeChanged()
+            if cascade and r.get('cancel_propagation') == 'linked' and r_sid not in discovered:
                 raise _CloseTreeChanged()
 
     # Return only target/linked sessions parent-first (depth ASC, session_id ASC) so delete_sessions'

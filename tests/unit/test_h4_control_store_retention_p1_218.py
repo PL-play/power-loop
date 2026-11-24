@@ -779,3 +779,457 @@ async def test_h4_p1_6_mysql_real_read_snapshot_cancel_does_not_leak_repeatable_
         await writer.execute(f"DROP TABLE IF EXISTS {tbl}")
         await db.close()
         await writer.close()
+
+
+# ── H4 Rework Regressions (P1-1 ~ P1-4) ────────────────────────────────────
+
+
+async def test_h4_p1_1_cancel_send_during_closing_release_preserves_db_lease_release(registry_store, monkeypatch):
+    """P1-1 rework: cancelling send() while closing release is in flight must not abort DB lease release."""
+    store, _ = registry_store
+    model_calls: list[str] = []
+
+    class _NoRunModel:
+        async def complete(self, _request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            model_calls.append(get_execution_context().session_id)
+            return LLMResponse(raw_text="should not run")
+
+        async def close(self):
+            pass
+
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        return ExecutionEnvironment(_NoRunModel(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _build)
+    rt = Runtime(
+        store=store,
+        factory=factory,
+        node_id="h4-p11-rw-node",
+        boot_id="h4-p11-rw-boot",
+        capacity=4,
+        fuse_local_send=True,
+        recovery_interval_s=None,
+        timers_enabled=False,
+    )
+    await rt.worker.start()
+    try:
+        t = await rt.client.create_session(
+            DESCRIPTOR, actor=ACTOR, options={"session_id": "h4-p11-rw-cancel-release"},
+        )
+        orig_aac = rt.client.inputs.accept_and_claim
+        orig_release_claim = rt.worker.inputs.release_claim
+        aac_committed = asyncio.Event()
+        allow_aac_return = asyncio.Event()
+        release_started = asyncio.Event()
+        allow_release_finish = asyncio.Event()
+
+        async def _paused_aac(*args, **kwargs):
+            result = await orig_aac(*args, **kwargs)
+            aac_committed.set()
+            await asyncio.wait_for(allow_aac_return.wait(), 5)
+            return result
+
+        async def _paused_release(batch, *args, **kwargs):
+            release_started.set()
+            await asyncio.wait_for(allow_release_finish.wait(), 5)
+            return await orig_release_claim(batch, *args, **kwargs)
+
+        monkeypatch.setattr(rt.client.inputs, "accept_and_claim", _paused_aac)
+        monkeypatch.setattr(rt.worker.inputs, "release_claim", _paused_release)
+
+        send_task = asyncio.create_task(
+            rt.client.send(t, "cancel during closing release", message_id="m-rw-p11", actor=ACTOR)
+        )
+        await asyncio.wait_for(aac_committed.wait(), 5)
+
+        await asyncio.wait_for(rt.worker.shutdown(timeout_s=2, cancel_running=False), 5)
+        assert rt.worker._closing is True
+
+        # Let send() proceed into dispatch_claimed -> closing release task, and pause inside release_claim.
+        allow_aac_return.set()
+        await asyncio.wait_for(release_started.wait(), 5)
+
+        # Cancel send() while it is waiting on drain_closing_releases()!
+        send_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+        # Slots must be released immediately, while the closing release task stays alive until finished.
+        assert rt.worker._active == {}
+        assert rt.worker._fusing == {}
+        assert len(rt.worker._closing_release_tasks) == 1
+
+        allow_release_finish.set()
+        await asyncio.wait_for(rt.worker.drain_closing_releases(), 5)
+        assert rt.worker._closing_release_tasks == set()
+        assert model_calls == []
+
+        row = await store._db.fetchone(
+            f"SELECT execution_state,owner_node_id,owner_boot_id,owner_lease_until_ms,pending_count "
+            f"FROM {store.t.sessions} WHERE session_id=?",
+            (t.session_id,),
+        )
+        assert row is not None
+        assert row["execution_state"] == "queued"
+        assert row["owner_node_id"] is None
+        assert row["owner_boot_id"] is None
+        assert row["owner_lease_until_ms"] is None
+        assert int(row["pending_count"]) == 1
+    finally:
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_h4_p1_2_workflow_leaf_public_reply_route_never_upgrades_to_workflow_node_result(registry_store):
+    """P1-2 rework: public agent_result on a workflow leaf never upgrades to workflow_node_result on final or recover."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12rw-main"})
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        leaf_desc = replace(DESCRIPTOR, config={"workflow_node": "n1"})
+
+        cm_drv = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12rw-drv",
+                message_id="drv-start",
+                body={"text": "run wf"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv_batch = cm_drv.preclaimed[0]
+        drv = drv_batch.target
+
+        # Register a local driver waiter queue to prove public agent_result NEVER triggers driver workflow events.
+        driver_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        port._driver_waiters[drv.session_id] = (driver_events, asyncio.Event(), object())
+
+        cm_leaf = await port.create_many(
+            parent=drv,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12rw-leaf",
+                message_id="leaf-start",
+                body={"text": "step 1"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv_batch.owner_epoch,
+            parent_cancel_seq=drv_batch.cancel_seq,
+        )
+        leaf_b1 = cm_leaf.preclaimed[0]
+        leaf = leaf_b1.target
+
+        # 1. Genuine internal leaf start settles as workflow_node_result and fires driver event.
+        fin1 = await port.final(leaf_b1, final_text="internal step 1")
+        assert fin1.result_delivery_error is None
+        wf_rows_1 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in wf_rows_1] == ["user", "workflow_node_result"]
+        assert wf_rows_1[1]["result_kind"] == "workflow_node_result"
+        assert not driver_events.empty()
+        driver_events.get_nowait()
+
+        # 2. Public send to finished workflow leaf with ordinary agent_result route targeting driver:
+        #    final() MUST deliver agent_result (NOT workflow_node_result) and fire 0 driver workflow events!
+        await client.send(
+            leaf,
+            "public ordinary send",
+            message_id="pub-ord-1",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        leaf_b2 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert leaf_b2 is not None
+        fin2 = await port.final(leaf_b2, final_text="public reply")
+        assert fin2.result_delivery_error is None
+        wf_rows_2 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in wf_rows_2] == ["user", "workflow_node_result", "agent_result"]
+        assert wf_rows_2[2]["result_kind"] == "agent_result"
+        assert driver_events.empty(), "public agent_result must NOT trigger driver workflow_node_result event"
+
+        # 3. Public send to workflow leaf with agent_result route that crashes -> recover() MUST emit
+        #    0 workflow_node_result rows and 0 driver events!
+        await client.send(
+            leaf,
+            "public crash send",
+            message_id="pub-crash-1",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        leaf_b3 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert leaf_b3 is not None
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?",
+            (leaf.session_id,),
+        )
+        rec_pub = await port.recover(leaf, node_id="n2", boot_id="b2")
+        assert rec_pub is not None
+        wf_rows_3 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in wf_rows_3] == ["user", "workflow_node_result", "agent_result"]
+        assert driver_events.empty()
+
+        # 4. Internal workflow_continue (public=False, workflow_node_result) that crashes ->
+        #    recover() STILL delivers workflow_node_result to driver!
+        await port.accept(
+            leaf,
+            "internal continue crash",
+            message_id="int-cont-crash",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        leaf_b4 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert leaf_b4 is not None
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?",
+            (leaf.session_id,),
+        )
+        rec_int = await port.recover(leaf, node_id="n2", boot_id="b2")
+        assert rec_int is not None
+        wf_rows_4 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in wf_rows_4] == [
+            "user", "workflow_node_result", "agent_result", "workflow_node_result",
+        ]
+        assert not driver_events.empty()
+    finally:
+        port._driver_waiters.pop("p12rw-drv", None)
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_h4_p1_2_deep_ancestor_slow_path_rebind_and_stale_ancestor_retarget(registry_store, monkeypatch):
+    """P1-2 rework: deep-ancestor slow path re-checks under tx lock; rebind retargets stale ancestor routes."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, connect = registry_store
+    peer = await connect(schema="verify")
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    peer_port = RuntimeInputStore(peer)
+    try:
+        # Part A: Deep-ancestor slow path racing with rebind_children between unlocked pre-check and write tx.
+        root_old = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12toctou-rold"})
+        root_new = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12toctou-rnew"})
+        mid = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=root_old, options={"session_id": "p12toctou-mid"},
+        )
+        leaf = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=mid, options={"session_id": "p12toctou-leaf"},
+        )
+        deep_actor = TrustedActor(ACTOR.tenant_id, ACTOR.principal_id, root_old.session_id)
+
+        orig_tx = store._db.transaction
+        rebound_once = False
+        tx_count = 0
+
+        @asynccontextmanager
+        async def _rebind_before_slow_tx():
+            nonlocal rebound_once, tx_count
+            tx_count += 1
+            # tx_count==1 is accept() fast-path UPDATE (0 rows for deep ancestor);
+            # tx_count==2 is _accept_slow_path()'s write tx right after unlocked diag/validation!
+            if tx_count == 2 and not rebound_once:
+                rebound_once = True
+                rb = await peer_port.rebind_children(root_old, root_new, child_targets=[mid], actor=ACTOR)
+                assert rb.rebound_children == (mid.session_id,)
+            async with orig_tx() as tx:
+                yield tx
+
+        monkeypatch.setattr(store._db, "transaction", _rebind_before_slow_tx)
+        with pytest.raises(RuntimeRequestError) as exc_info:
+            await client.send(
+                leaf,
+                "stale deep ancestor send",
+                message_id="p12toctou-m1",
+                actor=deep_actor,
+                reply_route={"target": root_old, "result_kind": "agent_result"},
+            )
+        assert exc_info.value.code == "forbidden"
+        assert rebound_once is True
+        monkeypatch.setattr(store._db, "transaction", orig_tx)
+
+        # Verify nothing was inserted into leaf's inbox.
+        qrows = await store._db.fetchall(
+            f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=?", (leaf.session_id,),
+        )
+        assert qrows == []
+
+        # Part B: Rebind retargets active grandchild per-input route pointing to stale old ancestor.
+        old_g = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12rebind-oldg"})
+        new_g = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12rebind-newg"})
+        p_mid = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=old_g, options={"session_id": "p12rebind-mid"},
+        )
+        g_leaf = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=p_mid, options={"session_id": "p12rebind-leaf"},
+        )
+        await client.send(
+            g_leaf,
+            "route to old grandparent",
+            message_id="p12rebind-m1",
+            actor=ACTOR,
+            reply_route={"target": old_g, "result_kind": "agent_result"},
+        )
+        rb2 = await port.rebind_children(old_g, new_g, child_targets=[p_mid], actor=ACTOR)
+        assert rb2.rebound_children == (p_mid.session_id,)
+        retargeted = await store._db.fetchone(
+            f"SELECT reply_to_session_id FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id='p12rebind-m1'",
+            (g_leaf.session_id,),
+        )
+        assert retargeted is not None and retargeted["reply_to_session_id"] == new_g.session_id
+    finally:
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_h4_p1_3_concurrent_linked_child_attached_between_discovery_and_direct_children(
+    registry_store, monkeypatch,
+):
+    """P1-3 rework: linked child committed between _discover_linked_tree and direct_children triggers retry."""
+    from power_loop.contracts.errors import SessionBusy
+
+    store, connect = registry_store
+    is_sqlite = store._db.dialect.name == "sqlite"
+    peer = await connect(schema="verify")
+    port = RuntimeInputStore(store)
+    peer_port = RuntimeInputStore(peer)
+
+    # Case 1: Idle linked child attached in the discovery window -> retry includes & deletes BOTH.
+    p1 = await target(port, "p13rw-parent-1")
+    if is_sqlite:
+        # SQLite uses BEGIN IMMEDIATE (single writer); pre-create the linked child and omit it
+        # from the first _discover_linked_tree result to simulate the exact PG/MySQL race window.
+        await target(port, "p13rw-late-linked-1", parent=p1, cancel_propagation="linked")
+    orig_discover = closing._discover_linked_tree
+    injected_1 = False
+    calls_1 = 0
+
+    async def _discover_inject_idle(st, tx, seed_ids, cascade):
+        nonlocal injected_1, calls_1
+        calls_1 += 1
+        res = await orig_discover(st, tx, seed_ids, cascade)
+        if not injected_1 and p1.session_id in seed_ids:
+            injected_1 = True
+            if is_sqlite:
+                res.pop("p13rw-late-linked-1", None)
+            else:
+                await target(peer_port, "p13rw-late-linked-1", parent=p1, cancel_propagation="linked")
+        return res
+
+    monkeypatch.setattr(closing, "_discover_linked_tree", _discover_inject_idle)
+    deleted_1 = await store.close_session_tree(p1.session_id)
+    assert calls_1 >= 2
+    assert set(deleted_1) == {p1.session_id, "p13rw-late-linked-1"}
+    assert await store.get_session(p1.session_id) is None
+    assert await store.get_session("p13rw-late-linked-1") is None
+
+    # Case 2: Busy linked child attached in the discovery window -> retry detects busy & raises SessionBusy,
+    # leaving parent open (NEVER half-closed as closing with an open linked child).
+    p2 = await target(port, "p13rw-parent-2")
+    if is_sqlite:
+        late_sq = await target(port, "p13rw-late-linked-2", parent=p2, cancel_propagation="linked")
+        await port.accept(late_sq, "active work", message_id="p13rw-m2", actor=ACTOR)
+    injected_2 = False
+    calls_2 = 0
+
+    async def _discover_inject_busy(st, tx, seed_ids, cascade):
+        nonlocal injected_2, calls_2
+        calls_2 += 1
+        res = await orig_discover(st, tx, seed_ids, cascade)
+        if not injected_2 and p2.session_id in seed_ids:
+            injected_2 = True
+            if is_sqlite:
+                res.pop("p13rw-late-linked-2", None)
+            else:
+                late = await target(peer_port, "p13rw-late-linked-2", parent=p2, cancel_propagation="linked")
+                await peer_port.accept(late, "active work", message_id="p13rw-m2", actor=ACTOR)
+        return res
+
+    monkeypatch.setattr(closing, "_discover_linked_tree", _discover_inject_busy)
+    with pytest.raises(SessionBusy):
+        await store.close_session_tree(p2.session_id)
+    assert calls_2 >= 2
+    p2_state = await store.get_session(p2.session_id)
+    assert p2_state is not None and p2_state.lifecycle == "open"
+
+
+async def test_h4_p1_4_raw_cursor_with_prefix_colliding_session_ids_advances_and_terminates(registry_store):
+    """P1-4 rework: legal IDs starting with sidi:/sid:ge:/sid:gt:/lc: never loop under raw cursor pagination."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+
+    # Create open sessions including prefix-colliding IDs after raw cursor 'r', plus trailing session 't'
+    # with an expired inbox item to prove pagination actually reaches and cleans 't'.
+    for sid in ("sid:ge:b", "sid:gt:c", "sidi:a", "t"):
+        await target(port, sid)
+    t_ref = TargetRef(store.store_id, "t")
+    r_t = await port.accept(t_ref, "expired inbox", message_id="p14rw-t-m1", actor=ACTOR)
+    await port.cancel(r_t.input_ref, actor=ACTOR)
+
+    future_ms = 2**62
+    cursor: str | None = "r"
+    pages = []
+    seen_cursors: set[str] = set()
+    for _ in range(10):
+        page = await store.purge_expired_page(
+            future_ms,
+            limit=5,
+            candidate_limit=1,
+            categories={"inbox"},
+            after_session_id=cursor,
+        )
+        pages.append(page)
+        cursor = page.next_after
+        if cursor is None:
+            break
+        assert cursor not in seen_cursors, f"cursor loop detected: {cursor!r} in {seen_cursors!r}"
+        seen_cursors.add(cursor)
+
+    assert cursor is None, f"pagination did not terminate: {[(p.scanned, p.deleted, p.next_after) for p in pages]}"
+    assert sum(p.deleted.get("inbox", 0) for p in pages) == 1
+    assert len(pages) == 5  # sid:ge:b, sid:gt:c, sidi:a, t (deletes 1), final empty page -> None
+

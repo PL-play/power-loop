@@ -37,12 +37,18 @@ async def delete_batch(tx, table, keys, where, params, limit, *, order=None):
 _LIFECYCLE_ORDER = ('closed', 'closing', 'open', 'suspended')
 _CURSOR_PREFIX = 'lc:'
 _INCLUSIVE_CURSOR_PREFIX = 'lci:'
-_RAW_INCLUSIVE_PREFIX = 'sidi:'
+_RAW_EXCLUSIVE_PREFIX = 'sid:gt:'
+_RAW_INCLUSIVE_PREFIX = 'sid:ge:'
 
 
 def _encode_cursor(lifecycle: str, updated_at: int, session_id: str, *, inclusive: bool = False) -> str:
     prefix = _INCLUSIVE_CURSOR_PREFIX if inclusive else _CURSOR_PREFIX
     return f'{prefix}{lifecycle}:{int(updated_at)}:{session_id}'
+
+
+def _encode_raw_cursor(session_id: str, *, inclusive: bool = False) -> str:
+    prefix = _RAW_INCLUSIVE_PREFIX if inclusive else _RAW_EXCLUSIVE_PREFIX
+    return f'{prefix}{session_id}'
 
 
 def _decode_cursor(token: str) -> tuple[str, int, str, bool] | None:
@@ -86,13 +92,17 @@ async def _fetch_lifecycle_candidates(
     if after_session_id is not None:
         parsed = _decode_cursor(after_session_id)
         if parsed is None:
-            # Backward-compatible raw session_id cursor (or inclusive resume cursor for raw mode).
-            inclusive_raw = after_session_id.startswith(_RAW_INCLUSIVE_PREFIX)
-            raw_sid = (
-                after_session_id[len(_RAW_INCLUSIVE_PREFIX):]
-                if inclusive_raw else after_session_id
-            )
-            cmp_op = '>=' if inclusive_raw else '>'
+            # Backward-compatible raw session_id cursor, plus explicit sid:gt:/sid:ge: tokens
+            # emitted by purge_expired_page so arbitrary printable session_ids never collide.
+            if after_session_id.startswith(_RAW_INCLUSIVE_PREFIX):
+                raw_sid = after_session_id[len(_RAW_INCLUSIVE_PREFIX):]
+                cmp_op = '>='
+            elif after_session_id.startswith(_RAW_EXCLUSIVE_PREFIX):
+                raw_sid = after_session_id[len(_RAW_EXCLUSIVE_PREFIX):]
+                cmp_op = '>'
+            else:
+                raw_sid = after_session_id
+                cmp_op = '>'
             ph = ','.join('?' for _ in lifecycles)
             rows = await store._db.fetchall(
                 f"SELECT session_id,lifecycle,updated_at FROM {store.t.sessions} "
@@ -170,7 +180,7 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
         if candidate['updated_at'] >= eligibility_cutoff:
             last = (
                 _encode_cursor(candidate['lifecycle'], candidate['updated_at'], sid)
-                if use_lifecycle_cursor else sid
+                if use_lifecycle_cursor else _encode_raw_cursor(sid)
             )
             continue
         async with store._db.transaction() as tx:
@@ -244,12 +254,12 @@ async def purge_expired(store, now, *, limit, retention_days, session_id=None, c
             # return an inclusive cursor so the next page re-enters this session cleanly.
             truncated_cursor = (
                 _encode_cursor(candidate['lifecycle'], candidate['updated_at'], sid, inclusive=True)
-                if use_lifecycle_cursor else f'{_RAW_INCLUSIVE_PREFIX}{sid}'
+                if use_lifecycle_cursor else _encode_raw_cursor(sid, inclusive=True)
             )
             break
         last = (
             _encode_cursor(candidate['lifecycle'], candidate['updated_at'], sid)
-            if use_lifecycle_cursor else sid
+            if use_lifecycle_cursor else _encode_raw_cursor(sid)
         )
     fetched = len(candidates)
     if truncated_cursor is not None:

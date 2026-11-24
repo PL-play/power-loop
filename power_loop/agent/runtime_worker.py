@@ -323,7 +323,9 @@ class RuntimeWorker:
     async def drain_closing_releases(self) -> None:
         while self._closing_release_tasks:
             tasks = tuple(self._closing_release_tasks)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # asyncio.wait does not cancel tasks if the caller itself is cancelled,
+            # ensuring in-flight closing lease releases always finish in the DB.
+            await asyncio.wait(tasks)
 
     def dispatch_claimed(self, batch) -> bool:
         """Schedule a locally fused accept_and_claim or pre-claimed batch without re-claiming.
