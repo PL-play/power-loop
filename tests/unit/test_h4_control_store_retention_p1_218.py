@@ -1233,3 +1233,234 @@ async def test_h4_p1_4_raw_cursor_with_prefix_colliding_session_ids_advances_and
     assert sum(p.deleted.get("inbox", 0) for p in pages) == 1
     assert len(pages) == 5  # sid:ge:b, sid:gt:c, sidi:a, t (deletes 1), final empty page -> None
 
+    # Direct raw pagination starting from legal prefix-looking session IDs (sid:gt:z, sid:ge:z, lc:open:0:z)
+    # must treat the caller input as a literal session_id and reach/clean successor session 't'!
+    for raw_start in ("sid:gt:z", "sid:ge:z", "lc:open:0:z"):
+        await target(port, raw_start)
+        r_next = await port.accept(t_ref, f"exp-{raw_start}", message_id=f"p14rw2-{raw_start}", actor=ACTOR)
+        await port.cancel(r_next.input_ref, actor=ACTOR)
+        deleted_total = 0
+        c2: str | None = raw_start
+        for _ in range(10):
+            pg = await store.purge_expired_page(
+                future_ms,
+                limit=5,
+                candidate_limit=1,
+                categories={"inbox"},
+                after_session_id=c2,
+            )
+            deleted_total += pg.deleted.get("inbox", 0)
+            c2 = pg.next_after
+            if c2 is None:
+                break
+        assert c2 is None
+        assert deleted_total == 1, f"failed to clean successor 't' starting from raw ID {raw_start!r}"
+
+
+async def test_h4_p1_2_workflow_leaf_cancel_never_upgrades_public_reply_route(registry_store):
+    """P1-2 rework 2: cancelling pending/finished public input on workflow leaf never emits workflow_node_result."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12c-main"})
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        leaf_desc = replace(DESCRIPTOR, config={"workflow_node": "n1"})
+
+        cm_drv = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12c-drv",
+                message_id="drv-start",
+                body={"text": "run wf"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv_batch = cm_drv.preclaimed[0]
+        drv = drv_batch.target
+        driver_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        port._driver_waiters[drv.session_id] = (driver_events, asyncio.Event(), object())
+
+        cm_leaf = await port.create_many(
+            parent=drv,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12c-leaf",
+                message_id="leaf-start",
+                body={"text": "step 1"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv_batch.owner_epoch,
+            parent_cancel_seq=drv_batch.cancel_seq,
+        )
+        leaf_b1 = cm_leaf.preclaimed[0]
+        leaf = leaf_b1.target
+        await port.final(leaf_b1, final_text="step 1 ok")
+        driver_events.get_nowait()  # consume initial workflow_node_result event
+
+        # 1. Cancel pending public input by InputRef (routed to main as agent_result):
+        #    must deliver agent_result to main, 0 workflow_node_result to drv, 0 driver events!
+        pub_r1 = await client.send(
+            leaf, "pub pending 1", message_id="p12c-pub-1", actor=ACTOR,
+            reply_route={"target": main, "result_kind": "agent_result"},
+        )
+        c1 = await port.cancel(pub_r1.input_ref, actor=ACTOR, reason="user stop 1")
+        assert c1.state == "voided"
+        main_rows_1 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (main.session_id,),
+        )
+        assert [r["kind"] for r in main_rows_1] == ["agent_result"]
+        drv_rows_1 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in drv_rows_1] == ["user", "workflow_node_result"]
+        assert driver_events.empty()
+
+        # 2. Repeat cancel on already-finished public input (redeliver path) must NOT emit workflow_node_result!
+        c1_again = await port.cancel(pub_r1.input_ref, actor=ACTOR, reason="repeat")
+        assert c1_again.state == "already_finished"
+        drv_rows_1b = await store._db.fetchall(
+            f"SELECT kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in drv_rows_1b] == ["user", "workflow_node_result"]
+        assert driver_events.empty()
+
+        # 3. Cancel pending public input by session target (_void_pending_for_session_tx, routed to drv as agent_result):
+        #    must deliver agent_result to drv (NOT workflow_node_result) and 0 driver workflow events!
+        await client.send(
+            leaf, "pub pending 2", message_id="p12c-pub-2", actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        await port.cancel(leaf, actor=ACTOR, reason="session stop")
+        drv_rows_2 = await store._db.fetchall(
+            f"SELECT kind,result_kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in drv_rows_2] == ["user", "workflow_node_result", "agent_result"]
+        assert drv_rows_2[2]["result_kind"] == "agent_result"
+        assert driver_events.empty()
+
+        # 4. Genuine internal workflow_continue pending input cancelled by InputRef & by session
+        #    STILL delivers workflow_node_result and fires driver events!
+        int_r1 = await port.accept(
+            leaf, "internal cont 1", message_id="p12c-int-1", actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        c_int1 = await port.cancel(int_r1.input_ref, actor=ACTOR, reason="wf stop 1")
+        assert c_int1.state == "voided"
+        assert not driver_events.empty()
+        driver_events.get_nowait()
+
+        await port.accept(
+            leaf, "internal cont 2", message_id="p12c-int-2", actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        await port.cancel(leaf, actor=ACTOR, reason="wf stop 2")
+        assert not driver_events.empty()
+        driver_events.get_nowait()
+
+        drv_rows_3 = await store._db.fetchall(
+            f"SELECT kind FROM {store.t.follow_up_queue} WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert [r["kind"] for r in drv_rows_3] == [
+            "user", "workflow_node_result", "agent_result", "workflow_node_result", "workflow_node_result",
+        ]
+    finally:
+        port._driver_waiters.pop("p12c-drv", None)
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_h4_p1_2_same_tree_rebind_retargets_direct_parent_and_preserves_shared_ancestor(registry_store):
+    """P1-2 rework 2: same-tree rebind retargets direct-parent route to new parent while keeping other shared ancestors."""
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        # Case 1: Same-tree rebind (A -> B, A -> C; C routes to A; rebind C from A to B -> delivers & wakes B!)
+        a = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12st-a"})
+        b = await client.create_session(DESCRIPTOR, actor=ACTOR, parent=a, options={"session_id": "p12st-b"})
+        c = await client.create_session(DESCRIPTOR, actor=ACTOR, parent=a, options={"session_id": "p12st-c"})
+        await client.send(
+            c, "work for parent", message_id="p12st-m1", actor=ACTOR,
+            reply_route={"target": a, "result_kind": "agent_result"},
+        )
+        batch_c = await port.claim(c, node_id="n1", boot_id="b1")
+        assert batch_c is not None and batch_c.reply_to_session_id == a.session_id
+
+        rb = await port.rebind_children(a, b, child_targets=[c], actor=ACTOR)
+        assert rb.rebound_children == (c.session_id,)
+        c_state = await store.get_session(c.session_id)
+        assert c_state is not None and c_state.parent_session_id == b.session_id
+
+        fb = await port.final(batch_c, final_text="rebound to b")
+        assert fb.result_delivery_error is None
+        assert fb.result_activation == b
+        a_rows = await store._db.fetchall(
+            f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=?", (a.session_id,),
+        )
+        b_rows = await store._db.fetchall(
+            f"SELECT kind,content_json FROM {store.t.follow_up_queue} WHERE session_id=?", (b.session_id,),
+        )
+        assert a_rows == []
+        assert len(b_rows) == 1 and b_rows[0]["kind"] == "agent_result"
+
+        # Case 2: Shared grandparent (G -> A2 -> C2, G -> B2; C2 explicitly routes to G; rebind A2 -> B2 keeps G!)
+        g = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12sh-g"})
+        a2 = await client.create_session(DESCRIPTOR, actor=ACTOR, parent=g, options={"session_id": "p12sh-a2"})
+        b2 = await client.create_session(DESCRIPTOR, actor=ACTOR, parent=g, options={"session_id": "p12sh-b2"})
+        c2 = await client.create_session(DESCRIPTOR, actor=ACTOR, parent=a2, options={"session_id": "p12sh-c2"})
+        await client.send(
+            c2, "work for shared gp", message_id="p12sh-m1", actor=ACTOR,
+            reply_route={"target": g, "result_kind": "agent_result"},
+        )
+        batch_c2 = await port.claim(c2, node_id="n1", boot_id="b1")
+        assert batch_c2 is not None and batch_c2.reply_to_session_id == g.session_id
+
+        rb2 = await port.rebind_children(a2, b2, child_targets=[c2], actor=ACTOR)
+        assert rb2.rebound_children == (c2.session_id,)
+        fb2 = await port.final(batch_c2, final_text="kept on g")
+        assert fb2.result_delivery_error is None
+        assert fb2.result_activation == g
+        g_rows = await store._db.fetchall(
+            f"SELECT kind FROM {store.t.follow_up_queue} WHERE session_id=?", (g.session_id,),
+        )
+        b2_rows = await store._db.fetchall(
+            f"SELECT id FROM {store.t.follow_up_queue} WHERE session_id=?", (b2.session_id,),
+        )
+        assert [r["kind"] for r in g_rows] == ["agent_result"]
+        assert b2_rows == []
+    finally:
+        await client.aclose()
+        await transport.aclose()

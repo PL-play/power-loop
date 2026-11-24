@@ -5389,11 +5389,6 @@ class RuntimeInputStore:
             rec = self.record(row)
             root_rec = await self._continuation_root(tx, rec) if row["continuation_of"] is not None else rec
             delivery_error = None
-            is_human_direct_leaf = (
-                route is not None
-                and route.get("result_kind") == "workflow_node_result"
-                and row["reply_to_session_id"] is None
-            )
             is_driver_run = self._is_driver_run_input(state, root_rec)
             agg_void: dict[str, Any] | None = None
             if (
@@ -5409,9 +5404,13 @@ class RuntimeInputStore:
                     database_now=now_ms(),
                 )
             res_json_void = canonical(agg_void) if agg_void is not None else None
+            eff_parent_sid, eff_rk, eff_start = self._resolve_input_delivery_route(
+                state, route, row, root_rec.ref,
+            )
             if (
-                route is not None
-                and not is_human_direct_leaf
+                eff_parent_sid is not None
+                and eff_rk is not None
+                and eff_start is not None
                 and is_driver_run
                 and row["kind"] in ("user", "workflow_continue")
             ):
@@ -5425,10 +5424,10 @@ class RuntimeInputStore:
                     child_target=target,
                     child_tenant_id=state["tenant_id"],
                     child_principal_id=state["principal_id"],
-                    parent_session_id=route["target"]["session_id"],
-                    start_ref=InputRef(**route["input_ref"]),
+                    parent_session_id=eff_parent_sid,
+                    start_ref=eff_start,
                     result=cancelled_res,
-                    result_kind=route["result_kind"],
+                    result_kind=eff_rk,
                     child_wake=child_wake,
                     activations=activations,
                     _driver_events_out=_driver_events_out,
@@ -5438,9 +5437,9 @@ class RuntimeInputStore:
                 elif delivery_error is not None and undeliverables is not None:
                     undeliverables.append((
                         target,
-                        route["target"]["session_id"],
+                        eff_parent_sid,
                         replace(cancelled_res, result_delivery_error=delivery_error),
-                        route["result_kind"],
+                        eff_rk,
                         delivery_error,
                     ))
             affected = await tx.execute(
@@ -5774,22 +5773,24 @@ class RuntimeInputStore:
         now_sql = self._now_sql()
         route = json.loads(state["result_route_json"]) if state["result_route_json"] else None
         # Check derived terminal status for normal completed rows (no final_settle_inbox)
-        is_human_direct_leaf = (
-            route is not None
-            and route.get("result_kind") == "workflow_node_result"
-            and row.get("reply_to_session_id") is None
-        )
+        eff_parent_sid, eff_rk, eff_start = self._resolve_input_delivery_route(state, route, row, ref)
         is_driver_run = self._is_driver_run_input(state, record)
         derived = await self._derive_input_terminal(tx, state, row)
         if derived["terminal_status"] is not None:
             if (
-                route is not None
+                eff_parent_sid is not None
+                and eff_rk is not None
+                and eff_start is not None
                 and self._can_redeliver_stored_result(state, row)
-                and not is_human_direct_leaf
                 and is_driver_run
             ):
+                eff_route = {
+                    "target": {"store_id": self.store.store_id, "session_id": eff_parent_sid},
+                    "input_ref": plain(eff_start),
+                    "result_kind": eff_rk,
+                }
                 await self._route_stored_result_tx(
-                    tx, state, route, record, activations,
+                    tx, state, eff_route, record, activations,
                     _driver_events_out=_driver_events_out,
                 )
             return self.receipt(record, state="already_finished")
@@ -5806,7 +5807,12 @@ class RuntimeInputStore:
                 )
             res_json_void = canonical(agg_void) if agg_void is not None else None
             delivery_error = None
-            if route is not None and not is_human_direct_leaf and is_driver_run:
+            if (
+                eff_parent_sid is not None
+                and eff_rk is not None
+                and eff_start is not None
+                and is_driver_run
+            ):
                 cancelled = Result(
                     ref, TargetRef(self.store.store_id, sid), "cancelled", None, None,
                     structured_output=agg_void,
@@ -5817,10 +5823,10 @@ class RuntimeInputStore:
                     child_target=TargetRef(self.store.store_id, sid),
                     child_tenant_id=state["tenant_id"],
                     child_principal_id=state["principal_id"],
-                    parent_session_id=route["target"]["session_id"],
-                    start_ref=InputRef(**route["input_ref"]),
+                    parent_session_id=eff_parent_sid,
+                    start_ref=eff_start,
                     result=cancelled,
-                    result_kind=route["result_kind"],
+                    result_kind=eff_rk,
                     child_wake=0 if cancel_by == "subtree" else 1,
                     activations=activations,
                     _driver_events_out=_driver_events_out,
@@ -5828,9 +5834,9 @@ class RuntimeInputStore:
                 if delivery_error is not None and undeliverables is not None:
                     undeliverables.append((
                         TargetRef(self.store.store_id, sid),
-                        route["target"]["session_id"],
+                        eff_parent_sid,
                         replace(cancelled, result_delivery_error=delivery_error),
-                        route["result_kind"],
+                        eff_rk,
                         delivery_error,
                     ))
             changed = await tx.execute(
@@ -5870,6 +5876,50 @@ class RuntimeInputStore:
             )
             return self.receipt(record, state="cancel_requested", reason=reason)
         return self.receipt(record, state="already_finished")
+
+    def _resolve_input_delivery_route(
+        self,
+        state: dict[str, Any],
+        route: dict[str, Any] | None,
+        row: dict[str, Any],
+        fallback_ref: InputRef,
+    ) -> tuple[str | None, str | None, InputRef | None]:
+        """Resolve (parent_session_id, result_kind, start_ref) for an input row on cancel/redeliver.
+
+        On workflow leaves (session-level ``workflow_node_result``), only inputs whose own
+        ``reply_result_kind == 'workflow_node_result'`` may deliver ``workflow_node_result``;
+        public routed inputs keep their own destination and ``reply_result_kind`` (never upgrading),
+        and unrouted human inputs emit nothing.
+        """
+        if route is not None and route.get("result_kind") == "workflow_node_result":
+            if (
+                row.get("reply_to_session_id") is not None
+                and row.get("reply_result_kind") == "workflow_node_result"
+            ):
+                return (
+                    str(route["target"]["session_id"]),
+                    "workflow_node_result",
+                    InputRef(**route["input_ref"]),
+                )
+            if row.get("reply_to_session_id") is not None:
+                start_ref = (
+                    InputRef(self.store.store_id, str(state["session_id"]), str(state["start_input_message_id"]))
+                    if state.get("start_input_message_id")
+                    else fallback_ref
+                )
+                return (
+                    str(row["reply_to_session_id"]),
+                    str(row.get("reply_result_kind") or "agent_result"),
+                    start_ref,
+                )
+            return None, None, None
+        if route is not None:
+            return (
+                str(route["target"]["session_id"]),
+                str(route["result_kind"]),
+                InputRef(**route["input_ref"]),
+            )
+        return None, None, None
 
     @staticmethod
     def _is_driver_run_input(state, record: InputRecord) -> bool:
@@ -6710,9 +6760,19 @@ class RuntimeInputStore:
                         node["root_session_id"] = new_root
                         node["depth"] = int(node["depth"]) + depth_delta
 
-                    # Retarget active per-input reply routes on the entire moved subtree that
-                    # pointed to from_parent or any stale ancestor above from_parent no longer
-                    # in to_parent's ancestor chain (keeps routes targeting shared ancestors).
+                    # 1) Always retarget direct children's active per-input routes pointing to
+                    #    from_parent -> to_parent (preserves direct-parent rebind even on same-tree
+                    #    rebinds where from_parent remains an ancestor of to_parent).
+                    await tx.execute(
+                        f"UPDATE {self.q} SET reply_to_session_id=? "
+                        f"WHERE session_id IN ({d_ph}) AND reply_to_session_id=? "
+                        "AND status IN ('pending','delivered') AND terminal_status IS NULL",
+                        (tp_sid, *direct_ids, fp_sid),
+                    )
+
+                    # 2) Retarget active per-input reply routes across the entire moved subtree
+                    #    that pointed to any stale ancestor above from_parent no longer in
+                    #    to_parent's ancestor chain (preserves explicit routes to shared ancestors).
                     async def _ancestors_of(start_row: dict[str, Any]) -> set[str]:
                         anc: set[str] = {str(start_row["session_id"])}
                         cur = start_row.get("parent_session_id")

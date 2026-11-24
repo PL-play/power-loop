@@ -35,10 +35,13 @@ async def delete_batch(tx, table, keys, where, params, limit, *, order=None):
 
 
 _LIFECYCLE_ORDER = ('closed', 'closing', 'open', 'suspended')
-_CURSOR_PREFIX = 'lc:'
-_INCLUSIVE_CURSOR_PREFIX = 'lci:'
-_RAW_EXCLUSIVE_PREFIX = 'sid:gt:'
-_RAW_INCLUSIVE_PREFIX = 'sid:ge:'
+# Leading ASCII Unit Separator (\x1f) is non-printable and therefore disallowed in all legal
+# session IDs (runtime_types.identifier), guaranteeing zero collision between caller-supplied
+# raw session IDs and system continuation tokens.
+_CURSOR_PREFIX = '\x1flc:'
+_INCLUSIVE_CURSOR_PREFIX = '\x1flci:'
+_RAW_EXCLUSIVE_PREFIX = '\x1fsid:gt:'
+_RAW_INCLUSIVE_PREFIX = '\x1fsid:ge:'
 
 
 def _encode_cursor(lifecycle: str, updated_at: int, session_id: str, *, inclusive: bool = False) -> str:
