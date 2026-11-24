@@ -134,25 +134,33 @@ async def action(loop, action, *, command=None, task_id=None, tool=None, args=No
         })
     if action not in {"list", "check", "wait", "cancel"}:
         raise RuntimeRequestError("invalid_options", "unknown background action")
-    ids = list(task_ids or ([task_id] if task_id else []))
-    if not ids:
-        page = await client.list_children(
-            TargetRef(loop.store.store_id, actor.session_id), actor=actor, limit=1000,
+    raw_ids = task_ids if task_ids else ([task_id] if task_id else [])
+    ids = list(dict.fromkeys(raw_ids))
+    if not ids and action == "list":
+        rows = await port.db.fetchall(
+            f"SELECT session_id FROM {port.s} "
+            "WHERE parent_session_id=? AND session_kind='background' "
+            "AND tenant_id=? AND principal_id=? "
+            "ORDER BY created_at DESC, session_id DESC LIMIT 1000",
+            (actor.session_id, actor.tenant_id, actor.principal_id),
         )
-        for child in page.items:
-            session = await port._session(port.db, child.session_id)
-            if session["session_kind"] == "background":
-                ids.append(child.session_id)
+        ids = [row["session_id"] for row in rows]
     if action in {"check", "wait", "cancel"} and not ids:
         raise RuntimeRequestError("invalid_options", "task_id is required")
     deadline = now_ms() + int(min(max(timeout_s or 600, 0.01), 3600) * 1000)
+    if action == "cancel":
+        cancelled = []
+        for current_id in ids:
+            target, _start = await _start_for_task(port, actor, current_id)
+            cancelled.append(plain(await client.cancel(
+                target, actor=actor, scope="subtree", reason="background cancelled",
+            )))
+        if len(cancelled) == 1 and task_ids is None:
+            return canonical(cancelled[0])
+        return canonical({"cancelled": cancelled})
     records = []
     for current_id in ids:
         target, start = await _start_for_task(port, actor, current_id)
-        if action == "cancel":
-            return canonical(plain(await client.cancel(
-                target, actor=actor, scope="subtree", reason="background cancelled",
-            )))
         if action == "wait":
             from power_loop.agent.runtime_types import WaitTimeout
             try:
@@ -184,6 +192,16 @@ class SessionToolResult:
 
 async def run_session(worker, ctx, env, config):
     """Invoke the frozen original registration once; recovery never calls this again."""
+    batch = ctx.batch
+    if batch.send_index != 1 or (
+        batch.start_input_message_id is not None
+        and not any(ref.message_id == batch.start_input_message_id for ref in batch.input_refs)
+    ):
+        return SessionToolResult(
+            "failed",
+            error="background session executes only its initial send",
+            error_code="background_replay_forbidden",
+        )
     frozen = ctx.descriptor.config["background"]
     name, arguments = frozen["tool"], frozen["arguments"]
     registered = env.tool_registry.get(name) if env.tool_registry is not None else None

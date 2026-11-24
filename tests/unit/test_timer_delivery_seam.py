@@ -1,5 +1,6 @@
 """Timer driver routes through RuntimeClient; host policy lives in the backend/driver."""
 import asyncio
+import json
 
 import pytest
 
@@ -52,7 +53,15 @@ async def test_hook_rewrite_or_skip_applies_before_client_acceptance(registry_st
         else:
             ref = InputRef(store.store_id, target.session_id, f'timer-{timer.timer_id}-{timer.created_at}-0')
             await runtime.client.wait(ref, actor=actor, deadline_ms=now_ms()+10000)
-            assert any(row.content == 'REWRITTEN: original' for row in await store.load_all_messages(target.session_id))
+            user_rows = [row for row in await store.load_all_messages(target.session_id) if row.role == 'user']
+            assert any(
+                row.content == 'REWRITTEN: original'
+                or any(
+                    isinstance(item, dict) and item.get('content') == 'REWRITTEN: original'
+                    for item in (json.loads(row.content).get('items', []) if row.content.startswith('{') else [])
+                )
+                for row in user_rows
+            )
 
 
 async def test_unknown_acceptance_is_not_replayed_and_next_timer_can_fire(registry_store, monkeypatch):

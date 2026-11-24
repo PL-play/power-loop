@@ -331,48 +331,95 @@ def _select_node(saved, options):
     return TargetRef(saved["driver_target"]["store_id"], session_id), entry
 
 
+def _parse_int_option(value: Any, code: str, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise WorkflowToolInputError(code)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise WorkflowToolInputError(code)
+        try:
+            parsed = int(stripped)
+        except ValueError as exc:
+            raise WorkflowToolInputError(code) from exc
+    else:
+        parsed = value
+    if minimum is not None and parsed < minimum:
+        raise WorkflowToolInputError(code)
+    return parsed
+
+
 async def _read_logs(loop, target, actor, options):
     """Bounded raw/projected session reads with no task/history authority."""
     source = options.get("source", "messages")
     if source not in {"messages", "projection"}:
         raise WorkflowToolInputError("invalid_workflow_history_source")
-    limit = min(options.get("limit", 20), 50)
-    preview = options.get("preview_chars", 500)
+    limit_raw = options.get("limit")
+    limit = min(_parse_int_option(limit_raw, "invalid_workflow_limit", minimum=1), 50) if limit_raw is not None else 20
+    preview_raw = options.get("preview_chars")
+    preview = _parse_int_option(preview_raw, "invalid_workflow_preview_chars", minimum=1) if preview_raw is not None else 500
+    output_file = options.get("output_file")
+    if output_file is not None and (not isinstance(output_file, str) or not output_file.strip()):
+        raise WorkflowToolInputError("workflow_export_path_invalid")
+    if source == "projection" and options.get("seq") is not None:
+        raise WorkflowToolInputError("invalid_workflow_logs_filter")
+
+    where, params = ["session_id=?"], [target.session_id]
+    filter_cols = (
+        (("seq", "seq"), ("id", "id"), ("message_id", "id"), ("send_index", "send_index"))
+        if source == "messages"
+        else (("id", "id"), ("message_id", "id"), ("send_index", "send_index"))
+    )
+    for key, column in filter_cols:
+        if options.get(key) is not None:
+            where.append(column + "=?")
+            params.append(_parse_int_option(options[key], f"invalid_workflow_{key}", minimum=1))
+    if "message_ids" in options and options["message_ids"] is not None:
+        raw_ids = options["message_ids"]
+        if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 100:
+            raise WorkflowToolInputError("invalid_workflow_message_ids")
+        ids = [_parse_int_option(value, "invalid_workflow_message_ids", minimum=1) for value in raw_ids]
+        where.append("id IN (" + ",".join("?" for _ in ids) + ")")
+        params.extend(ids)
+    has_cursor = options.get("cursor") is not None
+    cursor = _parse_int_option(options["cursor"], "invalid_workflow_cursor", minimum=0) if has_cursor else None
+    latest = not has_cursor and not any(
+        options.get(key) is not None for key in ("seq", "id", "message_id", "message_ids")
+    )
+
     client = loop._runtime_worker.runtime.client
     await client.inspect(target, actor=actor)
     store = loop.store
     table = store.t.messages if source == "messages" else store.t.project_messages
     coordinate = "seq" if source == "messages" else "id"
-    where, params = ["session_id=?"], [target.session_id]
-    for key, column in (("seq", "seq"), ("id", "id"), ("message_id", "id"), ("send_index", "send_index")):
-        if key in options:
-            where.append(column + "=?")
-            params.append(int(options[key]))
-    if "message_ids" in options:
-        ids = [int(value) for value in options["message_ids"]]
-        where.append("id IN (" + ",".join("?" for _ in ids) + ")")
-        params.extend(ids)
-    cursor = int(options.get("cursor") or 0)
-    latest = "cursor" not in options and not any(
-        key in options for key in ("seq", "id", "message_id", "message_ids")
-    )
-    upper = await store._db.fetchone(
-        f"SELECT MAX({coordinate}) AS value FROM {table} WHERE {' AND '.join(where)}", params,
-    )
-    if latest and upper["value"] is not None:
-        cursor = max(cursor, int(upper["value"]) - limit)
-    selected = [*where, coordinate + ">?", coordinate + "<=?"]
-    rows = await store._db.fetchall(
-        f"SELECT * FROM {table} WHERE {' AND '.join(selected)} ORDER BY {coordinate} LIMIT ?",
-        [*params, cursor, int(upper["value"] or 0), limit + 1],
-    )
+    if latest:
+        rows = await store._db.fetchall(
+            f"SELECT * FROM {table} WHERE {' AND '.join(where)} "
+            f"ORDER BY {coordinate} DESC LIMIT ?",
+            [*params, limit],
+        )
+        page_rows = list(reversed(rows))
+        has_more = False
+    else:
+        selected = list(where)
+        query_params = list(params)
+        if cursor is not None:
+            selected.append(f"{coordinate}>?")
+            query_params.append(cursor)
+        rows = await store._db.fetchall(
+            f"SELECT * FROM {table} WHERE {' AND '.join(selected)} "
+            f"ORDER BY {coordinate} ASC LIMIT ?",
+            [*query_params, limit + 1],
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
     records = []
-    for row in rows[:limit]:
+    for row in page_rows:
         item = dict(row)
         for key in ("id", "seq", "send_index", "source_seq_lo", "source_seq_hi"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
-        if output := options.get("output_file"):
+        if output_file:
             records.append(item)
         else:
             content = item.get("content") or item.get("content_json") or item.get("rendered_text")
@@ -380,21 +427,21 @@ async def _read_logs(loop, target, actor, options):
                 key: item[key] for key in ("id", "seq", "send_index", "role", "name", "kind")
                 if key in item
             } | {"preview": str(content or "")[:preview]})
-    if output := options.get("output_file"):
+    if output_file:
         from power_loop.runtime.env import RuntimeEnvError, get_runtime_env, safe_path
 
         try:
-            path = safe_path(output, "w", env=get_runtime_env())
+            path = safe_path(output_file, "w", env=get_runtime_env())
         except (ValueError, RuntimeEnvError) as exc:
             raise WorkflowToolInputError("workflow_export_path_invalid") from exc
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in records))
-        return {"status": "exported", "path": output, "records": len(records)}
+        return {"status": "exported", "path": output_file, "records": len(records)}
     return {
         "status": "ok" if records else "unavailable",
         "source": source,
         "records": records,
-        "next_cursor": str(rows[limit - 1][coordinate]) if len(rows) > limit else None,
+        "next_cursor": str(page_rows[-1][coordinate]) if has_more and page_rows else None,
     }
 
 
@@ -426,8 +473,16 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
             return _dump({"status": "valid", "summary": _spec_summary(prepared.spec)})
         if action == "list" or action == "status" and not options.get("run_id"):
             run_ids = await journal.list_run_ids(loop.store, sid)
-            offset = int(options.get("cursor") or 0)
-            limit = options.get("limit", 20)
+            offset = (
+                _parse_int_option(options["cursor"], "invalid_workflow_cursor", minimum=0)
+                if options.get("cursor") is not None
+                else 0
+            )
+            limit = (
+                min(_parse_int_option(options["limit"], "invalid_workflow_limit", minimum=1), 50)
+                if options.get("limit") is not None
+                else 20
+            )
             selected = run_ids[offset:offset + limit]
             value = {
                 "runs": [await journal.read(loop.store, sid, run_id) for run_id in selected],
@@ -487,7 +542,13 @@ def workflow_runtime_tool(handler, *, key="sdk.workflow"):
         ToolRuntimeContract(key, background_allowed=False, allowed_roles=("main",)),
         policy=lambda arguments: ToolDispatchPolicy(
             native_admitted=arguments.get("action", "help") in _ACTIONS,
-            control_only=arguments.get("action", "help") in _CONTROL_ACTIONS,
+            control_only=(
+                arguments.get("action", "help") in _CONTROL_ACTIONS
+                and not (
+                    arguments.get("action", "help") == "logs"
+                    and arguments.get("output_file") not in (None, "")
+                )
+            ),
         ),
     )
 

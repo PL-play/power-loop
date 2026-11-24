@@ -534,8 +534,10 @@ class DurableExecutor:
             await _cancel_newly_cancelled()
 
             live_sids = {item.target.session_id for item in live_items}
+            handled_sids: set[str] = set()
             for b in cm.preclaimed:
                 if b.target.session_id in live_sids:
+                    handled_sids.add(b.target.session_id)
                     self.worker.dispatch_claimed(b)
             spec_by_sid = {item.target.session_id: item for item in live_items}
             for qt in cm.queued_targets:
@@ -543,6 +545,7 @@ class DurableExecutor:
                 it = spec_by_sid.get(qt.session_id)
                 if it is None or it.target.session_id in cancelled_sids:
                     continue
+                handled_sids.add(qt.session_id)
                 await self.client._notify(qt, it.start.message_id, it.start, ["work", "activation"])
                 if self.client.wake_transport is not None:
                     try:
@@ -552,7 +555,7 @@ class DurableExecutor:
             if cm.already_created:
                 for item in list(live_items):
                     await _cancel_newly_cancelled()
-                    if item.target.session_id in cancelled_sids:
+                    if item.target.session_id in cancelled_sids or item.target.session_id in handled_sids:
                         continue
                     await self.client._notify(
                         item.target, item.start.message_id, item.start, ["work", "activation"],

@@ -1992,35 +1992,92 @@ class SessionStore:
             ('session_id','state_key'), ('value_json','updated_at')),
             (sid,key,_dumps(value),_now_ms()))
 
-    async def create_timer(self, session_id, *, due_at, note, interval_s=None, tx=None):
+    @staticmethod
+    def _timer_from_dict(value: dict[str, Any]) -> TimerRow:
+        return TimerRow(
+            session_id=value['session_id'],
+            timer_id=int(value['timer_id']),
+            due_at=int(value['due_at']),
+            note=value['note'],
+            status=value['status'],
+            interval_s=value.get('interval_s'),
+            fire_count=int(value['fire_count']),
+            last_fired_at=value.get('last_fired_at'),
+            created_at=int(value['created_at']),
+            updated_at=int(value['updated_at']),
+        )
+
+    def _timer_json_field(self, name: str, *, number: bool = False) -> str:
+        return f"(CASE WHEN state_key LIKE 'timer:%' THEN {self._json_field(name, number=number)} END)"
+
+    async def find_timer_by_operation_id(self, session_id, operation_id, *, reader=None):
+        if not operation_id:
+            return None
+        row = await (reader or self._db).fetchone(
+            f"SELECT value_json FROM {self.t.session_runtime_state} "
+            f"WHERE session_id=? AND state_key LIKE 'timer:%' "
+            f"AND {self._timer_json_field('operation_id')}=? LIMIT 1",
+            (session_id, str(operation_id)),
+        )
+        return self._timer_from_dict(_loads(row['value_json'])) if row is not None else None
+
+    async def create_timer(
+        self, session_id, *, due_at, note, interval_s=None,
+        operation_id=None, _check_operation_id=True, tx=None,
+    ):
         if tx is None:
             async with self._db.transaction() as tx:
-                await self._db.dialect.lock_state(tx,self.t.sessions,session_id)
-                return await self.create_timer(session_id,due_at=due_at,note=note,interval_s=interval_s,tx=tx)
-        row = await tx.fetchone(f"SELECT COALESCE(MAX({self._json_field('timer_id',number=True)}),0)+1 AS id "
-            f"FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key LIKE 'timer:%'", (session_id,))
+                await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
+                return await self.create_timer(
+                    session_id, due_at=due_at, note=note, interval_s=interval_s,
+                    operation_id=operation_id, _check_operation_id=_check_operation_id, tx=tx,
+                )
+        if operation_id and _check_operation_id:
+            existing = await self.find_timer_by_operation_id(session_id, operation_id, reader=tx)
+            if existing is not None:
+                return existing
+        row = await tx.fetchone(
+            f"SELECT COALESCE(MAX({self._timer_json_field('timer_id', number=True)}),0)+1 AS id "
+            f"FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key LIKE 'timer:%'",
+            (session_id,),
+        )
         now, timer_id = _now_ms(), int(row['id'])
-        value = dict(session_id=session_id,timer_id=timer_id,due_at=int(due_at),note=note,
-            status='armed',interval_s=interval_s,fire_count=0,last_fired_at=None,created_at=now,updated_at=now)
-        await self._put_aux(tx,session_id,f'timer:{timer_id}',value)
-        return TimerRow(**value)
+        value = dict(
+            session_id=session_id, timer_id=timer_id, due_at=int(due_at), note=note,
+            status='armed', interval_s=interval_s, fire_count=0, last_fired_at=None,
+            created_at=now, updated_at=now,
+        )
+        if operation_id:
+            value['operation_id'] = str(operation_id)
+        await self._put_aux(tx, session_id, f'timer:{timer_id}', value)
+        return self._timer_from_dict(value)
 
     async def get_timer(self, session_id, timer_id):
-        value = await self.get_runtime_state(session_id,f'timer:{int(timer_id)}')
-        return TimerRow(**value) if value is not None else None
+        value = await self.get_runtime_state(session_id, f'timer:{int(timer_id)}')
+        return self._timer_from_dict(value) if value is not None else None
 
-    async def list_timers(self, session_id, *, statuses=('armed','firing'), reader=None):
-        rows = await (reader or self._db).fetchall(f"SELECT value_json FROM {self.t.session_runtime_state} "
-            f"WHERE session_id=? AND state_key LIKE 'timer:%' AND {self._json_field('status')} "
-            f"IN ({','.join('?' for _ in statuses)}) ORDER BY {self._json_field('due_at',number=True)}", (session_id,*statuses))
-        return [TimerRow(**_loads(row['value_json'])) for row in rows]
+    async def list_timers(self, session_id, *, statuses=('armed', 'firing'), reader=None):
+        if not statuses:
+            return []
+        rows = await (reader or self._db).fetchall(
+            f"SELECT value_json FROM {self.t.session_runtime_state} "
+            f"WHERE session_id=? AND state_key LIKE 'timer:%' "
+            f"AND {self._timer_json_field('status')} IN ({','.join('?' for _ in statuses)}) "
+            f"ORDER BY {self._timer_json_field('due_at', number=True)}",
+            (session_id, *statuses),
+        )
+        return [self._timer_from_dict(_loads(row['value_json'])) for row in rows]
 
     async def due_timers(self, *, now=None, limit=50):
-        rows = await self._db.fetchall(f"SELECT value_json FROM {self.t.session_runtime_state} "
-            f"WHERE state_key LIKE 'timer:%' AND {self._json_field('status')}='armed' "
-            f"AND {self._json_field('due_at',number=True)}<=? ORDER BY {self._json_field('due_at',number=True)} LIMIT ?",
-            (_now_ms() if now is None else int(now),int(limit)))
-        return [TimerRow(**_loads(row['value_json'])) for row in rows]
+        rows = await self._db.fetchall(
+            f"SELECT value_json FROM {self.t.session_runtime_state} "
+            f"WHERE state_key LIKE 'timer:%' "
+            f"AND {self._timer_json_field('status')}='armed' "
+            f"AND {self._timer_json_field('due_at', number=True)}<=? "
+            f"ORDER BY {self._timer_json_field('due_at', number=True)} LIMIT ?",
+            (_now_ms() if now is None else int(now), int(limit)),
+        )
+        return [self._timer_from_dict(_loads(row['value_json'])) for row in rows]
 
     async def _change_timer(self, sid, tid, change):
         key = f'timer:{int(tid)}'
@@ -2064,10 +2121,14 @@ class SessionStore:
             return True
         return await self._change_timer(session_id,timer_id,change)
 
-    async def recover_stale_firing_timers(self, *, older_than_ms,limit=50):
-        rows = await self._db.fetchall(f"SELECT session_id,value_json FROM {self.t.session_runtime_state} "
-            f"WHERE state_key LIKE 'timer:%' AND {self._json_field('status')}='firing' AND updated_at<? "
-            'ORDER BY updated_at LIMIT ?', (_now_ms()-int(older_than_ms),limit))
+    async def recover_stale_firing_timers(self, *, older_than_ms, limit=50):
+        rows = await self._db.fetchall(
+            f"SELECT session_id,value_json FROM {self.t.session_runtime_state} "
+            f"WHERE state_key LIKE 'timer:%' "
+            f"AND {self._timer_json_field('status')}='firing' AND updated_at<? "
+            'ORDER BY updated_at LIMIT ?',
+            (_now_ms() - int(older_than_ms), limit),
+        )
         count = 0
         for row in rows:
             saved = _loads(row['value_json'])
@@ -2076,24 +2137,32 @@ class SessionStore:
                     return False
                 value['status'] = 'cancelled' if value['interval_s'] is None else 'armed'
                 if value['interval_s'] is not None:
-                    value['due_at'] = _now_ms()+value['interval_s']*1000
+                    value['due_at'] = _now_ms() + value['interval_s'] * 1000
                 value['fire_count'] += 1
                 return True
-            count += await self._change_timer(row['session_id'],saved['timer_id'],change)
+            count += await self._change_timer(row['session_id'], saved['timer_id'], change)
         return count
 
-    async def prune_timers(self,session_id, *, statuses=('fired','cancelled','unknown'),older_than_ms=None,now=None,limit=1000):
+    async def prune_timers(self, session_id, *, statuses=('fired', 'cancelled', 'unknown'), older_than_ms=None, now=None, limit=1000):
+        if not statuses:
+            return 0
         from .retention import batch_limit, delete_batch
-        where = f"state_key LIKE 'timer:%' AND {self._json_field('status')} IN ({','.join('?' for _ in statuses)})"
+        where = (
+            f"state_key LIKE 'timer:%' "
+            f"AND {self._timer_json_field('status')} IN ({','.join('?' for _ in statuses)})"
+        )
         params = list(statuses)
         if session_id is not None:
             where += ' AND session_id=?'
             params.append(session_id)
         if older_than_ms is not None:
-            where += ' AND updated_at<?'
-            params.append((_now_ms() if now is None else now)-int(older_than_ms))
+            where += ' AND updated_at<=?'
+            params.append((_now_ms() if now is None else now) - int(older_than_ms))
         async with self._db.transaction() as tx:
-            return await delete_batch(tx,self.t.session_runtime_state,('session_id','state_key'),where,tuple(params),batch_limit(limit))
+            return await delete_batch(
+                tx, self.t.session_runtime_state, ('session_id', 'state_key'),
+                where, tuple(params), batch_limit(limit),
+            )
 
     async def add_note(self, session_id,content, *, pinned=False):
         async with self._db.transaction() as tx:

@@ -94,9 +94,23 @@ class StoreTimerBackend:
             if (row['parent_session_id'] is not None or row['created_by_session_id'] is not None
                     or row['session_kind'] != 'agent'):
                 raise RuntimeRequestError('forbidden', 'only main agents may schedule timers')
-            if len(await self.store.list_timers(source.session_id,reader=tx)) >= 10:
+            if source.operation_id:
+                existing = await self.store.find_timer_by_operation_id(
+                    source.session_id, source.operation_id, reader=tx,
+                )
+                if existing is not None:
+                    return existing
+            if len(await self.store.list_timers(source.session_id, reader=tx)) >= 10:
                 raise RuntimeRequestError('timer_limit_reached')
-            return await self.store.create_timer(source.session_id, due_at=due, note=note.strip(), interval_s=interval_s, tx=tx)
+            return await self.store.create_timer(
+                source.session_id,
+                due_at=due,
+                note=note.strip(),
+                interval_s=interval_s,
+                operation_id=source.operation_id,
+                _check_operation_id=False,
+                tx=tx,
+            )
 
     async def list(self, source, *, statuses=('armed', 'firing')):
         await self._authorize(source, self.store._db)

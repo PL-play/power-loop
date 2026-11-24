@@ -675,26 +675,67 @@ class WorkflowEngine:
                         else:
                             self._iter_broken.append(failure)
 
+        iter_broken_before = len(self._iter_broken)
         if node.parallel:
             gathered = await self._gather_branches([one(it, i) for i, it in enumerate(items)], on_error=node.on_error)
         else:
             gathered = []
             for i, it in enumerate(items):
+                if self._budget_hit or self._cancelled or self._cancel.is_cancelled():
+                    break
+                broken_before_item = len(self._iter_broken)
                 try:
-                    gathered.append(await one(it, i))
+                    res = await one(it, i)
                 except Exception as exc:  # noqa: BLE001
                     if node.on_error == "halt":
                         raise
                     gathered.append(exc)
+                    continue
+                if node.on_error == "halt":
+                    if (
+                        res is not None
+                        and res.status not in {"completed", "skipped"}
+                        and res.node_id not in self._tolerated
+                    ):
+                        raise WorkflowRunError(f"branch {res.node_id}: {res.status}")
+                    if len(self._iter_broken) > broken_before_item:
+                        raise WorkflowRunError(f"branch {self._iter_broken[broken_before_item]}: failed")
+                gathered.append(res)
 
         leaves = [r for r in gathered if isinstance(r, AgentResult)]
         for r in gathered:
             if isinstance(r, BaseException):
                 self._errors.append(f"foreach item error: {r}")
+            elif (
+                node.on_error == "continue"
+                and r is not None
+                and r.status not in {"completed", "skipped"}
+                and r.node_id not in self._tolerated
+            ):
+                self._tolerated.add(r.node_id)
+                self._errors.append(f"foreach item {r.node_id}: {r.status}")
+        broken = next(
+            (
+                r for r in leaves
+                if r.status not in ("completed", "skipped") and r.node_id not in self._tolerated
+            ),
+            None,
+        )
+        has_iter_broken = len(self._iter_broken) > iter_broken_before
         if node.id:
+            if broken is not None:
+                agg_status = broken.status
+            elif has_iter_broken:
+                agg_status = "failed"
+            elif self._cancelled or self._cancel.is_cancelled():
+                agg_status = "cancelled"
+            elif self._budget_hit:
+                agg_status = "budget_exceeded"
+            else:
+                agg_status = "completed"
             agg = AgentResult(
                 node_id=node.id,
-                status="completed",
+                status=agg_status,
                 text="\n\n".join(r.text for r in leaves),
                 payload={"items": [r.payload if r.payload is not None else r.text for r in leaves]},
                 # Sum leaf usage so total/resume accounting includes the fan-out
@@ -706,7 +747,7 @@ class WorkflowEngine:
             # Journal the aggregate so resume can skip the whole foreach.
             await self._emit_step(agg)
             return agg
-        return leaves[-1] if leaves else None
+        return broken or (leaves[-1] if leaves else None)
 
     async def _exec_branch(self, node: BranchNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         value = self._resolve_ref(node.on)

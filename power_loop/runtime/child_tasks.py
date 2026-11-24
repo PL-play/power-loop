@@ -104,7 +104,16 @@ async def send_input(loop, sid, message, *, urgent=False):
 
     await require_orchestration(loop, "subagent")
     _, actor = await tool_actor(loop)
+    if sid == actor.session_id:
+        raise RuntimeRequestError("forbidden", "cannot send input to own session")
     target = TargetRef(loop.store.store_id, sid)
+    port = loop._runtime_worker.inputs
+    session = await port.authorize(port.db, target, actor)
+    if session["parent_session_id"] != actor.session_id or session["session_kind"] != "agent":
+        raise RuntimeRequestError(
+            "forbidden",
+            "spawn_agent(send) target must be a direct agent child session",
+        )
     message_id = "inp_" + sha256_canonical([
         "child_send", actor.session_id, plain(actor.call_ref), actor.tool_call_id,
     ])[:56]
