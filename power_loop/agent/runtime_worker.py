@@ -123,7 +123,9 @@ class RuntimeWorker:
         self._pending = {}
         self._active = {}
         self._fusing: dict[str, int] = {}
+        self._reserved_wakes: set[str] = set()
         self._pending_claims: dict[tuple[str, int], asyncio.Task | None] = {}
+        self._closing_release_tasks: set[asyncio.Task] = set()
         self._drivers = set()
         self._tasks = set()
         self._capacity = asyncio.Semaphore(runtime.capacity)
@@ -236,6 +238,26 @@ class RuntimeWorker:
         else:
             self._fusing[sid] = count
 
+    def try_reserve_fuse(self, sid: str) -> bool:
+        """Synchronously check local fuse eligibility and pre-reserve a capacity slot."""
+        if not self.can_fuse_locally(sid):
+            return False
+        self._active[sid] = None
+        self._begin_fuse(sid)
+        return True
+
+    def release_fuse_reservation(self, sid: str, *, dispatched: bool) -> None:
+        """Release a fuse slot reservation; free _active[sid] and wake when not dispatched."""
+        self._end_fuse(sid)
+        missed_wake = sid in self._reserved_wakes
+        self._reserved_wakes.discard(sid)
+        if not dispatched:
+            if self._active.get(sid) is None:
+                self._active.pop(sid, None)
+            if missed_wake and not self._closing:
+                self._activate(sid)
+            self._wake.set()
+
     def _note_local_claim(
         self, node_id: str, boot_id: str, claims: list[tuple[str, int]],
     ) -> None:
@@ -261,17 +283,68 @@ class RuntimeWorker:
         for sid, epoch in claims:
             self._pending_claims.pop((str(sid), int(epoch)), None)
 
-    def dispatch_claimed(self, batch) -> None:
-        """Schedule a locally fused accept_and_claim or pre-claimed batch without re-claiming."""
+    def _schedule_closing_lease_release(self, batch) -> asyncio.Task | None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = asyncio.create_task(
+            self._release_closing_claim(batch),
+            context=contextvars.Context(),
+        )
+        self._closing_release_tasks.add(task)
+        task.add_done_callback(self._closing_release_tasks.discard)
+        return task
+
+    async def _release_closing_claim(self, batch) -> None:
+        from power_loop.contracts.errors import SessionLeaseLost
+        try:
+            await self.inputs.release_claim(batch)
+        except SessionLeaseLost:
+            pass
+        except Exception:
+            log.warning(
+                "closing lease release failed for %s",
+                batch.target.session_id, exc_info=True,
+            )
+            try:
+                await self.inputs.release_orphan_lease(
+                    batch.target.session_id,
+                    node_id=self.runtime.node_id,
+                    boot_id=self.runtime.boot_id,
+                    owner_epoch=batch.owner_epoch,
+                )
+            except Exception:
+                log.warning(
+                    "closing orphan lease release failed for %s",
+                    batch.target.session_id, exc_info=True,
+                )
+
+    async def drain_closing_releases(self) -> None:
+        while self._closing_release_tasks:
+            tasks = tuple(self._closing_release_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def dispatch_claimed(self, batch) -> bool:
+        """Schedule a locally fused accept_and_claim or pre-claimed batch without re-claiming.
+
+        Returns False and releases the claimed lease when the worker is already closing.
+        """
         sid = batch.target.session_id
-        self._active[sid] = None
         self._pending_claims.pop((sid, int(batch.owner_epoch)), None)
+        if self._closing or self._closed:
+            if self._active.get(sid) is None:
+                self._active.pop(sid, None)
+            self._schedule_closing_lease_release(batch)
+            return False
+        self._active[sid] = None
         task = asyncio.create_task(
             self._run_session(sid, preclaimed_batch=batch),
             context=contextvars.Context(),
         )
         self._tasks.add(task)
         task.add_done_callback(self._task_finished)
+        return True
 
     def notify_urgent(self, sid: str) -> None:
         ctx = self._active.get(sid)
@@ -296,6 +369,9 @@ class RuntimeWorker:
             return
         if sid in self._active:
             ctx = self._active[sid]
+            if ctx is None and not cancelled and sid in self._fusing:
+                self._reserved_wakes.add(sid)
+                return
             if ctx is not None and cancelled:
                 if cancel_by is not None:
                     ctx.cancel_by = cancel_by
@@ -451,8 +527,7 @@ class RuntimeWorker:
                         if recovered.execution_state == "queued":
                             self._activate(sid)
                     elif not batch.reclaimed_has_assistant and "workflow_node" not in batch.descriptor.config:
-                        self.dispatch_claimed(batch)
-                        dispatched = True
+                        dispatched = self.dispatch_claimed(batch)
                     else:
                         recovered = await self.inputs.final(
                             batch, status="interrupted", final_text="",
@@ -1436,6 +1511,7 @@ class RuntimeWorker:
                     )
                 except Exception:
                     log.warning("graceful_release failed during shutdown", exc_info=True)
+            await self.drain_closing_releases()
             if self._wake_subscription is not None:
                 await self._wake_subscription.aclose()
             if self._wake_listener is not None:

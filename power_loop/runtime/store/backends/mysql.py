@@ -146,14 +146,26 @@ class MySQLDatabase:
     @asynccontextmanager
     async def read_snapshot(self) -> AsyncIterator[ReadSnapshot]:
         async with self._pool.acquire() as conn:
+            isolation_armed = False
+            tx_started = False
             try:
                 async with conn.cursor() as cur:
+                    isolation_armed = True
                     await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                     await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+                    tx_started = True
                 yield ReadSnapshot(_MyTransaction(self, conn))
             finally:
                 if not conn.closed:
-                    await conn.rollback()
+                    if tx_started:
+                        await conn.rollback()
+                    elif isolation_armed:
+                        try:
+                            async with conn.cursor() as cur:
+                                await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                        except BaseException:
+                            if not conn.closed:
+                                conn.close()
 
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         import aiomysql

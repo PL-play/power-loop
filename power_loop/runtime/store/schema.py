@@ -89,7 +89,14 @@ async def _acquire_provision_lock(tx: Transaction, db: Database, prefix: str) ->
     if db.dialect.name == "postgres":
         await tx.execute("SELECT pg_advisory_xact_lock(?)", (_provision_lock_key(prefix),))
     elif db.dialect.name == "mysql":
-        await tx.execute("SELECT GET_LOCK(?, 30)", (_mysql_lock_name(prefix),))
+        lock_name = _mysql_lock_name(prefix)
+        row = await tx.fetchone("SELECT GET_LOCK(?, 30) AS acquired", (lock_name,))
+        acquired = row.get("acquired") if row is not None else None
+        if acquired is None or isinstance(acquired, bool) or int(acquired) != 1:
+            raise StoreSchemaError(
+                f"failed to acquire MySQL schema provisioning lock {lock_name!r} "
+                f"(GET_LOCK returned {acquired!r})"
+            )
 
 
 async def _release_provision_lock(tx: Transaction, db: Database, prefix: str) -> None:

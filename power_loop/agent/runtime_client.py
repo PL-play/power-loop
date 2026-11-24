@@ -111,20 +111,18 @@ class RuntimeClient:
         """
         self._require_open()
         worker = self._local_worker
-        can_fuse = (
+        reserved = (
             worker is not None
             and worker._started
             and bool(wake)
             and getattr(worker.runtime, "fuse_local_send", True)
             and getattr(worker.runtime.coordinator, "installs_session_fence", False)
-            and worker.can_fuse_locally(target.session_id)
+            and worker.try_reserve_fuse(target.session_id)
         )
-        fusing = False
         batch = None
-        if can_fuse:
-            worker._begin_fuse(target.session_id)
-            fusing = True
-            try:
+        dispatched = False
+        try:
+            if reserved:
                 receipt, batch, activate = await self.inputs.accept_and_claim(
                     target, body, message_id=message_id, actor=actor,
                     node_id=worker.runtime.node_id, boot_id=worker.runtime.boot_id,
@@ -132,27 +130,27 @@ class RuntimeClient:
                     priority=priority, deadline_ms=deadline_ms, wake=wake,
                     kind=kind, reply_route=reply_route, can_execute=worker._capable,
                 )
-            except BaseException:
-                worker._end_fuse(target.session_id)
-                raise
-        else:
-            receipt, activate = await self.inputs.accept(
-                target, body, message_id=message_id, actor=actor, priority=priority,
-                deadline_ms=deadline_ms, wake=wake, kind=kind, reply_route=reply_route,
-                _with_activation=True,
-            )
-        try:
-            if receipt.newly_accepted:
-                from power_loop.contracts.hooks import HookPoint
-                from power_loop.core.execution_notifications import notify
-                await notify(self.hooks, HookPoint.MESSAGE_ACCEPTED, {"receipt": receipt}, timeout_s=self.hook_timeout_s)
+            else:
+                receipt, activate = await self.inputs.accept(
+                    target, body, message_id=message_id, actor=actor, priority=priority,
+                    deadline_ms=deadline_ms, wake=wake, kind=kind, reply_route=reply_route,
+                    _with_activation=True,
+                )
             if batch is not None:
-                worker.dispatch_claimed(batch)
-                from dataclasses import replace
-                return replace(receipt, notification="published", reason=None)
+                dispatched = worker.dispatch_claimed(batch)
+                if not dispatched:
+                    await worker.drain_closing_releases()
+                    activate = True
         finally:
-            if fusing:
-                worker._end_fuse(target.session_id)
+            if reserved:
+                worker.release_fuse_reservation(target.session_id, dispatched=dispatched)
+        if receipt.newly_accepted:
+            from power_loop.contracts.hooks import HookPoint
+            from power_loop.core.execution_notifications import notify
+            await notify(self.hooks, HookPoint.MESSAGE_ACCEPTED, {"receipt": receipt}, timeout_s=self.hook_timeout_s)
+        if dispatched:
+            from dataclasses import replace
+            return replace(receipt, notification="published", reason=None)
         if worker is not None and priority == "urgent" and receipt.state == "accepted":
             worker.notify_urgent(target.session_id)
         if receipt.state != "accepted" or not activate:

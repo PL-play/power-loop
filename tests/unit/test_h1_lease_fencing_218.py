@@ -78,24 +78,6 @@ async def test_h1_p0_1_batch_renew_releases_orphan_and_preserves_fusing_and_hot_
     fuse_renew_checked = {"ran": False, "lease_during_fuse": None}
     worker_box: list[Any] = []
 
-    async def on_accepted(ctx):
-        receipt = ctx.values["receipt"]
-        if receipt.target.session_id == "h1-p01-fused" and worker_box:
-            # Trigger batch_renew right after accept_and_claim committed in DB,
-            # BEFORE RuntimeClient.send calls worker.dispatch_claimed(batch).
-            w = worker_box[0]
-            assert "h1-p01-fused" in w._fusing
-            assert "h1-p01-fused" not in w._active
-            await w.batch_renew()
-            row = await store._db.fetchone(
-                f"SELECT owner_lease_until_ms,execution_state FROM {store.t.sessions} WHERE session_id=?",
-                ("h1-p01-fused",),
-            )
-            fuse_renew_checked["ran"] = True
-            fuse_renew_checked["lease_during_fuse"] = int(row["owner_lease_until_ms"])
-
-    hooks.register(HookPoint.MESSAGE_ACCEPTED, on_accepted)
-
     agent = await RunningAgent(
         store,
         _ScriptedModel(model_fn),
@@ -108,6 +90,27 @@ async def test_h1_p0_1_batch_renew_releases_orphan_and_preserves_fusing_and_hot_
     worker = agent.runtime.worker
     agent.runtime.client.hooks = hooks
     worker_box.append(worker)
+    orig_accept_and_claim = agent.runtime.client.inputs.accept_and_claim
+
+    async def wrapped_accept_and_claim(*args, **kwargs):
+        result = await orig_accept_and_claim(*args, **kwargs)
+        target_arg = args[0] if args else kwargs.get("target")
+        if target_arg is not None and target_arg.session_id == "h1-p01-fused":
+            # Trigger batch_renew right after accept_and_claim committed in DB,
+            # BEFORE RuntimeClient.send calls worker.dispatch_claimed(batch).
+            w = worker_box[0]
+            assert "h1-p01-fused" in w._fusing
+            assert w._active.get("h1-p01-fused") is None
+            await w.batch_renew()
+            row = await store._db.fetchone(
+                f"SELECT owner_lease_until_ms,execution_state FROM {store.t.sessions} WHERE session_id=?",
+                ("h1-p01-fused",),
+            )
+            fuse_renew_checked["ran"] = True
+            fuse_renew_checked["lease_during_fuse"] = int(row["owner_lease_until_ms"])
+        return result
+
+    agent.runtime.client.inputs.accept_and_claim = wrapped_accept_and_claim  # type: ignore[method-assign]
     port = RuntimeInputStore(store)
     try:
         # 1. Start a genuinely active session and pause inside its tool.

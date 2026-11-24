@@ -648,6 +648,57 @@ class SessionStore:
             from power_loop.contracts.errors import CancellationRequested
             raise CancellationRequested(diag.get("cancel_reason") or "cancelled")
 
+    def _check_append_diag(
+        self,
+        diag: Row | None,
+        session_id: str,
+        *,
+        guarded: bool,
+        active_lease,
+        expected_cancel_seq: int | None,
+        pending_tool_calls: bool,
+    ) -> None:
+        if diag is None:
+            raise ValueError(f"unknown session: {session_id}")
+        if guarded and (
+            active_lease is None
+            or int(diag["owner_epoch"]) != int(active_lease.epoch)
+            or diag["execution_state"] != "running"
+        ):
+            raise SessionLeaseLost(session_id)
+        if guarded and active_lease is not None and self._row_is_closed_aborted(diag, expected_cancel_seq):
+            from power_loop.contracts.errors import CancellationRequested
+            raise CancellationRequested(diag.get("cancel_reason") or "cancelled")
+        if pending_tool_calls and diag["pending_tool_seq"] is not None:
+            raise ValueError("pending_tool_calls_exist")
+
+    async def _diagnose_append_miss_tx(
+        self,
+        tx,
+        session_id: str,
+        *,
+        guarded: bool,
+        active_lease,
+        expected_cancel_seq: int | None,
+        pending_tool_calls: bool,
+    ) -> Row:
+        diag = await tx.fetchone(
+            f"SELECT owner_epoch,execution_state,pending_tool_seq,"
+            f"lifecycle,cancel_seq,cancel_by,cancel_reason "
+            f"FROM {self.t.sessions} WHERE session_id=?",
+            (session_id,),
+        )
+        self._check_append_diag(
+            diag,
+            session_id,
+            guarded=guarded,
+            active_lease=active_lease,
+            expected_cancel_seq=expected_cancel_seq,
+            pending_tool_calls=pending_tool_calls,
+        )
+        assert diag is not None
+        return diag
+
     def _state_update(self, session_id, sets, values, *, condition='', condition_values=()):
         """Declare an ordinary mutation with its owner condition in the DML."""
         guard, lease_arguments = self._lease_write_guard(session_id)
@@ -976,28 +1027,30 @@ class SessionStore:
                             signal_values = tuple(snapshot[column] for column in change_signals.COLUMNS)
                     if matched:
                         seq, state_written = expected, True
-                    elif guarded:
-                        await self._raise_if_closed_aborted_tx(
-                            tx, session_id,
-                            active_lease.epoch if active_lease is not None else None,
-                            expected_cancel_seq,
+                    elif guarded or pending_tool_calls:
+                        await self._diagnose_append_miss_tx(
+                            tx,
+                            session_id,
+                            guarded=guarded,
+                            active_lease=active_lease,
+                            expected_cancel_seq=expected_cancel_seq,
+                            pending_tool_calls=pending_tool_calls,
                         )
-                        raise SessionLeaseLost(session_id)
+                        if guarded:
+                            raise SessionLeaseLost(session_id)
                 if seq is not None:
                     pass
                 elif mysql:
                     st = await self._db.dialect.lock_state(tx, self.t.sessions, session_id)
-                    if (
-                        active_lease is not None
-                        and int(st["owner_epoch"]) == int(active_lease.epoch)
-                        and st["execution_state"] == "running"
-                        and self._row_is_closed_aborted(st, expected_cancel_seq)
-                    ):
-                        from power_loop.contracts.errors import CancellationRequested
-                        raise CancellationRequested(st.get("cancel_reason") or "cancelled")
+                    self._check_append_diag(
+                        st,
+                        session_id,
+                        guarded=(active_lease is not None),
+                        active_lease=active_lease,
+                        expected_cancel_seq=expected_cancel_seq,
+                        pending_tool_calls=pending_tool_calls,
+                    )
                     seq = int(st["next_seq"])
-                    if pending_tool_calls and st["pending_tool_seq"] is not None:
-                        raise ValueError("pending_tool_calls_exist")
                 else:
                     guard = " AND pending_tool_seq IS NULL" if pending_tool_calls else ""
                     extra_sets, extra_params = list(sets), list(params)
@@ -1010,15 +1063,14 @@ class SessionStore:
                         condition=guard+close_guard, condition_values=close_params)
                     st = await tx.fetchone(statement+f' RETURNING next_seq,{signal_columns}', arguments)
                     if st is None:
-                        if guarded:
-                            await self._raise_if_closed_aborted_tx(
-                                tx, session_id,
-                                active_lease.epoch if active_lease is not None else None,
-                                expected_cancel_seq,
-                            )
-                        if pending_tool_calls and await tx.fetchone(
-                                f"SELECT 1 AS present FROM {self.t.sessions} WHERE session_id=?", (session_id,)):
-                            raise ValueError("pending_tool_calls_exist")
+                        await self._diagnose_append_miss_tx(
+                            tx,
+                            session_id,
+                            guarded=guarded,
+                            active_lease=active_lease,
+                            expected_cancel_seq=expected_cancel_seq,
+                            pending_tool_calls=pending_tool_calls,
+                        )
                         if guarded:
                             raise SessionLeaseLost(session_id)
                         raise ValueError(f"unknown session: {session_id}")

@@ -60,10 +60,14 @@ async def _discover_linked_tree(store, tx, seed_ids, cascade):
     return discovered
 
 
-async def lock_sessions(store, tx, session_id, cascade, *, stop_on_busy=False):
-    """Lock linked tree strictly deep-first (depth DESC, session_id ASC) to match Final/cancel/set_lifecycle.
+async def lock_sessions(
+    store, tx, session_id, cascade, *, stop_on_busy=False, lock_unbound_children=True,
+):
+    """Lock linked tree (and direct children to be unbound) strictly deep-first (depth DESC, session_id ASC).
 
-    When ``stop_on_busy=True``, returns ``None`` immediately if any unlocked discovered row is
+    Matches Final/cancel/set_lifecycle/rebind lock order so unbinding ``independent`` children
+    or direct children under ``cascade=False`` never deadlocks against child ``final``/``cancel``.
+    When ``stop_on_busy=True``, returns ``None`` immediately if any unlocked target/linked row is
     already busy (preventing unnecessary lock waits when closing an in-flight Driver or leaf).
     """
     seed_ids = [session_id] if isinstance(session_id, str) else list(session_id)
@@ -75,8 +79,22 @@ async def lock_sessions(store, tx, session_id, cascade, *, stop_on_busy=False):
             if await busy(store, tx, sid, row):
                 return None
 
+    unbound_children: dict[str, dict] = {}
+    if lock_unbound_children:
+        d_ids = sorted(discovered.keys())
+        ph = ','.join('?' for _ in d_ids)
+        direct_children = await tx.fetchall(
+            f'SELECT * FROM {store.t.sessions} WHERE parent_session_id IN ({ph}) ORDER BY session_id ASC',
+            tuple(d_ids),
+        )
+        for ch in direct_children:
+            ch_sid = str(ch['session_id'])
+            if ch_sid not in discovered:
+                unbound_children[ch_sid] = dict(ch)
+
+    all_to_lock = {**discovered, **unbound_children}
     by_depth: dict[int, list[str]] = {}
-    for sid, row in discovered.items():
+    for sid, row in all_to_lock.items():
         by_depth.setdefault(int(row.get('depth') or 0), []).append(sid)
 
     suffix = '' if store._db.dialect.name == 'sqlite' else ' FOR UPDATE'
@@ -92,46 +110,58 @@ async def lock_sessions(store, tx, session_id, cascade, *, stop_on_busy=False):
         for st in lvl_rows:
             locked[str(st['session_id'])] = {**dict(st), 'state': st}
 
-    if set(locked.keys()) != set(discovered.keys()):
+    if set(locked.keys()) != set(all_to_lock.keys()):
         raise _CloseTreeChanged()
-    if cascade and locked:
+    if (cascade or lock_unbound_children) and locked:
         # Verify under locks that no concurrent create_many/rebind added, moved, unlinked,
-        # or reparented any discovered session (including same-depth rebind_children!).
+        # or reparented any discovered target/linked session or direct child to be unbound.
         for sid, row in locked.items():
-            orig = discovered[sid]
+            orig = all_to_lock[sid]
             if (
                 int(row.get('depth') or 0) != int(orig.get('depth') or 0)
                 or row.get('parent_session_id') != orig.get('parent_session_id')
                 or row.get('cancel_propagation') != orig.get('cancel_propagation')
             ):
                 raise _CloseTreeChanged()
-        reachable = {sid for sid in seed_ids if sid in locked}
-        grew = True
-        while grew:
-            grew = False
-            for sid, row in locked.items():
-                if (
-                    sid not in reachable
-                    and row.get('parent_session_id') in reachable
-                    and row.get('cancel_propagation') == 'linked'
-                ):
-                    reachable.add(sid)
-                    grew = True
-        if reachable != set(locked.keys()):
-            raise _CloseTreeChanged()
-        l_ids = sorted(locked.keys())
-        ph = ','.join('?' for _ in l_ids)
-        recheck = await tx.fetchall(
-            f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id IN ({ph}) '
-            "AND cancel_propagation='linked'",
-            tuple(l_ids),
-        )
+        if cascade:
+            reachable = {sid for sid in seed_ids if sid in discovered}
+            grew = True
+            while grew:
+                grew = False
+                for sid in discovered:
+                    row = locked[sid]
+                    if (
+                        sid not in reachable
+                        and row.get('parent_session_id') in reachable
+                        and row.get('cancel_propagation') == 'linked'
+                    ):
+                        reachable.add(sid)
+                        grew = True
+            if reachable != set(discovered.keys()):
+                raise _CloseTreeChanged()
+        d_ids = sorted(discovered.keys())
+        ph = ','.join('?' for _ in d_ids)
+        if lock_unbound_children:
+            recheck = await tx.fetchall(
+                f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id IN ({ph})',
+                tuple(d_ids),
+            )
+        else:
+            recheck = await tx.fetchall(
+                f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id IN ({ph}) '
+                "AND cancel_propagation='linked'",
+                tuple(d_ids),
+            )
         for r in recheck:
             if str(r['session_id']) not in locked:
                 raise _CloseTreeChanged()
 
-    # Return parent-first (depth ASC, session_id ASC) so delete_sessions' reversed(rows) deletes children first.
-    return sorted(locked.values(), key=lambda r: (int(r.get('depth') or 0), str(r['session_id'])))
+    # Return only target/linked sessions parent-first (depth ASC, session_id ASC) so delete_sessions'
+    # reversed(rows) deletes children first while unbound direct children remain locked in tx.
+    return sorted(
+        (locked[sid] for sid in discovered),
+        key=lambda r: (int(r.get('depth') or 0), str(r['session_id'])),
+    )
 
 
 async def mark_closing(store, tx, row):
@@ -159,7 +189,9 @@ async def close_if_idle(store, session_ids, *, cascade=True, limit=1000, resourc
     for _attempt in range(8):
         try:
             async with store._db.transaction() as tx:
-                rows = await lock_sessions(store, tx, seeds, cascade, stop_on_busy=True)
+                rows = await lock_sessions(
+                    store, tx, seeds, cascade, stop_on_busy=True, lock_unbound_children=False,
+                )
                 if rows is None:
                     return 'busy'
                 for row in rows:
@@ -221,7 +253,8 @@ async def delete_sessions(store, session_id, *, cascade=True, limit=1000, resour
                         if not remaining:
                             return deleted
                     children = await tx.fetchall(
-                        f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? LIMIT ?',
+                        f'SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? '
+                        'ORDER BY session_id ASC LIMIT ?',
                         (sid, remaining),
                     )
                     for child in children:

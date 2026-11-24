@@ -2413,11 +2413,12 @@ async def test_m1c_r4_double_rebind_aba_mixed_batch_and_kv_zero_extra_sql(
             DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": f"r4-c-{sfx}"},
         )
 
-        # Public send: unrouted direct input + explicit route targeting B (cross-parent!)
+        # Unrouted direct input + internal (non-public) cross-parent route targeting B
         await client.send(child_c, "direct work", message_id="direct", actor=ACTOR)
-        await client.send(
+        await port.accept(
             child_c, "routed work", message_id="routed", actor=ACTOR,
             reply_route={"target": main_b, "result_kind": "agent_result"},
+            public=False,
         )
         batch = await port.claim(child_c, node_id="n1", boot_id="b1")
         assert batch is not None
@@ -2451,15 +2452,16 @@ async def test_m1c_r4_double_rebind_aba_mixed_batch_and_kv_zero_extra_sql(
         assert a_body["final_text"] == "double rebound answer"
         assert a_body["input_ref"]["message_id"] == "routed"
 
-        # Control (no rebind): explicit route to B still delivers to B, AND set_runtime_state() keeps 6/6/7 SQL!
+        # Control (no rebind): explicit internal route to B still delivers to B, AND set_runtime_state() keeps 6/6/7 SQL!
         if not pass_consumed:
             child_ctrl = await client.create_session(
                 DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": "r4-c-ctrl"},
             )
             await client.send(child_ctrl, "d", message_id="d_ctrl", actor=ACTOR)
-            await client.send(
+            await port.accept(
                 child_ctrl, "r", message_id="r_ctrl", actor=ACTOR,
                 reply_route={"target": main_b, "result_kind": "agent_result"},
+                public=False,
             )
             b_ctrl = await port.claim(child_ctrl, node_id="n1", boot_id="b1")
             assert b_ctrl is not None
@@ -2745,8 +2747,10 @@ async def test_m1c_r5_real_worker_cross_parent_send_no_rebind_4_4_4_sql(registry
 
     await rt.worker.start()
     try:
-        main_a = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r5-wk-a"})
         main_b = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "r5-wk-b"})
+        main_a = await rt.client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_b, options={"session_id": "r5-wk-a"},
+        )
         child_c = await rt.client.create_session(
             DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": "r5-wk-c"},
         )
@@ -2809,8 +2813,10 @@ async def test_m1c_r5_mixed_batch_explicit_consumed_no_rebind_5_5_6_sql(registry
     port = client.inputs
     try:
         sfx = "kv" if write_kv else "plain"
-        main_a = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"r5-mx-a-{sfx}"})
         main_b = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"r5-mx-b-{sfx}"})
+        main_a = await client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_b, options={"session_id": f"r5-mx-a-{sfx}"},
+        )
         child_c = await client.create_session(
             DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": f"r5-mx-c-{sfx}"},
         )
@@ -2926,8 +2932,10 @@ async def test_m1c_r6_real_worker_system_notice_wake_false_4_4_4_sql(
 
     await rt.worker.start()
     try:
-        main_a = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": a_sid})
         main_b = await rt.client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": b_sid})
+        main_a = await rt.client.create_session(
+            DESCRIPTOR, actor=ACTOR, parent=main_b, options={"session_id": a_sid},
+        )
         child_c = await rt.client.create_session(
             DESCRIPTOR, actor=ACTOR, parent=main_a, options={"session_id": c_sid},
         )
@@ -3066,13 +3074,14 @@ async def test_m1c_r7_concurrent_rebound_child_and_old_parent_final_no_deadlock(
         )
         assert q_c is not None and q_c["reply_to_session_id"] == main_b.session_id
 
-        # 3. Public send to A explicitly routing receipt to C; A claims
-        await c2.send(
+        # 3. Internal (non-public) send to A explicitly routing receipt to C; A claims
+        await p2.accept(
             main_a,
             "work for a",
             message_id="a-msg-1",
             actor=ACTOR,
             reply_route={"target": child_c, "result_kind": "agent_result"},
+            public=False,
         )
         batch_a = await p2.claim(main_a, node_id="n-a", boot_id="b-a")
         assert batch_a is not None
@@ -3184,9 +3193,10 @@ async def test_m1c_r7_concurrent_rebound_child_and_old_parent_final_no_deadlock(
             assert bc2 is not None
             await p1.rebind_children(main_a2, main_b2, actor=ACTOR)
 
-            await c2.send(
+            await p2.accept(
                 main_a2, "a2 work", message_id="a2-msg", actor=ACTOR,
                 reply_route={"target": child_c2, "result_kind": "agent_result"},
+                public=False,
             )
             ba2 = await p2.claim(main_a2, node_id="n-a2", boot_id="b-a2")
             assert ba2 is not None

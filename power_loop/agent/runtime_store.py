@@ -52,6 +52,7 @@ _VALID_INPUT_KINDS = frozenset({
     "workflow_continue",
 })
 _PUBLIC_INPUT_KINDS = frozenset({"user", "system_notice"})
+_PUBLIC_REPLY_RESULT_KINDS = frozenset({"agent_result"})
 _VALID_RESULT_KINDS = frozenset({
     "agent_result",
     "workflow_result",
@@ -1122,25 +1123,59 @@ class RuntimeInputStore:
             "result_kind": route["result_kind"],
         }
 
-    @staticmethod
-    def _parse_reply_route(reply_route) -> tuple[str | None, str | None]:
+    def _parse_reply_route(self, reply_route, *, public: bool = True) -> tuple[str | None, str | None]:
         if reply_route is None:
             return None, None
         if not isinstance(reply_route, dict):
             raise RuntimeRequestError("invalid_options", "reply_route must be a mapping")
         target = reply_route.get("target") or reply_route.get("reply_to_session_id")
         if isinstance(target, TargetRef):
+            self.check_store(target)
             reply_sid = target.session_id
         elif isinstance(target, dict) and "session_id" in target:
+            if target.get("store_id") is not None and target["store_id"] != self.store.store_id:
+                raise RuntimeRequestError("forbidden", "reply_route store mismatch")
             reply_sid = str(target["session_id"])
+            if not reply_sid:
+                raise RuntimeRequestError("invalid_options", "reply_route target required")
         elif isinstance(target, str) and target:
             reply_sid = target
         else:
             raise RuntimeRequestError("invalid_options", "reply_route target required")
         rk = reply_route.get("result_kind") or reply_route.get("reply_result_kind") or "agent_result"
-        if rk not in _VALID_RESULT_KINDS:
+        if rk not in _VALID_RESULT_KINDS or (public and rk not in _PUBLIC_REPLY_RESULT_KINDS):
             raise RuntimeRequestError("invalid_options", "reply_route result_kind")
         return reply_sid, rk
+
+    async def _validate_public_reply_route(
+        self, reader, target: TargetRef, reply_to_sid: str, actor, *, target_row=None,
+    ) -> None:
+        """Ensure public reply_route points to an authorized shallower ancestor of target."""
+        if reply_to_sid == target.session_id:
+            raise RuntimeRequestError("forbidden", "reply_route target must be a shallower ancestor")
+        reply_row = await reader.fetchone(
+            f"SELECT session_id,parent_session_id,depth,tenant_id,principal_id "
+            f"FROM {self.s} WHERE session_id=?",
+            (reply_to_sid,),
+        )
+        if reply_row is None:
+            raise RuntimeRequestError("not_found", "reply_route target")
+        await self._authorize_known(
+            reader, TargetRef(self.store.store_id, reply_to_sid), actor, reply_row,
+        )
+        if target_row is None:
+            target_row = await reader.fetchone(
+                f"SELECT session_id,parent_session_id,depth,tenant_id,principal_id "
+                f"FROM {self.s} WHERE session_id=?",
+                (target.session_id,),
+            )
+            if target_row is None:
+                raise RuntimeRequestError("not_found")
+        if int(reply_row["depth"]) >= int(target_row["depth"]):
+            raise RuntimeRequestError("forbidden", "reply_route target must be a shallower ancestor")
+        parent_sid = target_row["parent_session_id"]
+        if parent_sid != reply_to_sid and not await self._is_ancestor(reader, parent_sid, reply_to_sid):
+            raise RuntimeRequestError("forbidden", "reply_route target must be a shallower ancestor")
 
     # ── Authorization & Lookup Helpers ───────────────────────────────────────
 
@@ -1223,7 +1258,7 @@ class RuntimeInputStore:
 
     def _validate_accept_args(
         self, target, body, *, message_id, priority, kind, wake, reply_route, public,
-        max_rounds: int | None = None,
+        result_kind: str | None = None, max_rounds: int | None = None,
     ):
         if priority not in {"normal", "urgent"}:
             raise RuntimeRequestError("invalid_options", "priority")
@@ -1231,12 +1266,16 @@ class RuntimeInputStore:
             raise RuntimeRequestError("invalid_options", "reserved message_id prefix")
         if kind not in _VALID_INPUT_KINDS or (public and kind not in _PUBLIC_INPUT_KINDS):
             raise RuntimeRequestError("invalid_options", "kind")
+        if public and result_kind is not None:
+            raise RuntimeRequestError("invalid_options", "result_kind")
         if max_rounds is not None:
             if public or not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1:
                 raise RuntimeRequestError("invalid_options", "max_rounds")
         self.check_store(target)
         ref = InputRef(target.store_id, target.session_id, message_id)
-        reply_to_sid, reply_rk = self._parse_reply_route(reply_route)
+        reply_to_sid, reply_rk = self._parse_reply_route(reply_route, public=public)
+        if public and reply_to_sid is not None and reply_to_sid == target.session_id:
+            raise RuntimeRequestError("forbidden", "reply_route target must be a shallower ancestor")
         content = canonical(body)
         meta_dict: dict[str, Any] = {"accepted_protocol": PROTOCOL_VERSION}
         if max_rounds is not None:
@@ -1268,7 +1307,7 @@ class RuntimeInputStore:
             self._validate_accept_args(
                 target, body, message_id=message_id, priority=priority,
                 kind=kind, wake=wake, reply_route=reply_route, public=public,
-                max_rounds=max_rounds,
+                result_kind=result_kind, max_rounds=max_rounds,
             )
         )
         now_sql = self._now_sql()
@@ -1341,6 +1380,8 @@ class RuntimeInputStore:
                             and row["execution_state"] == "queued"
                             and int(row["wake_pending_count"]) == 1
                         )
+                    if public and reply_to_sid is not None:
+                        await self._validate_public_reply_route(tx, target, reply_to_sid, actor)
                     try:
                         await tx.execute(
                             f"INSERT INTO {self.q} ("
@@ -1366,6 +1407,7 @@ class RuntimeInputStore:
                     actor=actor, priority=priority, deadline_ms=deadline_ms,
                     kind=kind, result_kind=result_kind, wake_int=wake_int,
                     limit=limit, reply_to_sid=reply_to_sid, reply_rk=reply_rk,
+                    public=public,
                 )
                 return (receipt, need_wake) if _with_activation else receipt
         except RuntimeRequestError:
@@ -1376,11 +1418,11 @@ class RuntimeInputStore:
     async def _accept_slow_path(
         self, target, ref, digest, content, meta, content_bytes, *,
         actor, priority, deadline_ms, kind, result_kind, wake_int, limit,
-        reply_to_sid, reply_rk,
+        reply_to_sid, reply_rk, public: bool = True,
     ) -> tuple[Receipt, bool]:
         now_sql = self._now_sql()
         diag = await self.db.fetchone(
-            "SELECT s.session_id,s.tenant_id,s.principal_id,s.parent_session_id,"
+            "SELECT s.session_id,s.tenant_id,s.principal_id,s.parent_session_id,s.depth,"
             f"s.lifecycle,s.pending_count,s.pending_bytes,{now_sql} AS db_now,"
             "q.id AS existing_id,q.request_hash AS existing_hash,"
             "q.result_send_index AS result_send_index,"
@@ -1400,6 +1442,10 @@ class RuntimeInputStore:
                 if not await self._is_ancestor(self.db, diag["parent_session_id"], actor.session_id):
                     raise RuntimeRequestError("forbidden")
                 is_deep_ancestor = True
+        if public and reply_to_sid is not None:
+            await self._validate_public_reply_route(
+                self.db, target, reply_to_sid, actor, target_row=diag,
+            )
         if diag["lifecycle"] != "open":
             if diag["lifecycle"] == "suspended":
                 raise RuntimeRequestError("session_suspended")
@@ -1576,7 +1622,7 @@ class RuntimeInputStore:
             self._validate_accept_args(
                 target, body, message_id=message_id, priority=priority,
                 kind=kind, wake=wake, reply_route=reply_route, public=public,
-                max_rounds=max_rounds,
+                result_kind=result_kind, max_rounds=max_rounds,
             )
         )
         if not wake:
@@ -1680,6 +1726,10 @@ class RuntimeInputStore:
                     descriptor = RuntimeDescriptor(**json.loads(srow["descriptor_json"]))
                     if can_execute is not None and not can_execute(descriptor):
                         raise _AcceptSlowPath("incapable")
+                    if public and reply_to_sid is not None:
+                        await self._validate_public_reply_route(
+                            tx, target, reply_to_sid, actor, target_row=srow,
+                        )
 
                     send_idx = int(srow["send_index"])
                     new_inbox_ver = int(srow["inbox_version"])

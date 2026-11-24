@@ -1637,6 +1637,7 @@ async def test_b3_1_merged_inputs_cancel_retry_preserves_delivery_and_usage(regi
     await port.accept(
         leaf, {"text": "second"}, message_id=second_id, actor=ACTOR,
         reply_route={"target": drv_batch.target, "result_kind": "workflow_node_result"},
+        public=False,
     )
     leaf_batch = await port.claim(leaf, node_id="n1", boot_id="b1")
     assert leaf_batch is not None and [r.message_id for r in leaf_batch.input_refs] == [first_id, second_id]
@@ -2076,6 +2077,7 @@ async def test_b3_1_real_capacity_exceeded_redelivery_via_urgent_preserves_origi
     await port.accept(
         leaf1, {"text": "urgent"}, message_id=urgent_id, actor=ACTOR, priority="urgent",
         reply_route={"target": drv_batch.target, "result_kind": "workflow_node_result"},
+        public=False,
     )
     leaf1_batch = await port.claim(leaf1, node_id="n1", boot_id="b1")
     assert leaf1_batch is not None and leaf1_batch.send_index == 1
