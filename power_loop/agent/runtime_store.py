@@ -3235,20 +3235,30 @@ class RuntimeInputStore:
         # Judge against the actually-consumed input subset so partial consume of only a human-chat
         # input does not inherit reply_to_session_id from an unconsumed input returned to pending.
         is_human_direct_leaf_chat = False
+        wf_source_item_id: str | None = None
         if route is not None and route.get("result_kind") == "workflow_node_result":
             consumed_has_wf_route = False
             consumed_has_any_route = False
             if not has_unconsumed:
-                consumed_has_wf_route = (
-                    (
-                        batch.reply_to_session_id is not None
-                        and batch.reply_result_kind == "workflow_node_result"
-                    )
-                    or any(
-                        to is not None and rk == "workflow_node_result"
-                        for to, rk in delivered_routes.values()
-                    )
-                )
+                if (
+                    batch.reply_to_session_id is not None
+                    and batch.reply_result_kind == "workflow_node_result"
+                ):
+                    consumed_has_wf_route = True
+                    wf_source_item_id = batch.reply_to_item_id
+                if not consumed_has_wf_route or wf_source_item_id is None:
+                    for ref in consumed_refs:
+                        to_sid, rk_val = delivered_routes.get(ref.message_id, (None, None))
+                        if to_sid is not None and rk_val == "workflow_node_result":
+                            consumed_has_wf_route = True
+                            wf_source_item_id = ref.message_id
+                            break
+                if not consumed_has_wf_route:
+                    for mid, (to_sid, rk_val) in delivered_routes.items():
+                        if to_sid is not None and rk_val == "workflow_node_result":
+                            consumed_has_wf_route = True
+                            wf_source_item_id = mid
+                            break
                 consumed_has_any_route = (
                     consumed_has_wf_route
                     or batch.reply_to_session_id is not None
@@ -3262,30 +3272,35 @@ class RuntimeInputStore:
                     and batch.reply_to_item_id in consumed_id_set_chk
                 ):
                     consumed_has_any_route = True
-                    consumed_has_wf_route = batch.reply_result_kind == "workflow_node_result"
+                    if batch.reply_result_kind == "workflow_node_result":
+                        consumed_has_wf_route = True
+                        wf_source_item_id = batch.reply_to_item_id
                 if not consumed_has_wf_route:
                     if delivered_routes:
-                        for mid in consumed_id_set_chk:
-                            to_sid, rk_val = delivered_routes.get(mid, (None, None))
+                        for ref in consumed_refs:
+                            to_sid, rk_val = delivered_routes.get(ref.message_id, (None, None))
                             if to_sid is not None:
                                 consumed_has_any_route = True
                                 if rk_val == "workflow_node_result":
                                     consumed_has_wf_route = True
+                                    wf_source_item_id = ref.message_id
                                     break
                     else:
                         c_ids_chk = [ref.message_id for ref in consumed_refs]
                         c_ph_chk = ",".join("?" for _ in c_ids_chk)
                         q_routes = await tx.fetchall(
-                            f"SELECT reply_to_session_id,reply_result_kind FROM {self.q} "
+                            f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
                             f"WHERE session_id=? AND item_id IN ({c_ph_chk}) "
-                            "AND reply_to_session_id IS NOT NULL",
+                            "AND reply_to_session_id IS NOT NULL ORDER BY id ASC",
                             (sid, *c_ids_chk),
                         )
                         if q_routes:
                             consumed_has_any_route = True
-                            consumed_has_wf_route = any(
-                                r["reply_result_kind"] == "workflow_node_result" for r in q_routes
-                            )
+                            for r in q_routes:
+                                if r["reply_result_kind"] == "workflow_node_result":
+                                    consumed_has_wf_route = True
+                                    wf_source_item_id = str(r["item_id"])
+                                    break
             if not consumed_has_wf_route:
                 route = None
                 is_human_direct_leaf_chat = not consumed_has_any_route
@@ -3302,6 +3317,8 @@ class RuntimeInputStore:
                 deliver_start_ref = InputRef(**route["input_ref"])
                 if is_driver:
                     deliver_source_ref = deliver_start_ref
+                elif wf_source_item_id is not None:
+                    deliver_source_ref = InputRef(batch.target.store_id, sid, wf_source_item_id)
             elif not is_human_direct_leaf_chat and batch.reply_to_session_id is not None:
                 consumed_id_set = {ref.message_id for ref in consumed_refs}
                 reply_item_id = batch.reply_to_item_id
@@ -4828,13 +4845,17 @@ class RuntimeInputStore:
                 live_root_sid = str(own_state["root_session_id"]) if own_state["root_session_id"] else None
                 is_closed = own_state["lifecycle"] in ("closing", "closed")
                 is_human_direct_leaf_chat = False
+                wf_row = None
                 if rows and route is not None and route.get("result_kind") == "workflow_node_result":
-                    has_wf_route = any(
-                        r["reply_to_session_id"] is not None
-                        and r["reply_result_kind"] == "workflow_node_result"
-                        for r in rows
+                    wf_row = next(
+                        (
+                            r for r in rows
+                            if r["reply_to_session_id"] is not None
+                            and r["reply_result_kind"] == "workflow_node_result"
+                        ),
+                        None,
                     )
-                    if not has_wf_route:
+                    if wf_row is None:
                         route = None
                         is_human_direct_leaf_chat = not any(
                             r["reply_to_session_id"] is not None for r in rows
@@ -4848,7 +4869,7 @@ class RuntimeInputStore:
                     deliver_parent_sid = route["target"]["session_id"]
                     deliver_res_kind = route["result_kind"]
                     deliver_start_ref = InputRef(**route["input_ref"])
-                    deliver_source_ref = self.record(rows[0]).ref
+                    deliver_source_ref = self.record(wf_row if wf_row is not None else rows[0]).ref
 
                 if deliver_parent_sid is not None and deliver_res_kind is not None and deliver_source_ref is not None:
                     route_result = Result(
@@ -5993,7 +6014,9 @@ class RuntimeInputStore:
                 first_row = await tx.fetchone(
                     f"SELECT item_id,meta_json FROM {self.q} "
                     "WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
-                    "ORDER BY CASE WHEN reply_to_session_id IS NOT NULL THEN 0 ELSE 1 END, "
+                    "ORDER BY CASE "
+                    "WHEN reply_to_session_id IS NOT NULL AND reply_result_kind='workflow_node_result' THEN 0 "
+                    "WHEN reply_to_session_id IS NOT NULL THEN 1 ELSE 2 END, "
                     "CASE WHEN delivered_seq IS NOT NULL THEN delivered_seq ELSE 2147483647 END ASC, "
                     "CASE priority WHEN 'urgent' THEN 0 ELSE 1 END, id ASC LIMIT 1",
                     (record.ref.session_id, result_si),

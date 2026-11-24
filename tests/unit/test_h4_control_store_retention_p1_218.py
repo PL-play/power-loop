@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -1622,7 +1623,6 @@ async def test_h4_p1_2_rebind_replay_undelivered_preserves_original_result_kind(
 
 async def test_h4_p1_4_truncated_cursor_advances_every_page_for_scheduler_budget(registry_store):
     """P1-4 rework 3: single-session multi-page truncation emits strictly advancing cursors matching scheduler checks."""
-    import json
     from dataclasses import asdict
 
     store, _ = registry_store
@@ -1821,6 +1821,8 @@ async def test_h4_p1_2_rebind_replay_merged_batch_preserves_workflow_kind_for_sh
         assert len(new_inbox) == 1, f"expected exactly 1 replayed receipt, got {len(new_inbox)}: {new_inbox}"
         assert new_inbox[0]["kind"] == "workflow_node_result"
         assert new_inbox[0]["result_kind"] == "workflow_node_result"
+        replayed_body = json.loads(new_inbox[0]["content_json"])
+        assert replayed_body["input_ref"]["message_id"] == f"mb-wf-{sfx}"
 
         src_errors = await store._db.fetchall(
             f"SELECT item_id,result_delivery_error FROM {store.t.follow_up_queue} "
@@ -1830,5 +1832,186 @@ async def test_h4_p1_2_rebind_replay_merged_batch_preserves_workflow_kind_for_sh
         assert len(src_errors) == 2
         assert all(r["result_delivery_error"] is None for r in src_errors)
     finally:
+        await client.aclose()
+        await transport.aclose()
+
+
+async def test_h4_p1_2_merged_batch_workflow_leaf_final_and_recover_reference_internal_input(registry_store):
+    """P1-2 rework 5: merged ordinary + internal workflow_continue batch cites the internal input in final() and recover()."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12mbsrc-main"})
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        leaf_desc = replace(DESCRIPTOR, config={"workflow_node": "n1"})
+
+        cm_drv = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12mbsrc-drv",
+                message_id="mbsrc-drv-start",
+                body={"text": "wf"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv_b = cm_drv.preclaimed[0]
+        drv = drv_b.target
+
+        driver_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        port._driver_waiters[drv.session_id] = (driver_events, asyncio.Event(), object())
+
+        cm_leaf = await port.create_many(
+            parent=drv,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12mbsrc-leaf",
+                message_id="mbsrc-leaf-init",
+                body={"text": "init"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv_b.owner_epoch,
+            parent_cancel_seq=drv_b.cancel_seq,
+        )
+        leaf_init = cm_leaf.preclaimed[0]
+        leaf = leaf_init.target
+        await port.final(leaf_init, final_text="init ok")
+        assert not driver_events.empty()
+        init_evt = driver_events.get_nowait()
+        assert init_evt["payload"]["input_ref"]["message_id"] == "mbsrc-leaf-init"
+
+        # 1. Normal final() (consumed=None) on merged batch: ordinary chat first, internal next second.
+        await client.send(
+            leaf,
+            "chat first",
+            message_id="mbsrc-chat-1",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        await port.accept(
+            leaf,
+            "internal next second",
+            message_id="mbsrc-next-1",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        b1 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert b1 is not None
+        assert [r.message_id for r in b1.input_refs] == ["mbsrc-chat-1", "mbsrc-next-1"]
+        assert b1.reply_to_item_id == "mbsrc-next-1"
+        assert b1.reply_result_kind == "workflow_node_result"
+
+        fin1 = await port.final(b1, final_text="merged normal reply")
+        assert fin1.result_delivery_error is None
+        drv_rows_1 = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert len(drv_rows_1) == 3
+        assert drv_rows_1[2]["kind"] == "workflow_node_result"
+        assert drv_rows_1[2]["result_kind"] == "workflow_node_result"
+        assert json.loads(drv_rows_1[2]["content_json"])["input_ref"]["message_id"] == "mbsrc-next-1"
+        evt1 = driver_events.get_nowait()
+        assert evt1["payload"]["input_ref"]["message_id"] == "mbsrc-next-1"
+
+        # 2. Normal final(consumed=batch.input_refs) worker fast path on merged batch (0 extra SQL).
+        await client.send(
+            leaf,
+            "chat first fast",
+            message_id="mbsrc-chat-2",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        await port.accept(
+            leaf,
+            "internal next second fast",
+            message_id="mbsrc-next-2",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        b2 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert b2 is not None
+        assert [r.message_id for r in b2.input_refs] == ["mbsrc-chat-2", "mbsrc-next-2"]
+        assert b2.reply_to_item_id == "mbsrc-next-2"
+
+        fin2 = await port.final(b2, final_text="merged fast reply", consumed=b2.input_refs)
+        assert fin2.result_delivery_error is None
+        drv_rows_2 = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert len(drv_rows_2) == 4
+        assert drv_rows_2[3]["kind"] == "workflow_node_result"
+        assert drv_rows_2[3]["result_kind"] == "workflow_node_result"
+        assert json.loads(drv_rows_2[3]["content_json"])["input_ref"]["message_id"] == "mbsrc-next-2"
+        evt2 = driver_events.get_nowait()
+        assert evt2["payload"]["input_ref"]["message_id"] == "mbsrc-next-2"
+
+        # 3. Lease-expired recover() on merged batch: ordinary chat first, internal next second.
+        await client.send(
+            leaf,
+            "chat first crash",
+            message_id="mbsrc-chat-3",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        await port.accept(
+            leaf,
+            "internal next second crash",
+            message_id="mbsrc-next-3",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        b3 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert b3 is not None
+        assert [r.message_id for r in b3.input_refs] == ["mbsrc-chat-3", "mbsrc-next-3"]
+        assert b3.reply_to_item_id == "mbsrc-next-3"
+
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=0 WHERE session_id=?",
+            (leaf.session_id,),
+        )
+        rec = await port.recover(leaf, node_id="n2", boot_id="b2")
+        assert rec is not None
+        drv_rows_3 = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert len(drv_rows_3) == 5
+        assert drv_rows_3[4]["kind"] == "workflow_node_result"
+        assert drv_rows_3[4]["result_kind"] == "workflow_node_result"
+        assert json.loads(drv_rows_3[4]["content_json"])["input_ref"]["message_id"] == "mbsrc-next-3"
+        evt3 = driver_events.get_nowait()
+        assert evt3["payload"]["input_ref"]["message_id"] == "mbsrc-next-3"
+    finally:
+        port._driver_waiters.pop("p12mbsrc-drv", None)
         await client.aclose()
         await transport.aclose()
