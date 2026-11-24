@@ -1052,15 +1052,10 @@ async def test_h6_p1_14_create_many_five_item_interleaved_progress_completes_e(r
 
 
 async def test_h6_p1_15_parallel_continue_sibling_serial_foreach_halt_isolation():
-    """P1-15 rework: sibling serial Foreach(halt) failure under Parallel(continue) must not abort healthy sibling."""
+    """P1-15 rework: Parallel(continue) containing failing Foreach(halt) completes sibling, downstream, and run."""
     good_started = asyncio.Event()
-    bad_recorded = asyncio.Event()
+    bad_halted = asyncio.Event()
     calls: list[tuple[str, str]] = []
-
-    class _ObservedBroken(list):
-        def append(self, item):
-            super().append(item)
-            bad_recorded.set()
 
     class CoExec:
         async def run_agent(self, request, *, allow_start=True):
@@ -1070,7 +1065,7 @@ async def test_h6_p1_15_parallel_continue_sibling_serial_foreach_halt_isolation(
                 return {"status": "failed", "final_text": "", "session_id": None, "usage": {}, "error": "bad boom"}
             if request.body == "good-1":
                 good_started.set()
-                await asyncio.wait_for(bad_recorded.wait(), 5)
+                await asyncio.wait_for(bad_halted.wait(), 5)
             return {"status": "completed", "final_text": f"ok:{request.body}", "session_id": None, "usage": {}}
 
         async def todo_remaining(self, session_id: str) -> list[str]:
@@ -1079,49 +1074,111 @@ async def test_h6_p1_15_parallel_continue_sibling_serial_foreach_halt_isolation(
     spec = WorkflowSpec.from_json({
         "name": "parallel-continue-foreach-isolation",
         "root": {
-            "type": "parallel",
-            "on_error": "continue",
-            "branches": [
+            "type": "sequence",
+            "steps": [
                 {
-                    "type": "foreach",
-                    "id": "bad",
-                    "items": ["bad-1", "bad-2"],
-                    "as": "x",
-                    "parallel": False,
-                    "on_error": "halt",
-                    "body": {
-                        "type": "agent",
-                        "id": "err",
-                        "input": "{{x}}",
-                        "spec": {"name": "err", "system_prompt": "p"},
-                    },
+                    "type": "parallel",
+                    "on_error": "continue",
+                    "branches": [
+                        {
+                            "type": "foreach",
+                            "id": "bad",
+                            "items": ["bad-1", "bad-2"],
+                            "as": "x",
+                            "parallel": False,
+                            "on_error": "halt",
+                            "body": {
+                                "type": "agent",
+                                "id": "err",
+                                "input": "{{x}}",
+                                "spec": {"name": "err", "system_prompt": "p"},
+                            },
+                        },
+                        {
+                            "type": "foreach",
+                            "id": "good",
+                            "items": ["good-1", "good-2"],
+                            "as": "y",
+                            "parallel": False,
+                            "on_error": "halt",
+                            "body": {
+                                "type": "agent",
+                                "id": "ok_node",
+                                "input": "{{y}}",
+                                "spec": {"name": "ok_node", "system_prompt": "p"},
+                            },
+                        },
+                    ],
                 },
                 {
-                    "type": "foreach",
-                    "id": "good",
-                    "items": ["good-1", "good-2"],
-                    "as": "y",
-                    "parallel": False,
-                    "on_error": "halt",
-                    "body": {
-                        "type": "agent",
-                        "id": "ok_node",
-                        "input": "{{y}}",
-                        "spec": {"name": "ok_node", "system_prompt": "p"},
-                    },
+                    "type": "agent",
+                    "id": "tail",
+                    "input": "after-parallel",
+                    "spec": {"name": "tail", "system_prompt": "p"},
                 },
             ],
         },
     })
     eng = WorkflowEngine(CoExec(), run_id="r-iso", driver_sid="drv")
-    eng._iter_broken = _ObservedBroken()
+    orig_exec_foreach = eng._exec_foreach
+
+    async def observed_exec_foreach(node, env, driver_sid):
+        try:
+            return await orig_exec_foreach(node, env, driver_sid)
+        finally:
+            if node.id == "bad":
+                bad_halted.set()
+
+    eng._exec_foreach = observed_exec_foreach  # type: ignore[method-assign]
     res = await eng.run(spec)
+    assert res.status == "completed"
     assert ("err", "bad-1") in calls
     assert ("err", "bad-2") not in calls
     assert ("ok_node", "good-1") in calls
     assert ("ok_node", "good-2") in calls
+    assert ("tail", "after-parallel") in calls
     assert res.results["good"].status == "completed"
     assert res.results["good"].payload == {"items": ["ok:good-1", "ok:good-2"]}
+    assert res.results["tail"].status == "completed"
+    assert any("err" in err or "bad" in err for err in res.errors)
+
+
+async def test_h6_p1_15_nested_foreach_inner_continue_isolates_iterations():
+    """P1-15 rework 2: outer foreach re-entering inner foreach(continue) must skip step2 and record every failure."""
+    ex = _StubForeachExec(fail_bodies={"s1-a", "s1-b"})
+    spec = WorkflowSpec.from_json({
+        "name": "nested-foreach-continue-isolation",
+        "root": {
+            "type": "foreach",
+            "id": "outer",
+            "items": ["a", "b"],
+            "as": "x",
+            "parallel": False,
+            "on_error": "halt",
+            "body": {
+                "type": "foreach",
+                "id": "inner",
+                "items": ["once"],
+                "as": "y",
+                "parallel": False,
+                "on_error": "continue",
+                "body": {
+                    "type": "sequence",
+                    "steps": [
+                        {"type": "agent", "id": "step1", "input": "s1-{{x}}",
+                         "spec": {"name": "step1", "system_prompt": "p"}},
+                        {"type": "agent", "id": "step2", "input": "s2-{{x}}",
+                         "spec": {"name": "step2", "system_prompt": "p"}},
+                    ],
+                },
+            },
+        },
+    })
+    res = await WorkflowEngine(ex, run_id="r-nested", driver_sid="drv").run(spec)
+    assert res.status == "completed"
+    assert ex.calls == [("step1", "s1-a"), ("step1", "s1-b")]
+    step1_errors = [err for err in res.errors if "step1" in err]
+    assert len(step1_errors) == 2, res.errors
 
 
 async def test_h6_p1_15_serial_foreach_continue_sequence_skips_step2_every_item():

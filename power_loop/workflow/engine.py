@@ -9,7 +9,7 @@ import re
 from collections import ChainMap
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from power_loop.runtime.cancellation import CancellationToken
@@ -36,6 +36,15 @@ _LOOP_KEY = "\x00loop"
 #: 体内的 inputs_from / when / 循环的 until 会读到别的迭代的结果。每个迭代在自己的 task 里开一层，嵌套的迭代再往里叠一层。
 _ITER_SCOPE: ContextVar[ChainMap[str, AgentResult] | None] = ContextVar("pl_wf_iter_scope", default=None)
 _DEFER_STEP: ContextVar[str | None] = ContextVar("pl_wf_defer_task_step", default=None)
+
+
+@dataclass
+class _ErrorScope:
+    iter_broken: list[str] = field(default_factory=list)
+    failed_results: list[AgentResult] = field(default_factory=list)
+
+
+_ERROR_SCOPE: ContextVar[_ErrorScope | None] = ContextVar("pl_wf_error_scope", default=None)
 
 
 class _ScopedResults(dict):
@@ -189,11 +198,34 @@ class WorkflowEngine:
         self._cancel_by: str | None = None
         self._results = _ScopedResults()
         self._errors, self._iter_broken, self._tolerated = [], [], set()
+        self._tolerated_results: dict[int, AgentResult] = {}
         self._last = None
         self._budget = None
         self._budget_hit = self._cancelled = self._leaf_cap_hit = False
         self._leaves_run = 0
         self._usage_acc = {}
+
+    def _mark_tolerated(self, result: AgentResult) -> None:
+        """Mark one concrete AgentResult instance as tolerated without masking future executions."""
+        self._tolerated_results[id(result)] = result
+        self._tolerated.add(result.node_id)
+
+    def _is_tolerated(self, result: AgentResult) -> bool:
+        return self._tolerated_results.get(id(result)) is result
+
+    def _absorb_error_scope(self, scope: _ErrorScope) -> None:
+        """Absorb subtree failures handled by an enclosing on_error='continue' container."""
+        for fr in scope.failed_results:
+            if not self._is_tolerated(fr):
+                self._mark_tolerated(fr)
+
+    def _merge_error_scope(self, child: _ErrorScope, parent: _ErrorScope | None) -> None:
+        """Propagate unresolved subtree failures to the enclosing error scope (or root)."""
+        if parent is not None:
+            parent.iter_broken.extend(child.iter_broken)
+            parent.failed_results.extend(child.failed_results)
+        else:
+            self._iter_broken.extend(child.iter_broken)
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
         self._spec = spec
@@ -201,6 +233,8 @@ class WorkflowEngine:
             self._budget = SharedBudget(spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct)
             self._budget.commit(self._usage_acc)
         token = _IN_WORKFLOW.set(True)
+        root_err_scope = _ErrorScope(iter_broken=self._iter_broken)
+        err_token = _ERROR_SCOPE.set(root_err_scope)
         status = "completed"
         try:
             await self._exec(spec.root, {"input": spec.input}, self._driver_sid)
@@ -208,13 +242,14 @@ class WorkflowEngine:
             self._errors.append(str(exc))
             status = "failed"
         finally:
+            _ERROR_SCOPE.reset(err_token)
             _IN_WORKFLOW.reset(token)
         if self._cancel.is_cancelled() or self._cancelled:
             status = "cancelled"
         elif self._budget_hit:
             status = "budget_exceeded"
         elif self._iter_broken or any(
-            r.status not in ("completed", "skipped") and nid not in self._tolerated for nid, r in self._results.items()
+            r.status not in ("completed", "skipped") and not self._is_tolerated(r) for r in self._results.values()
         ):
             status = "failed"
         return self._build_result(spec, status, cancel_by=self._cancel_by if status == "cancelled" else None)
@@ -293,7 +328,7 @@ class WorkflowEngine:
             if (
                 body_result is not None
                 and body_result.status not in ("completed", "skipped")
-                and body_result.node_id not in self._tolerated
+                and not self._is_tolerated(body_result)
             ):
                 why = f"上游 {body_result.node_id} 未完成：{body_result.status}；审核与下一轮已阻断"
                 break
@@ -312,7 +347,7 @@ class WorkflowEngine:
         }
         payload = {"converged": converged, "iterations": iteration, "why": why, "last": last}
         broken = any(
-            r.status not in ("completed", "skipped") and nid not in self._tolerated
+            r.status not in ("completed", "skipped") and not self._is_tolerated(r)
             for nid in body_ids
             if (r := self._results.get(nid)) is not None
         )
@@ -331,6 +366,10 @@ class WorkflowEngine:
             cancel_by=self._cancel_by if self._cancel.is_cancelled() else None,
         )
         self._results[node.id] = res
+        if res.status not in ("completed", "skipped"):
+            err_scope = _ERROR_SCOPE.get()
+            if err_scope is not None:
+                err_scope.failed_results.append(res)
         await self._emit_step(res)
         return res
 
@@ -481,7 +520,11 @@ class WorkflowEngine:
                 result = replace(fallback, node_id=node.id)
                 self._results[node.id] = self._last = result
         if node.continue_on_error and not result.ok:
-            self._tolerated.add(node.id)
+            self._mark_tolerated(result)
+        elif result.status not in ("completed", "skipped"):
+            err_scope = _ERROR_SCOPE.get()
+            if err_scope is not None:
+                err_scope.failed_results.append(result)
         return result
 
     async def _emit_step(self, result):
@@ -547,7 +590,7 @@ class WorkflowEngine:
             last = await self._exec(step, env, driver_sid)
             if self._budget_hit or self._cancelled:
                 break
-            if last is not None and last.status not in ("completed", "skipped") and last.node_id not in self._tolerated:
+            if last is not None and last.status not in ("completed", "skipped") and not self._is_tolerated(last):
                 break
         return last
 
@@ -576,7 +619,7 @@ class WorkflowEngine:
                 on_error == "halt"
                 and result is not None
                 and result.status not in {"completed", "skipped"}
-                and result.node_id not in self._tolerated
+                and not self._is_tolerated(result)
             ):
                 raise WorkflowRunError(f"branch {result.node_id}: {result.status}")
             return result
@@ -610,35 +653,66 @@ class WorkflowEngine:
     async def _exec_parallel(self, node: ParallelNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         sem = asyncio.Semaphore(node.max_concurrency)
         request_sem = asyncio.Semaphore(node.max_concurrency)
+        parent_err_scope = _ERROR_SCOPE.get()
+        branch_scopes: list[_ErrorScope] = [_ErrorScope() for _ in node.branches]
 
-        async def one(branch: WorkflowNode) -> AgentResult | None:
-            if node.concurrency_scope == "leaf":
-                from power_loop.workflow.admission import GATES, REQUEST_GATES
+        async def one(branch: WorkflowNode, bscope: _ErrorScope) -> AgentResult | None:
+            err_tok = _ERROR_SCOPE.set(bscope)
+            try:
+                if node.concurrency_scope == "leaf":
+                    from power_loop.workflow.admission import GATES, REQUEST_GATES
 
-                token = GATES.set((*GATES.get(), sem))
-                requests = REQUEST_GATES.set((*REQUEST_GATES.get(), request_sem))
-                try:
+                    token = GATES.set((*GATES.get(), sem))
+                    requests = REQUEST_GATES.set((*REQUEST_GATES.get(), request_sem))
+                    try:
+                        return await self._exec(branch, dict(env), driver_sid)
+                    finally:
+                        REQUEST_GATES.reset(requests)
+                        GATES.reset(token)
+                async with sem:
                     return await self._exec(branch, dict(env), driver_sid)
-                finally:
-                    REQUEST_GATES.reset(requests)
-                    GATES.reset(token)
-            async with sem:
-                return await self._exec(branch, dict(env), driver_sid)
+            finally:
+                _ERROR_SCOPE.reset(err_tok)
 
-        gathered = await self._gather_branches([one(b) for b in node.branches], on_error=node.on_error)
-        for r in gathered:
+        try:
+            gathered = await self._gather_branches(
+                [one(b, bscope) for b, bscope in zip(node.branches, branch_scopes, strict=True)],
+                on_error=node.on_error,
+            )
+        except BaseException:
+            for bscope in branch_scopes:
+                self._merge_error_scope(bscope, parent_err_scope)
+            raise
+        for r, bscope in zip(gathered, branch_scopes, strict=True):
             if isinstance(r, BaseException):
                 self._errors.append(f"parallel branch error: {r}")
-            elif node.on_error == "continue" and r is not None and r.status not in {"completed", "skipped"}:
-                self._tolerated.add(r.node_id)
-                self._errors.append(f"parallel branch {r.node_id}: {r.status}")
+                if node.on_error == "continue":
+                    self._absorb_error_scope(bscope)
+                else:
+                    self._merge_error_scope(bscope, parent_err_scope)
+            elif (
+                node.on_error == "continue"
+                and (
+                    (r is not None and r.status not in {"completed", "skipped"} and not self._is_tolerated(r))
+                    or bscope.iter_broken
+                    or any(not self._is_tolerated(fr) for fr in bscope.failed_results)
+                )
+            ):
+                if r is not None and r.status not in {"completed", "skipped"} and not self._is_tolerated(r):
+                    self._mark_tolerated(r)
+                    self._errors.append(f"parallel branch {r.node_id}: {r.status}")
+                elif bscope.iter_broken:
+                    self._errors.append(f"parallel branch error: {bscope.iter_broken[0]}")
+                self._absorb_error_scope(bscope)
+            else:
+                self._merge_error_scope(bscope, parent_err_scope)
         broken = next(
             (
                 r
                 for r in gathered
                 if isinstance(r, AgentResult)
                 and r.status not in ("completed", "skipped")
-                and r.node_id not in self._tolerated
+                and not self._is_tolerated(r)
             ),
             None,
         )
@@ -647,8 +721,8 @@ class WorkflowEngine:
     async def _exec_foreach(self, node: ForeachNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         items = self._resolve_items(node)
         sem = asyncio.Semaphore(node.max_concurrency)
+        parent_err_scope = _ERROR_SCOPE.get()
         local_broken: list[str] = []
-        local_tolerated: set[str] = set()
 
         async def one(item: Any, index: int, item_broken: list[str] | None = None) -> AgentResult | None:
             # ITERATION_ENV_KEY：body 的所有迭代共享同一个 node_id，宿主的 FileIO 端口靠它
@@ -660,27 +734,32 @@ class WorkflowEngine:
             outer = _ITER_SCOPE.get()
             scope: ChainMap[str, AgentResult] = ChainMap() if outer is None else outer.new_child()
             tok = _ITER_SCOPE.set(scope)
+            iter_err_scope = _ErrorScope()
+            err_tok = _ERROR_SCOPE.set(iter_err_scope)
             try:
                 if node.parallel:
                     async with sem:
                         return await self._exec(node.body, child_env, driver_sid)
                 return await self._exec(node.body, child_env, driver_sid)
             finally:
+                _ERROR_SCOPE.reset(err_tok)
                 _ITER_SCOPE.reset(tok)
                 # 这一路里没成功的节点（6.46.1）：全局结果表里体内 id 只留最后写的那一路，run 终态要看每一路
                 for nid, r in scope.maps[0].items():
-                    if r.status not in ("completed", "skipped") and nid not in self._tolerated:
+                    if r.status not in ("completed", "skipped") and not self._is_tolerated(r):
                         failure = f"{node.id or 'foreach'}[{index}].{nid}"
                         if node.on_error == "continue":
-                            # Defer adding to self._tolerated until after all iterations finish so
-                            # a tolerated failure in iteration i never masks the same body step in i+1.
-                            local_tolerated.add(nid)
+                            self._mark_tolerated(r)
                             self._errors.append(failure)
                         else:
                             if item_broken is not None:
                                 item_broken.append(failure)
                             local_broken.append(failure)
-                            self._iter_broken.append(failure)
+                            iter_err_scope.iter_broken.append(failure)
+                if node.on_error == "continue":
+                    self._absorb_error_scope(iter_err_scope)
+                else:
+                    self._merge_error_scope(iter_err_scope, parent_err_scope)
 
         if node.parallel:
             gathered = await self._gather_branches([one(it, i) for i, it in enumerate(items)], on_error=node.on_error)
@@ -701,15 +780,13 @@ class WorkflowEngine:
                     if (
                         res is not None
                         and res.status not in {"completed", "skipped"}
-                        and res.node_id not in self._tolerated
+                        and not self._is_tolerated(res)
                     ):
                         raise WorkflowRunError(f"branch {res.node_id}: {res.status}")
                     if item_broken:
                         raise WorkflowRunError(f"branch {item_broken[0]}: failed")
                 gathered.append(res)
 
-        if local_tolerated:
-            self._tolerated.update(local_tolerated)
         leaves = [r for r in gathered if isinstance(r, AgentResult)]
         for r in gathered:
             if isinstance(r, BaseException):
@@ -718,14 +795,14 @@ class WorkflowEngine:
                 node.on_error == "continue"
                 and r is not None
                 and r.status not in {"completed", "skipped"}
-                and r.node_id not in self._tolerated
+                and not self._is_tolerated(r)
             ):
-                self._tolerated.add(r.node_id)
+                self._mark_tolerated(r)
                 self._errors.append(f"foreach item {r.node_id}: {r.status}")
         broken = next(
             (
                 r for r in leaves
-                if r.status not in ("completed", "skipped") and r.node_id not in self._tolerated
+                if r.status not in ("completed", "skipped") and not self._is_tolerated(r)
             ),
             None,
         )
