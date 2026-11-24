@@ -647,8 +647,10 @@ class WorkflowEngine:
     async def _exec_foreach(self, node: ForeachNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         items = self._resolve_items(node)
         sem = asyncio.Semaphore(node.max_concurrency)
+        local_broken: list[str] = []
+        local_tolerated: set[str] = set()
 
-        async def one(item: Any, index: int) -> AgentResult | None:
+        async def one(item: Any, index: int, item_broken: list[str] | None = None) -> AgentResult | None:
             # ITERATION_ENV_KEY：body 的所有迭代共享同一个 node_id，宿主的 FileIO 端口靠它
             # 给每次迭代分不同的产出文件——不区分的话 N 个并发迭代会追加进同一个文件，互相搅乱。
             child_env = {**env, node.as_var: item, ITERATION_ENV_KEY: index}
@@ -670,12 +672,16 @@ class WorkflowEngine:
                     if r.status not in ("completed", "skipped") and nid not in self._tolerated:
                         failure = f"{node.id or 'foreach'}[{index}].{nid}"
                         if node.on_error == "continue":
-                            self._tolerated.add(nid)
+                            # Defer adding to self._tolerated until after all iterations finish so
+                            # a tolerated failure in iteration i never masks the same body step in i+1.
+                            local_tolerated.add(nid)
                             self._errors.append(failure)
                         else:
+                            if item_broken is not None:
+                                item_broken.append(failure)
+                            local_broken.append(failure)
                             self._iter_broken.append(failure)
 
-        iter_broken_before = len(self._iter_broken)
         if node.parallel:
             gathered = await self._gather_branches([one(it, i) for i, it in enumerate(items)], on_error=node.on_error)
         else:
@@ -683,9 +689,9 @@ class WorkflowEngine:
             for i, it in enumerate(items):
                 if self._budget_hit or self._cancelled or self._cancel.is_cancelled():
                     break
-                broken_before_item = len(self._iter_broken)
+                item_broken: list[str] = []
                 try:
-                    res = await one(it, i)
+                    res = await one(it, i, item_broken)
                 except Exception as exc:  # noqa: BLE001
                     if node.on_error == "halt":
                         raise
@@ -698,10 +704,12 @@ class WorkflowEngine:
                         and res.node_id not in self._tolerated
                     ):
                         raise WorkflowRunError(f"branch {res.node_id}: {res.status}")
-                    if len(self._iter_broken) > broken_before_item:
-                        raise WorkflowRunError(f"branch {self._iter_broken[broken_before_item]}: failed")
+                    if item_broken:
+                        raise WorkflowRunError(f"branch {item_broken[0]}: failed")
                 gathered.append(res)
 
+        if local_tolerated:
+            self._tolerated.update(local_tolerated)
         leaves = [r for r in gathered if isinstance(r, AgentResult)]
         for r in gathered:
             if isinstance(r, BaseException):
@@ -721,7 +729,7 @@ class WorkflowEngine:
             ),
             None,
         )
-        has_iter_broken = len(self._iter_broken) > iter_broken_before
+        has_iter_broken = bool(local_broken)
         if node.id:
             if broken is not None:
                 agg_status = broken.status

@@ -945,3 +945,527 @@ async def test_h6_p1_19_timer_runner_periodically_prunes_terminal_timers(registr
         await runtime.worker.shutdown()
         await runtime.client.aclose()
         await runtime.transport.aclose()
+
+
+# ── H6 Rework Regressions (Reviewer Counterexamples) ────────────────────────
+
+
+async def test_h6_p1_14_create_many_five_item_interleaved_progress_completes_e(registry_store, monkeypatch):
+    """P1-14 rework: 5 identical-identity items (A-E) with interleaved B/C/D collisions still create E."""
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    parent = await target(port)
+    drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+    cm_drv = await port.create_many(
+        parent=parent,
+        actor=ACTOR,
+        specs=[
+            ChildSpec(
+                session_id="drv_h6_p14_5",
+                message_id="inp_drv_h6_p14_5",
+                body={"run": 1},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                creation_identity_hash="d" * 64,
+            ),
+        ],
+        node_id="n1",
+        boot_id="b1",
+        can_execute=True,
+        free_slots=1,
+    )
+    driver_target = cm_drv.preclaimed[0].target
+    driver_actor = TrustedActor(ACTOR.tenant_id, ACTOR.principal_id, driver_target.session_id)
+
+    specs = [
+        ChildSpec(
+            session_id=f"leaf_h6_p14_5_{name}",
+            message_id=f"inp_leaf_h6_p14_5_{name}",
+            body=f"work {name}",
+            descriptor=DESCRIPTOR,
+            result_kind="workflow_node_result",
+            creation_identity_hash=ch * 64,
+        )
+        for name, ch in (("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5"))
+    ]
+
+    # Pre-create A before the 5-item batch starts.
+    await port.create_many(
+        parent=driver_target,
+        actor=driver_actor,
+        specs=[specs[0]],
+        node_id="n1",
+        boot_id="b1",
+        can_execute=False,
+        free_slots=0,
+        parent_owner_epoch=1,
+    )
+
+    # After each duplicate-key slow-path lookup, commit the next legal item (B, then C, then D)
+    # so the batch collides 4 times while strictly shrinking missing: 5 -> 4 -> 3 -> 2 -> 1 (E).
+    to_interleave = [specs[1], specs[2], specs[3]]
+    orig_fetchall = port.db.fetchall
+    in_interleave = False
+
+    async def interleaved_fetchall(sql, params=()):
+        nonlocal in_interleave
+        rows = await orig_fetchall(sql, params)
+        if not in_interleave and to_interleave and "creation_identity_hash" in sql:
+            nxt = to_interleave.pop(0)
+            in_interleave = True
+            try:
+                await port.create_many(
+                    parent=driver_target,
+                    actor=driver_actor,
+                    specs=[nxt],
+                    node_id="n1",
+                    boot_id="b1",
+                    can_execute=False,
+                    free_slots=0,
+                    parent_owner_epoch=1,
+                )
+            finally:
+                in_interleave = False
+        return rows
+
+    monkeypatch.setattr(port.db, "fetchall", interleaved_fetchall)
+    cm = await port.create_many(
+        parent=driver_target,
+        actor=driver_actor,
+        specs=specs,
+        node_id="n1",
+        boot_id="b1",
+        can_execute=True,
+        free_slots=2,
+        parent_owner_epoch=1,
+    )
+    assert not to_interleave
+    assert cm.already_created is True
+    assert [b.target.session_id for b in cm.preclaimed] == ["leaf_h6_p14_5_e"]
+    assert cm.queued_targets == ()
+
+    rows = await store._db.fetchall(
+        f"SELECT session_id FROM {store.t.sessions} WHERE parent_session_id=? ORDER BY session_id",
+        (driver_target.session_id,),
+    )
+    assert [r["session_id"] for r in rows] == [sp.session_id for sp in specs]
+
+
+async def test_h6_p1_15_parallel_continue_sibling_serial_foreach_halt_isolation():
+    """P1-15 rework: sibling serial Foreach(halt) failure under Parallel(continue) must not abort healthy sibling."""
+    good_started = asyncio.Event()
+    bad_recorded = asyncio.Event()
+    calls: list[tuple[str, str]] = []
+
+    class _ObservedBroken(list):
+        def append(self, item):
+            super().append(item)
+            bad_recorded.set()
+
+    class CoExec:
+        async def run_agent(self, request, *, allow_start=True):
+            calls.append((request.node_path, request.body))
+            if request.body == "bad-1":
+                await asyncio.wait_for(good_started.wait(), 5)
+                return {"status": "failed", "final_text": "", "session_id": None, "usage": {}, "error": "bad boom"}
+            if request.body == "good-1":
+                good_started.set()
+                await asyncio.wait_for(bad_recorded.wait(), 5)
+            return {"status": "completed", "final_text": f"ok:{request.body}", "session_id": None, "usage": {}}
+
+        async def todo_remaining(self, session_id: str) -> list[str]:
+            return []
+
+    spec = WorkflowSpec.from_json({
+        "name": "parallel-continue-foreach-isolation",
+        "root": {
+            "type": "parallel",
+            "on_error": "continue",
+            "branches": [
+                {
+                    "type": "foreach",
+                    "id": "bad",
+                    "items": ["bad-1", "bad-2"],
+                    "as": "x",
+                    "parallel": False,
+                    "on_error": "halt",
+                    "body": {
+                        "type": "agent",
+                        "id": "err",
+                        "input": "{{x}}",
+                        "spec": {"name": "err", "system_prompt": "p"},
+                    },
+                },
+                {
+                    "type": "foreach",
+                    "id": "good",
+                    "items": ["good-1", "good-2"],
+                    "as": "y",
+                    "parallel": False,
+                    "on_error": "halt",
+                    "body": {
+                        "type": "agent",
+                        "id": "ok_node",
+                        "input": "{{y}}",
+                        "spec": {"name": "ok_node", "system_prompt": "p"},
+                    },
+                },
+            ],
+        },
+    })
+    eng = WorkflowEngine(CoExec(), run_id="r-iso", driver_sid="drv")
+    eng._iter_broken = _ObservedBroken()
+    res = await eng.run(spec)
+    assert ("err", "bad-1") in calls
+    assert ("err", "bad-2") not in calls
+    assert ("ok_node", "good-1") in calls
+    assert ("ok_node", "good-2") in calls
+    assert res.results["good"].status == "completed"
+    assert res.results["good"].payload == {"items": ["ok:good-1", "ok:good-2"]}
+
+
+async def test_h6_p1_15_serial_foreach_continue_sequence_skips_step2_every_item():
+    """P1-15 rework: Foreach(parallel=False, on_error='continue') skips step2 on every failed step1 and records all errors."""
+    ex = _StubForeachExec(fail_bodies={"s1-a", "s1-b"})
+    spec = WorkflowSpec.from_json({
+        "name": "serial-seq-continue",
+        "root": {
+            "type": "sequence",
+            "steps": [
+                {
+                    "type": "foreach",
+                    "id": "fe",
+                    "items": ["a", "b"],
+                    "as": "x",
+                    "parallel": False,
+                    "on_error": "continue",
+                    "body": {
+                        "type": "sequence",
+                        "steps": [
+                            {"type": "agent", "id": "step1", "input": "s1-{{x}}",
+                             "spec": {"name": "step1", "system_prompt": "p"}},
+                            {"type": "agent", "id": "step2", "input": "s2-{{x}}",
+                             "spec": {"name": "step2", "system_prompt": "p"}},
+                        ],
+                    },
+                },
+                {
+                    "type": "agent",
+                    "id": "downstream",
+                    "input": "after",
+                    "spec": {"name": "downstream", "system_prompt": "p"},
+                },
+            ],
+        },
+    })
+    res = await WorkflowEngine(ex, run_id="r-seq-cont", driver_sid="drv").run(spec)
+    assert res.status == "completed"
+    assert ex.calls == [("step1", "s1-a"), ("step1", "s1-b"), ("downstream", "after")]
+    assert "fe[0].step1" in res.errors
+    assert "fe[1].step1" in res.errors
+    assert res.results["downstream"].status == "completed"
+
+
+async def test_h6_p1_18_workflow_logs_rejects_int64_overflow_and_array_source(registry_store, tmp_path):
+    """P1-18 rework: int64-overflow coordinates and unhashable array source return structured input errors."""
+    store, _ = registry_store
+    model = _Scripted([LLMResponse(raw_text="LEAF-OK")])
+    registry = ToolRegistry()
+    register_workflow_tool(registry)
+    agent = await RunningAgent(
+        store,
+        model,
+        registry,
+        AgentLoopConfig(context_budget_tokens=10**9, representation=ProjectedRepresentation()),
+        runtime_env=RuntimeEnv(workspace_dir=tmp_path),
+    ).start()
+    try:
+        handle = await agent.runtime.client.workflow(
+            agent.target,
+            {
+                "name": "logs-overflow",
+                "root": {
+                    "type": "agent", "id": "leaf", "input": "work",
+                    "spec": {"name": "leaf", "system_prompt": "ok", "tools": [], "max_rounds": 2},
+                },
+            },
+            message_id="wf-p18-ovf",
+            actor=agent.actor,
+        )
+        result = await handle.wait(deadline_ms=now_ms() + 10000)
+        assert result.status == "completed"
+        await agent.drain()
+
+        overflow = str((1 << 63))  # 9223372036854775808 (> signed int64 max)
+        base = {"action": "logs", "run_id": handle.run_id, "node": "leaf"}
+        cases = [
+            ("ovf-cursor", {**base, "cursor": overflow}),
+            ("ovf-seq", {**base, "seq": overflow}),
+            ("ovf-id", {**base, "id": overflow}),
+            ("ovf-mid", {**base, "message_ids": [overflow]}),
+            ("arr-source", {**base, "source": ["messages"]}),
+            ("obj-source", {**base, "source": {"k": "messages"}}),
+        ]
+        tool_responses = [_tool_resp(cid, "workflow", json.dumps(opts)) for cid, opts in cases]
+        model.responses.extend([*tool_responses, LLMResponse(raw_text="checked")])
+        model._idx = len(model.responses) - len(tool_responses) - 1
+        reply = await agent.send("check overflow and array source")
+        assert reply.status == "completed"
+
+        msgs = await store.load_all_messages(agent.target.session_id)
+        by_call = {r.tool_call_id: json.loads(r.content) for r in msgs if r.role == "tool" and r.name == "workflow"}
+        for cid, _ in cases:
+            assert "error" in by_call[cid], (cid, by_call[cid])
+            assert by_call[cid]["error"]["code"], (cid, by_call[cid])
+    finally:
+        await agent.aclose()
+
+
+async def test_h6_p1_18_workflow_list_and_status_support_limit_100(registry_store, tmp_path):
+    """P1-18 rework: workflow list and run_id-less status both return all 100 runs when limit=100."""
+    from power_loop.workflow import journal
+
+    store, _ = registry_store
+    model = _Scripted([])
+    registry = ToolRegistry()
+    register_workflow_tool(registry)
+    agent = await RunningAgent(
+        store,
+        model,
+        registry,
+        AgentLoopConfig(context_budget_tokens=10**9),
+        runtime_env=RuntimeEnv(workspace_dir=tmp_path),
+    ).start()
+    try:
+        port = agent.runtime.worker.inputs
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        specs = [
+            ChildSpec(
+                session_id=f"drv_list100_{idx:03d}",
+                message_id=f"inp_{idx:056x}",
+                body={"run": idx},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                creation_identity_hash=f"{idx:064x}",
+            )
+            for idx in range(100)
+        ]
+        await port.create_many(
+            parent=agent.target,
+            actor=agent.actor,
+            specs=specs,
+            node_id="n1",
+            boot_id="b1",
+            can_execute=False,
+            free_slots=0,
+        )
+        async with store._db.transaction() as tx:
+            for idx, sp in enumerate(specs):
+                await journal.put(
+                    store,
+                    tx,
+                    sp.session_id,
+                    journal.run_key(sp.message_id),
+                    {"run_id": sp.message_id, "name": f"wf-{idx}", "status": "completed", "nodes": []},
+                )
+
+        model.responses.extend([
+            _tool_resp("list-100", "workflow", json.dumps({"action": "list", "limit": 100})),
+            _tool_resp("status-100", "workflow", json.dumps({"action": "status", "limit": 100})),
+            LLMResponse(raw_text="listed-100"),
+        ])
+        reply = await agent.send("list 100 runs")
+        assert reply.status == "completed"
+
+        msgs = await store.load_all_messages(agent.target.session_id)
+        by_call = {r.tool_call_id: json.loads(r.content) for r in msgs if r.role == "tool" and r.name == "workflow"}
+        for cid in ("list-100", "status-100"):
+            assert len(by_call[cid]["runs"]) == 100, (cid, len(by_call[cid]["runs"]))
+            assert by_call[cid]["next_cursor"] is None, (cid, by_call[cid]["next_cursor"])
+    finally:
+        await agent.aclose()
+
+
+async def test_h6_p1_19_timer_cancel_before_send_releases_claim_once(registry_store, monkeypatch):
+    """P1-19 rework: cancelling worker 1 before send releases claim once and cannot clobber worker 2's firing claim."""
+    store, _ = registry_store
+    runtime, tgt, actor, _ = await _timer_runtime(store)
+    try:
+        from power_loop import StoreTimerBackend
+
+        backend = StoreTimerBackend(store)
+        source = TimerContext(store.store_id, tgt.session_id, actor)
+        timer = await backend.create(source, due_at_ms=1, note="single-release")
+
+        r1_in_hook = asyncio.Event()
+        r1_hold = asyncio.Event()
+        r2_in_hook = asyncio.Event()
+        r2_release = asyncio.Event()
+        r1_after_release = asyncio.Event()
+        r1_finish_cleanup = asyncio.Event()
+
+        hooks1 = AgentHooks()
+
+        async def hook1(ctx):
+            r1_in_hook.set()
+            await r1_hold.wait()
+
+        hooks1.register(HookPoint.TIMER_FIRE, hook1)
+
+        hooks2 = AgentHooks()
+
+        async def hook2(ctx):
+            r2_in_hook.set()
+            await r2_release.wait()
+
+        hooks2.register(HookPoint.TIMER_FIRE, hook2)
+
+        runner1 = TimerRunner(store=store, client=runtime.client, hooks=hooks1)
+        runner2 = TimerRunner(store=store, client=runtime.client, hooks=hooks2)
+
+        orig_transition = store.transition_timer
+        release_calls = 0
+
+        async def observed_transition(session_id, timer_id, *, from_status, to_status, **kwargs):
+            nonlocal release_calls
+            res = await orig_transition(
+                session_id, timer_id, from_status=from_status, to_status=to_status, **kwargs,
+            )
+            if from_status == "firing" and to_status == "armed":
+                release_calls += 1
+                if release_calls == 1:
+                    r1_after_release.set()
+                    await r1_finish_cleanup.wait()
+            return res
+
+        monkeypatch.setattr(store, "transition_timer", observed_transition)
+
+        send_calls = 0
+        orig_send = runtime.client.send
+
+        async def counting_send(*args, **kwargs):
+            nonlocal send_calls
+            send_calls += 1
+            return await orig_send(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.client, "send", counting_send)
+
+        task1 = asyncio.create_task(runner1.scan_once())
+        await asyncio.wait_for(r1_in_hook.wait(), 5)
+        task1.cancel()
+        await asyncio.wait_for(r1_after_release.wait(), 5)
+
+        # Worker 2 now claims the restored armed timer and enters its hook (status='firing').
+        task2 = asyncio.create_task(runner2.scan_once())
+        await asyncio.wait_for(r2_in_hook.wait(), 5)
+
+        # Resume worker 1's outer cleanup; it MUST NOT issue a second firing->armed transition.
+        r1_finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task1
+
+        mid_row = await store.get_timer(tgt.session_id, timer.timer_id)
+        assert mid_row is not None and mid_row.status == "firing"
+
+        # Let worker 2 finish delivery and settle cleanly to 'fired'.
+        r2_release.set()
+        assert await task2 == 1
+        assert release_calls == 1
+        assert send_calls == 1
+        final_row = await store.get_timer(tgt.session_id, timer.timer_id)
+        assert final_row is not None and final_row.status == "fired" and final_row.fire_count == 1
+    finally:
+        await runtime.worker.shutdown()
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
+async def test_h6_p1_19_timer_timeout_before_send_keeps_armed_and_can_refire(registry_store, monkeypatch):
+    """P1-19 rework: acceptance_timeout in TIMER_FIRE before send keeps timer armed with fire_count=0."""
+    store, _ = registry_store
+    runtime, tgt, actor, bus = await _timer_runtime(store)
+    events = []
+    bus.subscribe(AgentEventType.TIMER_FIRED, lambda e: events.append(e))
+    try:
+        from power_loop import StoreTimerBackend
+
+        backend = StoreTimerBackend(store)
+        source = TimerContext(store.store_id, tgt.session_id, actor)
+        timer = await backend.create(source, due_at_ms=1, note="pre-send-timeout")
+
+        block = True
+        never_set = asyncio.Event()
+        hooks = AgentHooks()
+
+        async def slow_hook(ctx):
+            if block:
+                await never_set.wait()
+
+        hooks.register(HookPoint.TIMER_FIRE, slow_hook)
+        send_calls = 0
+        orig_send = runtime.client.send
+
+        async def counting_send(*args, **kwargs):
+            nonlocal send_calls
+            send_calls += 1
+            return await orig_send(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.client, "send", counting_send)
+
+        runner = TimerRunner(
+            store=store, client=runtime.client, hooks=hooks, event_bus=bus, acceptance_timeout_s=0.05,
+        )
+        assert await runner.scan_once() == 0
+        assert send_calls == 0
+        row = await store.get_timer(tgt.session_id, timer.timer_id)
+        assert row is not None and row.status == "armed" and row.fire_count == 0
+        assert events == []
+
+        # Once the hook stops timing out, the timer fires normally.
+        block = False
+        assert await runner.scan_once() == 1
+        assert send_calls == 1
+        row2 = await store.get_timer(tgt.session_id, timer.timer_id)
+        assert row2 is not None and row2.status == "fired" and row2.fire_count == 1
+    finally:
+        await runtime.worker.shutdown()
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
+
+
+async def test_h6_p1_19_timer_prune_does_not_reuse_id_and_old_cancel_cannot_cancel_new(registry_store):
+    """P1-19 rework: pruning terminal timers never reuses timer_id so old receipts cannot cancel new timers."""
+    store, _ = registry_store
+    runtime, tgt, actor, _ = await _timer_runtime(store)
+    try:
+        from power_loop import StoreTimerBackend
+
+        backend = StoreTimerBackend(store)
+        src_old = TimerContext(store.store_id, tgt.session_id, actor, operation_id="op-old-1")
+        old_timer = await backend.create(src_old, due_at_ms=1, note="old")
+        assert old_timer.timer_id == 1
+
+        # Settle old timer to terminal 'fired' and prune with retention=0.
+        await store.transition_timer(tgt.session_id, old_timer.timer_id, from_status="armed", to_status="firing")
+        assert await store.finish_firing_timer(tgt.session_id, old_timer.timer_id)
+        runner = TimerRunner(store=store, client=runtime.client, prune_interval_s=0.01, prune_older_than_ms=0)
+        assert await runner.scan_once() == 0
+        assert await store.get_timer(tgt.session_id, old_timer.timer_id) is None
+
+        # Create a new timer with a new operation_id: timer_id must strictly advance (no reuse of 1).
+        src_new = TimerContext(store.store_id, tgt.session_id, actor, operation_id="op-new-2")
+        new_timer = await backend.create(src_new, delay_s=3600, note="new")
+        assert new_timer.timer_id > old_timer.timer_id
+
+        # Cancelling with the stale old receipt ID must return False and leave new_timer armed.
+        assert await backend.cancel(src_old, old_timer.timer_id) is False
+        kept = await store.get_timer(tgt.session_id, new_timer.timer_id)
+        assert kept is not None and kept.status == "armed"
+
+        # operation_id idempotency for new_timer still works while retained.
+        new_retry = await backend.create(src_new, delay_s=3600, note="new")
+        assert new_retry.timer_id == new_timer.timer_id
+    finally:
+        await runtime.worker.shutdown()
+        await runtime.client.aclose()
+        await runtime.transport.aclose()

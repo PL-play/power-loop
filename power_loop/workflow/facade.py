@@ -331,7 +331,12 @@ def _select_node(saved, options):
     return TargetRef(saved["driver_target"]["store_id"], session_id), entry
 
 
-def _parse_int_option(value: Any, code: str, *, minimum: int | None = None) -> int:
+_MAX_INT64 = (1 << 63) - 1
+
+
+def _parse_int_option(
+    value: Any, code: str, *, minimum: int | None = None, maximum: int | None = _MAX_INT64,
+) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise WorkflowToolInputError(code)
     if isinstance(value, str):
@@ -346,13 +351,15 @@ def _parse_int_option(value: Any, code: str, *, minimum: int | None = None) -> i
         parsed = value
     if minimum is not None and parsed < minimum:
         raise WorkflowToolInputError(code)
+    if maximum is not None and parsed > maximum:
+        raise WorkflowToolInputError(code)
     return parsed
 
 
 async def _read_logs(loop, target, actor, options):
     """Bounded raw/projected session reads with no task/history authority."""
     source = options.get("source", "messages")
-    if source not in {"messages", "projection"}:
+    if not isinstance(source, str) or source not in ("messages", "projection"):
         raise WorkflowToolInputError("invalid_workflow_history_source")
     limit_raw = options.get("limit")
     limit = min(_parse_int_option(limit_raw, "invalid_workflow_limit", minimum=1), 50) if limit_raw is not None else 20
@@ -479,7 +486,7 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
                 else 0
             )
             limit = (
-                min(_parse_int_option(options["limit"], "invalid_workflow_limit", minimum=1), 50)
+                min(_parse_int_option(options["limit"], "invalid_workflow_limit", minimum=1), 100)
                 if options.get("limit") is not None
                 else 20
             )

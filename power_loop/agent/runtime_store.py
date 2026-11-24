@@ -788,7 +788,7 @@ class RuntimeInputStore:
         had_existing = False
         now_sql = self._now_sql()
         lock_suffix = " FOR UPDATE" if self._dialect in ("postgres", "mysql") else ""
-        for _attempt in range(4):
+        while remaining:
             k = min(len(remaining), max(0, int(free_slots))) if can_execute else 0
             registered_claims: list[tuple[str, int]] = []
             try:
@@ -1009,11 +1009,11 @@ class RuntimeInputStore:
                 missing = [sp for sp in remaining if sp.session_id not in by_id]
                 if not missing:
                     return CreateManyResult(preclaimed=(), queued_targets=(), already_created=True)
-                if len(missing) == len(remaining):
+                if len(missing) >= len(remaining):
                     raise RuntimeRequestError("creation_conflict") from exc
                 had_existing = True
                 remaining = missing
-        raise RuntimeRequestError("creation_conflict")
+        return CreateManyResult(preclaimed=(), queued_targets=(), already_created=True)
 
     async def create_workflow_session(
         self, descriptor: RuntimeDescriptor, *, parent: TargetRef, actor,

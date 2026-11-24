@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from power_loop.agent.runtime_types import TargetRef, TrustedActor
 from power_loop.contracts.event_payloads import TimerFiredPayload
@@ -17,6 +18,17 @@ from .timer_backend import TimerDriverStatus
 DEFAULT_SCAN_INTERVAL_S = 2.0
 DEFAULT_PRUNE_INTERVAL_S = 300.0
 DEFAULT_PRUNE_OLDER_THAN_MS = 86_400_000
+
+
+@dataclass
+class _DeliveryAttempt:
+    send_started: bool = False
+    released: bool = False
+
+
+_CURRENT_ATTEMPT: contextvars.ContextVar[_DeliveryAttempt | None] = contextvars.ContextVar(
+    '_timer_delivery_attempt', default=None,
+)
 
 
 def format_timer_message(timer):
@@ -40,8 +52,6 @@ class TimerRunner:
         self._task = None
         self._last_recovery = 0.0
         self._last_prune: float | None = None
-        self._send_initiated: set[tuple[str, int]] = set()
-        self._deliver_timeout = None
         self._status = TimerDriverStatus('store', False)
 
     def status(self):
@@ -68,6 +78,14 @@ class TimerRunner:
             except Exception as exc:
                 self._status = replace(self._status, last_error=str(exc)[:500], ready=False)
 
+    async def _release_claim_once(self, timer, attempt: _DeliveryAttempt) -> None:
+        if not attempt.released:
+            attempt.released = True
+            await self.store.transition_timer(
+                timer.session_id, timer.timer_id,
+                from_status='firing', to_status='armed',
+            )
+
     async def scan_once(self):
         now_mono = time.monotonic()
         if now_mono - self._last_recovery >= 120:
@@ -87,15 +105,14 @@ class TimerRunner:
                     from_status='armed', to_status='firing', expected_due_at=timer.due_at,
                     expected_fire_count=timer.fire_count):
                 continue
-            key = (timer.session_id, timer.timer_id)
-            self._send_initiated.discard(key)
+            attempt = _DeliveryAttempt()
+            tok = _CURRENT_ATTEMPT.set(attempt)
             try:
-                async with asyncio.timeout(self.acceptance_timeout_s) as cm:
-                    self._deliver_timeout = cm
+                async with asyncio.timeout(self.acceptance_timeout_s):
                     await self._deliver(timer)
                 count += 1
             except asyncio.CancelledError as exc:
-                if key in self._send_initiated:
+                if attempt.send_started:
                     # Never automatically replay an unknown accepted input. End this
                     # occurrence, allowing a recurring timer's next occurrence.
                     error = f'timer {timer.session_id}/{timer.timer_id} unknown: {type(exc).__name__}: {exc}'
@@ -103,12 +120,20 @@ class TimerRunner:
                     await self.store.finish_firing_timer(timer.session_id, timer.timer_id, unknown=True)
                     self._emit(timer, 'unknown')
                 else:
-                    # Interrupted before client.send was initiated: restore armed so the timer is not lost.
-                    await self.store.transition_timer(
-                        timer.session_id, timer.timer_id,
-                        from_status='firing', to_status='armed',
-                    )
+                    # Interrupted before client.send was initiated: release claim at most once.
+                    await self._release_claim_once(timer, attempt)
                 raise
+            except TimeoutError as exc:
+                if attempt.send_started:
+                    error = f'timer {timer.session_id}/{timer.timer_id} unknown: {type(exc).__name__}: {exc}'
+                    self._status = replace(self._status, last_error=error[:500])
+                    await self.store.finish_firing_timer(timer.session_id, timer.timer_id, unknown=True)
+                    self._emit(timer, 'unknown')
+                else:
+                    # Timed out before client.send (e.g. TIMER_FIRE hook): keep armed for retry.
+                    error = f'timer {timer.session_id}/{timer.timer_id} pre-send timeout: {type(exc).__name__}: {exc}'
+                    self._status = replace(self._status, last_error=error[:500])
+                    await self._release_claim_once(timer, attempt)
             except Exception as exc:
                 # Never automatically replay an unknown accepted input. End this
                 # occurrence, allowing a recurring timer's next occurrence.
@@ -117,14 +142,14 @@ class TimerRunner:
                 await self.store.finish_firing_timer(timer.session_id, timer.timer_id, unknown=True)
                 self._emit(timer, 'unknown')
             finally:
-                self._deliver_timeout = None
-                self._send_initiated.discard(key)
+                _CURRENT_ATTEMPT.reset(tok)
         self._status = replace(self._status, ready=True, last_scan_ms=int(time.time()*1000))
         return count
 
     async def _deliver(self, timer):
-        key = (timer.session_id, timer.timer_id)
-        send_started = False
+        attempt = _CURRENT_ATTEMPT.get()
+        if attempt is None:
+            attempt = _DeliveryAttempt()
         try:
             session = await self.store.get_session(timer.session_id)
             if session is None:
@@ -155,19 +180,15 @@ class TimerRunner:
                     from_status='firing', to_status='armed', due_at=int(time.time()*1000+ctx.postpone_s*1000))
                 outcome = 'postponed'
             else:
-                send_started = True
-                self._send_initiated.add(key)
+                attempt.send_started = True
                 await self.client.send(TargetRef(self.store.store_id, timer.session_id), ctx.message,
                     message_id=f'timer-{timer.timer_id}-{timer.created_at}-{timer.fire_count}',
                     actor=TrustedActor(session.tenant_id,session.principal_id,None))
                 await self.store.finish_firing_timer(timer.session_id, timer.timer_id)
             self._emit(timer, outcome)
         except asyncio.CancelledError:
-            if not send_started and (self._deliver_timeout is None or not self._deliver_timeout.expired()):
-                await self.store.transition_timer(
-                    timer.session_id, timer.timer_id,
-                    from_status='firing', to_status='armed',
-                )
+            if not attempt.send_started:
+                await self._release_claim_once(timer, attempt)
             raise
 
     def _emit(self, timer, outcome):

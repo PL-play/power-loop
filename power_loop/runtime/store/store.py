@@ -2036,12 +2036,20 @@ class SessionStore:
             existing = await self.find_timer_by_operation_id(session_id, operation_id, reader=tx)
             if existing is not None:
                 return existing
+        seq_row = await tx.fetchone(
+            f"SELECT value_json FROM {self.t.session_runtime_state} "
+            "WHERE session_id=? AND state_key='timer_seq'",
+            (session_id,),
+        )
+        last_seq = int(_loads(seq_row['value_json']).get('last_timer_id', 0)) if seq_row is not None else 0
         row = await tx.fetchone(
-            f"SELECT COALESCE(MAX({self._timer_json_field('timer_id', number=True)}),0)+1 AS id "
+            f"SELECT COALESCE(MAX({self._timer_json_field('timer_id', number=True)}),0) AS id "
             f"FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key LIKE 'timer:%'",
             (session_id,),
         )
-        now, timer_id = _now_ms(), int(row['id'])
+        now = _now_ms()
+        timer_id = max(last_seq, int(row['id'])) + 1
+        await self._put_aux(tx, session_id, 'timer_seq', {'last_timer_id': timer_id})
         value = dict(
             session_id=session_id, timer_id=timer_id, due_at=int(due_at), note=note,
             status='armed', interval_s=interval_s, fire_count=0, last_fired_at=None,
