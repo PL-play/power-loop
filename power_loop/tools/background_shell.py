@@ -27,6 +27,7 @@ class _BoundedStreamReader:
         self._lock = threading.Lock()
         self._head: list[str] = []
         self._head_bytes = 0
+        self._head_closed = False
         self._tail: deque[tuple[str, int]] = deque()
         self._tail_bytes = 0
         self.truncated = False
@@ -51,7 +52,7 @@ class _BoundedStreamReader:
         raw = chunk.encode("utf-8", errors="replace")
         size = len(raw)
         with self._lock:
-            if not self.truncated and self._head_bytes < self._head_budget:
+            if not self._head_closed:
                 remaining_head = self._head_budget - self._head_bytes
                 if size <= remaining_head:
                     self._head.append(chunk)
@@ -62,16 +63,19 @@ class _BoundedStreamReader:
                 if head_len:
                     self._head.append(head_text)
                     self._head_bytes += head_len
+                # Once any byte spills past the head budget, never append later
+                # chunks back into _head or output order would invert.
+                self._head_closed = True
                 raw = raw[head_len:]
                 chunk = raw.decode("utf-8", errors="replace")
                 size = len(raw)
                 if not size:
                     return
             if size > self._tail_budget:
-                dropped = size - self._tail_budget
                 chunk = raw[-self._tail_budget :].decode("utf-8", errors="ignore")
-                size = len(chunk.encode("utf-8"))
-                self.omitted_bytes += dropped
+                new_size = len(chunk.encode("utf-8"))
+                self.omitted_bytes += size - new_size
+                size = new_size
                 self.truncated = True
             self._tail.append((chunk, size))
             self._tail_bytes += size

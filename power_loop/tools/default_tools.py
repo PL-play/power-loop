@@ -1293,6 +1293,40 @@ def run_glob(pattern: str, path: str = ".", max_results: int = 100, include_hidd
         return f"Error: {e}"
 
 
+def _normalize_root_prefix(path: Path) -> Path:
+    """Normalize a configured root prefix without resolving symlinks inside that root."""
+    runtime_env = get_runtime_env()
+    lexical = Path(os.path.normpath(str(path)))
+    pairs: list[tuple[Path, Path]] = []
+    for root in runtime_env.read_only_roots:
+        pairs.append((Path(os.path.normpath(str(root))), root.resolve()))
+    if runtime_env.workspace_dir is not None:
+        pairs.append((Path(os.path.normpath(str(runtime_env.workspace_dir))), runtime_env.workspace_dir.resolve()))
+    if runtime_env.home_dir is not None:
+        for root in runtime_env.home_rw_allowlist:
+            pairs.append((Path(os.path.normpath(str(root))), root.resolve()))
+        pairs.append((Path(os.path.normpath(str(runtime_env.home_dir))), runtime_env.home_dir.resolve()))
+    for raw_root, resolved_root in sorted(pairs, key=lambda item: len(item[0].parts), reverse=True):
+        if lexical.is_relative_to(raw_root):
+            return Path(os.path.normpath(str(resolved_root / lexical.relative_to(raw_root))))
+    return lexical
+
+
+def _lexical_grep_target(raw_path: str) -> Path:
+    """Resolve user-supplied grep ``path`` against root prefixes WITHOUT following target symlinks."""
+    runtime_env = get_runtime_env()
+    workspace_dir = runtime_env.require_workspace_dir().resolve()
+    raw_input = (raw_path or "").strip()
+    if raw_input.startswith("@workspace/"):
+        joined = workspace_dir / raw_input[len("@workspace/") :]
+    elif raw_input.startswith("@home/"):
+        joined = runtime_env.require_home_dir().resolve() / raw_input[len("@home/") :]
+    else:
+        p = Path(raw_input).expanduser()
+        joined = _normalize_root_prefix(p) if p.is_absolute() else (workspace_dir / p)
+    return Path(os.path.normpath(str(joined)))
+
+
 def _grep_scope_root(base: Path) -> Path | None:
     """Return the single authorized root that ``_grep_with_python`` must stay within.
 
@@ -1302,8 +1336,9 @@ def _grep_scope_root(base: Path) -> Path | None:
     ``home_rw_allowlist`` entry scopes the search to that specific root.
     """
     runtime_env = get_runtime_env()
-    anchor = base.parent.resolve() if base.is_symlink() else base.resolve()
+    lexical = _normalize_root_prefix(base)
     if runtime_env.workspace_dir is None:
+        anchor = base.parent.resolve() if base.is_symlink() else base.resolve()
         return anchor.parent if (not base.is_symlink() and base.is_file()) else anchor
 
     candidates: list[Path] = []
@@ -1314,7 +1349,7 @@ def _grep_scope_root(base: Path) -> Path | None:
         for root in runtime_env.home_rw_allowlist:
             candidates.append(root.resolve())
 
-    matching = [root for root in dict.fromkeys(candidates) if anchor.is_relative_to(root)]
+    matching = [root for root in dict.fromkeys(candidates) if lexical.is_relative_to(root)]
     if not matching:
         return None
     return max(matching, key=lambda root: len(root.parts))
@@ -1328,11 +1363,13 @@ def _grep_with_python(
     literal: bool,
     case_sensitive: bool,
     include_hidden: bool,
+    *,
+    scope_root: Path | None = None,
 ) -> str:
     flags = 0 if case_sensitive else re.IGNORECASE
     compiled = re.compile(re.escape(pattern) if literal else pattern, flags)
-    scope_root = _grep_scope_root(base)
-    if scope_root is None:
+    effective_root = scope_root if scope_root is not None else _grep_scope_root(base)
+    if effective_root is None:
         return ""
     roots = [base] if base.is_file() else []
     if base.is_dir():
@@ -1351,7 +1388,7 @@ def _grep_with_python(
     for fp in roots:
         try:
             resolved = fp.resolve()
-            if not resolved.is_relative_to(scope_root):
+            if not resolved.is_relative_to(effective_root):
                 continue
             st = resolved.stat()
             if not stat.S_ISREG(st.st_mode) or st.st_size > TEXT_FILE_MAX_BYTES:
@@ -1390,6 +1427,10 @@ def run_grep(
             return f"Error: path does not exist: {path}"
         if not pattern:
             return "Error: pattern is required"
+        lexical_base = _lexical_grep_target(path)
+        scope_root = _grep_scope_root(lexical_base)
+        if scope_root is None or not base.is_relative_to(scope_root):
+            return f"No matches for '{pattern}' in {path}"
         max_results = _clamp_int(max_results, 50, 1, SEARCH_MAX_RESULTS)
 
         rg_cmd = [
@@ -1444,7 +1485,16 @@ def run_grep(
                 lines.append(f"... results truncated at {max_results}")
             return "\n".join(lines)
         except FileNotFoundError:
-            output = _grep_with_python(pattern, base, include, max_results, literal, case_sensitive, include_hidden)
+            output = _grep_with_python(
+                pattern,
+                base,
+                include,
+                max_results,
+                literal,
+                case_sensitive,
+                include_hidden,
+                scope_root=scope_root,
+            )
             return output if output else f"No matches for '{pattern}' in {_display_path(base)}"
     except re.error as e:
         return f"Error: Invalid regex: {e}"

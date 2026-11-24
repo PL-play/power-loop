@@ -157,6 +157,49 @@ def test_h7_p1_21_background_shell_bounded_memory_on_large_output(
         reset_current_loop(loop_tok)
 
 
+def test_h7_p1_21_background_shell_preserves_order_across_multibyte_head_tail_boundary(
+    tmp_path: Path,
+) -> None:
+    """Rework 2: once any multi-byte char spills from _head into _tail, subsequent small chunks
+    must NOT be appended back into _head (which would invert output order)."""
+    # 1) Direct reader unit check (16-byte cap => 8-byte head, 8-byte tail)
+    reader = background_shell._BoundedStreamReader(None, max_bytes=16)
+    reader._append_text("1234567")  # 7 bytes in head (1 byte left)
+    reader._append_text("汉")       # 3 bytes -> spills to tail; must close head
+    reader._append_text("Z")        # 1 byte -> must stay after "汉" in tail, NOT go back to head
+    assert reader.truncated is False
+    assert reader.text() == "1234567汉Z"
+
+    # 2) Same boundary followed by overflow truncation still preserves head prefix and tail order
+    reader2 = background_shell._BoundedStreamReader(None, max_bytes=16)
+    reader2._append_text("1234567")
+    reader2._append_text("汉")
+    reader2._append_text("A" * 20)
+    reader2._append_text("Z")
+    assert reader2.truncated is True
+    rendered = reader2.text()
+    assert rendered.startswith("1234567\n... (")
+    assert rendered.endswith("Z")
+    assert reader2._head_bytes + reader2._tail_bytes <= 16
+
+    # 3) Real background_shell.execute() with default 2 MiB cap (524,288-byte stdout head budget)
+    fake_loop = SimpleNamespace(_runtime_worker_context=SimpleNamespace(session_id="s_bg_order", send_index=1))
+    loop_tok = set_current_loop(cast(Any, fake_loop))
+    cancel_tok = set_current_cancel_token(CancellationToken())
+    try:
+        with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path)):
+            out = background_shell.execute(
+                "python3 -c 'import sys; sys.stdout.write(\"a\" * 524287 + \"汉\"); "
+                "sys.stdout.flush(); sys.stdout.write(\"Z\"); sys.stdout.flush()'",
+                timeout=15.0,
+            )
+        assert out.startswith("exit_code=0\n")
+        assert out.endswith("汉Z"), f"unexpected tail: {out[-16:]!r}"
+    finally:
+        reset_current_cancel_token(cancel_tok)
+        reset_current_loop(loop_tok)
+
+
 def test_h7_p1_21_background_shell_cancel_stops_process_and_closes_streams(tmp_path: Path) -> None:
     pidfile = tmp_path / "bg_sleep.pid"
     cancel_token = CancellationToken()
@@ -780,7 +823,10 @@ def test_h7_p1_23_grep_workspace_does_not_follow_symlinks_to_other_authorized_ro
 
     # Symlinks inside workspace pointing to OTHER authorized roots (and outside)
     os.symlink(ro / "ro_doc.txt", ws / "link_to_ro.txt")
+    os.symlink(ro, ws / "link_to_ro_dir")
     os.symlink(cache / "cache_doc.txt", ws / "link_to_cache.txt")
+    # Legitimate in-workspace symlink
+    os.symlink(ws / "ws_file.txt", ws / "in_ws_link.txt")
     # Symlink inside read_only_root pointing back into workspace or outside
     os.symlink(ws / "ws_file.txt", ro / "link_to_ws.txt")
     os.symlink(outside / "out.txt", ro / "link_to_outside.txt")
@@ -800,14 +846,33 @@ def test_h7_p1_23_grep_workspace_does_not_follow_symlinks_to_other_authorized_ro
         assert ws_cache_out.startswith("No matches")
         assert "cache_doc.txt" not in ws_cache_out and "link_to_cache.txt" not in ws_cache_out
 
-        # Direct _grep_with_python on workspace symlink pointing to ro must also skip it.
+        # 2) Public run_grep directly targeting a workspace symlink pointing to another authorized root
+        #    must ALSO refuse to escape workspace_dir (relative, @workspace/, absolute, and via dir symlink).
+        for escaping_target in (
+            "link_to_ro.txt",
+            "@workspace/link_to_ro.txt",
+            str(ws / "link_to_ro.txt"),
+            "link_to_ro_dir",
+            "link_to_ro_dir/ro_doc.txt",
+        ):
+            res = dt.run_grep("TOKEN_IN_RO_ROOT", path=escaping_target)
+            assert res.startswith("No matches"), f"unexpected match for {escaping_target}: {res}"
+            assert "ro_doc.txt" not in res or escaping_target.endswith("ro_doc.txt")
+            assert "TOKEN_IN_RO_ROOT:" not in res and ":1:" not in res
+
+        assert dt.run_grep("TOKEN_IN_HOME_CACHE", path="link_to_cache.txt").startswith("No matches")
         assert dt._grep_with_python("TOKEN_IN_RO_ROOT", ws / "link_to_ro.txt", None, 50, True, True, False) == ""
 
-        # 2) Explicit grep targeting read_only_root or @home/.cache works within that root,
-        #    and does NOT escape that root into workspace or outside via symlinks.
+        # Legitimate in-workspace symlink still works via public run_grep.
+        assert "ws_file.txt:1:TOKEN_WS_ONLY" in dt.run_grep("TOKEN_WS_ONLY", path="in_ws_link.txt")
+
+        # 3) Explicit grep targeting read_only_root or @home/.cache works within that root,
+        #    and does NOT escape that root into workspace or outside via symlinks (recursive OR direct).
         explicit_ro = dt.run_grep("TOKEN_IN_RO_ROOT", path=str(ro))
         assert "ro_doc.txt:1:TOKEN_IN_RO_ROOT" in explicit_ro
+        assert "ro_doc.txt:1:TOKEN_IN_RO_ROOT" in dt.run_grep("TOKEN_IN_RO_ROOT", path=str(ro / "ro_doc.txt"))
         assert "ws_file.txt" not in dt.run_grep("TOKEN_WS_ONLY", path=str(ro))
+        assert dt.run_grep("TOKEN_WS_ONLY", path=str(ro / "link_to_ws.txt")).startswith("No matches")
         assert "out.txt" not in dt.run_grep("TOKEN_OUTSIDE", path=str(ro))
 
         explicit_cache = dt.run_grep("TOKEN_IN_HOME_CACHE", path="@home/.cache")
