@@ -3177,6 +3177,9 @@ class RuntimeInputStore:
 
         # Resolve consumed inputs if caller passed consumed=None and we need exact list for abnormal settle or River.
         delivered_routes: dict[str, tuple[str | None, str | None]] = {}
+        delivered_routes_complete = False
+        batch_id_set = {ref.message_id for ref in batch.input_refs}
+        extra_consumed_ids = [ref.message_id for ref in consumed_refs if ref.message_id not in batch_id_set]
         if consumed is None and (effective_status != "completed" or batch.result_route is not None or batch.reply_to_session_id is not None):
             delivered = await tx.fetchall(
                 f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
@@ -3193,6 +3196,26 @@ class RuntimeInputStore:
                         row["reply_to_session_id"],
                         row["reply_result_kind"],
                     )
+                delivered_routes_complete = True
+        elif extra_consumed_ids and (
+            batch.result_route is not None
+            or batch.reply_to_session_id is not None
+            or batch.parent_session_id is not None
+        ):
+            # Mid-turn follow-up inputs claimed via claim_follow_up() are absent from batch.input_refs;
+            # load their routes so workflow_node_result (or routed follow-up) is never dropped on final().
+            ec_ph = ",".join("?" for _ in extra_consumed_ids)
+            extra_delivered = await tx.fetchall(
+                f"SELECT item_id,reply_to_session_id,reply_result_kind FROM {self.q} "
+                f"WHERE session_id=? AND status='delivered' AND delivered_send_index=? "
+                f"AND item_id IN ({ec_ph}) AND reply_to_session_id IS NOT NULL ORDER BY id ASC",
+                (sid, batch.send_index, *extra_consumed_ids),
+            )
+            for row in extra_delivered:
+                delivered_routes[str(row["item_id"])] = (
+                    row["reply_to_session_id"],
+                    row["reply_result_kind"],
+                )
 
         # Restore any unconsumed items back to pending (rare partial-consume path)
         if unconsumed_ids:
@@ -3276,7 +3299,7 @@ class RuntimeInputStore:
                         consumed_has_wf_route = True
                         wf_source_item_id = batch.reply_to_item_id
                 if not consumed_has_wf_route:
-                    if delivered_routes:
+                    if delivered_routes_complete:
                         for ref in consumed_refs:
                             to_sid, rk_val = delivered_routes.get(ref.message_id, (None, None))
                             if to_sid is not None:
@@ -3319,12 +3342,23 @@ class RuntimeInputStore:
                     deliver_source_ref = deliver_start_ref
                 elif wf_source_item_id is not None:
                     deliver_source_ref = InputRef(batch.target.store_id, sid, wf_source_item_id)
-            elif not is_human_direct_leaf_chat and batch.reply_to_session_id is not None:
+            elif not is_human_direct_leaf_chat and (
+                batch.reply_to_session_id is not None
+                or any(to is not None for to, _ in delivered_routes.values())
+            ):
                 consumed_id_set = {ref.message_id for ref in consumed_refs}
                 reply_item_id = batch.reply_to_item_id
                 effective_reply_to: str | None = batch.reply_to_session_id
                 effective_reply_rk: str | None = batch.reply_result_kind
-                if reply_item_id is not None and reply_item_id not in consumed_id_set:
+                if effective_reply_to is None:
+                    for ref in consumed_refs:
+                        live_to, live_rk = delivered_routes.get(ref.message_id, (None, None))
+                        if live_to is not None:
+                            reply_item_id = ref.message_id
+                            effective_reply_to = str(live_to)
+                            effective_reply_rk = live_rk
+                            break
+                elif reply_item_id is not None and reply_item_id not in consumed_id_set:
                     c_ids = [ref.message_id for ref in consumed_refs]
                     c_ph = ",".join("?" for _ in c_ids)
                     q_alt = await tx.fetchone(

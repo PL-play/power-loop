@@ -2015,3 +2015,176 @@ async def test_h4_p1_2_merged_batch_workflow_leaf_final_and_recover_reference_in
         port._driver_waiters.pop("p12mbsrc-drv", None)
         await client.aclose()
         await transport.aclose()
+
+
+async def test_h4_p1_2_mid_turn_claim_follow_up_internal_continue_delivers_workflow_node_result(registry_store):
+    """P1-2 rework 6: mid-turn claim_follow_up of internal workflow_continue while handling ordinary chat delivers 1 workflow_node_result(next)."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "p12fup-main"})
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        leaf_desc = replace(DESCRIPTOR, config={"workflow_node": "n1"})
+
+        cm_drv = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12fup-drv",
+                message_id="fup-drv-start",
+                body={"text": "wf"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv_b = cm_drv.preclaimed[0]
+        drv = drv_b.target
+
+        driver_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        port._driver_waiters[drv.session_id] = (driver_events, asyncio.Event(), object())
+
+        cm_leaf = await port.create_many(
+            parent=drv,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id="p12fup-leaf",
+                message_id="fup-leaf-init",
+                body={"text": "init"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv_b.owner_epoch,
+            parent_cancel_seq=drv_b.cancel_seq,
+        )
+        leaf_init = cm_leaf.preclaimed[0]
+        leaf = leaf_init.target
+        await port.final(leaf_init, final_text="init ok")
+        driver_events.get_nowait()
+
+        # 1. Ordinary public chat (agent_result) claimed FIRST; internal workflow_continue arrives mid-turn
+        #    and is drained by claim_follow_up(), then final(consumed=[chat, next]).
+        await client.send(
+            leaf,
+            "public chat claimed first",
+            message_id="fup-chat-1",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        b1 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert b1 is not None
+        assert [r.message_id for r in b1.input_refs] == ["fup-chat-1"]
+        assert b1.reply_result_kind == "agent_result"
+
+        await port.accept(
+            leaf,
+            "internal continue mid-turn",
+            message_id="fup-next-1",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        fup1 = await port.claim_follow_up(b1)
+        assert fup1 is not None
+        fup1_refs, _, _, _ = fup1
+        consumed_1 = [*b1.input_refs, *fup1_refs]
+        assert [r.message_id for r in consumed_1] == ["fup-chat-1", "fup-next-1"]
+
+        fin1 = await port.final(b1, final_text="merged mid-turn reply", consumed=consumed_1)
+        assert fin1.result_delivery_error is None
+        rows1 = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert len(rows1) == 3, f"expected [user, init wf, fup-next-1 wf], got {rows1}"
+        assert rows1[2]["kind"] == "workflow_node_result"
+        assert rows1[2]["result_kind"] == "workflow_node_result"
+        assert json.loads(rows1[2]["content_json"])["input_ref"]["message_id"] == "fup-next-1"
+        evt1 = driver_events.get_nowait()
+        assert evt1["payload"]["input_ref"]["message_id"] == "fup-next-1"
+
+        # 2. Unrouted human direct chat claimed FIRST; internal workflow_continue drained mid-turn via claim_follow_up().
+        await client.send(leaf, "unrouted human chat", message_id="fup-human-2", actor=ACTOR)
+        b2 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert b2 is not None and b2.reply_to_session_id is None
+
+        await port.accept(
+            leaf,
+            "internal continue after human chat",
+            message_id="fup-next-2",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        fup2 = await port.claim_follow_up(b2)
+        assert fup2 is not None
+        consumed_2 = [*b2.input_refs, *fup2[0]]
+        fin2 = await port.final(b2, final_text="merged after human", consumed=consumed_2)
+        assert fin2.result_delivery_error is None
+        rows2 = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert len(rows2) == 4
+        assert rows2[3]["kind"] == "workflow_node_result"
+        assert rows2[3]["result_kind"] == "workflow_node_result"
+        assert json.loads(rows2[3]["content_json"])["input_ref"]["message_id"] == "fup-next-2"
+        evt2 = driver_events.get_nowait()
+        assert evt2["payload"]["input_ref"]["message_id"] == "fup-next-2"
+
+        # 3. Negative control: ordinary public chat claimed FIRST + ordinary public follow-up drained mid-turn ->
+        #    MUST remain ordinary agent_result and fire 0 workflow driver events!
+        await client.send(
+            leaf,
+            "public chat A",
+            message_id="fup-pub-a",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        b3 = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert b3 is not None
+        await client.send(
+            leaf,
+            "public chat B mid-turn",
+            message_id="fup-pub-b",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        fup3 = await port.claim_follow_up(b3)
+        assert fup3 is not None
+        consumed_3 = [*b3.input_refs, *fup3[0]]
+        fin3 = await port.final(b3, final_text="ordinary only reply", consumed=consumed_3)
+        assert fin3.result_delivery_error is None
+        rows3 = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (drv.session_id,),
+        )
+        assert len(rows3) == 5
+        assert rows3[4]["kind"] == "agent_result"
+        assert rows3[4]["result_kind"] == "agent_result"
+        assert driver_events.empty(), "ordinary-only mid-turn follow-up must NOT trigger workflow_node_result event"
+    finally:
+        port._driver_waiters.pop("p12fup-drv", None)
+        await client.aclose()
+        await transport.aclose()
