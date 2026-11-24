@@ -6860,48 +6860,82 @@ class RuntimeInputStore:
                             "AND result_delivery_error='session_closed' ORDER BY id ASC",
                             tuple(direct_ids),
                         )
-                        for urow in undeliv:
-                            c_sid = str(urow["session_id"])
-                            c_si = urow["result_send_index"] or urow["delivered_send_index"]
-                            c_si_int = int(c_si) if c_si is not None else 0
-                            raw_replay_id = f"res_rebind_{c_sid}_s{c_si_int}"
-                            replay_id = (
-                                raw_replay_id if len(raw_replay_id) <= 64
-                                else "res_rebind_" + sha256_canonical([c_sid, urow["item_id"], c_si_int])[:48]
-                            )
+                        # Group undelivered rows by settled send (c_sid, c_si) so a merged multi-input
+                        # batch replays as ONE receipt matching the batch's authoritative result_kind
+                        # regardless of input row order or session_id length; pending-cancelled rows
+                        # (c_si is None) stay keyed per item_id.
+                        grouped_undeliv: dict[tuple[str, int | None, str | None], list[dict[str, Any]]] = {}
+                        for row_u in undeliv:
+                            g_sid = str(row_u["session_id"])
+                            g_si_raw = row_u["result_send_index"] or row_u["delivered_send_index"]
+                            g_si = int(g_si_raw) if g_si_raw is not None else None
+                            g_key = (g_sid, g_si, None if g_si is not None else str(row_u["item_id"]))
+                            grouped_undeliv.setdefault(g_key, []).append(dict(row_u))
+
+                        for (c_sid, c_si, _pending_item), group_rows in grouped_undeliv.items():
                             c_row = child_by_id[c_sid]
                             c_route = json.loads(c_row["result_route_json"]) if c_row.get("result_route_json") else None
-                            urow_rk = urow.get("reply_result_kind")
+                            wf_row = next(
+                                (
+                                    r for r in group_rows
+                                    if r.get("reply_to_session_id") is not None
+                                    and r.get("reply_result_kind") == "workflow_node_result"
+                                ),
+                                None,
+                            )
+                            routed_row = next(
+                                (r for r in group_rows if r.get("reply_to_session_id") is not None),
+                                None,
+                            )
                             if isinstance(c_route, dict) and c_route.get("result_kind") == "workflow_node_result":
-                                if (
-                                    urow.get("reply_to_session_id") is not None
-                                    and urow_rk == "workflow_node_result"
-                                ):
+                                if wf_row is not None:
+                                    urow = wf_row
                                     c_result_kind = "workflow_node_result"
                                 else:
+                                    urow = routed_row or group_rows[0]
+                                    urow_rk = urow.get("reply_result_kind")
                                     c_result_kind = (
                                         urow_rk if urow_rk in _VALID_RESULT_KINDS else "agent_result"
                                     )
                             elif isinstance(c_route, dict) and c_route.get("result_kind") in _VALID_RESULT_KINDS:
+                                urow = wf_row or routed_row or group_rows[0]
                                 c_result_kind = c_route["result_kind"]
                             else:
+                                urow = routed_row or group_rows[0]
+                                urow_rk = urow.get("reply_result_kind")
                                 c_result_kind = (
                                     urow_rk if urow_rk in _VALID_RESULT_KINDS else "agent_result"
                                 )
+                            if c_si is not None:
+                                raw_replay_id = f"res_rebind_{c_sid}_s{c_si}"
+                                replay_id = (
+                                    raw_replay_id if len(raw_replay_id) <= 64
+                                    else "res_rebind_" + sha256_canonical([c_sid, c_si])[:48]
+                                )
+                            else:
+                                replay_id = (
+                                    "res_rebind_"
+                                    + sha256_canonical([c_sid, str(urow["item_id"]), None])[:48]
+                                )
+                            group_row_ids = [int(r["id"]) for r in group_rows]
+                            g_id_ph = ",".join("?" for _ in group_row_ids)
                             orig_txt = ""
-                            if urow["result_json"]:
-                                try:
-                                    parsed_rj = json.loads(urow["result_json"])
-                                    if isinstance(parsed_rj, dict):
-                                        orig_txt = str(parsed_rj.get("final_text") or parsed_rj.get("text") or "")
-                                except ValueError:
-                                    pass
+                            for r_txt in (urow, *group_rows):
+                                if r_txt["result_json"]:
+                                    try:
+                                        parsed_rj = json.loads(r_txt["result_json"])
+                                        if isinstance(parsed_rj, dict):
+                                            orig_txt = str(parsed_rj.get("final_text") or parsed_rj.get("text") or "")
+                                            if orig_txt:
+                                                break
+                                    except ValueError:
+                                        pass
                             if not orig_txt and c_si is not None:
                                 mrow = await tx.fetchone(
                                     f"SELECT content FROM {self.store.t.messages} "
                                     "WHERE session_id=? AND send_index=? AND role='assistant' "
                                     "ORDER BY seq DESC LIMIT 1",
-                                    (c_sid, int(c_si)),
+                                    (c_sid, c_si),
                                 )
                                 if mrow is not None and mrow["content"]:
                                     orig_txt = str(mrow["content"])
@@ -6916,7 +6950,7 @@ class RuntimeInputStore:
                                 "cancel_by": urow["cancel_by"],
                                 "final_text": combined_txt,
                                 "text": combined_txt,
-                                "send_index": int(c_si) if c_si is not None else None,
+                                "send_index": c_si,
                                 "result_seq": urow["result_seq"],
                                 "error": urow["error_detail"],
                                 "error_code": urow["error_code"],
@@ -7000,8 +7034,8 @@ class RuntimeInputStore:
                                     ),
                                 )
                                 await tx.execute(
-                                    f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id=?",
-                                    (int(urow["id"]),),
+                                    f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id IN ({g_id_ph})",
+                                    tuple(group_row_ids),
                                 )
                                 replayed += 1
                             else:
@@ -7011,8 +7045,8 @@ class RuntimeInputStore:
                                 )
                                 if dup is not None:
                                     await tx.execute(
-                                        f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id=?",
-                                        (int(urow["id"]),),
+                                        f"UPDATE {self.q} SET result_delivery_error=NULL WHERE id IN ({g_id_ph})",
+                                        tuple(group_row_ids),
                                     )
                                 else:
                                     raise CapacityError()

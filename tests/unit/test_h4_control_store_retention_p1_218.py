@@ -1711,3 +1711,124 @@ async def test_h4_p1_4_truncated_cursor_advances_every_page_for_scheduler_budget
     assert raw_cursor is None
     assert raw_total == 12
     assert await store.get_session(s_raw.session_id) is None
+
+
+@pytest.mark.parametrize("leaf_id_mode", ["short", "long60"])
+async def test_h4_p1_2_rebind_replay_merged_batch_preserves_workflow_kind_for_short_and_long_ids(
+    registry_store, leaf_id_mode,
+):
+    """P1-2 rework 4: merged ordinary + internal workflow_continue batch replays as 1 workflow_node_result for short & 60-char IDs."""
+    from dataclasses import replace
+
+    from power_loop.agent.runtime_client import RuntimeClient
+    from power_loop.agent.runtime_store import ChildSpec
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    transport = MemoryMessageTransport()
+    client = RuntimeClient(store=store, transport=transport)
+    port = client.inputs
+    try:
+        sfx = "sh" if leaf_id_mode == "short" else "lg"
+        main = await client.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": f"p12mb-main-{sfx}"})
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        leaf_desc = replace(DESCRIPTOR, config={"workflow_node": "n1"})
+
+        cm_drv = await port.create_many(
+            parent=main,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id=f"p12mb-drv-{sfx}",
+                message_id=f"mb-drv-start-{sfx}",
+                body={"text": "wf"},
+                descriptor=drv_desc,
+                result_kind="workflow_result",
+                cancel_propagation="independent",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+        )
+        drv_b = cm_drv.preclaimed[0]
+        drv = drv_b.target
+        new_drv = await client.create_session(
+            drv_desc, actor=ACTOR, options={"session_id": f"p12mb-newdrv-{sfx}"},
+        )
+
+        leaf_sid = f"leaf-{sfx}" if leaf_id_mode == "short" else ("p12mb_" + "x" * 54)
+        assert leaf_id_mode != "long60" or len(leaf_sid) == 60
+
+        cm_leaf = await port.create_many(
+            parent=drv,
+            actor=ACTOR,
+            specs=[ChildSpec(
+                session_id=leaf_sid,
+                message_id=f"mb-leaf-init-{sfx}",
+                body={"text": "init"},
+                descriptor=leaf_desc,
+                result_kind="workflow_node_result",
+            )],
+            node_id="n1",
+            boot_id="b1",
+            can_execute=True,
+            free_slots=1,
+            parent_owner_epoch=drv_b.owner_epoch,
+            parent_cancel_seq=drv_b.cancel_seq,
+        )
+        leaf_init = cm_leaf.preclaimed[0]
+        leaf = leaf_init.target
+        await port.final(leaf_init, final_text="init ok")
+
+        # Queue ordinary public message FIRST (smaller id), then internal workflow_continue SECOND;
+        # both are claimed into the SAME send_index=2.
+        await client.send(
+            leaf,
+            "ordinary chat first",
+            message_id=f"mb-pub-{sfx}",
+            actor=ACTOR,
+            reply_route={"target": drv, "result_kind": "agent_result"},
+        )
+        await port.accept(
+            leaf,
+            "internal workflow continue second",
+            message_id=f"mb-wf-{sfx}",
+            actor=ACTOR,
+            kind="workflow_continue",
+            reply_route={"target": drv, "result_kind": "workflow_node_result"},
+            public=False,
+        )
+        merged_batch = await port.claim(leaf, node_id="n1", boot_id="b1")
+        assert merged_batch is not None
+        assert [r.message_id for r in merged_batch.input_refs] == [f"mb-pub-{sfx}", f"mb-wf-{sfx}"]
+        assert merged_batch.reply_result_kind == "workflow_node_result"
+
+        # Close old driver before final so merged batch records result_delivery_error='session_closed' on BOTH rows.
+        await port.set_lifecycle(drv, "closed", actor=ACTOR, inflight="abort", subtree="none")
+        fin = await port.final(merged_batch, final_text="merged workflow answer")
+        assert fin.result_delivery_error == "session_closed"
+
+        rb = await port.rebind_children(
+            drv, new_drv, child_targets=[leaf], replay_undelivered=True, actor=ACTOR,
+        )
+        assert rb.replayed_results == 1
+
+        new_inbox = await store._db.fetchall(
+            f"SELECT kind,result_kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? ORDER BY id ASC",
+            (new_drv.session_id,),
+        )
+        assert len(new_inbox) == 1, f"expected exactly 1 replayed receipt, got {len(new_inbox)}: {new_inbox}"
+        assert new_inbox[0]["kind"] == "workflow_node_result"
+        assert new_inbox[0]["result_kind"] == "workflow_node_result"
+
+        src_errors = await store._db.fetchall(
+            f"SELECT item_id,result_delivery_error FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND item_id IN (?,?) ORDER BY id ASC",
+            (leaf.session_id, f"mb-pub-{sfx}", f"mb-wf-{sfx}"),
+        )
+        assert len(src_errors) == 2
+        assert all(r["result_delivery_error"] is None for r in src_errors)
+    finally:
+        await client.aclose()
+        await transport.aclose()
