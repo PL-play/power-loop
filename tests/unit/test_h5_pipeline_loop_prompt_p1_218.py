@@ -420,7 +420,30 @@ async def test_h5_p1_9_urgent_blocks_queued_concurrent_tool_waiting_on_semaphore
     # Tool three (queued in _pre waiting on semaphore) MUST NOT invoke its handler and MUST be skipped.
     bus = AgentEventBus()
     steer_events: list[dict[str, Any]] = []
+    started_events: list[dict[str, Any]] = []
     bus.subscribe(AgentEventType.STEER_INTERRUPTED, lambda e: steer_events.append(dict(e.payload or {})))
+    bus.subscribe(AgentEventType.TOOL_CALL_STARTED, lambda e: started_events.append(dict(e.payload or {})))
+    from power_loop.contrib.otel_sink import attach_otel_sink
+
+    class _FakeSpan:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.ended = False
+
+        def set_attribute(self, k: str, v: Any) -> None:
+            pass
+
+        def set_status(self, status: Any) -> None:
+            pass
+
+        def end(self) -> None:
+            self.ended = True
+
+    class _FakeTracer:
+        def start_span(self, name: str, context: Any = None, attributes: Any = None) -> _FakeSpan:
+            return _FakeSpan(name)
+
+    otel_bridge = attach_otel_sink(bus, tracer=_FakeTracer())
 
     entered = {"one": asyncio.Event(), "two": asyncio.Event()}
     release = asyncio.Event()
@@ -496,7 +519,98 @@ async def test_h5_p1_9_urgent_blocks_queued_concurrent_tool_waiting_on_semaphore
         assert by_name["two"] == "res_two"
         assert (by_name["three"] or "").startswith("[skipped:")
         assert any(e.get("tool_name") == "three" and e.get("where") == "between_tools" for e in steer_events)
+        # Never-entered queued tool 'c3' MUST NOT emit TOOL_CALL_STARTED or leave an unclosed OTel span!
+        started_ids = [e.get("tool_call_id") for e in started_events]
+        assert "c3" not in started_ids
+        assert set(started_ids) == {"c1", "c2"}
+        assert otel_bridge._tool == {}
         assert any("URGENT_STOP_QUEUED" in str(m.get("content")) for m in llm.requests[1].messages)
+    finally:
+        otel_bridge.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_h5_p1_9_urgent_during_serial_tool_before_hook_skips_tool_without_started_event(
+    runtime_agent,
+) -> None:
+    # Reviewer rework-1 counterexample 1: two serial tools 'one', 'two'; urgent arrives while
+    # async TOOL_BEFORE hook for 'two' is awaiting. After releasing the hook, 'two' MUST NOT
+    # execute (call count == 0), must NOT emit TOOL_CALL_STARTED, must write skipped result,
+    # and next round receives the urgent message.
+    bus = AgentEventBus()
+    started_events: list[dict[str, Any]] = []
+    steer_events: list[dict[str, Any]] = []
+    bus.subscribe(AgentEventType.TOOL_CALL_STARTED, lambda e: started_events.append(dict(e.payload or {})))
+    bus.subscribe(AgentEventType.STEER_INTERRUPTED, lambda e: steer_events.append(dict(e.payload or {})))
+
+    hook_entered = asyncio.Event()
+    hook_release = asyncio.Event()
+    called: list[str] = []
+
+    def tool_one(**kw: Any) -> str:
+        called.append("one")
+        return "actual_one"
+
+    def tool_two(**kw: Any) -> str:
+        called.append("two")
+        return "actual_two"
+
+    reg = ToolRegistry()
+    for name, fn in (("one", tool_one), ("two", tool_two)):
+        reg.register(
+            ToolDefinition(
+                name=name,
+                description=name,
+                input_schema={"type": "object", "properties": {}},
+                pricing=Free("test_fixture"),
+            ),
+            fn,
+        )
+
+    hooks = AgentHooks()
+
+    async def gate_second_before(ctx: ToolBeforeCtx) -> None:
+        if ctx.tool_name == "two":
+            hook_entered.set()
+            await hook_release.wait()
+
+    hooks.register(HookPoint.TOOL_BEFORE, gate_second_before, name="t.gate_two")
+
+    llm = _ScriptedLLM(
+        steps=[
+            LLMResponse(raw_text="", tool_calls=[_tc("c1", "one"), _tc("c2", "two")], token_usage=USAGE),
+            LLMResponse(raw_text="handled urgent after hook", token_usage=USAGE),
+        ]
+    )
+    store = await SessionStore.open(":memory:")
+    try:
+        agent = await runtime_agent(
+            model=llm,
+            store=store,
+            registry=reg,
+            hooks=hooks,
+            event_bus=bus,
+            config=AgentLoopConfig(system_prompt="S", max_rounds=4, context_budget_tokens=10**9),
+        )
+        run = asyncio.create_task(agent.send("run two serial"))
+        await asyncio.wait_for(hook_entered.wait(), 5)
+        assert called == ["one"]
+        await agent.runtime.client.send(
+            agent.target, "URGENT_IN_TOOL_BEFORE", priority="urgent", message_id="urg-tb-1", actor=agent.actor
+        )
+        hook_release.set()
+        res = await asyncio.wait_for(run, 5)
+        assert res.status == "completed"
+        assert res.final_text == "handled urgent after hook"
+        assert called == ["one"]
+        tool_rows = [r for r in await store.load_active_messages(agent.target.session_id) if r.role == "tool"]
+        by_name = {r.name: r.content for r in tool_rows}
+        assert by_name["one"] == "actual_one"
+        assert (by_name["two"] or "").startswith("[skipped:")
+        assert [e.get("tool_call_id") for e in started_events] == ["c1"]
+        assert any(e.get("tool_name") == "two" and e.get("where") == "between_tools" for e in steer_events)
+        assert any("URGENT_IN_TOOL_BEFORE" in str(m.get("content")) for m in llm.requests[1].messages)
     finally:
         await store.close()
 

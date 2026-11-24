@@ -677,6 +677,7 @@ class AgentPipeline:
         *, tool_call_id: str | None = None, count: bool = True,
         tool_stop: asyncio.Future[ControlledLoopStop] | None = None,
         check_steer: bool = False,
+        emit_started_round: int | None = None,
     ) -> asyncio.Future:
         """Run one tool call as its own task with its OWN stop token (a child of the run's —
         design/124 §8.2), exposed to the handler as the current cancel token. Stopping the run
@@ -689,6 +690,14 @@ class AgentPipeline:
                 return None
             if check_steer and self._steer_pending():
                 return _STEER_SKIPPED
+            if emit_started_round is not None:
+                self._emit(
+                    AgentEventType.TOOL_CALL_STARTED,
+                    ToolCallStartedPayload(
+                        name=tool_name, tool_input=tool_args, tool_call_id=tool_call_id or "",
+                    ),
+                    round_index=emit_started_round,
+                )
             task = asyncio.current_task()
             assert task is not None
             self._tool_tokens[task] = tok
@@ -2426,17 +2435,29 @@ class AgentPipeline:
                             )
                             continue
 
-                        self._emit(AgentEventType.TOOL_CALL_STARTED,
-                                   ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
-                                   round_index=round_idx)
+                        if self._steer_pending():
+                            await self._resolve_skipped_tool_calls(
+                                [tool_call], reason=self.STEER_SKIP_REASON, round_idx=round_idx,
+                            )
+                            self._emit(
+                                AgentEventType.STEER_INTERRUPTED,
+                                SteerInterruptedPayload(
+                                    where="between_tools", action="skip", round_index=round_idx,
+                                    tool_name=tool_name, tool_call_id=call_id, skipped=1,
+                                ),
+                                round_index=round_idx,
+                            )
+                            continue
 
                         if i in _eligible and any(j > i for j in _eligible):
                             # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
                             # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
+                            # TOOL_CALL_STARTED 延后到获得并发名额并通过 steer/stop 检查后真正启动时再发。
                             _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
                             pre_task = self._start_tool(
                                 tool_name, tool_args, _pre_sem,
-                                tool_call_id=call_id, tool_stop=_tool_stop, check_steer=True,
+                                tool_call_id=call_id, tool_stop=_tool_stop,
+                                check_steer=True, emit_started_round=round_idx,
                             )
                             _active_work = pre_task
                             for j in _eligible:
@@ -2464,14 +2485,11 @@ class AgentPipeline:
                                 if tb_j.directive == HookDirective.SKIP:
                                     _pre_skip[j] = tb_j
                                     continue
-                                self._emit(AgentEventType.TOOL_CALL_STARTED,
-                                           ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
-                                                                  tool_call_id=str(tc_j.get("id") or "")),
-                                           round_index=round_idx)
                                 _pre[j] = (self._start_tool(
                                     tb_j.tool_name, tb_j.tool_args, _pre_sem,
                                     tool_call_id=str(tc_j.get("id") or ""),
                                     tool_stop=_tool_stop, check_steer=True,
+                                    emit_started_round=round_idx,
                                 ), tb_j)
 
                     # ── Business logic: execute tool ──
@@ -2484,8 +2502,11 @@ class AgentPipeline:
                         if not self.cancel_token.is_never or _tool_stop is not None:
                             # design/124 §8.4: race the call against a stop.
                             if _work is None:
-                                _work = self._start_tool(tool_name, tool_args,
-                                                         tool_call_id=call_id, tool_stop=_tool_stop)
+                                _work = self._start_tool(
+                                    tool_name, tool_args,
+                                    tool_call_id=call_id, tool_stop=_tool_stop,
+                                    check_steer=True, emit_started_round=round_idx,
+                                )
                                 _active_work = _work
                             _res, _why = await self._race(_work, tool_stop=_tool_stop)
                             if _why == "done":
@@ -2498,6 +2519,11 @@ class AgentPipeline:
                                 output, failed = outcome.stop_note + outcome.output, outcome.failed
                                 _stopped = True
                         else:
+                            self._emit(
+                                AgentEventType.TOOL_CALL_STARTED,
+                                ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
+                                round_index=round_idx,
+                            )
                             output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
                     except ControlledLoopStop as stop:
                         _pre[i] = (_work, tb_ctx)
