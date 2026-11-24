@@ -113,6 +113,10 @@ async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: in
     Mirrors ``SessionStore.latest_project_compact`` (``ORDER BY send_index DESC LIMIT 1``):
     keeps the highest-``send_index`` compact row and only deletes non-compact rows covered
     by THAT row's ``compact_to_send`` plus strictly older compact rows (``send_index < latest``).
+
+    The conditional ``DELETE`` re-evaluates the current committed latest compact row at delete
+    time so concurrent ``upsert_project_message`` commits under ``READ COMMITTED`` (PostgreSQL /
+    MySQL) cannot cause rows needed by a newer or rewritten compact summary to be deleted.
     """
     if limit <= 0:
         return 0
@@ -123,7 +127,7 @@ async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: in
         sub_params.append(session_id)
     tbl = store.t.project_messages
     rows = await tx.fetchall(
-        f"SELECT p.id FROM {tbl} p "
+        f"SELECT p.id, p.session_id FROM {tbl} p "
         f"JOIN ("
         f"SELECT c1.session_id, c1.send_index AS latest_compact_send, "
         f"c1.compact_to_send AS latest_compact_to "
@@ -143,8 +147,34 @@ async def _delete_superseded_projections(store, tx, *, cutoff_ms: int, limit: in
         return 0
     ids = tuple(row['id'] for row in rows)
     marks = ','.join('?' for _ in ids)
+    if store._db.dialect.name == 'mysql':
+        sids = tuple(dict.fromkeys(row['session_id'] for row in rows))
+        sid_marks = ','.join('?' for _ in sids)
+        return await tx.execute(
+            f"DELETE p FROM {tbl} p "
+            f"JOIN ("
+            f"SELECT c1.session_id, c1.send_index AS latest_compact_send, "
+            f"c1.compact_to_send AS latest_compact_to "
+            f"FROM {tbl} c1 "
+            f"JOIN (SELECT session_id, MAX(send_index) AS max_send FROM {tbl} "
+            f"WHERE kind='compact' AND session_id IN ({sid_marks}) GROUP BY session_id) m "
+            "ON m.session_id=c1.session_id AND m.max_send=c1.send_index "
+            "WHERE c1.kind='compact' AND c1.compact_to_send IS NOT NULL"
+            ") c ON c.session_id=p.session_id "
+            f"WHERE p.id IN ({marks}) AND p.created_at<? AND ("
+            "(p.kind<>'compact' AND p.send_index<=c.latest_compact_to) "
+            "OR (p.kind='compact' AND p.send_index<c.latest_compact_send))",
+            (*sids, *ids, cutoff_ms),
+        )
     return await tx.execute(
-        f"DELETE FROM {tbl} WHERE id IN ({marks}) AND created_at<?",
+        f"DELETE FROM {tbl} WHERE id IN ({marks}) AND created_at<? "
+        f"AND EXISTS (SELECT 1 FROM {tbl} c1 "
+        f"WHERE c1.session_id={tbl}.session_id "
+        "AND c1.kind='compact' AND c1.compact_to_send IS NOT NULL "
+        f"AND c1.send_index=(SELECT MAX(c2.send_index) FROM {tbl} c2 "
+        f"WHERE c2.session_id={tbl}.session_id AND c2.kind='compact') "
+        f"AND (({tbl}.kind<>'compact' AND {tbl}.send_index<=c1.compact_to_send) "
+        f"OR ({tbl}.kind='compact' AND {tbl}.send_index<c1.send_index)))",
         (*ids, cutoff_ms),
     )
 

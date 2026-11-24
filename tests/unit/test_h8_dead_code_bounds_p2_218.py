@@ -1054,3 +1054,121 @@ async def test_h8_rework2_full_pending_queue_does_not_leak_driver_ids():
         assert drv_room.session_id in worker._drivers
     finally:
         await store.close()
+
+
+# ── Rework 3 regression test (PG16 / MySQL 8.4 READ-COMMITTED concurrent race) ─
+
+
+@pytest.mark.asyncio
+async def test_h8_rework3_concurrent_compact_upsert_before_projection_delete(registry_store):
+    """Rework 3 (PG16 & MySQL 8.4 READ-COMMITTED):
+    If another connection commits a new or rewritten compact summary with a shorter
+    ``compact_to_send`` AFTER retention selects candidate projection IDs and BEFORE
+    the ``DELETE`` executes, the conditional ``DELETE`` must re-check the current
+    effective compact row and preserve all now-uncovered sends ([3, 4]).
+    """
+    from contextlib import asynccontextmanager
+
+    from power_loop.runtime.store.retention import DAY_MS
+
+    store, connect = registry_store
+    if store._db.dialect.name == "sqlite":
+        pytest.skip("two-connection READ-COMMITTED concurrency test runs on postgres and mysql")
+
+    store2 = await connect()
+    try:
+        port = RuntimeInputStore(store)
+        future_now = now_ms() + 31 * DAY_MS
+
+        async def _run_interleaved(
+            sid_hint: str,
+            initial_compact: tuple[int, int],
+            concurrent_compact: tuple[int, int],
+        ) -> None:
+            s = await target(port, sid_hint)
+            for si in range(1, 5):
+                await store.upsert_project_message(
+                    s.session_id, send_index=si, kind="project", content=f"send-{si}",
+                )
+            await store.upsert_project_message(
+                s.session_id,
+                send_index=initial_compact[0],
+                kind="compact",
+                content=f"initial-1-{initial_compact[1]}",
+                compact_to_send=initial_compact[1],
+            )
+
+            interleaved = False
+            orig_tx = store._db.transaction
+
+            @asynccontextmanager
+            async def _hooked_tx(*args, **kwargs):
+                async with orig_tx(*args, **kwargs) as tx:
+                    orig_execute = tx.execute
+
+                    async def _intercept_delete(sql, params=()):
+                        nonlocal interleaved
+                        if (
+                            not interleaved
+                            and sql.lstrip().upper().startswith("DELETE")
+                            and store.t.project_messages in sql
+                        ):
+                            interleaved = True
+                            await store2.upsert_project_message(
+                                s.session_id,
+                                send_index=concurrent_compact[0],
+                                kind="compact",
+                                content=f"concurrent-1-{concurrent_compact[1]}",
+                                compact_to_send=concurrent_compact[1],
+                            )
+                        return await orig_execute(sql, params)
+
+                    tx.execute = _intercept_delete  # type: ignore[method-assign]
+                    yield tx
+
+            store._db.transaction = _hooked_tx  # type: ignore[method-assign]
+            try:
+                page = await store.purge_expired_page(
+                    now=future_now, limit=100, categories=("projections",),
+                )
+            finally:
+                store._db.transaction = orig_tx  # type: ignore[method-assign]
+
+            assert interleaved is True
+            assert page.deleted.get("projections", 0) == 2
+
+            latest = await store.latest_project_compact(s.session_id)
+            assert latest is not None
+            assert latest.send_index == concurrent_compact[0]
+            assert latest.compact_to_send == concurrent_compact[1]
+            remaining = await store.load_project_messages(
+                s.session_id, after_send_index=latest.compact_to_send,
+            )
+            assert [r.send_index for r in remaining if r.kind == "project"] == [3, 4]
+            return s.session_id
+
+        # Probe A: sends 1..4 + compact(3, to=3); concurrent conn commits compact(4, to=2) before DELETE.
+        sid_a = await _run_interleaved("h8-r3-new-compact", (3, 3), (4, 2))
+        # Next pass cleans Probe A's now-superseded compact(3) while preserving sends [3, 4].
+        drain_a = await store.purge_expired_page(now=future_now, limit=100, categories=("projections",))
+        assert drain_a.deleted.get("projections", 0) == 1
+        rem_a = await store.load_project_messages(sid_a, after_send_index=2)
+        assert [r.send_index for r in rem_a if r.kind == "project"] == [3, 4]
+        # Probe B: sends 1..4 + compact(4, to=4); concurrent conn rewrites compact(4, to=2) before DELETE.
+        await _run_interleaved("h8-r3-rewrite-compact", (4, 4), (4, 2))
+
+        # Batch limit still strictly bounded.
+        s_lim = await target(port, "h8-r3-limit")
+        for si in range(1, 5):
+            await store.upsert_project_message(
+                s_lim.session_id, send_index=si, kind="project", content=f"lim-{si}",
+            )
+        await store.upsert_project_message(
+            s_lim.session_id, send_index=4, kind="compact", content="lim-1-4", compact_to_send=4,
+        )
+        page_lim = await store.purge_expired_page(
+            now=future_now, limit=1, categories=("projections",),
+        )
+        assert page_lim.deleted.get("projections", 0) == 1
+    finally:
+        await store2.close()
