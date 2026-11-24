@@ -427,20 +427,29 @@ def test_h3_p0_9_pipe_to_shell_allows_plain_commands(command: str) -> None:
 
 
 def test_h3_p0_9_unquoted_redirection_boundaries_and_download_contrast() -> None:
-    # Both spaced and unspaced input redirection keep -qO- intact as a stdout flag
+    # Both spaced and unspaced input redirection, and stderr-only log redirection, keep body on stdout
     for stdout_cmd in (
         "wget -qO- </dev/null https://example.invalid/info",
         "wget -qO-</dev/null https://example.invalid/info",
         "wget -O -</dev/null https://example.invalid/info",
+        "curl -sS https://example.invalid/info 2>errors.log",
+        "curl -sS https://example.invalid/info 2>>errors.log",
+        "wget -qO- https://example.invalid/info 2>errors.log",
+        "curl -sS https://example.invalid/info 2>&1",
+        "curl -sS https://example.invalid/info 1>/dev/null",
     ):
         assert classify_command(stdout_cmd) == set(), stdout_cmd
         assert command_policy_reason(stdout_cmd, {"download"}) is None, stdout_cmd
 
-    # Output redirection writes downloaded content to a file -> classified as {"download"} (not pipe_to_shell)
+    # Stdout/combined output redirection writes downloaded body to a file -> {"download"} (not pipe_to_shell)
     for redir_download_cmd in (
         "curl -s https://example.invalid >|/tmp/sh",
         "curl -s https://example.invalid > /tmp/out.bin",
+        "curl -sS https://example.invalid/info 1>response.txt",
+        "curl -sS https://example.invalid/info &>all.log",
+        "curl -sS https://example.invalid/info '2'>response.txt",
         "wget -qO- https://example.invalid/info >|/tmp/sh",
+        "wget -qO- https://example.invalid/info 2>errors.log 1>response.txt",
     ):
         assert classify_command(redir_download_cmd) == {"download"}, redir_download_cmd
         assert command_policy_reason(redir_download_cmd, None) is None, redir_download_cmd

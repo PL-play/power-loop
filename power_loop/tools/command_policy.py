@@ -78,7 +78,7 @@ def _is_interpreter(prog: str) -> bool:
 _REDIR_THREE = {"<<<", "&>>", "<<-"}
 _REDIR_TWO = {">>", "<<", "<>", ">|", ">&", "<&", "&>"}
 _REDIR_ONE = {"<", ">"}
-_FILE_OUTPUT_REDIRS = {">", ">>", ">|", "&>", "&>>"}
+_STDOUT_FILE_REDIRS = {">", ">>", ">|", "1>", "1>>", "1>|", "&>", "&>>"}
 
 
 def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
@@ -86,15 +86,29 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     buf: list[str] = []
     in_word = False
+    word_quoted = False
     i = 0
     n = len(command)
 
     def flush() -> None:
-        nonlocal in_word
+        nonlocal in_word, word_quoted
         if in_word:
             out.append(("".join(buf), "word"))
             buf.clear()
             in_word = False
+            word_quoted = False
+
+    def emit_redir(op: str) -> None:
+        nonlocal in_word, word_quoted
+        if in_word and not word_quoted and not op.startswith("&") and all("0" <= c <= "9" for c in buf):
+            fd = "".join(buf)
+            buf.clear()
+            in_word = False
+            word_quoted = False
+            out.append((fd + op, "redir"))
+        else:
+            flush()
+            out.append((op, "redir"))
 
     while i < n:
         ch = command[i]
@@ -104,6 +118,7 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
             continue
         if ch == "'":
             in_word = True
+            word_quoted = True
             i += 1
             while i < n and command[i] != "'":
                 buf.append(command[i])
@@ -113,6 +128,7 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
             continue
         if ch == '"':
             in_word = True
+            word_quoted = True
             i += 1
             while i < n and command[i] != '"':
                 if command[i] == "\\" and i + 1 < n and command[i + 1] in {'"', "\\", "$", "`", "\n"}:
@@ -129,28 +145,27 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
             if i + 1 < n:
                 if command[i + 1] != "\n":
                     in_word = True
+                    word_quoted = True
                     buf.append(command[i + 1])
                 i += 2
             else:
                 in_word = True
+                word_quoted = True
                 buf.append(ch)
                 i += 1
             continue
         three = command[i : i + 3]
         if three in _REDIR_THREE:
-            flush()
-            out.append((three, "redir"))
+            emit_redir(three)
             i += 3
             continue
         two = command[i : i + 2]
         if two in _REDIR_TWO:
-            flush()
-            out.append((two, "redir"))
+            emit_redir(two)
             i += 2
             continue
         if ch in _REDIR_ONE:
-            flush()
-            out.append((ch, "redir"))
+            emit_redir(ch)
             i += 1
             continue
         if len(two) == 2 and two in _OPERATORS:
@@ -172,7 +187,7 @@ def _lex_shell_tokens(command: str) -> list[tuple[str, str]]:
 
 def _has_file_output_redirect(seg_tokens: list[tuple[str, str]]) -> bool:
     for idx, (tok, kind) in enumerate(seg_tokens):
-        if kind != "redir" or tok not in _FILE_OUTPUT_REDIRS:
+        if kind != "redir" or tok not in _STDOUT_FILE_REDIRS:
             continue
         target = seg_tokens[idx + 1][0] if idx + 1 < len(seg_tokens) and seg_tokens[idx + 1][1] == "word" else ""
         if target != "/dev/null":
