@@ -506,8 +506,12 @@ async def test_h3_p0_10_schedule_wakeup_via_tool_registry_invoke_async_omitting_
         boot_id="h3-boot",
         actor=actor,
     )
+    async def _ensure_store():
+        return store
+
     fake_loop = SimpleNamespace(
         store=store,
+        _ensure_store=_ensure_store,
         config=AgentLoopConfig(),
         timer_backend=StoreTimerBackend(store),
     )

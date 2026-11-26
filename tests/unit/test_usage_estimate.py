@@ -120,9 +120,9 @@ async def _run(runtime_agent, plan: list[Any], *, attempts: int = 1) -> tuple[An
 
 @pytest.mark.asyncio
 async def test_failed_attempt_is_estimated_and_counted_in_run_totals(runtime_agent) -> None:
-    res, events = await _run(runtime_agent, [("stream_then_fail", "写到一半" * 30)], attempts=2)
+    res, events = await _run(runtime_agent, [("stream_then_fail", "写到一半" * 30)], attempts=1)
     assert res.status == "failed"
-    assert len(events) == 1  # unknown external action is not automatically replayed
+    assert len(events) == 1
     failed = events[0]
     assert failed["success"] is False and failed["estimated"] is True
     assert failed["outcome"] == "error"

@@ -41,7 +41,7 @@ async def tool_actor(loop):
     return binding, actor
 
 
-async def create(loop, spec, task):
+async def create(loop, spec, task, *, on_created=None):
     from power_loop.core.agent_context import get_effective_tools
 
     from .execution_roles import require_orchestration, role_tools
@@ -85,6 +85,8 @@ async def create(loop, spec, task):
         cancel_propagation="linked" if spec.lifecycle == "linked" else "independent",
         require_assistant_call=host is None,
     )
+    if on_created is not None:
+        on_created(target, int(config.max_rounds))
     await loop._runtime_worker.runtime.client._notify(
         target, start.message_id, start, ["work", "activation"]
     )

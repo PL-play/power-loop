@@ -19,7 +19,7 @@ from tests.runtime_fixture import RunningAgent
 from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
 from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
-from ._change_signal_crash_worker import write
+from ._change_signal_crash_worker import prepare_background_batch, serialize_batch, write
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -29,24 +29,44 @@ async def versions(store, sid):
     return tuple(row[column] for column in COLUMNS)
 
 
+def expected_versions(kind: str, *, committed: bool) -> tuple[int, int, int]:
+    if not committed:
+        return (0, 0, 0)
+    # Schema 18 routes background child completions via River into the parent's follow_up_queue
+    # and bumps parent.inbox_version in the same _final_tx transaction (background_version is unused).
+    if kind in ("inbox", "background"):
+        return (1, 0, 0)
+    return (0, 0, 1)
+
+
 async def payload(store, sid, kind):
     if kind == "inbox":
-        return await store.inbox_items(sid)
+        return await store._db.fetchall(
+            f"SELECT item_id,kind,content_json FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='user'", (sid,)
+        )
     if kind == "background":
-        return await store.list_unseen_background_updates(sid)
+        return await store._db.fetchall(
+            f"SELECT item_id,kind,content_json FROM {store.t.follow_up_queue} "
+            "WHERE session_id=? AND kind='background_result'",
+            (sid,),
+        )
     return await store.get_runtime_state(sid, "todo")
 
 
 @pytest.mark.parametrize("kind", ["inbox", "background", "runtime"])
 @pytest.mark.parametrize("stage", ["after_signal", "before_commit"])
 async def test_process_death_rolls_back_signal_and_payload_together(registry_store, tmp_path, kind, stage):
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
     store, connect = registry_store
     sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
+    batch = await prepare_background_batch(store, sid) if kind == "background" else None
     backend = store._db.dialect.name
     dsn = str(tmp_path / "registry.db") if backend == "sqlite" else os.environ[
         "POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
+    extra_args = [serialize_batch(batch)] if batch is not None else []
     process = await asyncio.create_subprocess_exec(sys.executable, "-m", "tests.unit._change_signal_crash_worker",
-        dsn, store.table_prefix, sid, kind, stage, cwd=Path(__file__).resolve().parents[2],
+        dsn, store.table_prefix, sid, kind, stage, *extra_args, cwd=Path(__file__).resolve().parents[2],
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     try:
         output, _ = await asyncio.wait_for(process.communicate(), 30)
@@ -58,35 +78,67 @@ async def test_process_death_rolls_back_signal_and_payload_together(registry_sto
     cold = await connect(schema="verify")
     assert await versions(cold, sid) == (0, 0, 0)
     assert not await payload(cold, sid, kind)
-    await write(cold, sid, kind)
-    expected = tuple(int(column == kind + "_version") for column in COLUMNS)
-    assert await versions(cold, sid) == expected
-    assert await payload(cold, sid, kind)
+    if batch is not None:
+        cold_port = RuntimeInputStore(cold)
+        assert await cold_port.get_result(batch.input_refs[0], actor=STORE_ACTOR) is None
+        child_row = await cold._db.fetchone(
+            f"SELECT execution_state FROM {cold.t.sessions} WHERE session_id=?", (batch.target.session_id,)
+        )
+        assert child_row["execution_state"] == "running"
+    await write(cold, sid, kind, batch=batch)
+    assert await versions(cold, sid) == expected_versions(kind, committed=True)
+    written = await payload(cold, sid, kind)
+    assert written
+    if batch is not None:
+        assert "once" in written[0]["content_json"]
+        res = await RuntimeInputStore(cold).get_result(batch.input_refs[0], actor=STORE_ACTOR)
+        assert res is not None and res.status == "completed" and res.final_text == "once"
 
 
 @pytest.mark.parametrize("kind", ["inbox", "background", "runtime"])
 @pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
 async def test_signal_and_payload_share_failed_or_unknown_commit(registry_store, monkeypatch, kind, fault):
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import StoreError
+
     store, connect = registry_store
     sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
+    batch = await prepare_background_batch(store, sid) if kind == "background" else None
     transaction = store._db.transaction
+    injected: list[str] = []
 
     @asynccontextmanager
     async def fail():
         async with transaction() as tx:
             yield tx
             if fault == "rollback":
+                injected.append("before_commit")
                 raise OSError("before_commit")
+        injected.append("committed_ack_lost")
         raise OSError("committed_ack_lost")
 
     with monkeypatch.context() as patch:
         patch.setattr(store._db, "transaction", fail)
-        with pytest.raises(OSError, match="before_commit|committed_ack_lost"):
-            await write(store, sid, kind)
+        if kind == "background" and fault == "ack_loss":
+            # RuntimeInputStore.final reconciles post-commit ACK loss via _final_after_unknown.
+            reconciled = await write(store, sid, kind, batch=batch)
+            assert reconciled is not None and reconciled.results[0].status == "completed"
+        else:
+            with pytest.raises((OSError, StoreError)):
+                await write(store, sid, kind, batch=batch)
+    assert injected == ["before_commit" if fault == "rollback" else "committed_ack_lost"]
     cold = await connect(schema="verify")
-    expected = tuple(int(fault == "ack_loss" and column == kind + "_version") for column in COLUMNS)
-    assert await versions(cold, sid) == expected
-    assert bool(await payload(cold, sid, kind)) == (fault == "ack_loss")
+    committed = fault == "ack_loss"
+    assert await versions(cold, sid) == expected_versions(kind, committed=committed)
+    written = await payload(cold, sid, kind)
+    assert bool(written) == committed
+    if batch is not None:
+        res = await RuntimeInputStore(cold).get_result(batch.input_refs[0], actor=STORE_ACTOR)
+        if committed:
+            assert "once" in written[0]["content_json"]
+            assert res is not None and res.status == "completed" and res.final_text == "once"
+        else:
+            assert res is None
 
 
 class Model(LLMService):
@@ -205,11 +257,19 @@ async def test_pass_turn_accepts_late_append_without_losing_it(registry_store, m
 
 
 async def test_concurrent_writers_advance_counter_without_losing_input(registry_store):
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import TargetRef
+
     store, connect = registry_store
     sid = await store.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     other = await connect(schema="verify")
+    ports = (RuntimeInputStore(other), RuntimeInputStore(store))
+    target = TargetRef(store.store_id, sid)
     await asyncio.wait_for(asyncio.gather(*(
-        (store if number % 2 else other).inbox_put(sid, [{"item_id": str(number), "content": str(number)}])
+        ports[number % 2].accept(target, str(number), message_id=str(number), actor=STORE_ACTOR)
         for number in range(8))), 10)
     assert await versions(store, sid) == (8, 0, 0)
-    assert {row["item_id"] for row in await store.inbox_items(sid)} == {str(number) for number in range(8)}
+    rows = await store._db.fetchall(
+        f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=?", (sid,)
+    )
+    assert {row["item_id"] for row in rows} == {str(number) for number in range(8)}

@@ -52,22 +52,86 @@ async def test_sessions_and_children_release_execution_memory(runtime_agent, rec
     assert not any(ref() is not None for ref in loops), live_counts
 
 
-async def test_cancelled_waiter_does_not_split_the_session_lock(tmp_path):
-    from power_loop import SessionStore
-    from tests.unit.test_loop_resume_cache import _cache_loop
-    store = await SessionStore.open(str(tmp_path/'locks.db'))
-    loop = _cache_loop(store)
-    async def waiter():
-        async with loop._session_guard('memory-race'):
-            raise AssertionError('cancelled waiter must not enter')
+async def test_cancelled_waiter_does_not_split_the_session_lock(tmp_path, monkeypatch):
+    from power_loop import RegistryRuntimeFactory, Runtime, SessionStore
+    from power_loop.agent.stateful_loop import _ExecutionLoop
+
+    sid = 'memory-race'
+    store = await SessionStore.open(str(tmp_path / 'locks.db'))
+    runtime = Runtime(
+        store=store,
+        factory=RegistryRuntimeFactory(),
+        node_id='lock-node',
+        boot_id='lock-boot',
+        recovery_interval_s=None,
+        timers_enabled=False,
+    )
+    worker = runtime.worker
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+    later_entered = asyncio.Event()
+    release_later = asyncio.Event()
+    entered: list[str] = []
+    active_inside = 0
+    peak_inside = 0
+
+    async def fake_run_session_owned(target_sid, *, preclaimed_batch=None):
+        nonlocal active_inside, peak_inside
+        assert target_sid == sid
+        tag = str(preclaimed_batch)
+        active_inside += 1
+        peak_inside = max(peak_inside, active_inside)
+        entered.append(tag)
+        try:
+            if tag == 'holder':
+                holder_entered.set()
+                await release_holder.wait()
+            elif tag == 'later':
+                later_entered.set()
+                await release_later.wait()
+        finally:
+            active_inside -= 1
+
+    monkeypatch.setattr(worker, '_run_session_owned', fake_run_session_owned)
+    holder = waiter = later = None
     try:
-        async with loop._session_guard('memory-race'):
-            waiting = asyncio.create_task(waiter())
-            await asyncio.sleep(0)
-            waiting.cancel()
-            await asyncio.gather(waiting, return_exceptions=True)
-            assert loop._session_busy('memory-race')
-        assert 'memory-race' not in _SESSION_SYNC and not loop._sync_sids
+        holder = asyncio.create_task(worker._run_one_session(sid, preclaimed_batch='holder'))
+        await asyncio.wait_for(holder_entered.wait(), 5)
+
+        waiter = asyncio.create_task(worker._run_one_session(sid, preclaimed_batch='waiter'))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert 'waiter' not in entered
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert 'waiter' not in entered
+        assert _ExecutionLoop._session_busy(sid) and sid in _SESSION_SYNC
+
+        # Cancelling the waiter must not split or release the lock while the holder is active.
+        later = asyncio.create_task(worker._run_one_session(sid, preclaimed_batch='later'))
+        await asyncio.sleep(0.02)
+        assert not later_entered.is_set()
+        assert entered == ['holder'] and peak_inside == 1
+
+        release_holder.set()
+        await asyncio.wait_for(holder, 5)
+
+        await asyncio.wait_for(later_entered.wait(), 5)
+        release_later.set()
+        await asyncio.wait_for(later, 5)
+
+        assert entered == ['holder', 'later']
+        assert peak_inside == 1
+        assert sid not in _SESSION_SYNC
     finally:
-        await loop.aclose()
+        release_holder.set()
+        release_later.set()
+        for task in (holder, waiter, later):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(t for t in (holder, waiter, later) if t is not None), return_exceptions=True)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
         await store.close()

@@ -59,7 +59,7 @@ async def test_child_factory_is_applied_before_admission_and_on_worker(store,mod
     try:
         result=await runner.send('delegate')
         assert result.status=='completed'
-        children=await store._db.fetchall(f"SELECT session_id FROM {store.table_prefix}jobs WHERE kind='subagent'")
+        children=await store.list_children(runner.target.session_id)
         requests=[r for r in model.seen if r.system_prompt.startswith('p')]
         if mode in {'bad_type','exception'}:
             assert not children and not requests

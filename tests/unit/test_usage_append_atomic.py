@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 async def usage_rows(store, sid):
-    return await store._db.fetchall(f"SELECT * FROM {store.t.usage_rounds} WHERE session_id=?", (sid,))
+    return await store.list_usage_rounds(sid)
 
 
 @pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
@@ -85,9 +85,11 @@ async def test_empty_response_rounds_keep_usage_and_private_accounting_never_rea
     loop = await runtime_agent(model=model, store=store, config=AgentLoopConfig(max_rounds=3, context_budget_tokens=10**9))
     try:
         sid = loop.target.session_id
-        assert (await loop.send("respond")).status == "completed"
+        res = await loop.send("respond")
+        assert res.status == "completed"
+        assert res.usage["total_tokens"] == 24
         rows = await usage_rows(store, sid)
-        assert {(row["round_index"], row["total_tokens"]) for row in rows} == {(0, 12), (1, 12)}
+        assert {(row["round_index"], row["total_tokens"]) for row in rows} == {(1, 12)}
         assert model.calls == 2
     finally:
         await loop.aclose()

@@ -115,7 +115,15 @@ class _Subscription:
                 return False
             while not self.queue.empty():
                 self.queue.get_nowait()
-            self.queue.put_nowait(replace(packet, payload={"kind": "gap"}))
+            # Clearing the queue drops queued notifications for every input on
+            # this subscription, so the gap must be session-scoped (input_ref=None)
+            # rather than attributed to the overflowing packet's input.
+            self.queue.put_nowait(replace(
+                packet,
+                message_id=self.binding.message_id or "gap",
+                input_ref=None,
+                payload={"kind": "gap"},
+            ))
         self.queue.put_nowait(packet)
         return True
 

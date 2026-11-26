@@ -1302,6 +1302,53 @@ async def test_b5_inprocess_wake0_receipt_does_not_wake_driver_waiter_after_fina
         port.unregister_driver_waiter(drv_sid)
 
 
+async def test_undeliverable_result_callback_preserves_rounds_consistent_with_final_and_get_result(registry_store):
+    """D3: final(), get_result(), and on_result_undeliverable report identical rounds (including replay)."""
+    from power_loop.agent.runtime_store import RuntimeInputStore
+
+    from .session_native_fixture import ACTOR
+
+    store, _ = registry_store
+    callbacks: list[tuple[str, str, dict, str]] = []
+
+    async def on_undeliv(child_sid: str, parent_sid: str, result_dict: dict, reason: str):
+        callbacks.append((child_sid, parent_sid, result_dict, reason))
+
+    port = RuntimeInputStore(store, on_result_undeliverable=on_undeliv)
+    _, drv_batch, (leaf_batch,) = await _setup_driver_and_leaf(port, "d3-undeliv-rounds")
+    await port.set_lifecycle(drv_batch.target, "closed", actor=ACTOR, inflight="abort", subtree="none")
+
+    fin = await port.final(leaf_batch, status="completed", final_text="ok", rounds=2)
+    stored = await port.get_result(leaf_batch.input_refs[0], actor=ACTOR)
+
+    assert fin.result_delivery_error == "session_closed"
+    assert fin.results[0].rounds == 2
+    assert stored is not None and stored.rounds == 2
+    assert len(callbacks) == 1
+    cb_child, cb_parent, cb_result, cb_reason = callbacks[0]
+    assert cb_child == leaf_batch.target.session_id
+    assert cb_parent == drv_batch.target.session_id
+    assert cb_reason == "session_closed"
+    assert cb_result["rounds"] == 2
+
+    # Also verify _route_stored_result_tx reconstructs delivery Result with rounds=2 from stored metadata.
+    routed_results = []
+    orig_river = port._river_deliver_tx
+
+    async def _capture_river(tx, **kwargs):
+        routed_results.append(kwargs["result"])
+        return await orig_river(tx, **kwargs)
+
+    port._river_deliver_tx = _capture_river  # type: ignore[method-assign]
+    try:
+        repeat_receipt = await port.cancel(leaf_batch.input_refs[0], actor=ACTOR)
+    finally:
+        port._river_deliver_tx = orig_river  # type: ignore[method-assign]
+    assert repeat_receipt.state == "already_finished"
+    assert len(routed_results) == 1
+    assert routed_results[0].rounds == 2
+
+
 async def test_b6_independent_driver_cascade_only_for_cancel_subtree_not_lifecycle_linked(registry_store):
     """B6: Identical tree compares set_lifecycle(subtree='linked') vs cancel(scope='subtree')."""
     from dataclasses import replace

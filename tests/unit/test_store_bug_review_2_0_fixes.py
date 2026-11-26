@@ -22,7 +22,6 @@ from power_loop.runtime.store.schema import (
     validate_table_prefix,
 )
 from power_loop.runtime.store.store import SessionStore
-from power_loop.runtime.store.types import SubagentLifecycle
 from tests.unit.session_native_fixture import ACTOR as STORE_ACTOR
 from tests.unit.session_native_fixture import DESCRIPTOR as STORE_DESCRIPTOR
 
@@ -61,10 +60,13 @@ async def test_timer_and_note_ids_sequential_under_lock_state():
 
 
 async def test_note_without_session_state_row_is_tolerated():
-    """Legacy allowed notes for a session id with no session_state row; the new per-session
-    lock (lock_state) must not turn that into a hard ValueError."""
+    """Schema 18 enforces session existence: add_note locks the session row and rejects
+    unknown session ids explicitly instead of writing orphan notes."""
     s = await SessionStore.open(":memory:")
-    n = await s.add_note("sess_never_created", "orphan")  # no create_session
+    with pytest.raises(ValueError, match="unknown session"):
+        await s.add_note("sess_never_created", "orphan")  # no create_session
+    sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="sess_created")
+    n = await s.add_note(sid, "valid")
     assert n.note_id == 1
     await s.close()
 
@@ -78,12 +80,11 @@ async def test_provisioning_ddl_stamp_is_idempotent_sqlite():
     assert "ON CONFLICT" in ddl[-1].upper()  # not a plain INSERT
     for stmt in ddl:
         await db.execute(stmt)
-    identity = await db.fetchone("SELECT store_id FROM pl_task_store WHERE id=1")
+    identity = await db.fetchone("SELECT store_id FROM pl_schema_migrations WHERE id=1")
     for _ in range(2):
-        for stmt in ddl[-2:]:  # Identity/version stamps are idempotent.
-            await db.execute(stmt)
+        await db.execute(ddl[-1])  # Identity/version stamp is idempotent.
         await ensure_schema(db, "pl_", policy=SchemaPolicy.VERIFY)
-    assert await db.fetchone("SELECT store_id FROM pl_task_store WHERE id=1") == identity
+    assert await db.fetchone("SELECT store_id FROM pl_schema_migrations WHERE id=1") == identity
     row = await db.fetchone("SELECT COUNT(*) AS c FROM pl_schema_migrations")
     assert row["c"] == 1
     await db.close()
@@ -121,12 +122,12 @@ async def test_verify_detects_dropped_data_table(tmp_path):
     s = await SessionStore.open(path, schema=SchemaPolicy.AUTO_CREATE)
     await s.close()
     raw = SqliteDatabase.open(path)
-    await raw.execute("DROP TABLE pl_timers")
+    await raw.execute("DROP TABLE pl_follow_up_queue")
     await raw.close()
     with pytest.raises(StoreSchemaError) as ei:
         await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
     msg = str(ei.value)
-    assert "timers" in msg and "incomplete" in msg
+    assert "follow_up_queue" in msg and "incomplete" in msg
 
 
 # ── G15: VERIFY surfaces a real read error instead of 'not initialized' ──────
@@ -243,16 +244,16 @@ async def test_close_session_tree_returns_linked_subtree_ids():
     s = await SessionStore.open(":memory:")
     p = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
     c1 = await s.create_session(
-        session_id="c1", parent_session_id="p", lifecycle=SubagentLifecycle.LINKED
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="c1", parent_session_id="p", cancel_propagation="linked"
     )
     gc = await s.create_session(
-        session_id="gc", parent_session_id="c1", lifecycle=SubagentLifecycle.LINKED
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="gc", parent_session_id="c1", cancel_propagation="linked"
     )
     det = await s.create_session(
-        session_id="det", parent_session_id="p", lifecycle=SubagentLifecycle.DETACHED
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="det", parent_session_id="p", cancel_propagation="independent"
     )
     deleted = await s.close_session_tree("p", cascade=True)
-    # parent + LINKED descendants are deleted (and returned); DETACHED is re-parented, not.
+    # parent + linked descendants are deleted (and returned); independent is re-parented, not.
     assert set(deleted) == {p, c1, gc}
     assert det not in deleted
     assert await s.get_session("det") is not None  # survived, re-parented
@@ -264,7 +265,7 @@ async def test_close_session_count_unchanged_by_id_collection():
     s = await SessionStore.open(":memory:")
     await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="p")
     await s.create_session(
-        session_id="c1", parent_session_id="p", lifecycle=SubagentLifecycle.LINKED
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="c1", parent_session_id="p", cancel_propagation="linked"
     )
     n = await s.close_session("p", cascade=True)  # still returns an int count
     assert n == 2
@@ -321,10 +322,10 @@ async def test_close_session_no_cascade_keeps_children_and_reparents():
     s = await SessionStore.open(":memory:")
     await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="driver")
     await s.create_session(
-        session_id="leaf1", parent_session_id="driver", lifecycle=SubagentLifecycle.LINKED
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="leaf1", parent_session_id="driver", cancel_propagation="linked"
     )
     await s.create_session(
-        session_id="leaf2", parent_session_id="driver", lifecycle=SubagentLifecycle.LINKED
+        STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="leaf2", parent_session_id="driver", cancel_propagation="linked"
     )
     await s.append_message("leaf1", role="assistant", content="finding A")
 

@@ -434,10 +434,18 @@ async def test_real_crash_after_child_creation_recovers_deterministic_refs(regis
         repair = await _worker_command(c, {"action": "read_repair"})
         assert repair["content"]["creation_result_uncertain"] is True
         assert repair["content"]["input_ref"] == receipt["input_ref"]
-        original = await port.get_result(
-            InputRef(store.store_id, parent.session_id, "parent-start"), actor=ACTOR,
-        )
-        assert original.status == "interrupted"
+        parent_start_ref = InputRef(store.store_id, parent.session_id, "parent-start")
+        original = await _worker_command(c, {
+            "action": "wait",
+            "input_ref": {
+                "store_id": parent_start_ref.store_id,
+                "session_id": parent_start_ref.session_id,
+                "message_id": parent_start_ref.message_id,
+            },
+        })
+        assert original["status"] == "interrupted"
+        persisted = await port.get_result(parent_start_ref, actor=ACTOR)
+        assert persisted is not None and persisted.status == "interrupted"
         after = await _worker_command(c, {
             "action": "send", "body": "after repair", "message_id": "after-repair",
         })
@@ -447,3 +455,179 @@ async def test_real_crash_after_child_creation_recovers_deterministic_refs(regis
             if process.returncode is None:
                 process.kill()
             await process.wait()
+
+
+async def test_crash_recovery_repair_visible_before_interrupted_final_waits_cleanly(
+    registry_store, monkeypatch,
+):
+    """D6: Deterministically pin the window between reclaim_running (Tx 1: repair message visible)
+    and final(status='interrupted') (Tx 2: parent-start terminal status visible).
+    Verify get_result is None in that window while client.wait observes interrupted cleanly
+    once Tx 2 commits, and a subsequent send completes.
+    """
+    from power_loop import ExecutionEnvironment, RegistryRuntimeFactory, Runtime
+    from power_loop.runtime.message_ref import MessageRef
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    parent = await port.create_session(DESCRIPTOR, actor=ACTOR, options={"session_id": "sync-crash-parent"})
+    parent_actor = TrustedActor("tenant", "host", parent.session_id)
+
+    # Simulate parent-start claimed by a crashed worker after writing assistant(tool_calls=[spawn])
+    # and creating the deterministic child session, before writing any tool result or calling final().
+    parent_start = (await port.accept(parent, "delegate", message_id="parent-start", actor=ACTOR)).input_ref
+    batch = await port.claim(parent, node_id="dead-crash", boot_id="dead-crash", ttl_s=1.0)
+    assert batch is not None
+    asst_seq = await store.append_message(
+        parent.session_id,
+        role="assistant",
+        content="",
+        tool_calls=[{
+            "id": "spawn",
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "arguments": json.dumps({"task": "compute", "system_prompt": "CHILD", "tools": []}),
+            },
+        }],
+        round_index=0,
+        send_index=batch.send_index,
+    )
+    call_ref = await store.message_ref(parent.session_id, asst_seq)
+    assert isinstance(call_ref, MessageRef)
+    child_desc = DESCRIPTOR
+    from dataclasses import replace as dc_replace
+    child_desc = dc_replace(
+        DESCRIPTOR,
+        config={**DESCRIPTOR.config, "child_spec": {"name": "child", "system_prompt": "CHILD", "tools": []}},
+    )
+    child_target, child_start, _ = await port.create_child(
+        child_desc,
+        parent=parent,
+        actor=parent_actor,
+        call_ref=call_ref,
+        tool_call_id="spawn",
+        body="compute",
+        cancel_propagation="linked",
+    )
+    # Expire the crashed worker's lease so worker C will reclaim it.
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
+        (parent.session_id,),
+    )
+
+    # Worker B executes the child session and completes on the original child InputRef.
+    b_factory = RegistryRuntimeFactory()
+
+    async def _build_child(_d, _c):
+        return ExecutionEnvironment(
+            ParentAndChild(), ToolRegistry(),
+            AgentLoopConfig(system_prompt="CHILD", context_budget_tokens=10**9),
+        )
+
+    b_factory.register(
+        "test.agent@215", _build_child,
+        can_execute=lambda d: "child_spec" in d.config,
+    )
+    rt_b = Runtime(
+        store=store, factory=b_factory, node_id="sync-B", boot_id="sync-B",
+        recovery_interval_s=3600.0, session_lease_ttl_s=5.0, timers_enabled=False, capacity=2,
+    )
+    await rt_b.worker.start()
+    try:
+        await rt_b.worker.periodic_tick()
+        child_res = await rt_b.client.wait(child_start, actor=ACTOR, deadline_ms=now_ms() + 10000)
+        assert child_res.status == "completed" and child_res.final_text == "child result"
+    finally:
+        await rt_b.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt_b.client.aclose()
+        await rt_b.transport.aclose()
+
+    # Worker C reclaims the crashed parent; pause strictly between Tx 1 (reclaim_running commit)
+    # and Tx 2 (final(status='interrupted') commit).
+    c_factory = RegistryRuntimeFactory()
+
+    async def _build_parent(_d, _c):
+        model = ParentAndChild()
+        model.spawned = True
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    c_factory.register(
+        "test.agent@215", _build_parent,
+        can_execute=lambda d: "child_spec" not in d.config,
+    )
+    rt_c = Runtime(
+        store=store, factory=c_factory, node_id="sync-C", boot_id="sync-C",
+        recovery_interval_s=3600.0, session_lease_ttl_s=5.0, timers_enabled=False, capacity=2,
+    )
+    between_tx1_and_tx2 = asyncio.Event()
+    allow_tx2 = asyncio.Event()
+    orig_final = rt_c.worker.inputs.final
+
+    async def _pause_before_interrupted_final(final_batch_arg, *args, **kwargs):
+        if (
+            final_batch_arg.target.session_id == parent.session_id
+            and kwargs.get("status") == "interrupted"
+            and not between_tx1_and_tx2.is_set()
+        ):
+            between_tx1_and_tx2.set()
+            await asyncio.wait_for(allow_tx2.wait(), 10)
+        return await orig_final(final_batch_arg, *args, **kwargs)
+
+    monkeypatch.setattr(rt_c.worker.inputs, "final", _pause_before_interrupted_final)
+    await rt_c.worker.start()
+    try:
+        tick_task = asyncio.create_task(rt_c.worker.periodic_tick())
+        await asyncio.wait_for(between_tx1_and_tx2.wait(), 10)
+
+        # Timepoint 1 (Tx 1 committed, Tx 2 not yet run): repair row is already readable with
+        # the deterministic child InputRef, while parent-start get_result is still None.
+        repair_rows = await store._db.fetchall(
+            f"SELECT content,meta_json FROM {store.t.messages} "
+            "WHERE session_id=? AND role='tool' AND tool_call_id='spawn' ORDER BY seq",
+            (parent.session_id,),
+        )
+        assert len(repair_rows) == 1
+        repair_content = json.loads(repair_rows[0]["content"])
+        assert repair_content["creation_result_uncertain"] is True
+        assert InputRef(**repair_content["input_ref"]) == child_start
+        assert TargetRef(**repair_content["target_ref"]) == child_target
+        assert await port.get_result(parent_start, actor=ACTOR) is None
+
+        # Start waiting via the existing client.wait entry point while still in the window,
+        # synchronize until client.wait has subscribed and observed the pre-Tx-2 state, then
+        # release Tx 2 and confirm parent-start transitions cleanly to interrupted.
+        wait_subscribed = asyncio.Event()
+        orig_subscribe_output = rt_c.client.subscribe_output
+
+        async def _notify_subscribed(*args, **kwargs):
+            output = await orig_subscribe_output(*args, **kwargs)
+            wait_subscribed.set()
+            return output
+
+        monkeypatch.setattr(rt_c.client, "subscribe_output", _notify_subscribed)
+        wait_task = asyncio.create_task(
+            rt_c.client.wait(parent_start, actor=ACTOR, deadline_ms=now_ms() + 10000),
+        )
+        await asyncio.wait_for(wait_subscribed.wait(), 10)
+        assert not wait_task.done()
+        allow_tx2.set()
+        await asyncio.wait_for(tick_task, 10)
+        original = await asyncio.wait_for(wait_task, 10)
+        assert original.status == "interrupted"
+        persisted = await port.get_result(parent_start, actor=ACTOR)
+        assert persisted is not None and persisted.status == "interrupted"
+
+        # Subsequent new input on the repaired parent session completes normally.
+        after_receipt = await rt_c.client.send(
+            parent, "after repair", message_id="after-repair", actor=ACTOR,
+        )
+        after = await rt_c.client.wait(
+            after_receipt.input_ref, actor=ACTOR, deadline_ms=now_ms() + 10000,
+        )
+        assert after.status == "completed"
+    finally:
+        allow_tx2.set()
+        await rt_c.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt_c.client.aclose()
+        await rt_c.transport.aclose()

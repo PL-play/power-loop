@@ -983,7 +983,7 @@ async def test_h8_rework2_full_pending_queue_does_not_leak_driver_ids():
         orig_expired = worker.inputs.discover_expired_leases
         orig_recover = worker.inputs.recover
 
-        async def _no_queued(limit=32):
+        async def _no_queued(limit=32, *, after_session_id=None, _with_kind=False):
             return []
 
         worker.inputs.discover_queued = _no_queued  # type: ignore[method-assign]

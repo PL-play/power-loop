@@ -104,6 +104,8 @@ def _category(chain, sql=""):
         "select pg_try_advisory_lock($1)", "select get_lock(%s,0)",
     }:
         return "session_control"
+    if "runtime.store.process_guard:release" in chain and normalized == "select release_lock(%s)":
+        return "session_control"
     if "runtime.store.process_guard:check" in chain and normalized == "select 1":
         return "periodic" if "agent.runtime_worker:_watch_guard" in chain else "session_control"
     if "agent.runtime_store:poll_notifications" in chain and re.match(r"\s*select\b", normalized):
@@ -587,9 +589,8 @@ async def test_m1a_tool_round_zero_control_sql(registry_store, tools_per_round):
 
 
 async def test_m1a_periodic_node_sql_profile(registry_store):
-    """Design 217 M1a node periodic tick: batch_renew + discover_queued(32) + sweep_expired_leases(32) == 3/3/4."""
+    """Design 217 M1a idle node periodic tick: batch_renew + discover_queued(32) + sweep_expired_leases(32) == 3/3/3."""
     store, _ = registry_store
-    db = store._db.dialect.name
     original = store._db
     profiled = Profiled(original)
     store._db = profiled
@@ -600,8 +601,7 @@ async def test_m1a_periodic_node_sql_profile(registry_store):
         profiled.tx_sites.clear()
         profiled.transactions = 0
         await agent.runtime.worker.periodic_tick(limit=32)
-        expected = 4 if db == "mysql" else 3
-        assert len(profiled.records) == expected, [r["sql"] for r in profiled.records]
+        assert len(profiled.records) == 3, [r["sql"] for r in profiled.records]
     finally:
         await agent.aclose()
         store._db = original

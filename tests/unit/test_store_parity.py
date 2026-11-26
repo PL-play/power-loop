@@ -140,17 +140,68 @@ async def scn_runtime_shared(st: Any) -> list[Any]:
 
 
 async def scn_bgtasks(st: Any) -> list[Any]:
+    """Schema 18 background tasks execute as durable child sessions (kind='background')
+    and deliver completion via River into parent.follow_up_queue (kind='background_result')."""
+    import json
+
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import TargetRef, TrustedActor
+    from power_loop.runtime.background import load_record
+
     await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="s")
-    out: list[Any] = []
-    await st.upsert_background_task("s", task_id="t1", command="cmd", status="running")
-    out.append([t.task_id for t in await st.list_unseen_background_updates("s")])
-    await st.mark_background_seen("s", ["t1"])
-    out.append([t.task_id for t in await st.list_unseen_background_updates("s")])  # seen → []
-    await st.upsert_background_task("s", task_id="t1", command="cmd", status="done",
-                                    return_code=0, output_tail="ok")
-    out.append([t.task_id for t in await st.list_unseen_background_updates("s")])  # monotonic bump
-    bt = await st.get_background_task("s", "t1")
-    out.append((bt.status, bt.return_code, bt.output_tail))
+    port = RuntimeInputStore(st)
+    seq = await st.append_message("s", role="user", content="start bg")
+    call_ref = await st.message_ref("s", seq)
+    parent_actor = TrustedActor(STORE_ACTOR.tenant_id, STORE_ACTOR.principal_id, "s", call_ref, "bg1")
+    frozen = {
+        "tool": "echo",
+        "arguments": {"text": "cmd"},
+        "definition_hash": "parity-bg-hash",
+        "call_ref": call_ref.to_dict(),
+        "call_id": "bg1",
+    }
+    bg_desc = dataclasses.replace(
+        STORE_DESCRIPTOR,
+        kind="background",
+        config={**dict(STORE_DESCRIPTOR.config), "background": frozen},
+    )
+    child_target, start_ref, receipt = await port.create_child(
+        bg_desc,
+        parent=TargetRef(st.store_id, "s"),
+        actor=parent_actor,
+        call_ref=call_ref,
+        tool_call_id="bg1",
+        body=frozen,
+        result_kind="background_result",
+        require_assistant_call=False,
+    )
+    out: list[Any] = [receipt.newly_accepted]
+    children = await st.list_children("s")
+    out.append([c.session_kind for c in children])
+    before_rec = await load_record(st, "s", child_target.session_id)
+    out.append((before_rec["tool"], before_rec["args"], before_rec["status"], before_rec["result"]))
+
+    batch = await port.claim(child_target, node_id="parity-node", boot_id="parity-boot")
+    assert batch is not None
+    await port.final(batch, status="completed", final_text="ok")
+
+    after_rec = await load_record(st, "s", child_target.session_id)
+    out.append((after_rec["tool"], after_rec["args"], after_rec["status"], after_rec["result"]))
+    child_res = await port.get_result(start_ref, actor=STORE_ACTOR)
+    out.append((child_res.status, child_res.final_text))
+
+    parent_q = await st._db.fetchall(
+        f"SELECT kind,status,content_json FROM {st.t.follow_up_queue} "
+        "WHERE session_id=? AND kind='background_result'",
+        ("s",),
+    )
+    parent_row = await st._db.fetchone(
+        f"SELECT inbox_version,background_version,execution_state FROM {st.t.sessions} WHERE session_id=?",
+        ("s",),
+    )
+    body = json.loads(parent_q[0]["content_json"])
+    out.append((parent_q[0]["kind"], parent_q[0]["status"], body["status"], body["final_text"]))
+    out.append((int(parent_row["inbox_version"]), int(parent_row["background_version"]), parent_row["execution_state"]))
     return out
 
 
@@ -171,16 +222,24 @@ async def scn_cascade(st: Any) -> list[Any]:
 
 
 async def scn_export_import(st: Any) -> list[Any]:
+    """Schema 18: export_session succeeds with identical table/message payloads;
+    import_session raises capability_unavailable identically across backends."""
+    from power_loop.agent.runtime_types import RuntimeRequestError
+
     await st.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR, session_id="src")
     for i in range(3):
         await st.append_message("src", role="user", content=f"m{i}")
     await st.add_note("src", "note")
     await st.create_timer("src", due_at=1000, note="t")
     blob = await st.export_session("src")
-    new_id = await st.import_session(blob, new_session_id="restored")
-    msgs = [m.content for m in await st.load_active_messages("restored")]
-    sess = await st.get_session("restored")
-    return [new_id, sorted(blob["tables"].keys()), msgs, sess.parent_session_id, sess.kind.value]
+    msgs = [r["content"] for r in blob["tables"]["messages"]]
+    sess = await st.get_session("src")
+    import_code = None
+    try:
+        await st.import_session(blob, new_session_id="restored")
+    except RuntimeRequestError as exc:
+        import_code = exc.code
+    return [import_code, sorted(blob["tables"].keys()), msgs, sess.parent_session_id, sess.session_kind]
 
 
 async def scn_prune(st: Any) -> list[Any]:

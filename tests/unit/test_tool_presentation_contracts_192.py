@@ -164,7 +164,8 @@ def test_host_view_extension_needs_no_sdk_business_class_and_rechecks_binding():
     registered, original = registry.get('custom_view'), source('custom_view')
     assert archive_label(original, registered) == 'host view'
     assert truncate_context(registered, original, ToolContextPolicy(), raw_arguments='{}') == ('{}', 'bounded host preview')
-    registered.definition.input_schema['properties']['late'] = {'type': 'string'}
+    # H8 zero-hash identity binding: replacing the frozen definition breaks the binding.
+    object.__setattr__(registered, 'definition', replace(definition, description='late'))
     for read in [lambda: context_presentation(registered, original),
                  lambda: truncate_context(registered, original, ToolContextPolicy(), raw_arguments='{}')]:
         with pytest.raises(ToolContractError, match='binding_changed'):
@@ -197,13 +198,15 @@ async def test_alias_archive_restart_and_group_recall_preserve_originals(store):
     history, seqs = [], []
     original = source('inspect_original')
     for index in range(2):
-        for row in [
-            {'role': 'assistant', 'tool_calls': [{'id': f'call{index}', 'type': 'function',
-                'function': {'name': original.name, 'arguments': json.dumps(dict(original.arguments))}}]},
-            {'role': 'tool', 'tool_call_id': f'call{index}', 'content': original.result},
-        ]:
-            seqs.append(await store.append_message(sid, send_index=1, **row))
-            history.append(row)
+        asst_row = {'role': 'assistant', 'tool_calls': [{'id': f'call{index}', 'type': 'function',
+            'function': {'name': original.name, 'arguments': json.dumps(dict(original.arguments))}}]}
+        asst_seq = await store.append_message(sid, send_index=1, **asst_row)
+        seqs.append(asst_seq)
+        history.append(asst_row)
+        tool_row = {'role': 'tool', 'tool_call_id': f'call{index}', 'content': original.result}
+        tool_seq = await store.append_message(sid, send_index=1, meta={'_assistant_seq': asst_seq}, **tool_row)
+        seqs.append(tool_seq)
+        history.append(tool_row)
     config = ToolContextConfig(hot_tail=0, overrides={original.name: {'general': 'archive'}})
     engine = ToolContextEngine(config=config, store=store, owner_session_id=sid, owner_send_index=1,
                                llm=None, model='test', registry=registry)

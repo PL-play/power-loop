@@ -15,6 +15,7 @@ from power_loop.agent.runtime_types import (
     plain,
     sha256_canonical,
 )
+from power_loop.contracts.errors import CancellationRequested
 from power_loop.contracts.tools import ToolResult
 from power_loop.core import agent_context
 
@@ -263,6 +264,9 @@ async def run_session(worker, ctx, env, config):
             if text.startswith("Error:"):
                 return SessionToolResult("failed", text, error=text, error_code="tool_failed")
             return SessionToolResult("completed", text, usage={})
+        except CancellationRequested as exc:
+            reason = ctx.stop.reason or getattr(exc, "reason", None) or str(exc) or "cancelled"
+            return SessionToolResult("cancelled", error=reason, error_code="cancelled")
         except asyncio.CancelledError as exc:
             if ctx.stop.is_cancelled():
                 reason = ctx.stop.reason or "cancelled"

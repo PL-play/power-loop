@@ -530,7 +530,7 @@ async def test_release_claim_honours_matching_cancel(registry_store):
         assert state == {"execution_state": "queued", "owner_node_id": None}
         messages = await store._db.fetchall(
             f"SELECT role FROM {store.t.messages} WHERE session_id=?", (root.session_id,))
-        assert messages == []
+        assert messages == [{"role": "user"}]
         assert model_a.calls == 0
     finally:
         finish_build.set()

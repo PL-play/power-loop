@@ -1325,7 +1325,7 @@ class SessionStore:
                 "WHERE session_id=? AND send_index<? ORDER BY send_index DESC LIMIT ?) recent "
                 "UNION "
                 f"SELECT send_index FROM (SELECT send_index FROM {table} "
-                "WHERE session_id=? AND kind='compact' AND send_index<? "
+                "WHERE session_id=? AND kind='compact' AND compact_to_send IS NOT NULL AND send_index<? "
                 "ORDER BY send_index DESC LIMIT 1) latest_compact"
                 ") w ON p.send_index=w.send_index "
                 "WHERE p.session_id=? ORDER BY p.send_index ASC, p.id ASC",
@@ -1813,7 +1813,7 @@ class SessionStore:
     ) -> ProjectMessageRow | None:
         row = await fetchone(
             f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND kind='compact' "
-            "ORDER BY send_index DESC LIMIT 1",
+            "AND compact_to_send IS NOT NULL ORDER BY send_index DESC LIMIT 1",
             (session_id,),
         )
         return _row_to_project_message(row) if row is not None else None

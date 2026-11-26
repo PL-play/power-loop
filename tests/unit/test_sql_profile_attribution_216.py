@@ -53,6 +53,7 @@ def test_unknown_sql_through_notification_entry_still_fails_classification():
 @pytest.mark.parametrize(("chain", "sql", "expected"), [
     (["runtime.store.process_guard:acquire"], "SELECT pg_try_advisory_lock($1)", "session_control"),
     (["runtime.store.process_guard:acquire"], "SELECT GET_LOCK(%s,0)", "session_control"),
+    (["runtime.store.process_guard:release"], "SELECT RELEASE_LOCK(%s)", "session_control"),
     (["runtime.store.process_guard:check"], "SELECT 1", "session_control"),
     (["runtime.store.process_guard:check", "agent.runtime_worker:_watch_guard"], "SELECT 1", "periodic"),
     (["runtime.store.process_guard:check", "runtime.execution_budget:charge"], "SELECT 1", "billing"),
@@ -67,8 +68,10 @@ def test_process_guard_classifies_real_lock_and_check_sql(chain, sql, expected):
     (["agent.runtime_worker:_watch_guard"], "SELECT 1"),
     (["runtime.store.process_guard:acquire"], "SELECT 1"),
     (["runtime.store.process_guard:acquire"], "SELECT something_else()"),
+    (["runtime.store.process_guard:release"], "SELECT 1"),
     (["runtime.store.process_guard:check"], "SELECT 2"),
     ([], "SELECT GET_LOCK(%s,0)"),
+    ([], "SELECT RELEASE_LOCK(%s)"),
 ])
 def test_process_guard_does_not_claim_unmatched_sql(chain, sql):
     with pytest.raises(AssertionError, match="unclassified SQL"):

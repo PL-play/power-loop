@@ -177,3 +177,26 @@ def test_changed_foreach_body_dependency_invalidates_all_iterations_and_prefixes
     plan = plan_continuation(design, "source")
     assert plan.invalidated == {"source", "map", "prefix", "consumer", "tail"}
     assert "independent" not in plan.invalidated
+
+
+def test_system_prompt_template_dependency_invalidates_consumer_and_downstream():
+    source = agent("source")
+    consumer = AgentNode(
+        type="agent",
+        id="consumer",
+        spec=AgentSpec(name="consumer", system_prompt="Use {{source.answer}}."),
+        input="plain task",
+    )
+    downstream = agent("downstream", input="summary={{consumer.answer}}")
+    untouched = AgentNode(
+        type="agent",
+        id="untouched",
+        spec=AgentSpec(name="untouched", system_prompt="plain source.answer {{source}} {{unknown.answer}}"),
+        input="independent task",
+    )
+    design = spec(parallel(source, consumer, downstream, untouched))
+    plan = plan_continuation(design, "source")
+    assert plan.invalidated == {"source", "consumer", "downstream"}
+    assert "untouched" not in plan.invalidated
+    assert "template" in dict(plan.reasons)["consumer"]
+    assert "template" in dict(plan.reasons)["downstream"]

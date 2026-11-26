@@ -764,3 +764,837 @@ async def test_m1b_repair_three_modes_and_context_budget(registry_store):
     )
     with pytest.raises(SessionBusy):
         await port.repair(target, mode="heal_broken", actor=ACTOR)
+
+
+# ── 9. R01: repair(mode='compact') Snapshot Consistency & State Updates ──────
+
+
+async def test_r01_compact_concurrent_seed_preserves_new_history_and_retry_visibility(registry_store):
+    """R01: Pause repair(compact) right after paged read, seed send 24 with a unique marker,
+    then resume repair. Verify conflict detection, untouched state, next-turn projection window
+    visibility both before and after retrying repair(compact), and actual model prompt visibility.
+    """
+    import asyncio
+
+    from power_loop.runtime.representation import ProjectedRepresentation
+
+    store, _ = registry_store
+    model = _RecordingModel([
+        LLMResponse(raw_text="ack_after_retry_compact"),
+    ])
+    agent = await RunningAgent(
+        store, model, ToolRegistry(),
+        AgentLoopConfig(system_prompt="SYS", max_rounds=4, context_budget_tokens=10**9),
+        fuse_local_send=True,
+    ).start()
+    try:
+        sid = agent.target.session_id
+        # Populate 23 sends (> 1 page with page_size=20) so load_projections_paged pages across chunks.
+        for si in range(1, 24):
+            await store.upsert_project_message(
+                sid, send_index=si, kind="user", content={"input": [f"q{si}"]}, rendered_text=f"q{si}",
+            )
+            await store.upsert_project_message(
+                sid, send_index=si, kind="project", content={"final_text": f"a{si}"}, rendered_text=f"a{si}",
+            )
+        initial_stats = json.dumps({
+            "v": 3, "sends": 23, "rows": 46, "tokens": 230, "maximum": 23,
+            "compact_to_send": None, "dedup": {"abcdef012345": 23}, "revision": "rev_init",
+        })
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET send_index=23,next_seq=47,fold_stats_json=? "
+            "WHERE session_id=?",
+            (initial_stats, sid),
+        )
+
+        paged_done = asyncio.Event()
+        resume_repair = asyncio.Event()
+        orig_paged = store.load_projections_paged
+
+        async def paused_paged(*args, **kwargs):
+            rows = await orig_paged(*args, **kwargs)
+            paged_done.set()
+            await resume_repair.wait()
+            return rows
+
+        marker = "R01_UNIQUE_SEED_MARKER_SEND_24"
+        store.load_projections_paged = paused_paged  # type: ignore[method-assign]
+        try:
+            repair_task = asyncio.create_task(
+                agent.runtime.client.repair(agent.target, mode="compact", actor=agent.actor)
+            )
+            await asyncio.wait_for(paged_done.wait(), timeout=5.0)
+            seed_res = await agent.runtime.client.seed_context(
+                agent.target,
+                [{"role": "user", "content": marker}],
+                actor=agent.actor,
+            )
+            assert seed_res["send_index"] == 24
+            resume_repair.set()
+
+            with pytest.raises(RuntimeRequestError) as exc_info:
+                await repair_task
+            assert exc_info.value.code == "request_conflict"
+        finally:
+            store.load_projections_paged = orig_paged  # type: ignore[method-assign]
+
+        # Conflict must not write a stale compact or clobber fold_stats_json.
+        assert await store.latest_project_compact(sid) is None
+        srow_conflict = await store._db.fetchone(
+            f"SELECT send_index,fold_stats_json FROM {store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        assert int(srow_conflict["send_index"]) == 24
+        assert srow_conflict["fold_stats_json"] == initial_stats
+
+        # Before retrying repair, the next turn's projection window MUST see the seeded marker.
+        projector = ProjectedRepresentation()
+        win_before = await store.load_projection_window(sid, current_send_index=25)
+        assert win_before.compact is None
+        assert any(r.send_index == 24 and r.kind == "seed" for r in win_before.rows)
+        rendered_before = projector.render(list(win_before.rows))
+        assert any(marker in str(m.get("content") or "") for m in rendered_before)
+
+        # Retry repair(mode='compact') without contention: summary & compact_to_send both reach 24.
+        retry_res = await agent.runtime.client.repair(
+            agent.target, mode="compact", actor=agent.actor,
+        )
+        assert retry_res.repaired_projections == 1
+        assert retry_res.send_index == 24
+        assert retry_res.summary is not None and marker in retry_res.summary
+
+        compact_row = await store.latest_project_compact(sid)
+        assert compact_row is not None
+        assert compact_row.compact_from_send == 1
+        assert compact_row.compact_to_send == 24
+        assert marker in (compact_row.rendered_text or "")
+
+        srow_after = await store._db.fetchone(
+            f"SELECT fold_stats_json FROM {store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        parsed_after = parse_state(srow_after["fold_stats_json"])
+        assert parsed_after is not None
+        assert parsed_after["compact_to_send"] == 24
+        assert parsed_after["maximum"] == 24
+        assert parsed_after["dedup"] == {}
+
+        # Next turn's actual projection window AND real LLM request prompt MUST still see the marker.
+        win_after = await store.load_projection_window(sid, current_send_index=25)
+        assert win_after.compact is not None and win_after.compact.compact_to_send == 24
+        assert win_after.rows == []
+        rendered_after = projector.render([win_after.compact])
+        assert any(marker in str(m.get("content") or "") for m in rendered_after)
+
+        next_turn = await agent.send("follow up turn 25")
+        assert next_turn.status == "completed" and next_turn.final_text == "ack_after_retry_compact"
+        assert len(model.seen_messages) == 1
+        assert any(marker in str(m.get("content") or "") for m in model.seen_messages[0])
+    finally:
+        await agent.aclose()
+
+
+async def test_r01_compact_bounds_to_summarized_sends_preserves_pending_tool_seq_and_rolls_prior_compact(
+    registry_store,
+):
+    """R01: Without contention, repair(compact):
+    - Never advances compact_to_send past the highest summarized projection (e.g. unprojected send 3).
+    - Preserves pending_tool_seq (does not clear unresolved dangling tool calls).
+    - Keeps fold_stats_json.compact_to_send aligned with the written compact_to_send.
+    - Rolls forward any prior compact summary into the new compact and removes superseded compacts.
+    """
+    from power_loop.runtime.representation import ProjectedRepresentation
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    target = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    sid = target.session_id
+
+    # Sends 1..2 projected; send 3 interrupted (no projection row yet, pending_tool_seq=5).
+    for si in (1, 2):
+        await store.upsert_project_message(
+            sid, send_index=si, kind="user", content={"input": [f"turn_{si}_q"]}, rendered_text=f"turn_{si}_q",
+        )
+        await store.upsert_project_message(
+            sid, send_index=si, kind="project", content={"final_text": f"turn_{si}_a"}, rendered_text=f"turn_{si}_a",
+        )
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET send_index=3,next_seq=6,pending_tool_seq=5,fold_stats_json=? "
+        "WHERE session_id=?",
+        (
+            json.dumps({
+                "v": 3, "sends": 2, "rows": 4, "tokens": 40, "maximum": 2,
+                "compact_to_send": None, "dedup": {"112233445566": 2}, "revision": "r1",
+            }),
+            sid,
+        ),
+    )
+
+    res1 = await port.repair(target, mode="compact", actor=ACTOR)
+    assert res1.repaired_projections == 1
+    assert res1.send_index == 2  # Must NOT advance to unprojected send 3!
+    assert "turn_1_q" in (res1.summary or "") and "turn_2_a" in (res1.summary or "")
+
+    c1 = await store.latest_project_compact(sid)
+    assert c1 is not None and c1.compact_from_send == 1 and c1.compact_to_send == 2
+    srow1 = await store._db.fetchone(
+        f"SELECT pending_tool_seq,fold_stats_json FROM {store.t.sessions} WHERE session_id=?", (sid,),
+    )
+    assert int(srow1["pending_tool_seq"]) == 5  # Must NOT wipe unresolved pending_tool_seq!
+    stats1 = parse_state(srow1["fold_stats_json"])
+    assert stats1 is not None
+    assert stats1["compact_to_send"] == 2
+    assert stats1["maximum"] == 2
+    assert stats1["dedup"] == {}
+
+    # Now project send 3 and compact again: prior compact (1..2) must roll forward into (1..3).
+    await store.upsert_project_message(
+        sid, send_index=3, kind="user", content={"input": ["turn_3_q"]}, rendered_text="turn_3_q",
+    )
+    await store.upsert_project_message(
+        sid, send_index=3, kind="project", content={"final_text": "turn_3_a"}, rendered_text="turn_3_a",
+    )
+    res2 = await port.repair(target, mode="compact", actor=ACTOR)
+    assert res2.repaired_projections == 1
+    assert res2.send_index == 3
+    assert "turn_1_q" in (res2.summary or "") and "turn_3_a" in (res2.summary or "")
+
+    compacts = [r for r in await store.load_project_messages(sid) if r.kind == "compact"]
+    assert len(compacts) == 1
+    assert compacts[0].compact_from_send == 1 and compacts[0].compact_to_send == 3
+    win = await store.load_projection_window(sid, current_send_index=4)
+    rendered = ProjectedRepresentation().render(([win.compact] if win.compact else []) + list(win.rows))
+    joined = "\n".join(str(m.get("content") or "") for m in rendered)
+    assert "turn_1_q" in joined and "turn_2_a" in joined and "turn_3_a" in joined
+    srow2 = await store._db.fetchone(
+        f"SELECT pending_tool_seq,fold_stats_json FROM {store.t.sessions} WHERE session_id=?", (sid,),
+    )
+    assert int(srow2["pending_tool_seq"]) == 5
+    stats2 = parse_state(srow2["fold_stats_json"])
+    assert stats2 is not None and stats2["compact_to_send"] == 3 and stats2["dedup"] == {}
+
+
+async def test_r01_compact_stops_before_unprojected_active_gap_and_preserves_visibility(registry_store):
+    """R01 rework: When an intermediate send has active audit messages but no projection yet
+    (e.g. send 1 succeeded, send 2 failed on LLM error, send 3 seeded), uncontended
+    repair(mode='compact') MUST NOT advance compact_to_send past the unprojected gap;
+    turn 4's actual model request must still contain both send 2's input and send 3's seed.
+    """
+    store, _ = registry_store
+
+    # Case 1: gap in the middle (send 1 ok, send 2 LLM failure -> no projection, send 3 seed)
+    model = _RecordingModel([
+        LLMResponse(raw_text="ok_1"),
+        RuntimeError("simulated model failure"),
+        LLMResponse(raw_text="ok_4"),
+    ])
+    agent = await RunningAgent(
+        store, model, ToolRegistry(),
+        AgentLoopConfig(system_prompt="SYS", max_rounds=4, context_budget_tokens=10**9),
+        fuse_local_send=True,
+    ).start()
+    try:
+        sid = agent.target.session_id
+        r1 = await agent.send("R01_SEND1_OK")
+        assert r1.status == "completed"
+        r2 = await agent.send("GAP_R01_SEND2")
+        assert r2.status == "failed"
+        seed3 = await agent.runtime.client.seed_context(
+            agent.target, [{"role": "user", "content": "R01_SEED3"}], actor=agent.actor,
+        )
+        assert seed3["send_index"] == 3
+
+        rep = await agent.runtime.client.repair(agent.target, mode="compact", actor=agent.actor)
+        assert rep.repaired_projections == 1
+        assert rep.send_index == 1  # Must stop before unprojected send 2!
+        assert "R01_SEND1_OK" in (rep.summary or "")
+        assert "R01_SEED3" not in (rep.summary or "")
+
+        win = await store.load_projection_window(sid, current_send_index=4)
+        assert win.compact is not None and win.compact.compact_to_send == 1
+        assert win.window_lo == 2
+        assert any(r.send_index == 3 and r.kind == "seed" for r in win.rows)
+
+        srow = await store._db.fetchone(
+            f"SELECT fold_stats_json FROM {store.t.sessions} WHERE session_id=?", (sid,),
+        )
+        stats = parse_state(srow["fold_stats_json"])
+        assert stats is not None
+        assert stats["compact_to_send"] == 1
+        assert stats["maximum"] == 3
+        assert stats["sends"] == 1
+        assert stats.get("invalid") is True
+
+        r4 = await agent.send("four")
+        assert r4.status == "completed"
+        prompt4 = str(model.seen_messages[-1])
+        assert "R01_SEND1_OK" in prompt4
+        assert "GAP_R01_SEND2" in prompt4
+        assert "R01_SEED3" in prompt4
+    finally:
+        await agent.aclose()
+
+    # Case 2: gap before the very first projected send (send 1 failed, send 2 seed) -> no-op compact
+    model2 = _RecordingModel([
+        RuntimeError("simulated model failure on turn 1"),
+        LLMResponse(raw_text="ok_3"),
+    ])
+    agent2 = await RunningAgent(
+        store, model2, ToolRegistry(),
+        AgentLoopConfig(system_prompt="SYS", max_rounds=4, context_budget_tokens=10**9),
+        fuse_local_send=True,
+    ).start()
+    try:
+        sid2 = agent2.target.session_id
+        r1_fail = await agent2.send("GAP_R01_FIRST_SEND")
+        assert r1_fail.status == "failed"
+        seed2 = await agent2.runtime.client.seed_context(
+            agent2.target, [{"role": "user", "content": "R01_SEED2_AFTER_FAIL"}], actor=agent2.actor,
+        )
+        assert seed2["send_index"] == 2
+
+        rep2 = await agent2.runtime.client.repair(agent2.target, mode="compact", actor=agent2.actor)
+        assert rep2.repaired_projections == 0
+        assert await store.latest_project_compact(sid2) is None
+
+        r3 = await agent2.send("three")
+        assert r3.status == "completed"
+        prompt3 = str(model2.seen_messages[-1])
+        assert "GAP_R01_FIRST_SEND" in prompt3
+        assert "R01_SEED2_AFTER_FAIL" in prompt3
+    finally:
+        await agent2.aclose()
+
+
+# ── 10. R02: Re-compacting Across Page Boundary Preserves Prior Summary ──────
+
+
+async def test_r02_recompact_across_page_boundary_preserves_first_and_avoids_duplication(
+    registry_store,
+):
+    """R02: Populate >20 sends (default page_size=20) with FIRST in send 1, compact once,
+    append AFTER in send 26, then compact again. Verify FIRST and AFTER both appear in the
+    new context window and real model prompt, covered sends are not duplicated, and ordering
+    plus the 300-char per-row truncation rule are preserved.
+    """
+    from power_loop.runtime.representation import ProjectedRepresentation
+
+    store, _ = registry_store
+    model = _RecordingModel([LLMResponse(raw_text="ack_r02_turn_27")])
+    agent = await RunningAgent(
+        store, model, ToolRegistry(),
+        AgentLoopConfig(system_prompt="SYS", max_rounds=4, context_budget_tokens=10**9),
+        fuse_local_send=True,
+    ).start()
+    try:
+        sid = agent.target.session_id
+        for si in range(1, 26):
+            q = "FIRST" if si == 1 else f"R02_TURN_{si}_Q"
+            a = f"R02_TURN_{si}_A"
+            await store.upsert_project_message(
+                sid, send_index=si, kind="user", content={"input": [q]}, rendered_text=q,
+            )
+            await store.upsert_project_message(
+                sid, send_index=si, kind="project", content={"final_text": a}, rendered_text=a,
+            )
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET send_index=25,next_seq=51 WHERE session_id=?",
+            (sid,),
+        )
+
+        # First compact across >1 page (25 sends > page_size 20).
+        r1 = await agent.runtime.client.repair(agent.target, mode="compact", actor=agent.actor)
+        assert r1.repaired_projections == 1
+        assert r1.send_index == 25
+        assert r1.summary is not None and "FIRST" in r1.summary
+        c1 = await store.latest_project_compact(sid)
+        assert c1 is not None and c1.compact_from_send == 1 and c1.compact_to_send == 25
+
+        # Append AFTER (with a >300-char project reply to verify per-row 300-char cap).
+        long_reply = "AFTER_REPLY_" + ("Z" * 350) + "_TAIL_DROPPED"
+        await store.upsert_project_message(
+            sid, send_index=26, kind="user", content={"input": ["AFTER"]}, rendered_text="AFTER",
+        )
+        await store.upsert_project_message(
+            sid, send_index=26, kind="project",
+            content={"final_text": long_reply}, rendered_text=long_reply,
+        )
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET send_index=26,next_seq=53 WHERE session_id=?",
+            (sid,),
+        )
+
+        # Second compact: load_projections_paged stops at compact@25 (page 1 = sends 7..26).
+        r2 = await agent.runtime.client.repair(agent.target, mode="compact", actor=agent.actor)
+        assert r2.repaired_projections == 1
+        assert r2.send_index == 26
+
+        compacts = [r for r in await store.load_project_messages(sid) if r.kind == "compact"]
+        assert len(compacts) == 1
+        assert compacts[0].compact_from_send == 1
+        assert compacts[0].compact_to_send == 26
+
+        win = await store.load_projection_window(sid, current_send_index=27)
+        assert win.compact is not None and win.compact.compact_to_send == 26
+        assert win.rows == []
+        rendered = ProjectedRepresentation().render([win.compact])
+        joined = "\n".join(str(m.get("content") or "") for m in rendered)
+
+        assert joined.count("FIRST") == 1
+        assert joined.count("AFTER_REPLY_") == 1
+        assert "[send 26 user] AFTER" in joined
+        assert "_TAIL_DROPPED" not in joined  # existing 300-char per-row cap preserved
+        for si in range(2, 26):
+            assert joined.count(f"R02_TURN_{si}_Q") == 1
+            assert joined.count(f"R02_TURN_{si}_A") == 1
+        # Projection ordering: send 1 -> send 25 -> send 26 user -> send 26 project.
+        assert (
+            joined.index("FIRST")
+            < joined.index("R02_TURN_25_A")
+            < joined.index("[send 26 user] AFTER")
+            < joined.index("[send 26 project] AFTER_REPLY_")
+        )
+
+        # Idempotent re-compact with no new sends after boundary.
+        r3 = await agent.runtime.client.repair(agent.target, mode="compact", actor=agent.actor)
+        assert r3.repaired_projections == 0
+
+        # Real next turn receives both FIRST and AFTER without duplicating covered turns.
+        turn27 = await agent.send("turn 27 check")
+        assert turn27.status == "completed" and turn27.final_text == "ack_r02_turn_27"
+        prompt27 = "\n".join(str(m.get("content") or "") for m in model.seen_messages[0])
+        assert prompt27.count("FIRST") == 1
+        assert "[send 26 user] AFTER" in prompt27
+        assert prompt27.count("R02_TURN_7_Q") == 1
+        assert prompt27.count("R02_TURN_25_Q") == 1
+    finally:
+        await agent.aclose()
+
+
+async def test_r02_recompact_starts_from_latest_valid_compact_across_pruned_and_multipage_tail(
+    registry_store,
+):
+    """R02 edge cases:
+    1) When old rows <= compact_to_send were pruned (FIRST exists only in the prior compact)
+       and a malformed kind='compact' row with compact_to_send=NULL sits at a higher send_index,
+       resolve/window/repair still start from the latest valid compact and ignore the invalid row.
+    2) When >20 new sends accumulate after a prior compact, re-compacting pages back to that
+       valid compact, preserves FIRST, and appends only sends strictly after compact_to_send.
+    """
+    from power_loop.runtime.representation import ProjectedRepresentation
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    target = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    sid = target.session_id
+
+    # Seed a valid compact covering sends 1..25 (FIRST only lives in this compact row).
+    await store.upsert_project_message(
+        sid, send_index=25, kind="compact",
+        content={"summary": "[send 1 user] FIRST\n[send 25 project] R02_OLD_25", "from_send": 1, "to_send": 25},
+        rendered_text="[send 1 user] FIRST\n[send 25 project] R02_OLD_25",
+        compact_from_send=1, compact_to_send=25,
+    )
+    # Add an invalid compact row (compact_to_send=NULL) at a higher send_index plus >20 new sends.
+    await store._db.execute(
+        f"INSERT INTO {store.t.project_messages} ("
+        "session_id,send_index,kind,content_json,rendered_text,"
+        "source_seq_lo,source_seq_hi,compact_from_send,compact_to_send,"
+        "projector_version,token_estimate,created_at,completed_through_send_index) "
+        "VALUES (?,26,'compact','{\"summary\":\"INVALID\"}','INVALID',NULL,NULL,NULL,NULL,0,2,1000,26)",
+        (sid,),
+    )
+    for si in range(26, 48):
+        label = "AFTER" if si == 47 else f"R02_TAIL_{si}"
+        await store.upsert_project_message(
+            sid, send_index=si, kind="user", content={"input": [label]}, rendered_text=label,
+        )
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET send_index=47,next_seq=95 WHERE session_id=?",
+        (sid,),
+    )
+
+    res = await port.repair(target, mode="compact", actor=ACTOR)
+    assert res.repaired_projections == 1
+    assert res.send_index == 47
+
+    latest = await store.latest_project_compact(sid)
+    assert latest is not None
+    assert latest.compact_from_send == 1 and latest.compact_to_send == 47
+
+    win = await store.load_projection_window(sid, current_send_index=48)
+    assert win.compact is not None and win.compact.compact_to_send == 47
+    assert win.rows == []
+    joined = "\n".join(
+        str(m.get("content") or "") for m in ProjectedRepresentation().render([win.compact])
+    )
+    assert joined.count("FIRST") == 1
+    assert joined.count("R02_OLD_25") == 1
+    assert joined.count("AFTER") == 1
+    assert "INVALID" not in joined
+    for si in range(26, 47):
+        assert joined.count(f"R02_TAIL_{si}") == 1
+
+    # Capped window also selects the latest valid compact cleanly.
+    win_capped = await store.load_projection_window(sid, current_send_index=48, send_limit=5)
+    assert win_capped.compact is not None and win_capped.compact.compact_to_send == 47
+    assert "FIRST" in (win_capped.compact.rendered_text or "")
+    assert "AFTER" in (win_capped.compact.rendered_text or "")
+
+
+async def test_r06_seed_context_summary_callback_outside_transaction(registry_store):
+    """R06: async summary_fn runs outside the DB write transaction without self-deadlock.
+
+    Covers:
+      1. Async summary_fn reads the same SessionStore via get_session() and returns a unique
+         summary; seed_context completes and the next turn receives that summary.
+      2. Pausing summary_fn on an asyncio.Event allows concurrent reads/writes on another
+         session on the same SessionStore without blocking.
+      3. Raising inside summary_fn leaves zero messages, projections, or session mutations.
+      4. Unauthorized caller is rejected before summary_fn runs.
+      5. Session becoming busy while summary_fn awaits raises SessionBusy on commit with no
+         half-seed written; concurrent idle advance commits cleanly at the next send_index.
+    """
+    import asyncio
+
+    from power_loop.agent.runtime_types import TrustedActor
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    long_msgs = [
+        {"role": "user", "content": "OLD_CTX " + "x" * 400},
+        {"role": "assistant", "content": "MID_CTX " + "y" * 400},
+    ]
+
+    # 1. Async summary_fn queries same SessionStore; next turn reads the returned unique summary.
+    model = _RecordingModel([LLMResponse(raw_text="turn1_ok")])
+    agent = await RunningAgent(
+        store, model, ToolRegistry(),
+        AgentLoopConfig(system_prompt="SYS", max_rounds=2, context_budget_tokens=10**9),
+        fuse_local_send=True,
+    ).start()
+    try:
+        sid = agent.target.session_id
+        unique_summary = f"R06_UNIQUE_SUMMARY_{sid}"
+
+        async def _reading_summary(msgs):
+            row = await store.get_session(sid)
+            assert row is not None and row.session_id == sid
+            assert len(msgs) == 2
+            return unique_summary
+
+        seed_res = await asyncio.wait_for(
+            agent.runtime.client.seed_context(
+                agent.target,
+                long_msgs,
+                actor=agent.actor,
+                overflow="compact",
+                max_tokens=50,
+                summary_fn=_reading_summary,
+            ),
+            timeout=5.0,
+        )
+        assert seed_res["send_index"] == 0
+        assert seed_res["truncated"] is True
+        assert seed_res["seeded_count"] == 1
+
+        turn1 = await agent.send("follow_up_after_r06_seed")
+        assert turn1.status == "completed"
+        seen = " ".join(str(m.get("content") or "") for m in model.seen_messages[0])
+        assert unique_summary in seen and "follow_up_after_r06_seed" in seen
+    finally:
+        await agent.aclose()
+
+    # 2. Pause summary_fn on an event and operate on another session on the same store concurrently.
+    t_a = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    t_b = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _paused_summary(_msgs):
+        row = await store.get_session(t_a.session_id)
+        assert row is not None
+        entered.set()
+        await release.wait()
+        return "R06_PAUSED_SUMMARY_A"
+
+    task_a = asyncio.create_task(
+        port.seed_context(
+            t_a, long_msgs, actor=ACTOR, overflow="compact", max_tokens=50, summary_fn=_paused_summary,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        # Operate on session B while session A's callback is suspended.
+        b_row = await asyncio.wait_for(store.get_session(t_b.session_id), timeout=3.0)
+        assert b_row is not None
+        b_res = await asyncio.wait_for(
+            port.seed_context(t_b, [{"role": "user", "content": "R06_CONCURRENT_B"}], actor=ACTOR),
+            timeout=3.0,
+        )
+        assert b_res["send_index"] == 0
+        release.set()
+        a_res = await asyncio.wait_for(task_a, timeout=5.0)
+        assert a_res["send_index"] == 0 and a_res["truncated"] is True
+    finally:
+        release.set()
+        if not task_a.done():
+            task_a.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task_a
+
+    prows_a = await store.load_project_messages(t_a.session_id)
+    assert len(prows_a) == 1 and "R06_PAUSED_SUMMARY_A" in (prows_a[0].rendered_text or "")
+
+    # 3. Callback error leaves zero half-seed writes and preserves session state.
+    t_err = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    before_s = await store._db.fetchone(
+        f"SELECT send_index,next_seq,inbox_version FROM {store.t.sessions} WHERE session_id=?",
+        (t_err.session_id,),
+    )
+
+    async def _failing_summary(_msgs):
+        assert await store.get_session(t_err.session_id) is not None
+        raise RuntimeError("r06_summary_boom")
+
+    with pytest.raises(RuntimeError, match="r06_summary_boom"):
+        await port.seed_context(
+            t_err, long_msgs, actor=ACTOR, overflow="compact", max_tokens=50, summary_fn=_failing_summary,
+        )
+    after_s = await store._db.fetchone(
+        f"SELECT send_index,next_seq,inbox_version FROM {store.t.sessions} WHERE session_id=?",
+        (t_err.session_id,),
+    )
+    assert dict(after_s) == dict(before_s)
+    assert await store.load_all_messages(t_err.session_id) == []
+    assert await store.load_project_messages(t_err.session_id) == []
+
+    # 4. Unauthorized caller fails before summary_fn is invoked.
+    cb_calls = 0
+
+    async def _never_called(_msgs):
+        nonlocal cb_calls
+        cb_calls += 1
+        return "SHOULD_NOT_RUN"
+
+    intruder = TrustedActor("other-tenant", "other-user", None)
+    with pytest.raises(RuntimeRequestError) as exc_forb:
+        await port.seed_context(
+            t_err, long_msgs, actor=intruder, overflow="compact", max_tokens=50, summary_fn=_never_called,
+        )
+    assert exc_forb.value.code == "forbidden"
+    assert cb_calls == 0
+
+    # 5. Session becoming busy during callback is rejected in final commit with no half-seed.
+    t_busy = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    busy_entered = asyncio.Event()
+    busy_release = asyncio.Event()
+
+    async def _busy_race_summary(_msgs):
+        busy_entered.set()
+        await busy_release.wait()
+        return "R06_LATE_SUMMARY"
+
+    task_busy = asyncio.create_task(
+        port.seed_context(
+            t_busy, long_msgs, actor=ACTOR, overflow="compact", max_tokens=50, summary_fn=_busy_race_summary,
+        )
+    )
+    try:
+        await asyncio.wait_for(busy_entered.wait(), timeout=5.0)
+        _, claimed, _ = await port.accept_and_claim(
+            t_busy, "concurrent turn", message_id="r06-m1", actor=ACTOR,
+            node_id="n1", boot_id="b1", ttl_s=30.0,
+        )
+        assert claimed is not None
+        busy_release.set()
+        with pytest.raises(SessionBusy):
+            await asyncio.wait_for(task_busy, timeout=5.0)
+    finally:
+        busy_release.set()
+        if not task_busy.done():
+            task_busy.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task_busy
+
+    seed_prows = [
+        r for r in await store.load_project_messages(t_busy.session_id) if r.kind == "seed"
+    ]
+    assert seed_prows == []
+
+    # 6. Concurrent idle seed advances send_index while callback awaits; final commit uses latest state.
+    t_adv = await port.create_session(DESCRIPTOR, actor=ACTOR)
+    adv_entered = asyncio.Event()
+    adv_release = asyncio.Event()
+
+    async def _adv_summary(_msgs):
+        adv_entered.set()
+        await adv_release.wait()
+        return "R06_SECOND_AFTER_CONCURRENT_SEED"
+
+    task_adv = asyncio.create_task(
+        port.seed_context(
+            t_adv, long_msgs, actor=ACTOR, overflow="compact", max_tokens=50, summary_fn=_adv_summary,
+        )
+    )
+    try:
+        await asyncio.wait_for(adv_entered.wait(), timeout=5.0)
+        first_seed = await port.seed_context(
+            t_adv, [{"role": "user", "content": "R06_FIRST_CONCURRENT_SEED"}], actor=ACTOR,
+        )
+        assert first_seed["send_index"] == 0
+        adv_release.set()
+        second_seed = await asyncio.wait_for(task_adv, timeout=5.0)
+        assert second_seed["send_index"] == 1
+    finally:
+        adv_release.set()
+        if not task_adv.done():
+            task_adv.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task_adv
+
+    adv_prows = await store.load_project_messages(t_adv.session_id)
+    assert [(r.send_index, r.kind) for r in adv_prows] == [(0, "seed"), (1, "seed")]
+    assert "R06_SECOND_AFTER_CONCURRENT_SEED" in (adv_prows[1].rendered_text or "")
+
+
+async def test_r06_seed_context_budget_tightened_during_callback(registry_store):
+    """R06 rework: final commit checks tightened session budget even when summary_fn ran.
+
+    Covers:
+      1. Session budget starts at 100, seed_context omits explicit max_tokens, and summary_fn
+         tightens budget to 10 via configure_session before returning a summary with 10 < est < 100
+         -> raises request_conflict, runs callback once, keeps budget=10, writes zero rows and
+         does not advance send_index/next_seq.
+      2. Same tightening (100 -> 10), but returned summary fits (est <= 10) -> commits cleanly.
+      3. Explicit max_tokens keeps precedence over session config tightening, and unchanged
+         session budget preserves existing behavior.
+    """
+    from dataclasses import replace
+
+    from power_loop.runtime.budget import estimate_tokens
+
+    store, _ = registry_store
+    port = RuntimeInputStore(store)
+    desc_100 = replace(DESCRIPTOR, config={**DESCRIPTOR.config, "context_budget_tokens": 100})
+    desc_10 = replace(DESCRIPTOR, config={**DESCRIPTOR.config, "context_budget_tokens": 10})
+    long_msgs = [
+        {"role": "user", "content": "OLD_CTX " + "x" * 400},
+        {"role": "assistant", "content": "MID_CTX " + "y" * 400},
+    ]
+    assert estimate_tokens(long_msgs) > 100
+
+    oversized_summary = "R06_OVER_10_UNDER_100 " + "s" * 100
+    oversized_est = estimate_tokens([{"role": "user", "content": oversized_summary}])
+    assert 10 < oversized_est < 100
+
+    fitting_summary = "R06_FIT_OK"
+    fitting_est = estimate_tokens([{"role": "user", "content": fitting_summary}])
+    assert fitting_est <= 10
+
+    # 1. Tightened budget (100 -> 10) with summary exceeding new budget -> request_conflict.
+    t_conflict = await port.create_session(desc_100, actor=ACTOR)
+    before_s = await store._db.fetchone(
+        f"SELECT send_index,next_seq,inbox_version FROM {store.t.sessions} WHERE session_id=?",
+        (t_conflict.session_id,),
+    )
+    conflict_calls = 0
+
+    async def _tighten_oversized(_msgs):
+        nonlocal conflict_calls
+        conflict_calls += 1
+        await port.configure_session(t_conflict, actor=ACTOR, descriptor=desc_10)
+        return oversized_summary
+
+    with pytest.raises(RuntimeRequestError) as exc_conflict:
+        await port.seed_context(
+            t_conflict, long_msgs, actor=ACTOR, overflow="compact", summary_fn=_tighten_oversized,
+        )
+    assert exc_conflict.value.code == "request_conflict"
+    assert conflict_calls == 1
+
+    after_s = await store._db.fetchone(
+        f"SELECT send_index,next_seq,inbox_version,descriptor_json FROM {store.t.sessions} "
+        "WHERE session_id=?",
+        (t_conflict.session_id,),
+    )
+    assert json.loads(after_s["descriptor_json"])["config"]["context_budget_tokens"] == 10
+    assert int(after_s["send_index"]) == int(before_s["send_index"])
+    assert int(after_s["next_seq"]) == int(before_s["next_seq"])
+    assert int(after_s["inbox_version"]) == int(before_s["inbox_version"])
+    assert await store.load_all_messages(t_conflict.session_id) == []
+    assert await store.load_project_messages(t_conflict.session_id) == []
+
+    # 2. Tightened budget (100 -> 10) with summary still fitting (est <= 10) -> succeeds.
+    t_fit = await port.create_session(desc_100, actor=ACTOR)
+    fit_calls = 0
+
+    async def _tighten_fitting(_msgs):
+        nonlocal fit_calls
+        fit_calls += 1
+        await port.configure_session(t_fit, actor=ACTOR, descriptor=desc_10)
+        return fitting_summary
+
+    fit_res = await port.seed_context(
+        t_fit, long_msgs, actor=ACTOR, overflow="compact", summary_fn=_tighten_fitting,
+    )
+    assert fit_calls == 1
+    assert fit_res["send_index"] == 0
+    assert fit_res["truncated"] is True
+    assert fit_res["token_estimate"] == fitting_est <= 10
+
+    fit_row = await store._db.fetchone(
+        f"SELECT send_index,next_seq,descriptor_json FROM {store.t.sessions} WHERE session_id=?",
+        (t_fit.session_id,),
+    )
+    assert json.loads(fit_row["descriptor_json"])["config"]["context_budget_tokens"] == 10
+    fit_msgs = await store.load_all_messages(t_fit.session_id)
+    assert len(fit_msgs) == 1 and fit_msgs[0].content == fitting_summary
+    fit_prows = await store.load_project_messages(t_fit.session_id)
+    assert len(fit_prows) == 1 and fitting_summary in (fit_prows[0].rendered_text or "")
+
+    # 3. Explicit max_tokens keeps precedence over session config tightening.
+    t_explicit = await port.create_session(desc_100, actor=ACTOR)
+    explicit_calls = 0
+
+    async def _tighten_with_explicit(_msgs):
+        nonlocal explicit_calls
+        explicit_calls += 1
+        await port.configure_session(t_explicit, actor=ACTOR, descriptor=desc_10)
+        return oversized_summary
+
+    explicit_res = await port.seed_context(
+        t_explicit,
+        long_msgs,
+        actor=ACTOR,
+        overflow="compact",
+        max_tokens=100,
+        summary_fn=_tighten_with_explicit,
+    )
+    assert explicit_calls == 1
+    assert explicit_res["send_index"] == 0
+    assert explicit_res["truncated"] is True
+    assert explicit_res["token_estimate"] == oversized_est
+    explicit_row = await store._db.fetchone(
+        f"SELECT descriptor_json FROM {store.t.sessions} WHERE session_id=?",
+        (t_explicit.session_id,),
+    )
+    assert json.loads(explicit_row["descriptor_json"])["config"]["context_budget_tokens"] == 10
+
+    # 4. Unchanged session budget preserves existing behavior even if summary_fn exceeds budget.
+    t_same = await port.create_session(desc_10, actor=ACTOR)
+    same_calls = 0
+
+    async def _unchanged_budget_summary(_msgs):
+        nonlocal same_calls
+        same_calls += 1
+        return oversized_summary
+
+    same_res = await port.seed_context(
+        t_same, long_msgs, actor=ACTOR, overflow="compact", summary_fn=_unchanged_budget_summary,
+    )
+    assert same_calls == 1
+    assert same_res["send_index"] == 0
+    assert same_res["truncated"] is True
+    assert same_res["token_estimate"] == oversized_est
+
+
+

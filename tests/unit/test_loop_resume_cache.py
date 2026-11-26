@@ -302,51 +302,6 @@ async def test_appended_input_is_visible_after_worker_rebuild(runtime_agent):
     assert any(m["role"] == "user" and "steer" in m["content"] for m in next_model.calls[0]["messages"])
 
 
-@pytest.mark.parametrize("size", [0, 2])
-async def test_internal_cache_remains_bounded_and_prewarm_handles_missing_session(tmp_path, size):
-    store = await SessionStore.open(str(tmp_path / "cache.db"))
-    loop = _cache_loop(store, size=size)
-    try:
-        assert not await loop.prewarm("missing")
-        for i in range(4):
-            from .session_native_fixture import new_session
-            sid = (await new_session(store)).session_id
-            await store.append_message(sid, role="user", content=str(i))
-            await loop.prewarm(sid)
-        assert loop.cache_stats["entries"] <= size
-        if size:
-            assert loop.cache_stats["evictions"] >= 2
-        else:
-            assert loop.cache_stats == {"hits": 0, "misses": 0, "evictions": 0, "entries": 0}
-    finally:
-        await loop.aclose()
-        await store.close()
-
-
-async def test_internal_cache_invalidates_folded_rows(tmp_path):
-    store = await SessionStore.open(str(tmp_path / "cache.db"))
-    loop = _cache_loop(store)
-    try:
-        from .session_native_fixture import new_session
-        sid = (await new_session(store)).session_id
-        for i in range(4):
-            await store.append_message(sid, role="user", content=f"m{i}")
-        assert await loop.prewarm(sid)
-        state = await store.get_state(sid)
-        assert loop._cache_get(sid, state.next_seq, state.last_compact_seq) is not None
-        assert loop._cache_get(sid, state.next_seq, state.last_compact_seq+1) is None
-        await loop.prewarm(sid)
-        await store.record_compaction(sid, from_seq=2, to_seq=3, note_content="sum", before_tokens=9,
-            after_tokens=1, round_index=0, fold_seqs=[2,3], order_key=2)
-        await loop._refresh_window_cache_after_send(sid, store)
-        assert sid not in loop._session_cache
-        active = [m.content for m in await store.load_active_messages(sid)]
-        assert "m1" not in active and "m2" not in active and "sum" in active
-    finally:
-        await loop.aclose()
-        await store.close()
-
-
 async def test_store_schema_verify_and_reopen_through_current_runtime(tmp_path):
     path = str(tmp_path / "store.db")
     with pytest.raises(StoreSchemaError) as error:

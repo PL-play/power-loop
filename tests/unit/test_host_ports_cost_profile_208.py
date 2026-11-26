@@ -129,7 +129,7 @@ async def test_host_port_cost(registry_store, operation):
             expected = {
                 'sqlite': ([], 0),
                 'postgres': (['SELECT pg_try_advisory_lock($1)', 'SELECT 1'], 0),
-                'mysql': (['SELECT GET_LOCK(%s,0)'], 1),
+                'mysql': (['SELECT GET_LOCK(%s,0)', 'SELECT RELEASE_LOCK(%s)'], 1),
             }
             statements, pings = expected[original.dialect.name]
             assert [record['sql'] for record in records] == statements

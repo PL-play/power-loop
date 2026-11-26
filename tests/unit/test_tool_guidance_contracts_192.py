@@ -110,13 +110,17 @@ async def test_presentation_metadata_rejects_ambiguous_types(field, value):
 
 @pytest.mark.parametrize('field,value', [('usage_hint', 'changed'), ('background_hint', False)])
 async def test_registered_contract_freezes_presentation_metadata_too(field, value):
+    from dataclasses import FrozenInstanceError
     implementation = FunctionRuntimeTool(lambda **args: '', ToolRuntimeContract('example.frozen'))
     registry = ToolRegistry()
     definition = ToolDefinition('probe', '', pricing=Free("test_fixture"))
     registry.register(definition, implementation)
-    object.__setattr__(definition, field, value)
+    with pytest.raises(FrozenInstanceError):
+        setattr(definition, field, value)
+    registered = registry.subset(['probe']).get('probe')
+    object.__setattr__(registered, 'definition', replace(definition, **{field: value}))
     with pytest.raises(ToolContractError, match='binding_changed'):
-        resolve(registry.subset(['probe']).get('probe'))
+        resolve(registered)
 
 
 async def test_progress_prompt_names_only_actual_capabilities_and_respects_filtered_tools():

@@ -368,6 +368,7 @@ class _ExecutionLoop:
         stop_event: CancellationLike, system_prompt: str | None = None,
         max_rounds: int | None = None, response_format: dict[str, Any] | None = None,
         with_history: bool = True, boundary=None,
+        effective_tools: frozenset[str] | None = None,
     ) -> StatefulResult:
         """Run one claimed send on the session-native boundary (design 215 §7–§8).
 
@@ -402,6 +403,7 @@ class _ExecutionLoop:
                     tool_registry=tool_registry, hooks=hooks, event_bus=event_bus,
                     stop_event=stop_event, system_prompt=system_prompt, max_rounds=max_rounds,
                     response_format=response_format, with_history=with_history, boundary=boundary,
+                    effective_tools=effective_tools,
                 )
                 res.next_seq = reads.next_seq
                 return res
@@ -411,6 +413,7 @@ class _ExecutionLoop:
     async def _run_session_send_impl(
         self, sid: str, *, batch, ownership, send, config, tool_registry, hooks, event_bus,
         stop_event, system_prompt, max_rounds, response_format, with_history, boundary=None,
+        effective_tools: frozenset[str] | None = None,
     ) -> StatefulResult:
         store = self.store
         projector = config.representation
@@ -559,8 +562,7 @@ class _ExecutionLoop:
             _overrides["response_format"] = response_format
         runtime_config = replace(config, **_overrides) if _overrides else config
         effective_registry = self._resolve_registry(tool_registry)
-        _eff_tools = (frozenset(effective_registry.names())
-                      if tool_registry is not None and effective_registry is not None else None)
+        _eff_tools = effective_tools
 
         stop = CancellationToken.from_any(stop_event).child()
         send.stop_renewal = stop

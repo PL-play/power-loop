@@ -1228,3 +1228,113 @@ async def test_caller_cancel_during_forbidden_cleanup_then_client_close(registry
         await asyncio.gather(task, return_exceptions=True)
         transport.subscribe = original_subscribe
         await client.aclose()
+
+
+# ── R04: output queue overflow gap is session-scoped ───────────────────────
+
+
+async def test_output_queue_overflow_from_other_input_wakes_waiter_via_session_gap(
+    registry_store, monkeypatch
+):
+    store, _ = registry_store
+    client, transport = _client(store)
+    session = await _session(client.inputs, "r04-overflow-wait")
+    ref_a = await _accept(client.inputs, session, "input-a")
+    ref_b = InputRef(store.store_id, session.session_id, "input-b")
+    reads = await _count_reads(monkeypatch, client.inputs)
+    try:
+        output = await client.subscribe_output(ref_a, actor=ACTOR)
+        assert output._initial_read.result is None and reads["n"] == 1
+
+        # Persist A's terminal state and enqueue its completion notification.
+        await _finish(client.inputs, session, final_text="answer-A")
+        await transport.publish(_completed(ref_a))
+        assert output.subscription.queue.qsize() == 1
+
+        # Fill the remaining 255 slots with same-session B packets, then trigger overflow.
+        for index in range(255):
+            await transport.publish(_delta(ref_b, f"b-{index}"))
+        assert output.subscription.queue.full()
+        await transport.publish(_delta(ref_b, "b-overflow"))
+        assert output.subscription.queue.qsize() == 2
+
+        queued = list(output.subscription.queue._queue)
+        assert queued[0].input_ref is None and queued[0].payload == {"kind": "gap"}
+        assert queued[1].input_ref == ref_b and queued[1].payload["text"] == "b-overflow"
+
+        # Stop publishing; deadline_ms=None ensures only the overflow gap triggers the DB read.
+        result = await asyncio.wait_for(output.wait(deadline_ms=None), timeout=5.0)
+        assert result.input_ref == ref_a
+        assert result.status == "completed" and result.final_text == "answer-A"
+        assert reads["n"] == 2
+        assert client._slots == 0 and not client._waiters and not client._outputs
+    finally:
+        await client.aclose()
+
+
+async def test_output_queue_overflow_keeps_delta_and_completion_filtered_by_input(
+    registry_store, monkeypatch
+):
+    store, _ = registry_store
+    client, transport = _client(store)
+    session = await _session(client.inputs, "r04-overflow-filter")
+    ref_a = await _accept(client.inputs, session, "input-a")
+    ref_b = InputRef(store.store_id, session.session_id, "input-b")
+    reads = await _count_reads(monkeypatch, client.inputs)
+    try:
+        output = await client.subscribe_output(ref_a, actor=ACTOR)
+        assert (await anext(output)).kind == "gap"
+        assert reads["n"] == 1
+
+        # While A is still pending, B overflows the queue with deltas + completion.
+        for index in range(257):
+            await transport.publish(_delta(ref_b, f"noise-{index}"))
+        await transport.publish(_completed(ref_b))
+        gap_item = await asyncio.wait_for(anext(output), timeout=5.0)
+        assert gap_item.kind == "gap" and reads["n"] == 2
+
+        # B's trailing delta and completion are filtered out without emitting to A or reading DB.
+        await _finish(client.inputs, session, final_text="answer-A-stream")
+        await transport.publish(_completed(ref_a))
+        for index in range(256):
+            await transport.publish(_delta(ref_b, f"after-{index}"))
+        done_item = await asyncio.wait_for(anext(output), timeout=5.0)
+        assert done_item.kind == "completed"
+        assert done_item.payload["final_text"] == "answer-A-stream"
+        assert reads["n"] == 3
+        with pytest.raises(StopAsyncIteration):
+            await anext(output)
+    finally:
+        await client.aclose()
+
+
+async def test_database_polling_output_overflow_recovers_after_poller_exit(
+    registry_store, monkeypatch
+):
+    store, connect = registry_store
+    writer = RuntimeInputStore(store)
+    session = await _session(writer, "r04-db-overflow")
+    ref_a = await _accept(writer, session, "input-a")
+    ref_b = InputRef(store.store_id, session.session_id, "input-b")
+    reader = await connect()
+    async with _observed_polling(reader) as (client, transport, discovery):
+        reads = await _count_reads(monkeypatch, client.inputs)
+        output = await client.subscribe_output(ref_a, actor=ACTOR)
+        assert output._initial_read.result is None and reads["n"] == 1
+        await discovery.first_page.wait()
+
+        # Poller discovers A's terminal row, enqueues it, and exits (discovery_message_id set).
+        await _finish(writer, session, final_text="answer-A-db")
+        await asyncio.wait_for(output.subscription.poller, timeout=5.0)
+        assert output.subscription.queue.qsize() == 1
+
+        # Local B deltas overflow the queue and drop A's polled completion packet.
+        for index in range(256):
+            await transport.publish(_delta(ref_b, f"local-b-{index}"))
+        assert output.subscription.queue.qsize() == 2
+
+        result = await asyncio.wait_for(output.wait(deadline_ms=None), timeout=5.0)
+        assert result.input_ref == ref_a
+        assert result.status == "completed" and result.final_text == "answer-A-db"
+        assert reads["n"] == 2
+        _assert_polling_released(client, transport, output.subscription.poller)

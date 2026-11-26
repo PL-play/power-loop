@@ -114,9 +114,10 @@ async def test_close_session_cascades_project_messages(store: SessionStore) -> N
 
 
 async def exercise_export_import_send_index(store: SessionStore) -> None:
-    """Backend-agnostic (regression for #7): a v2 session round-trips with its send_index column
-    intact (incl. a NULL legacy row), so projection still partitions by send after a restore.
-    Distinct session ids → safe against a shared, freshly-truncated DB (run on PG/MySQL too)."""
+    """Schema 18: export_session preserves send_index (incl. NULL), while import_session
+    explicitly raises capability_unavailable (aligned with E34)."""
+    from power_loop.agent.runtime_types import RuntimeRequestError
+
     sid = "ei_si_src"
     await store.create_session(dataclasses.replace(STORE_DESCRIPTOR, config={"system_prompt": "S"}), actor=STORE_ACTOR, session_id=sid)
     await store.append_message(sid, role="user", content="u1", send_index=1)
@@ -124,11 +125,12 @@ async def exercise_export_import_send_index(store: SessionStore) -> None:
     await store.append_message(sid, role="user", content="u2", send_index=2)
     await store.append_message(sid, role="user", content="legacy")  # NULL send_index
     blob = await store.export_session(sid)
-    new_id = await store.import_session(blob, new_session_id="ei_si_restored")
-    rows = await store.load_active_messages(new_id)
-    assert [(r.content, r.send_index) for r in rows] == [
+    assert [(r["content"], r["send_index"]) for r in blob["tables"]["messages"]] == [
         ("u1", 1), ("a1", 1), ("u2", 2), ("legacy", None),
     ]
+    with pytest.raises(RuntimeRequestError) as exc:
+        await store.import_session(blob, new_session_id="ei_si_restored")
+    assert exc.value.code == "capability_unavailable"
 
 
 @pytest.mark.asyncio
@@ -148,15 +150,16 @@ async def test_v1_store_is_refused_without_rewriting_originals(tmp_path) -> None
     sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await s.append_message(sid, role="user", content="original")
     async with s._db.transaction() as tx:
-        await tx.execute("DROP VIEW pl_usage_rounds")
-        await tx.execute("DROP TABLE pl_project_messages")
-        await tx.execute("DROP TABLE pl_hook_events")
+        await tx.execute("DROP VIEW IF EXISTS pl_usage_rounds")
+        await tx.execute("DROP TABLE IF EXISTS pl_project_messages")
+        await tx.execute("DROP TABLE IF EXISTS pl_hook_events")
+        await tx.execute("DROP INDEX IF EXISTS pl_idx_messages_send")
         await tx.execute("ALTER TABLE pl_messages DROP COLUMN send_index")
         await tx.execute("UPDATE pl_schema_migrations SET version=1 WHERE id=1")
     await s.close()
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         before = list(original.iterdump())
-    with pytest.raises(StoreSchemaError, match="fresh store"):
+    with pytest.raises(StoreSchemaError, match="fresh.*store"):
         await SessionStore.open(path)
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         assert list(original.iterdump()) == before
@@ -173,12 +176,12 @@ async def test_v2_store_is_refused_without_rewriting_originals(tmp_path) -> None
     sid = await s.create_session(STORE_DESCRIPTOR, actor=STORE_ACTOR)
     await s.append_message(sid, role="user", content="original", send_index=7)
     async with s._db.transaction() as tx:
-        await tx.execute("DROP TABLE pl_hook_events")
+        await tx.execute("DROP TABLE IF EXISTS pl_hook_events")
         await tx.execute("UPDATE pl_schema_migrations SET version=2 WHERE id=1")
     await s.close()
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         before = list(original.iterdump())
-    with pytest.raises(StoreSchemaError, match="fresh store"):
+    with pytest.raises(StoreSchemaError, match="fresh.*store"):
         await SessionStore.open(path)
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         assert list(original.iterdump()) == before

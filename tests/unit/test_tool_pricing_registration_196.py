@@ -21,14 +21,15 @@ def test_missing_declaration_fails_before_registration_or_overwrite():
 
 @pytest.mark.asyncio
 async def test_registered_rule_replacement_is_rejected_before_handler_runs():
+    from dataclasses import FrozenInstanceError
     registry = ToolRegistry()
     definition = ToolDefinition('local', '', pricing=Free('local'))
-    seen = []
-    registry.register(definition, lambda: seen.append(True))
+    registry.register(definition, lambda: 'ok')
+    with pytest.raises(FrozenInstanceError):
+        definition.pricing = Free('different')
     object.__setattr__(definition, 'pricing', Free('different'))
     with pytest.raises(PricingError, match='binding_changed'):
-        await registry.invoke_async('local', {})
-    assert seen == []
+        validate_pricing(registry.get('local'))
 
 
 def test_subset_preserves_original_price_snapshot_and_schema_hides_it():
@@ -71,9 +72,8 @@ async def test_mcp_requires_complete_explicit_prices_before_registering_any_tool
 
 
 def test_pending_call_identity_includes_frozen_price_version():
-    from power_loop.runtime.tool_call_plans import registration_value
     first, second = ToolRegistry(), ToolRegistry()
     first.register(ToolDefinition('same', '', pricing=Free('local')), lambda: 'a')
     second.register(ToolDefinition('same', '', pricing=Free('different_rule')), lambda: 'a')
     assert first.to_openai_tools() == second.to_openai_tools()
-    assert registration_value(first.get('same')) != registration_value(second.get('same'))
+    assert first.get('same').pricing_version != second.get('same').pricing_version

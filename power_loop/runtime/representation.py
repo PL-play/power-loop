@@ -77,7 +77,10 @@ def resolve_send_projections(
         if before_send_index is not None and si >= before_send_index:
             continue
         if row.kind == "compact":
-            if compact_row is None or si >= int(compact_row.send_index):
+            if row.compact_to_send is not None and (
+                compact_row is None
+                or (si, int(row.id or 0)) >= (int(compact_row.send_index), int(compact_row.id or 0))
+            ):
                 compact_row = row
             continue
         by_send_raw.setdefault(si, []).append(row)

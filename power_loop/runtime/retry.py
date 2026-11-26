@@ -197,27 +197,36 @@ async def with_retry(
     for attempt in range(policy.max_attempts):
         token.raise_if_cancelled()
 
-        if deadline is not None and time.monotonic() >= deadline:
-            raise LLMTimeout(
-                elapsed=time.monotonic() - start,
-                attempts=attempt,
-                total_timeout=policy.total_timeout or 0.0,
-            )
+        remaining: float | None = None
+        if deadline is not None:
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                raise LLMTimeout(
+                    elapsed=now - start,
+                    attempts=attempt,
+                    total_timeout=policy.total_timeout or 0.0,
+                )
 
         try:
-            if deadline is not None:
+            if remaining is not None:
                 # Bound the in-flight call by the REMAINING wall-clock budget, not just
                 # the between-attempts deadline — otherwise a single hung call blows
                 # past total_timeout (bounded only by the transport's own timeout). (C16)
-                remaining = max(0.0, deadline - time.monotonic())
+                # Use asyncio.timeout so a TimeoutError raised by call() itself is
+                # distinguished from outer total-budget expiration via budget.expired().
+                budget = asyncio.timeout(remaining)
                 try:
-                    return await asyncio.wait_for(call(), timeout=remaining)
-                except asyncio.TimeoutError as exc:
-                    raise LLMTimeout(
-                        elapsed=time.monotonic() - start,
-                        attempts=attempt + 1,
-                        total_timeout=policy.total_timeout or 0.0,
-                    ) from exc
+                    async with budget:
+                        return await call()
+                except TimeoutError as exc:
+                    if budget.expired():
+                        raise LLMTimeout(
+                            elapsed=time.monotonic() - start,
+                            attempts=attempt + 1,
+                            total_timeout=policy.total_timeout or 0.0,
+                        ) from exc
+                    raise
             return await call()
         except CancellationRequested:
             raise

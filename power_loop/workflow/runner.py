@@ -493,7 +493,7 @@ class DurableExecutor:
             and getattr(r.coordinator, "installs_session_fence", False)
             and all(self.worker._capable(item.descriptor) for item in batch_items)
         )
-        free_slots = max(0, r.capacity - self.worker._active_llm_count()) if can_preclaim else 0
+        free_slots = self.worker.available_llm_slots() if can_preclaim else 0
 
         try:
             cm = await self.port.create_many(
@@ -727,10 +727,16 @@ class DurableExecutor:
 
     def _is_leaf_local_pending_or_active(self, leaf_sid: str) -> bool:
         """True when this Worker owns or is actively draining the local queue for ``leaf_sid``."""
-        if leaf_sid in self.worker._active or leaf_sid in self.worker._pending:
+        if (
+            leaf_sid in self.worker._active
+            or leaf_sid in self.worker._pending
+            or leaf_sid in self.worker._claimed_pending
+        ):
             return True
         if not self.worker.runtime.shared_execution and (
-            self.worker._active_llm_count() > 0 or bool(self.worker._pending)
+            self.worker._active_llm_count() > 0
+            or bool(self.worker._pending)
+            or bool(self.worker._claimed_pending)
         ):
             return True
         return False

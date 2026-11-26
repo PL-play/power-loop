@@ -25,6 +25,7 @@ from power_loop import (
     AgentEventType,
     AgentLoopConfig,
     CancellationToken,
+    LLMNonRetryable,
     LLMRetryExhausted,
     LLMRetryPolicy,
     LLMTimeout,
@@ -163,8 +164,8 @@ def test_callable_raising_treated_as_not_cancelled() -> None:
     assert tok.is_cancelled() is False
 
 
-# Runtime does not replay an unknown model request. The standalone retry
-# utility above remains available for host actions known to be retryable.
+# With max_attempts=1, an unknown model failure is not retried and stays visible,
+# while a subsequent user input can continue normally.
 @pytest.mark.asyncio
 async def test_pipeline_unknown_failure_is_visible_and_new_input_can_continue(runtime_agent):
     llm = _ScriptedLLM(script=[RuntimeError("unconfirmed call"), LLMResponse(raw_text="new input succeeded")])
@@ -172,7 +173,7 @@ async def test_pipeline_unknown_failure_is_visible_and_new_input_can_continue(ru
     bus = AgentEventBus()
     bus.subscribe(None, events.append)
     loop = await runtime_agent(model=llm, event_bus=bus, config=AgentLoopConfig(context_budget_tokens=10**9,
-        retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0)))
+        retry_policy=LLMRetryPolicy(max_attempts=1, backoff_initial=0)))
     result = await loop.send("first input")
     assert result.status == "failed" and "unconfirmed call" in result.error
     assert llm.calls == 1
@@ -229,3 +230,157 @@ def test_backoff_does_not_overflow_for_huge_attempt() -> None:
     policy = LLMRetryPolicy(max_attempts=5000, backoff_initial=1.0, backoff_max=8.0)
     assert policy.backoff_for_attempt(2000) == 8.0  # clamped, no OverflowError
     assert policy.backoff_for_attempt(1) == 1.0
+
+
+# ── R08: inner TimeoutError vs outer total_timeout budget ────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_retry_inner_timeout_retries_and_succeeds() -> None:
+    """An inner TimeoutError raised by call() before total_timeout expires must be
+    retried according to policy instead of immediately turning into LLMTimeout."""
+    calls = 0
+    retried: list[tuple[int, type[BaseException]]] = []
+
+    async def call() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("per-attempt timeout")
+        return "ok"
+
+    policy = LLMRetryPolicy(
+        total_timeout=60.0,
+        max_attempts=3,
+        backoff_initial=0.001,
+        backoff_max=0.001,
+    )
+    result = await with_retry(
+        call,
+        policy=policy,
+        token=CancellationToken.never(),
+        on_retry=lambda attempt, exc, _sleep: retried.append((attempt, type(exc))),
+    )
+    assert result == "ok"
+    assert calls == 2
+    assert retried == [(0, TimeoutError)]
+
+
+@pytest.mark.asyncio
+async def test_with_retry_real_total_timeout_raises_llmtimeout() -> None:
+    """A hung call that outlasts total_timeout raises LLMTimeout."""
+    calls = 0
+
+    async def hang() -> str:
+        nonlocal calls
+        calls += 1
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    policy = LLMRetryPolicy(
+        total_timeout=0.05,
+        max_attempts=3,
+        backoff_initial=0.001,
+        backoff_max=0.001,
+    )
+    t0 = time.monotonic()
+    with pytest.raises(LLMTimeout) as excinfo:
+        await with_retry(hang, policy=policy, token=CancellationToken.never())
+    assert time.monotonic() - t0 < 1.0
+    assert calls == 1
+    assert excinfo.value.attempts == 1
+    assert excinfo.value.total_timeout == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_with_retry_direct_task_cancel_propagates_cancelled_error() -> None:
+    """Direct task cancellation while awaiting call() under total_timeout stays CancelledError."""
+    entered = asyncio.Event()
+    calls = 0
+
+    async def hang() -> str:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    policy = LLMRetryPolicy(total_timeout=60.0, max_attempts=3)
+    task = asyncio.create_task(with_retry(hang, policy=policy, token=CancellationToken.never()))
+    await asyncio.wait_for(entered.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_with_retry_inner_timeout_respects_retry_on_exclusion() -> None:
+    """When retry_on excludes TimeoutError, an inner TimeoutError propagates directly,
+    while actual outer total_timeout expiration still raises LLMTimeout."""
+    calls = 0
+
+    async def immediate_timeout() -> str:
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("inner transport timeout")
+
+    policy = LLMRetryPolicy(
+        total_timeout=60.0,
+        max_attempts=3,
+        backoff_initial=0.001,
+        backoff_max=0.001,
+        retry_on=(ValueError,),
+    )
+    with pytest.raises(TimeoutError, match="inner transport timeout"):
+        await with_retry(immediate_timeout, policy=policy, token=CancellationToken.never())
+    assert calls == 1
+
+    async def hang() -> str:
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    short_policy = LLMRetryPolicy(
+        total_timeout=0.05,
+        max_attempts=3,
+        retry_on=(ValueError,),
+    )
+    with pytest.raises(LLMTimeout):
+        await with_retry(hang, policy=short_policy, token=CancellationToken.never())
+
+
+@pytest.mark.asyncio
+async def test_with_retry_inner_timeout_respects_give_up_on_and_max_attempts() -> None:
+    """Inner TimeoutError obeys give_up_on and max_attempts exhaustion."""
+    calls = 0
+
+    async def always_timeout() -> str:
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("per-attempt timeout")
+
+    give_up_policy = LLMRetryPolicy(
+        total_timeout=60.0,
+        max_attempts=3,
+        backoff_initial=0.001,
+        backoff_max=0.001,
+        give_up_on=lambda exc: isinstance(exc, TimeoutError),
+    )
+    with pytest.raises(LLMNonRetryable) as non_retryable:
+        await with_retry(always_timeout, policy=give_up_policy, token=CancellationToken.never())
+    assert calls == 1
+    assert non_retryable.value.attempts == 1
+    assert isinstance(non_retryable.value.last_error, TimeoutError)
+
+    calls = 0
+    exhaust_policy = LLMRetryPolicy(
+        total_timeout=60.0,
+        max_attempts=3,
+        backoff_initial=0.001,
+        backoff_max=0.001,
+    )
+    with pytest.raises(LLMRetryExhausted) as exhausted:
+        await with_retry(always_timeout, policy=exhaust_policy, token=CancellationToken.never())
+    assert calls == 3
+    assert exhausted.value.attempts == 3
+    assert isinstance(exhausted.value.last_error, TimeoutError)

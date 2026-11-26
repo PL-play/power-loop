@@ -174,11 +174,20 @@ async def test_subtree_cancel_reaches_child_model(registry_store, kind):
                 message_id='workflow',actor=runner.actor)
             reference = handle.input_ref
         await asyncio.wait_for(model.hanging.wait(),10)
-        await runner.runtime.client.cancel(reference,actor=runner.actor,scope='subtree')
+        await runner.runtime.client.cancel(runner.target,actor=runner.actor,scope='subtree')
         await asyncio.wait_for(runner.drain(),10)
         assert model.cancelled == 1
-        rows = await store._db.fetchall(f"SELECT outcome FROM {store.table_prefix}jobs WHERE kind=?",(kind,))
-        assert rows and all(row['outcome']=='cancelled' for row in rows)
+        children = await store.list_children(runner.target.session_id)
+        assert children
+        if kind == 'workflow':
+            res = await runner.runtime.worker.inputs.get_result(reference, actor=runner.actor)
+            assert res is not None and res.status == 'cancelled'
+        else:
+            qrows = await store._db.fetchall(
+                f"SELECT terminal_status FROM {store.t.follow_up_queue} WHERE session_id=?",
+                (children[0].session_id,),
+            )
+            assert qrows and all(row['terminal_status'] == 'cancelled' for row in qrows)
     finally:
         await runner.aclose()
 
@@ -192,7 +201,7 @@ def _tagged_pids(task_id: str) -> list[int]:
             continue
         try:
             with open(f"/proc/{p}/environ", "rb") as fh:
-                if f"POWER_LOOP_BACKGROUND_JOB={task_id}".encode() in fh.read().split(b"\0"):
+                if f"POWER_LOOP_BACKGROUND_SESSION={task_id}".encode() in fh.read().split(b"\0"):
                     out.append(int(p))
         except OSError:
             continue
@@ -215,9 +224,11 @@ async def test_background_shell_stop_reaches_processes_that_left_the_group(regis
             while not _tagged_pids(tag):
                 await asyncio.sleep(.02)
         status = await runner.runtime.client.inspect(ref,actor=runner.actor)
-        await runner.runtime.client.cancel(status.input_ref,actor=runner.actor)
+        await runner.runtime.client.cancel(status.input_ref,actor=runner.actor,reason='stop detached shell')
         result = await runner.runtime.client.wait(ref,actor=runner.actor,deadline_ms=now_ms()+10000)
         assert result.status == 'cancelled'
+        assert result.error_code == 'cancelled'
+        assert result.error == 'stop detached shell'
         async with asyncio.timeout(5):
             while _tagged_pids(tag):
                 await asyncio.sleep(.02)

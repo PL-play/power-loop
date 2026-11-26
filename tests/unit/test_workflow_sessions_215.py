@@ -629,3 +629,433 @@ async def test_submit_descriptor_facts_retry_conflict_and_authorization(registry
     children = await store._db.fetchone(
         f"SELECT COUNT(*) AS n FROM {store.t.sessions} WHERE parent_session_id=?", (parent.session_id,))
     assert int(children["n"]) == 1
+
+
+@pytest.mark.parametrize("discovery_mode", ("recover", "periodic_tick"))
+async def test_fresh_worker_recovers_queued_workflow_driver_under_capacity_while_bounding_agent(
+    registry_store, discovery_mode,
+):
+    """A brand-new worker without prior in-memory _drivers state schedules a queued workflow_driver
+    even while capacity=1 is occupied, yet keeps ordinary queued agent sessions bounded.
+    """
+    store, _ = registry_store
+    leaf_b_started, release_leaf_b = asyncio.Event(), asyncio.Event()
+    blocker_started, release_blocker = asyncio.Event(), asyncio.Event()
+    ordinary_started = asyncio.Event()
+
+    class Scripted(Model):
+        async def complete(self, request, **kwargs):
+            if request.system_prompt.startswith("B"):
+                leaf_b_started.set()
+                await release_leaf_b.wait()
+                return LLMResponse(raw_text="B done")
+            if request.system_prompt.startswith("A"):
+                return LLMResponse(raw_text="A done")
+            last = request.messages[-1] if request.messages else {}
+            text = last.get("content", "") if isinstance(last, dict) else getattr(last, "content", "")
+            if text == "hold-slot":
+                blocker_started.set()
+                await release_blocker.wait()
+                return LLMResponse(raw_text="blocker done")
+            if text == "ordinary-queued":
+                ordinary_started.set()
+                return LLMResponse(raw_text="ordinary done")
+            return LLMResponse(raw_text="ack")
+
+    runner1 = await RunningAgent(
+        store, Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+    ).start()
+    runner2 = None
+    try:
+        # 1) Run workflow on runner1 until leaf B runs, then simulate driver + worker1 crash
+        #    leaving driver and leaf B running in DB with unreleased leases.
+        handle = await runner1.runtime.client.workflow(
+            runner1.target,
+            {"name": "fresh-worker-driver-recovery", "root": {"type": "sequence", "steps": [leaf("A"), leaf("B")]}},
+            message_id="fresh-worker-drv", actor=runner1.actor,
+        )
+        await asyncio.wait_for(leaf_b_started.wait(), 5)
+        driver_task = await _driver_task(runner1, handle)
+        runner1.runtime.worker._active[handle.target.session_id].shutdown_interrupted = True
+        driver_task.cancel("driver process crash")
+        await asyncio.gather(driver_task, return_exceptions=True)
+        runner1.runtime.worker._active.pop(handle.target.session_id, None)
+        release_leaf_b.set()
+        await runner1.runtime.worker.shutdown(timeout_s=0, cancel_running=True, release_leases=False)
+        await runner1.aclose()
+        runner1 = None
+
+        # 2) Start a completely fresh worker (runner2, capacity=1, empty _drivers) and occupy its sole LLM slot.
+        runner2 = await RunningAgent(
+            store, Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+        ).start()
+        blocker = await runner2.loop.new_session(runner2.descriptor, actor=runner2.actor)
+        blocker_receipt = await runner2.runtime.client.send(
+            blocker, "hold-slot", message_id="hold-1", actor=runner2.actor,
+        )
+        await asyncio.wait_for(blocker_started.wait(), 5)
+
+        # 3) Recover the crashed workflow driver to queued in DB and queue an ordinary agent session in DB.
+        await _expire(store, handle.target.session_id)
+        recovered = await runner2.runtime.worker.inputs.recover(
+            handle.target, node_id="recovery", boot_id="recovery", ttl_s=30,
+        )
+        assert recovered is not None and recovered.execution_state == "queued"
+
+        ordinary = await runner2.runtime.worker.inputs.create_session(runner2.descriptor, actor=runner2.actor)
+        ordinary_receipt = await runner2.runtime.worker.inputs.accept(
+            ordinary, "ordinary-queued", message_id="ord-1", actor=runner2.actor,
+        )
+
+        # Fresh worker has no prior in-memory _drivers state for either session.
+        assert handle.target.session_id not in runner2.runtime.worker._drivers
+        assert ordinary.session_id not in runner2.runtime.worker._drivers
+
+        # 4) Trigger discovery on fresh runner2 while capacity=1 is still occupied.
+        if discovery_mode == "recover":
+            await runner2.runtime.worker.recover()
+        else:
+            await runner2.runtime.worker.periodic_tick(limit=32)
+
+        # Workflow driver MUST enter running, send_index=2 while capacity=1 is occupied.
+        async with asyncio.timeout(5):
+            while True:
+                state = await store._db.fetchone(
+                    f"SELECT execution_state,send_index FROM {store.t.sessions} WHERE session_id=?",
+                    (handle.target.session_id,),
+                )
+                if state["execution_state"] == "running" and int(state["send_index"]) == 2:
+                    break
+                await asyncio.sleep(0.01)
+
+        # Ordinary agent session MUST stay queued and NOT enter _drivers while capacity=1 is held.
+        assert ordinary.session_id not in runner2.runtime.worker._drivers
+        assert not ordinary_started.is_set()
+        ord_state = await store._db.fetchone(
+            f"SELECT execution_state,send_index FROM {store.t.sessions} WHERE session_id=?",
+            (ordinary.session_id,),
+        )
+        assert ord_state["execution_state"] == "queued" and int(ord_state["send_index"]) == 0
+
+        # 5) Cancel the recovered workflow driver via runner2 and release blocker so ordinary session finishes.
+        receipt = await runner2.runtime.client.cancel(
+            handle.input_ref, actor=runner2.actor, reason="stop fresh continuation",
+        )
+        assert receipt.state == "cancel_requested" and receipt.send_index == 2
+        wf_res = await runner2.runtime.client.wait(
+            handle.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert wf_res.status == "cancelled" and wf_res.send_index == 2
+
+        release_blocker.set()
+        blocker_res = await runner2.runtime.client.wait(
+            blocker_receipt.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert blocker_res.status == "completed"
+        ord_res = await runner2.runtime.client.wait(
+            ordinary_receipt.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert ord_res.status == "completed" and ord_res.send_index == 1
+    finally:
+        release_blocker.set()
+        release_leaf_b.set()
+        if runner2 is not None:
+            await runner2.aclose()
+        if runner1 is not None:
+            await runner1.aclose()
+
+
+async def test_recover_full_pending_queue_does_not_leak_driver_ids(registry_store):
+    """When _pending is full (1,024), recover() must not add un-enqueued workflow_driver IDs to _drivers."""
+    store, _ = registry_store
+    runner = await RunningAgent(store, Model(), config=AgentLoopConfig(context_budget_tokens=10**9)).start()
+    try:
+        worker = runner.runtime.worker
+        drv_desc = replace(DESCRIPTOR, kind="workflow_driver")
+        drv = await worker.inputs.create_session(drv_desc, actor=ACTOR)
+        await worker.inputs.accept(drv, "go", message_id="m-full-rec", actor=ACTOR)
+
+        for i in range(1024):
+            worker._pending[f"filler-{i}"] = 1
+        try:
+            await worker.recover()
+            assert drv.session_id not in worker._pending
+            assert drv.session_id not in worker._drivers
+            assert worker._overflow is True
+        finally:
+            worker._pending.clear()
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("discovery_mode", ("recover", "periodic_tick"))
+async def test_bounded_scan_advances_past_head_ordinary_session_to_discover_driver(
+    registry_store, discovery_mode,
+):
+    """With capacity=1 occupied and 'aaa-ordinary' sorted ahead of the queued workflow_driver,
+    bounded claim_limit=1 recover() and limit=1 periodic_tick() advance past page 1 so the
+    driver enters running (send_index=2) while aaa-ordinary stays queued until the slot frees.
+    """
+    store, _ = registry_store
+    leaf_b_started, release_leaf_b = asyncio.Event(), asyncio.Event()
+    blocker_started, release_blocker = asyncio.Event(), asyncio.Event()
+    ordinary_started = asyncio.Event()
+
+    class Scripted(Model):
+        async def complete(self, request, **kwargs):
+            if request.system_prompt.startswith("B"):
+                leaf_b_started.set()
+                await release_leaf_b.wait()
+                return LLMResponse(raw_text="B done")
+            if request.system_prompt.startswith("A"):
+                return LLMResponse(raw_text="A done")
+            last = request.messages[-1] if request.messages else {}
+            text = last.get("content", "") if isinstance(last, dict) else getattr(last, "content", "")
+            if text == "hold-slot":
+                blocker_started.set()
+                await release_blocker.wait()
+                return LLMResponse(raw_text="blocker done")
+            if text == "ordinary-queued":
+                ordinary_started.set()
+                return LLMResponse(raw_text="ordinary done")
+            return LLMResponse(raw_text="ack")
+
+    runner1 = await RunningAgent(
+        store, Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+    ).start()
+    runner2 = None
+    try:
+        handle = await runner1.runtime.client.workflow(
+            runner1.target,
+            {"name": "bounded-cursor-driver", "root": {"type": "sequence", "steps": [leaf("A"), leaf("B")]}},
+            message_id="bounded-cursor-drv", actor=runner1.actor,
+        )
+        await asyncio.wait_for(leaf_b_started.wait(), 5)
+        driver_task = await _driver_task(runner1, handle)
+        runner1.runtime.worker._active[handle.target.session_id].shutdown_interrupted = True
+        driver_task.cancel("driver process crash")
+        await asyncio.gather(driver_task, return_exceptions=True)
+        runner1.runtime.worker._active.pop(handle.target.session_id, None)
+        release_leaf_b.set()
+        await runner1.runtime.worker.shutdown(timeout_s=0, cancel_running=True, release_leases=False)
+        await runner1.aclose()
+        runner1 = None
+
+        runner2 = await RunningAgent(
+            store, Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+        ).start()
+        worker2 = runner2.runtime.worker
+        if discovery_mode == "recover":
+            runner2.runtime.claim_limit = 1
+
+        # Occupy the sole capacity=1 LLM slot on fresh runner2.
+        blocker = await runner2.loop.new_session(runner2.descriptor, actor=runner2.actor)
+        blocker_receipt = await runner2.runtime.client.send(
+            blocker, "hold-slot", message_id="hold-bounded-1", actor=runner2.actor,
+        )
+        await asyncio.wait_for(blocker_started.wait(), 5)
+
+        # Recover driver to queued and create 'aaa-ordinary' sorted strictly ahead of driver.
+        await _expire(store, handle.target.session_id)
+        recovered = await worker2.inputs.recover(
+            handle.target, node_id="recovery", boot_id="recovery", ttl_s=30,
+        )
+        assert recovered is not None and recovered.execution_state == "queued"
+
+        ordinary = await worker2.inputs.create_session(
+            runner2.descriptor, actor=runner2.actor, options={"session_id": "aaa-ordinary"},
+        )
+        ordinary_receipt = await worker2.inputs.accept(
+            ordinary, "ordinary-queued", message_id="ord-bounded-1", actor=runner2.actor,
+        )
+        assert ordinary.session_id == "aaa-ordinary"
+        assert ordinary.session_id < handle.target.session_id
+        assert handle.target.session_id not in worker2._drivers
+
+        # Verify default public discovery APIs keep their original return types/order.
+        default_queued = await worker2.inputs.discover_queued(limit=32)
+        assert default_queued == [ordinary.session_id, handle.target.session_id]
+        default_unfinished = await worker2.inputs.discover_unfinished(limit=100)
+        assert default_unfinished[:2] == (ordinary, handle.target)
+
+        # Isolate the tested discovery path: only call recover() OR only call periodic_tick(limit=1).
+        if discovery_mode == "recover":
+            await worker2.recover()
+            assert worker2._recover_cursor == ("queued", None, ordinary.session_id)
+            assert handle.target.session_id not in worker2._drivers
+            await worker2.recover()
+        else:
+            tick1 = await worker2.periodic_tick(limit=1)
+            assert tick1["queued"] == [ordinary.session_id]
+            assert worker2._queued_cursor == ordinary.session_id
+            assert handle.target.session_id not in worker2._drivers
+            tick2 = await worker2.periodic_tick(limit=1)
+            assert tick2["queued"] == [handle.target.session_id]
+
+        # Driver MUST advance to running, send_index=2 while capacity=1 remains occupied.
+        async with asyncio.timeout(5):
+            while True:
+                state = await store._db.fetchone(
+                    f"SELECT execution_state,send_index FROM {store.t.sessions} WHERE session_id=?",
+                    (handle.target.session_id,),
+                )
+                if state["execution_state"] == "running" and int(state["send_index"]) == 2:
+                    break
+                await asyncio.sleep(0.01)
+
+        # Ordinary session stays queued until the model slot is released.
+        assert ordinary.session_id not in worker2._drivers
+        assert not ordinary_started.is_set()
+        ord_state = await store._db.fetchone(
+            f"SELECT execution_state,send_index FROM {store.t.sessions} WHERE session_id=?",
+            (ordinary.session_id,),
+        )
+        assert ord_state["execution_state"] == "queued" and int(ord_state["send_index"]) == 0
+
+        # Original cancel semantics and single workflow_continue preserved.
+        receipt = await runner2.runtime.client.cancel(
+            handle.input_ref, actor=runner2.actor, reason="stop bounded continuation",
+        )
+        assert receipt.state == "cancel_requested" and receipt.send_index == 2
+        wf_res = await runner2.runtime.client.wait(
+            handle.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert wf_res.status == "cancelled" and wf_res.send_index == 2
+        continuations = await store._db.fetchall(
+            f"SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=? AND kind='workflow_continue'",
+            (handle.target.session_id,),
+        )
+        assert len(continuations) == 1
+
+        # Cursor wraps cleanly back to None once past the end of the queued set
+        # (including the parent session queued by the cancelled workflow's result delivery).
+        if discovery_mode == "recover":
+            for _ in range(3):
+                await worker2.recover()
+                if worker2._recover_cursor is None:
+                    break
+            assert worker2._recover_cursor is None
+        else:
+            for _ in range(3):
+                tick_tail = await worker2.periodic_tick(limit=1)
+                assert len(tick_tail["queued"]) <= 1
+                if worker2._queued_cursor is None:
+                    break
+            assert worker2._queued_cursor is None
+
+        # Releasing the blocker allows aaa-ordinary to execute and finish.
+        release_blocker.set()
+        blocker_res = await runner2.runtime.client.wait(
+            blocker_receipt.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert blocker_res.status == "completed"
+        ord_res = await runner2.runtime.client.wait(
+            ordinary_receipt.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert ord_res.status == "completed" and ord_res.send_index == 1
+    finally:
+        release_blocker.set()
+        release_leaf_b.set()
+        if runner2 is not None:
+            await runner2.aclose()
+        if runner1 is not None:
+            await runner1.aclose()
+
+
+async def test_periodic_tick_recognizes_driver_after_reassigned_discover_queued(registry_store):
+    """Restoring worker.inputs.discover_queued onto the instance must not disable session_kind discovery."""
+    store, _ = registry_store
+    leaf_b_started, release_leaf_b = asyncio.Event(), asyncio.Event()
+    blocker_started, release_blocker = asyncio.Event(), asyncio.Event()
+
+    class Scripted(Model):
+        async def complete(self, request, **kwargs):
+            if request.system_prompt.startswith("B"):
+                leaf_b_started.set()
+                await release_leaf_b.wait()
+                return LLMResponse(raw_text="B done")
+            if request.system_prompt.startswith("A"):
+                return LLMResponse(raw_text="A done")
+            last = request.messages[-1] if request.messages else {}
+            text = last.get("content", "") if isinstance(last, dict) else getattr(last, "content", "")
+            if text == "hold-slot":
+                blocker_started.set()
+                await release_blocker.wait()
+                return LLMResponse(raw_text="blocker done")
+            return LLMResponse(raw_text="ack")
+
+    runner1 = await RunningAgent(
+        store, Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+    ).start()
+    runner2 = None
+    try:
+        handle = await runner1.runtime.client.workflow(
+            runner1.target,
+            {"name": "reassigned-discover-queued", "root": {"type": "sequence", "steps": [leaf("A"), leaf("B")]}},
+            message_id="reassigned-dq", actor=runner1.actor,
+        )
+        await asyncio.wait_for(leaf_b_started.wait(), 5)
+        driver_task = await _driver_task(runner1, handle)
+        runner1.runtime.worker._active[handle.target.session_id].shutdown_interrupted = True
+        driver_task.cancel("driver process crash")
+        await asyncio.gather(driver_task, return_exceptions=True)
+        runner1.runtime.worker._active.pop(handle.target.session_id, None)
+        release_leaf_b.set()
+        await runner1.runtime.worker.shutdown(timeout_s=0, cancel_running=True, release_leases=False)
+        await runner1.aclose()
+        runner1 = None
+
+        runner2 = await RunningAgent(
+            store, Scripted(), config=AgentLoopConfig(context_budget_tokens=10**9), capacity=1,
+        ).start()
+        worker2 = runner2.runtime.worker
+        # Assign original bound method onto the instance (leaves 'discover_queued' in inputs.__dict__).
+        orig_discover = worker2.inputs.discover_queued
+        worker2.inputs.discover_queued = orig_discover  # type: ignore[method-assign]
+        assert "discover_queued" in worker2.inputs.__dict__
+
+        blocker = await runner2.loop.new_session(runner2.descriptor, actor=runner2.actor)
+        blocker_receipt = await runner2.runtime.client.send(
+            blocker, "hold-slot", message_id="hold-reassign-1", actor=runner2.actor,
+        )
+        await asyncio.wait_for(blocker_started.wait(), 5)
+
+        await _expire(store, handle.target.session_id)
+        recovered = await worker2.inputs.recover(
+            handle.target, node_id="recovery", boot_id="recovery", ttl_s=30,
+        )
+        assert recovered is not None and recovered.execution_state == "queued"
+        assert handle.target.session_id not in worker2._drivers
+
+        await worker2.periodic_tick(limit=32)
+
+        async with asyncio.timeout(5):
+            while True:
+                state = await store._db.fetchone(
+                    f"SELECT execution_state,send_index FROM {store.t.sessions} WHERE session_id=?",
+                    (handle.target.session_id,),
+                )
+                if state["execution_state"] == "running" and int(state["send_index"]) == 2:
+                    break
+                await asyncio.sleep(0.01)
+
+        receipt = await runner2.runtime.client.cancel(
+            handle.input_ref, actor=runner2.actor, reason="stop reassigned continuation",
+        )
+        assert receipt.state == "cancel_requested" and receipt.send_index == 2
+        wf_res = await runner2.runtime.client.wait(
+            handle.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert wf_res.status == "cancelled" and wf_res.send_index == 2
+        release_blocker.set()
+        blocker_res = await runner2.runtime.client.wait(
+            blocker_receipt.input_ref, actor=runner2.actor, deadline_ms=now_ms() + 10000,
+        )
+        assert blocker_res.status == "completed"
+    finally:
+        release_blocker.set()
+        release_leaf_b.set()
+        if runner2 is not None:
+            await runner2.aclose()
+        if runner1 is not None:
+            await runner1.aclose()

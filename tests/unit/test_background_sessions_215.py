@@ -144,6 +144,8 @@ async def test_cancel_background_handler(registry_store, tmp_path):
             deadline_ms=now_ms() + 10000,
         )
         assert result.status == "cancelled" and not release.is_set()
+        assert result.error_code == "cancelled"
+        assert result.error == "stop background"
     finally:
         release.set()
         await runner.aclose()
@@ -299,4 +301,35 @@ async def test_background_target_context_policy_and_original_delivery(
         assert json.loads(derived[1])["targets"][0]["result"] == record["result"]
     finally:
         active_engine.reset(token)
+        await runner.aclose()
+
+
+async def test_background_tool_exception_reports_tool_failed(registry_store, tmp_path):
+    store, _ = registry_store
+
+    async def slow():
+        raise RuntimeError("boom")
+
+    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
+    registry.register(
+        ToolDefinition(
+            "slow", "failing coroutine", async_capable=True, interrupt="abort",
+            pricing=Free("local"), input_schema={"type": "object"},
+        ),
+        slow,
+    )
+    runner = await RunningAgent(
+        store, BackgroundParent(), registry, AgentLoopConfig(context_budget_tokens=10**9),
+    ).start()
+    try:
+        await runner.send("start")
+        receipt = _receipt(await store.load_all_messages(runner.target.session_id))
+        result = await runner.runtime.client.wait(
+            InputRef(**receipt["input_ref"]), actor=runner.actor,
+            deadline_ms=now_ms() + 10000,
+        )
+        assert result.status == "failed"
+        assert result.error_code == "tool_failed"
+        assert result.error == "RuntimeError: boom"
+    finally:
         await runner.aclose()

@@ -2001,6 +2001,611 @@ async def test_m1c_b3_r2_automatic_takeover_respects_capacity_limit(registry_sto
         await rt.transport.aclose()
 
 
+async def test_m1c_b3_r2_final_mysql_1213_deadlock_retries_cleanly_without_rerun_or_duplicate_notify(
+    registry_store, monkeypatch,
+):
+    """D5: A MySQL 8.4 InnoDB 1213 deadlock during _final_tx rolls back the tx and retries only final(),
+    never re-running the LLM or leaking partial state/notifications; non-1213 errors still raise StoreError.
+    """
+    store, _ = registry_store
+    if store._db.dialect.name != "mysql":
+        pytest.skip("MySQL 8.4 InnoDB 1213 deadlock regression")
+
+    import pymysql
+
+    from power_loop.agent.runtime_types import StoreError
+    from power_loop.contracts.errors import SessionLeaseLost
+    from power_loop.runtime.store.backends.mysql import _MyTransaction
+
+    port = RuntimeInputStore(store)
+    in_flight = 0
+    max_in_flight = 0
+    calls_by_sid: dict[str, int] = {}
+    started_order: list[str] = []
+    gates = {f"b3r2-cap-{i}": asyncio.Event() for i in range(1, 4)}
+    entered = {f"b3r2-cap-{i}": asyncio.Event() for i in range(1, 4)}
+
+    class _CountingBlockingModel:
+        async def complete(self, request, **_kwargs):
+            nonlocal in_flight, max_in_flight
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            calls_by_sid[sid] = calls_by_sid.get(sid, 0) + 1
+            started_order.append(sid)
+            entered[sid].set()
+            try:
+                await asyncio.wait_for(gates[sid].wait(), 5)
+            finally:
+                in_flight -= 1
+            return LLMResponse(raw_text=f"done:{sid}")
+
+        async def close(self):
+            pass
+
+    model = _CountingBlockingModel()
+    factory = RegistryRuntimeFactory()
+
+    async def _cap_build(_d, _c):
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _cap_build)
+
+    refs: list[InputRef] = []
+    for i in range(1, 4):
+        sid = f"b3r2-cap-{i}"
+        t = await target(port, sid)
+        r = await port.accept(t, f"task-{i}", message_id=f"m{i}", actor=ACTOR)
+        b = await port.claim(t, node_id="dead-node", boot_id="dead-boot", ttl_s=1.0)
+        assert b is not None
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=1 WHERE session_id=?",
+            (sid,),
+        )
+        refs.append(r.input_ref)
+
+    orig_packed = _MyTransaction.execute_packed
+    injected_1213 = 0
+    final_tx_attempts_cap3 = 0
+
+    async def _fault_packed(self, sql, params=()):
+        nonlocal injected_1213, final_tx_attempts_cap3
+        res = await orig_packed(self, sql, params)
+        if "b3r2-cap-3" in params and f"UPDATE {store.t.sessions}" in sql:
+            final_tx_attempts_cap3 += 1
+            if injected_1213 == 0:
+                injected_1213 += 1
+                raise pymysql.err.OperationalError(
+                    1213, "Deadlock found when trying to get lock; try restarting transaction",
+                )
+        return res
+
+    monkeypatch.setattr(_MyTransaction, "execute_packed", _fault_packed)
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="b3r2-node", boot_id="b3r2-boot",
+        capacity=1, session_lease_ttl_s=1.5, recovery_interval_s=0.1, timers_enabled=False,
+    )
+    notified_sids: list[str] = []
+    orig_notify = rt.worker._notify_results
+
+    async def _counting_notify(final_batch):
+        for res in final_batch.results:
+            notified_sids.append(res.target.session_id)
+        return await orig_notify(final_batch)
+
+    rt.worker._notify_results = _counting_notify  # type: ignore[method-assign]
+
+    await rt.worker.start()
+    try:
+        await asyncio.wait_for(
+            asyncio.wait(
+                [asyncio.create_task(ev.wait()) for ev in entered.values()],
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            5,
+        )
+        gates[started_order[0]].set()
+        for expected_started in (2, 3):
+            for _ in range(100):
+                if len(started_order) >= expected_started:
+                    break
+                await asyncio.sleep(0.03)
+            assert len(started_order) == expected_started
+            gates[started_order[-1]].set()
+
+        results = await asyncio.gather(*(
+            rt.client.wait(ref, actor=ACTOR, deadline_ms=now_ms() + 5000) for ref in refs
+        ))
+        assert [r.status for r in results] == ["completed", "completed", "completed"]
+        assert [r.final_text for r in results] == [f"done:b3r2-cap-{i}" for i in range(1, 4)]
+        assert calls_by_sid == {"b3r2-cap-1": 1, "b3r2-cap-2": 1, "b3r2-cap-3": 1}
+        assert max_in_flight == 1
+        assert injected_1213 == 1 and final_tx_attempts_cap3 == 2
+        assert notified_sids.count("b3r2-cap-3") == 1
+
+        # Verify no duplicate/leftover rows from the rolled-back attempt on b3r2-cap-3.
+        msgs = await store.load_all_messages("b3r2-cap-3")
+        assert [m.role for m in msgs] == ["user", "assistant"]
+        projs = await store.load_project_messages("b3r2-cap-3")
+        assert [(p.send_index, p.kind) for p in projs] == [(1, "user"), (1, "project")]
+
+        # Non-1213 errors (e.g. 2013 lost connection / commit unknown) MUST NOT retry and still raise StoreError.
+        t_unk = await target(port, "b3r2-unknown-err")
+        await port.accept(t_unk, "task-unk", message_id="m-unk", actor=ACTOR)
+        b_unk = await port.claim(t_unk, node_id="u-node", boot_id="u-boot", ttl_s=30.0)
+        assert b_unk is not None
+        unk_attempts = 0
+
+        async def _fault_2013(self, sql, params=()):
+            nonlocal unk_attempts
+            if "b3r2-unknown-err" in params and f"UPDATE {store.t.sessions}" in sql:
+                unk_attempts += 1
+                raise pymysql.err.OperationalError(2013, "Lost connection to MySQL server during query")
+            return await orig_packed(self, sql, params)
+
+        monkeypatch.setattr(_MyTransaction, "execute_packed", _fault_2013)
+        with pytest.raises(StoreError):
+            await port.final(b_unk, status="completed", final_text="ok")
+        assert unk_attempts == 1
+
+        # Non-driver ValueError(1213) MUST NOT retry (transaction body executes once) and still raises StoreError.
+        t_val = await target(port, "b3r2-value-1213")
+        await port.accept(t_val, "task-val", message_id="m-val", actor=ACTOR)
+        b_val = await port.claim(t_val, node_id="u-node", boot_id="u-boot", ttl_s=30.0)
+        assert b_val is not None
+        val_attempts = 0
+
+        async def _fault_value_1213(self, sql, params=()):
+            nonlocal val_attempts
+            if "b3r2-value-1213" in params and f"UPDATE {store.t.sessions}" in sql:
+                val_attempts += 1
+                raise ValueError(1213)
+            return await orig_packed(self, sql, params)
+
+        monkeypatch.setattr(_MyTransaction, "execute_packed", _fault_value_1213)
+        with pytest.raises(StoreError):
+            await port.final(b_val, status="completed", final_text="ok")
+        assert val_attempts == 1
+
+        # Ownership fence (SessionLeaseLost) MUST still raise immediately without retry.
+        monkeypatch.setattr(_MyTransaction, "execute_packed", orig_packed)
+        t_lost = await target(port, "b3r2-lease-lost")
+        await port.accept(t_lost, "task-lost", message_id="m-lost", actor=ACTOR)
+        b_lost = await port.claim(t_lost, node_id="u-node", boot_id="u-boot", ttl_s=30.0)
+        assert b_lost is not None
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_epoch=owner_epoch+1 WHERE session_id=?",
+            ("b3r2-lease-lost",),
+        )
+        lost_attempts = 0
+
+        async def _count_lost(self, sql, params=()):
+            nonlocal lost_attempts
+            if "b3r2-lease-lost" in params and f"UPDATE {store.t.sessions}" in sql:
+                lost_attempts += 1
+            return await orig_packed(self, sql, params)
+
+        monkeypatch.setattr(_MyTransaction, "execute_packed", _count_lost)
+        with pytest.raises(SessionLeaseLost):
+            await port.final(b_lost, status="completed", final_text="ok")
+        assert lost_attempts == 1
+    finally:
+        for ev in gates.values():
+            ev.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_m1c_b3_r2_mysql_batch_renew_epoch_turnover_reports_renewed_epoch_and_keeps_worker_alive(
+    registry_store, monkeypatch,
+):
+    """D5: When the same node finishes epoch=1 and claims epoch=2 between MySQL batch_renew's initial
+    SELECT and UPDATE, batch_renew must extend epoch=2 and report epoch=2 (never stale epoch=1 or []),
+    and RuntimeWorker.batch_renew must keep the valid epoch=2 execution alive.
+    """
+    store, _ = registry_store
+    if store._db.dialect.name != "mysql":
+        pytest.skip("MySQL 8.4 batch_renew epoch-turnover concurrency regression")
+
+    import sys
+
+    from power_loop.runtime.store.db import is_mysql_deadlock_error
+
+    # Guardrail: helper works cleanly even when optional pymysql dependency is absent.
+    with monkeypatch.context() as mp:
+        mp.setitem(sys.modules, "pymysql", None)
+        assert is_mysql_deadlock_error(ValueError(1213)) is False
+
+    sid = "b3r2-renew-epoch"
+    entered = {"turn-1": asyncio.Event(), "turn-2": asyncio.Event()}
+    gates = {"turn-1": asyncio.Event(), "turn-2": asyncio.Event()}
+
+    class _TwoTurnModel:
+        async def complete(self, request, **_kwargs):
+            content = request.messages[-1]["content"]
+            text = content if isinstance(content, str) else str(content)
+            entered[text].set()
+            await asyncio.wait_for(gates[text].wait(), 5)
+            return LLMResponse(raw_text=f"done:{text}")
+
+        async def close(self):
+            pass
+
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        return ExecutionEnvironment(_TwoTurnModel(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _build)
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="rn-node", boot_id="rn-boot",
+        capacity=1, session_lease_ttl_s=6.0, recovery_interval_s=3600.0, timers_enabled=False,
+    )
+    await rt.worker.start()
+    try:
+        t = await target(RuntimeInputStore(store), sid)
+        ref1 = (await rt.client.send(t, "turn-1", message_id="m-turn-1", actor=ACTOR)).input_ref
+        await asyncio.wait_for(entered["turn-1"].wait(), 5)
+
+        db_ep1 = await store._db.fetchone(
+            f"SELECT owner_epoch, execution_state FROM {store.t.sessions} WHERE session_id=?",
+            (sid,),
+        )
+        assert db_ep1 is not None and int(db_ep1["owner_epoch"]) == 1
+        assert rt.worker._active[sid] is not None
+        assert rt.worker._active[sid].batch.owner_epoch == 1
+
+        orig_fetchall = store._db.fetchall
+        select1_done = asyncio.Event()
+        allow_update = asyncio.Event()
+        paused_once = False
+        first_select_epochs: list[int] = []
+
+        async def _pause_after_first_renew_select(sql, params=()):
+            nonlocal paused_once
+            rows = await orig_fetchall(sql, params)
+            if (
+                not paused_once
+                and "SELECT session_id,owner_epoch,cancel_seq" in sql
+                and f"FROM {store.t.sessions}" in sql
+            ):
+                paused_once = True
+                first_select_epochs.extend(int(r["owner_epoch"]) for r in rows if r["session_id"] == sid)
+                select1_done.set()
+                await asyncio.wait_for(allow_update.wait(), 5)
+            return rows
+
+        monkeypatch.setattr(store._db, "fetchall", _pause_after_first_renew_select)
+
+        renew_task = asyncio.create_task(rt.worker.batch_renew())
+        await asyncio.wait_for(select1_done.wait(), 5)
+        assert first_select_epochs == [1]
+
+        # Complete epoch=1 and let the SAME node claim a new input (epoch=2) before UPDATE runs.
+        gates["turn-1"].set()
+        res1 = await rt.client.wait(ref1, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert res1.status == "completed" and res1.final_text == "done:turn-1"
+
+        ref2 = (await rt.client.send(t, "turn-2", message_id="m-turn-2", actor=ACTOR)).input_ref
+        await asyncio.wait_for(entered["turn-2"].wait(), 5)
+
+        # Shorten epoch=2's lease slightly (still valid > now, < now+3000ms) to prove DB renewal extends epoch=2.
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET owner_lease_until_ms=(UNIX_TIMESTAMP(NOW(3))*1000)+800 "
+            "WHERE session_id=? AND owner_epoch=2",
+            (sid,),
+        )
+        db_before_renew = await store._db.fetchone(
+            f"SELECT owner_epoch, owner_lease_until_ms FROM {store.t.sessions} WHERE session_id=?",
+            (sid,),
+        )
+        assert db_before_renew is not None and int(db_before_renew["owner_epoch"]) == 2
+        lease_before_renew = int(db_before_renew["owner_lease_until_ms"])
+
+        allow_update.set()
+        worker_rows = await asyncio.wait_for(renew_task, 5)
+
+        db_after_renew = await store._db.fetchone(
+            f"SELECT owner_epoch, owner_lease_until_ms, execution_state FROM {store.t.sessions} WHERE session_id=?",
+            (sid,),
+        )
+        assert db_after_renew is not None
+        assert int(db_after_renew["owner_epoch"]) == 2
+        assert db_after_renew["execution_state"] == "running"
+        assert int(db_after_renew["owner_lease_until_ms"]) > lease_before_renew + 1000
+
+        worker_epochs = [int(r["owner_epoch"]) for r in worker_rows if r["session_id"] == sid]
+        assert worker_epochs == [2]
+
+        ctx2 = rt.worker._active.get(sid)
+        assert ctx2 is not None and ctx2.batch.owner_epoch == 2
+        assert ctx2.ownership is not None and not ctx2.ownership.lost
+        assert not ctx2.stop.is_cancelled()
+
+        gates["turn-2"].set()
+        res2 = await rt.client.wait(ref2, actor=ACTOR, deadline_ms=now_ms() + 5000)
+        assert res2.status == "completed" and res2.final_text == "done:turn-2"
+    finally:
+        for ev in gates.values():
+            ev.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_m1c_b3_r2_mysql_batch_renew_keeps_newly_claimed_session_b_alive_without_refreshing_deadline(
+    registry_store, monkeypatch,
+):
+    """D5: Session A is active at batch_renew start; session B is newly claimed while MySQL
+    batch_renew is paused between SELECT (seeing only A) and UPDATE (renewing only A).
+    Worker must refresh A's deadline, keep B's ownership alive WITHOUT refreshing B's claim-time
+    deadline, keep newly claimed pending session C untouched, and let B complete on its InputRef.
+    """
+    store, _ = registry_store
+    if store._db.dialect.name != "mysql":
+        pytest.skip("MySQL 8.4 batch_renew newly-claimed-during-scan regression")
+
+    sid_a = "b3r2-scan-a"
+    sid_b = "b3r2-scan-b"
+    sid_c = "b3r2-scan-c"
+    entered = {sid_a: asyncio.Event(), sid_b: asyncio.Event()}
+    gates = {sid_a: asyncio.Event(), sid_b: asyncio.Event()}
+
+    class _GatedModel:
+        async def complete(self, request, **_kwargs):
+            from power_loop.core.execution_context import get_execution_context
+            sid = get_execution_context().session_id
+            entered[sid].set()
+            await asyncio.wait_for(gates[sid].wait(), 5)
+            return LLMResponse(raw_text=f"done:{sid}")
+
+        async def close(self):
+            pass
+
+    factory = RegistryRuntimeFactory()
+
+    async def _build(_d, _c):
+        return ExecutionEnvironment(_GatedModel(), ToolRegistry(), AgentLoopConfig(context_budget_tokens=10**9))
+
+    factory.register("test.agent@215", _build)
+
+    rt = Runtime(
+        store=store, factory=factory, node_id="ab-node", boot_id="ab-boot",
+        capacity=2, session_lease_ttl_s=6.0, recovery_interval_s=3600.0, timers_enabled=False,
+    )
+    port = RuntimeInputStore(store)
+    await rt.worker.start()
+    try:
+        t_a = await target(port, sid_a)
+        t_b = await target(port, sid_b)
+        t_c = await target(port, sid_c)
+
+        ref_a = (await rt.client.send(t_a, "work-a", message_id="m-a", actor=ACTOR)).input_ref
+        await asyncio.wait_for(entered[sid_a].wait(), 5)
+
+        ctx_a = rt.worker._active[sid_a]
+        assert ctx_a is not None and ctx_a.ownership is not None
+        # Pull A's local deadline slightly back (still > now) so we can verify A gets refreshed.
+        ctx_a.ownership.expires_at -= 1.0
+        a_expires_before = ctx_a.ownership.expires_at
+
+        orig_fetchall = store._db.fetchall
+        select_done = asyncio.Event()
+        allow_update = asyncio.Event()
+        paused = False
+        first_select_sids: list[str] = []
+
+        async def _pause_after_select(sql, params=()):
+            nonlocal paused
+            rows = await orig_fetchall(sql, params)
+            if (
+                not paused
+                and "SELECT session_id,owner_epoch,cancel_seq" in sql
+                and f"FROM {store.t.sessions}" in sql
+            ):
+                paused = True
+                first_select_sids.extend(str(r["session_id"]) for r in rows)
+                select_done.set()
+                await asyncio.wait_for(allow_update.wait(), 5)
+            return rows
+
+        monkeypatch.setattr(store._db, "fetchall", _pause_after_select)
+
+        renew_task = asyncio.create_task(rt.worker.batch_renew())
+        await asyncio.wait_for(select_done.wait(), 5)
+        assert first_select_sids == [sid_a]
+
+        # While batch_renew is paused between SELECT and UPDATE, claim B (active) and C (claimed_pending).
+        ref_b = (await rt.client.send(t_b, "work-b", message_id="m-b", actor=ACTOR)).input_ref
+        await asyncio.wait_for(entered[sid_b].wait(), 5)
+        ctx_b = rt.worker._active[sid_b]
+        assert ctx_b is not None and ctx_b.ownership is not None
+        b_expires_before = ctx_b.ownership.expires_at
+
+        await port.accept(t_c, "work-c", message_id="m-c", actor=ACTOR)
+        batch_c = await port.claim(t_c, node_id="ab-node", boot_id="ab-boot", ttl_s=6.0)
+        assert batch_c is not None
+        c_claimed_before = batch_c.claimed_at_mono
+        rt.worker._claimed_pending[sid_c] = batch_c
+
+        allow_update.set()
+        renewed_rows = await asyncio.wait_for(renew_task, 5)
+        assert [(str(r["session_id"]), int(r["owner_epoch"])) for r in renewed_rows] == [(sid_a, 1)]
+
+        # A: confirmed renewed -> deadline refreshed, ownership intact.
+        assert not ctx_a.ownership.lost
+        assert ctx_a.ownership.expires_at > a_expires_before
+
+        # B: newly claimed during scan -> ownership intact, claim-time deadline NOT overwritten.
+        assert not ctx_b.ownership.lost
+        assert not ctx_b.stop.is_cancelled()
+        assert ctx_b.ownership.expires_at == b_expires_before
+
+        # C: newly claimed pending batch during scan -> retained, claimed_at_mono NOT overwritten.
+        assert sid_c in rt.worker._claimed_pending
+        assert rt.worker._claimed_pending[sid_c].claimed_at_mono == c_claimed_before
+        rt.worker._claimed_pending.pop(sid_c, None)
+
+        gates[sid_a].set()
+        gates[sid_b].set()
+        res_a, res_b = await asyncio.gather(
+            rt.client.wait(ref_a, actor=ACTOR, deadline_ms=now_ms() + 5000),
+            rt.client.wait(ref_b, actor=ACTOR, deadline_ms=now_ms() + 5000),
+        )
+        assert res_a.status == "completed" and res_a.final_text == f"done:{sid_a}"
+        assert res_b.status == "completed" and res_b.final_text == f"done:{sid_b}"
+    finally:
+        for ev in gates.values():
+            ev.set()
+        await rt.worker.shutdown(timeout_s=2, cancel_running=True)
+        await rt.client.aclose()
+        await rt.transport.aclose()
+
+
+async def test_m1c_b3_r2_mysql_batch_renew_retry_exhaustion_excludes_unrenewed_final_read_epoch(
+    registry_store, monkeypatch,
+):
+    """D5: When all 4 MySQL batch_renew UPDATE attempts mismatch, an epoch that only appears on
+    the final read (never targeted by an UPDATE) must NOT be reported as renewed, while a session
+    that actually matched an UPDATE IS reported; when all 4 attempts update 0 rows, return [].
+    Also verify _claimed_pending keeps a newer local epoch when batch_renew returns an older epoch.
+    """
+    store, _ = registry_store
+    if store._db.dialect.name != "mysql":
+        pytest.skip("MySQL 8.4 batch_renew retry-exhaustion regression")
+
+    port = RuntimeInputStore(store)
+
+    # Case 1: Session A stays at epoch=1 (renewed by UPDATE), session B churns 1->2->3->4->5
+    # between each SELECT and UPDATE so all 4 attempts mismatch (updated=1 < 2).
+    sid_a = "b3r2-exh-a"
+    sid_b = "b3r2-exh-b"
+    t_a = await target(port, sid_a)
+    t_b = await target(port, sid_b)
+
+    await port.accept(t_a, "a-1", message_id="ma-1", actor=ACTOR)
+    batch_a = await port.claim(t_a, node_id="exh-node", boot_id="exh-boot", ttl_s=6.0)
+    assert batch_a is not None and batch_a.owner_epoch == 1
+    await store._db.execute(
+        f"UPDATE {store.t.sessions} SET owner_lease_until_ms=(UNIX_TIMESTAMP(NOW(3))*1000)+800 "
+        "WHERE session_id=? AND owner_epoch=1",
+        (sid_a,),
+    )
+    a_lease_before = int((await store._db.fetchone(
+        f"SELECT owner_lease_until_ms FROM {store.t.sessions} WHERE session_id=?", (sid_a,),
+    ))["owner_lease_until_ms"])
+
+    await port.accept(t_b, "b-1", message_id="mb-1", actor=ACTOR)
+    current_b = await port.claim(t_b, node_id="exh-node", boot_id="exh-boot", ttl_s=6.0)
+    assert current_b is not None and current_b.owner_epoch == 1
+
+    orig_fetchall = store._db.fetchall
+    select_calls = 0
+
+    async def _churn_b_after_select(sql, params=()):
+        nonlocal select_calls, current_b
+        rows = await orig_fetchall(sql, params)
+        if "SELECT session_id,owner_epoch,cancel_seq" in sql and f"FROM {store.t.sessions}" in sql:
+            select_calls += 1
+            if select_calls <= 4:
+                # Finish current epoch and immediately claim next epoch before UPDATE executes.
+                await port.final(current_b, status="completed", final_text=f"ok-{select_calls}")
+                nxt = select_calls + 1
+                await port.accept(t_b, f"b-{nxt}", message_id=f"mb-{nxt}", actor=ACTOR)
+                current_b = await port.claim(t_b, node_id="exh-node", boot_id="exh-boot", ttl_s=6.0)
+                assert current_b is not None and current_b.owner_epoch == nxt
+        return rows
+
+    monkeypatch.setattr(store._db, "fetchall", _churn_b_after_select)
+    renewed = await port.batch_renew(node_id="exh-node", boot_id="exh-boot", ttl_s=6.0)
+    assert select_calls == 5  # 4 attempt SELECTs + 1 final SELECT
+    assert [(str(r["session_id"]), int(r["owner_epoch"])) for r in renewed] == [(sid_a, 1)]
+    assert current_b.owner_epoch == 5
+
+    a_lease_after = int((await store._db.fetchone(
+        f"SELECT owner_lease_until_ms FROM {store.t.sessions} WHERE session_id=?", (sid_a,),
+    ))["owner_lease_until_ms"])
+    assert a_lease_after > a_lease_before + 1000
+
+    # Case 2: All 4 UPDATE attempts hit 0 rows -> returns [] immediately (no 5th SELECT),
+    # never reporting epoch=5 as renewed.
+    monkeypatch.setattr(store._db, "fetchall", orig_fetchall)
+    sid_solo = "b3r2-exh-solo"
+    t_solo = await target(port, sid_solo)
+    await port.accept(t_solo, "s-1", message_id="ms-1", actor=ACTOR)
+    current_solo = await port.claim(t_solo, node_id="solo-node", boot_id="solo-boot", ttl_s=6.0)
+    assert current_solo is not None and current_solo.owner_epoch == 1
+    solo_selects = 0
+
+    async def _churn_solo_after_select(sql, params=()):
+        nonlocal solo_selects, current_solo
+        rows = await orig_fetchall(sql, params)
+        if "SELECT session_id,owner_epoch,cancel_seq" in sql and f"FROM {store.t.sessions}" in sql:
+            solo_selects += 1
+            if solo_selects <= 4:
+                await port.final(current_solo, status="completed", final_text=f"ok-{solo_selects}")
+                nxt = solo_selects + 1
+                await port.accept(t_solo, f"s-{nxt}", message_id=f"ms-{nxt}", actor=ACTOR)
+                current_solo = await port.claim(t_solo, node_id="solo-node", boot_id="solo-boot", ttl_s=6.0)
+                assert current_solo is not None and current_solo.owner_epoch == nxt
+        return rows
+
+    monkeypatch.setattr(store._db, "fetchall", _churn_solo_after_select)
+    solo_renewed = await port.batch_renew(node_id="solo-node", boot_id="solo-boot", ttl_s=6.0)
+    assert solo_selects == 4
+    assert solo_renewed == []
+    assert current_solo.owner_epoch == 5
+
+    # Case 3: RuntimeWorker._claimed_pending receiving an older epoch (1 < local 2) keeps
+    # the newer batch untouched and does NOT overwrite claimed_at_mono.
+    monkeypatch.setattr(store._db, "fetchall", orig_fetchall)
+    factory = RegistryRuntimeFactory()
+
+    async def _noop_build(_d, _c):
+        return ExecutionEnvironment(
+            _ScriptedModel(lambda _i, _r: LLMResponse(raw_text="ok")),
+            ToolRegistry(),
+            AgentLoopConfig(context_budget_tokens=10**9),
+        )
+
+    factory.register("test.agent@215", _noop_build)
+    rt = Runtime(
+        store=store, factory=factory, node_id="pend-node", boot_id="pend-boot",
+        capacity=1, session_lease_ttl_s=6.0, recovery_interval_s=3600.0, timers_enabled=False,
+    )
+    t_p = await target(port, "b3r2-pend-newer")
+    await port.accept(t_p, "p-1", message_id="mp-1", actor=ACTOR)
+    b1 = await port.claim(t_p, node_id="pend-node", boot_id="pend-boot", ttl_s=6.0)
+    assert b1 is not None and b1.owner_epoch == 1
+    await port.final(b1, status="completed", final_text="p1")
+    await port.accept(t_p, "p-2", message_id="mp-2", actor=ACTOR)
+    b2 = await port.claim(t_p, node_id="pend-node", boot_id="pend-boot", ttl_s=6.0)
+    assert b2 is not None and b2.owner_epoch == 2
+
+    async def _return_older_epoch(**_kw):
+        rt.worker._claimed_pending["b3r2-pend-newer"] = b2
+        return [{
+            "session_id": "b3r2-pend-newer",
+            "owner_epoch": 1,
+            "cancel_seq": 0,
+            "cancel_by": None,
+            "cancel_reason": None,
+            "lifecycle": "open",
+        }]
+
+    monkeypatch.setattr(rt.worker.inputs, "batch_renew", _return_older_epoch)
+    await rt.worker.batch_renew()
+    assert "b3r2-pend-newer" in rt.worker._claimed_pending
+    assert rt.worker._claimed_pending["b3r2-pend-newer"].owner_epoch == 2
+    assert rt.worker._claimed_pending["b3r2-pend-newer"].claimed_at_mono == b2.claimed_at_mono
+    await rt.client.aclose()
+    await rt.transport.aclose()
+
+
 async def test_m1c_b3_r2_post_commit_hook_no_false_execution_lost_and_real_loss_fires(registry_store):
     """B3-R2: Committed Final awaiting post-commit RESULT_UNDELIVERABLE never fires EXECUTION_LOST; real loss does."""
     store, connect = registry_store

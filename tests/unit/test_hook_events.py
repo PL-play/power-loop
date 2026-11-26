@@ -433,7 +433,7 @@ async def test_leak_guard_audit_never_enters_history_or_request(runtime_agent) -
     """The load-bearing test: captured audit must NOT be on the persisted message row, must NOT
     appear when the row is converted into an LLM-request message, and must NOT accrete into the
     next request's history."""
-    from power_loop.runtime.representation import _row_to_loop_dict
+    from power_loop.agent.stateful_loop import _row_to_loop_message
 
     store = await SessionStore.open(":memory:")
     llm = _RecLLM()
@@ -454,7 +454,7 @@ async def test_leak_guard_audit_never_enters_history_or_request(runtime_agent) -
         assert "hook_injected" not in (asst.meta or {})
         assert "SECRET" not in (asst.content or "")
         # (c) converting the row to an LLM message yields ONLY the protocol keys
-        d = _row_to_loop_dict(asst)
+        d = _row_to_loop_message(asst)
         assert set(d.keys()) <= {"role", "content", "tool_calls", "tool_call_id", "name"}
         # (d) a SECOND send: the history portion (everything before the freshly re-injected memory)
         # must not contain the recorded audit/SECRET except as the live ephemeral re-injection.

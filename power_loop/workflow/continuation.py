@@ -115,8 +115,9 @@ def plan_continuation(spec, node_id):
                     edges[by_id[ref]].append((path, True, "inputs_from"))
             if node.when:
                 reference(str(node.when.get("ref") or ""), path, "when")
-            for ref in _TEMPLATE.findall(node.input):
-                reference(ref, path, "template")
+            for text in (node.input, node.spec.system_prompt):
+                for ref in _TEMPLATE.findall(text):
+                    reference(ref, path, "template")
             for name, _ in _FILE.findall(node.input):
                 for producer in files.get(posixpath.normpath(name), ()):
                     edges[producer].append((path, True, "file"))

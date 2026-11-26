@@ -98,12 +98,14 @@ async def test_context_checkpoint_ends_send_when_real_prompt_reaches_threshold(t
         _resp("should never be reached"),
     ])
     events: list = []
+    round_events: list = []
     bus = AgentEventBus(suppress_subscriber_errors=True)
     bus.subscribe(AgentEventType.STATUS_CHANGED, events.append)
+    bus.subscribe(AgentEventType.ROUND_COMPLETED, round_events.append)
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, context_checkpoint_tokens=4000), registry=_echo_registry("ok"), event_bus=bus)
     res = await loop.send("hi")
     assert res.status == "failed" and res.error_code == "context_checkpoint"
-    assert (await loop.runtime.store.get_session_stats(loop.target.session_id)).rounds == 2
+    assert len(round_events) == 2
     assert llm._idx == 2, "第三个响应不该被消费：检查点在轮边界停"
     kinds = [(e.payload or {}).get("kind") for e in events]
     assert "context_checkpoint" in kinds
@@ -140,7 +142,7 @@ async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path, 
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+                               insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
     res = await loop.send("hi")
     assert res.status == "completed"
     assert len(llm.seen) == 4
@@ -169,7 +171,7 @@ async def test_insend_distill_respects_hot_tail(tmp_path, runtime_agent):
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=10, insend_distill_hot_tail=2, **kwargs), registry=_echo_registry(big))
+                               insend_distill_hot_tail=2, **kwargs), registry=_echo_registry(big))
     await loop.send("hi")
     # 只有两条工具结果且 hot_tail=2 → 一条都不许动
     assert _tool_rows(llm.seen[2]) == [big, big]
@@ -224,7 +226,7 @@ async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatc
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+                               insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
     assert (await loop.send("hi")).status == "completed"
     await loop.aclose()
 
@@ -255,7 +257,7 @@ async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=10, insend_distill_tokens=50,
-                               insend_distill_batch=10, insend_distill_hot_tail=8, **kwargs), registry=_echo_registry(big))
+                               insend_distill_hot_tail=8, **kwargs), registry=_echo_registry(big))
     assert (await loop.send("hi")).status == "completed"
     for i, req in enumerate(llm.seen):
         rows = _tool_rows(req)
@@ -303,7 +305,7 @@ async def test_insend_distill_also_slims_tool_call_arguments(tmp_path, runtime_a
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry("ok"))
+                               insend_distill_hot_tail=0, **kwargs), registry=_echo_registry("ok"))
     assert (await loop.send("hi")).status == "completed"
 
     last = _args_of(llm.seen[-1])
@@ -340,14 +342,14 @@ async def test_insend_distill_measures_total_context(tmp_path, runtime_agent):
     if rep_cls is not None:
         kwargs["representation"] = rep_cls()
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+                               insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
     assert (await loop.send("hi")).status == "completed"
     for req in llm.seen[1:]:
         assert all(r.startswith("[distilled #") for r in _tool_rows(req)), "总上下文超过阈值即触发"
     # 同样的配置，send 内真涨了就该动（基线 100 → 100+60）
     llm2 = _Scripted(responses=[_tool_resp("c1", prompt=100), _tool_resp("c2", prompt=160), _resp("done")])
     loop2 = await runtime_agent(model=llm2, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
+                               insend_distill_hot_tail=0, **kwargs), registry=_echo_registry(big))
     assert (await loop2.send("hi")).status == "completed"
     assert _tool_rows(llm2.seen[2])[0].startswith("[distilled #")
     await loop.aclose()
@@ -389,7 +391,7 @@ async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_pat
         return "said"
     reg.register(ToolDefinition(name="say", description="speak", input_schema={"type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("test_fixture")), _say)
     loop = await runtime_agent(model=llm, config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
-                               insend_distill_batch=5, insend_distill_hot_tail=0,
+                               insend_distill_hot_tail=0,
                                insend_distill_keep_tools=("say",), **kwargs), registry=reg)
     assert (await loop.send("hi")).status == "completed"
     last = _args_of(llm.seen[-1])
@@ -409,7 +411,7 @@ def test_insend_distill_never_touches_rows_before_this_send():
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
     if rep_cls is None:
         pytest.skip("保险丝只在投影表示法下工作")
-    p.config = AgentLoopConfig(system_prompt="t", insend_distill_tokens=1, insend_distill_batch=10,
+    p.config = AgentLoopConfig(system_prompt="t", insend_distill_tokens=1,
                                insend_distill_hot_tail=0, representation=rep_cls())
     p.send_index = 3
     p.sink = None

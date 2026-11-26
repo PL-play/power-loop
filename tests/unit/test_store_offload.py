@@ -83,21 +83,26 @@ async def test_blocking_store_write_does_not_freeze_event_loop(runtime_agent) ->
 
 
 async def test_blocking_active_history_read_does_not_freeze_event_loop(runtime_agent) -> None:
-    """SCALE-3: the per-send ``load_active_messages`` read is offloaded too, so a
-    large (slow) active-history load doesn't stall other tasks."""
+    """SCALE-3: the per-send history read is offloaded too, so a large (slow)
+    projection/history load doesn't stall other tasks."""
     store = await SessionStore.open(":memory:")
     try:
+        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
+        # Seed a prior send so the next send actually executes a history SELECT (cold send 1 skips history reads).
+        await loop_obj.send("seed")
+
         db = store._db
         orig_b_fetchall = db._b_fetchall
+        slow_hits = 0
 
         def slow_b_fetchall(sql: str, params: Any) -> Any:
+            nonlocal slow_hits
             if "messages" in sql and "SELECT" in sql.upper():
-                time.sleep(0.2)  # stand-in for an O(history) read on a fat session
+                slow_hits += 1
+                time.sleep(0.2)  # stand-in for a slow history/projection read on a fat session
             return orig_b_fetchall(sql, params)
 
         db._b_fetchall = slow_b_fetchall  # type: ignore[method-assign]
-
-        loop_obj = await runtime_agent(model=_FakeLLM(), store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=1, context_budget_tokens=10**9))
 
         ticks = 0
         stop = False
@@ -113,6 +118,7 @@ async def test_blocking_active_history_read_does_not_freeze_event_loop(runtime_a
         stop = True
         await t
 
+        assert slow_hits >= 1, "expected at least one offloaded history SELECT"
         assert ticks >= 8, f"event loop appears blocked during the history read (ticks={ticks})"
     finally:
         await loop_obj.aclose()

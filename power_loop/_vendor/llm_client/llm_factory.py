@@ -188,9 +188,9 @@ class OpenAICompatibleChatLLMService(LLMService):
         return self._capabilities
 
     def _ensure_client(self) -> Any:
-        from .attempt_scope import single_attempt
+        from .attempt_scope import single_attempt_client
         if self._client is not None:
-            return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
+            return single_attempt_client(self._client)
         _normalize_proxy_env_inplace()
 
         self._client = ExactAsyncOpenAI(
@@ -200,7 +200,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             max_retries=0,
             http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
         )
-        return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
+        return single_attempt_client(self._client)
 
     async def close(self) -> None:
         """

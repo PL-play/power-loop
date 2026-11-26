@@ -532,6 +532,7 @@ class AgentPipeline:
         hook_injected: dict[str, Any] | None = None,
         round_usage: dict[str, Any] | None = None,
         cumulative_usage: dict[str, Any] | None = None,
+        executed_rounds: int | None = None,
     ) -> bool:
         # An inbox delivery (design/124 §6) arrives with a private ``_inbox`` marker naming the
         # claimed inbox rows it carries. Strip it BEFORE hooks/history — the history row is sent
@@ -570,6 +571,8 @@ class AgentPipeline:
             sink_msg = {**sink_msg, "_round_usage": round_usage}
         if cumulative_usage is not None:
             sink_msg = {**sink_msg, "_cumulative_usage": cumulative_usage}
+        if executed_rounds is not None:
+            sink_msg = {**sink_msg, "_executed_rounds": int(executed_rounds)}
         if inbox is not None:
             sink_msg = {**sink_msg, "inbox": inbox}
             # Persist the claim before admitting any text/images/token estimates
@@ -1378,11 +1381,16 @@ class AgentPipeline:
                 t0 = time.perf_counter()
                 provider_started = False
                 try:
-                    provider_started = True
-                    resp = await self.llm.complete(
-                        request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
-                    )
-                    response_received = True
+                    from power_loop._vendor.llm_client.attempt_scope import single_attempt
+                    attempt_token = single_attempt.set(True)
+                    try:
+                        provider_started = True
+                        resp = await self.llm.complete(
+                            request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                        )
+                        response_received = True
+                    finally:
+                        single_attempt.reset(attempt_token)
                 except BaseException as exc:
                     # No usage chunk will ever come for this attempt, but it was billed: prompt
                     # in full once the provider started on it, plus what it streamed before the
@@ -2156,6 +2164,10 @@ class AgentPipeline:
                     hook_injected=hook_audit,
                     round_usage=usage,
                     cumulative_usage=(dict(self.ctx.usage_totals) if not tool_calls else None),
+                    executed_rounds=(
+                        max(0, round_idx + 1 - getattr(self, "_initial_round_index", 0))
+                        if not tool_calls else None
+                    ),
                 )
             # 截断的第二种表现：工具调用本身在，但它的 arguments JSON 断在半路 → 降成 {} →
             # 必填校验报「缺参数」，模型据此以为自己忘了填，于是原样再写一遍、再被截断。
@@ -2789,7 +2801,11 @@ class AgentPipeline:
         # the success branch returned it to the caller but never recorded it, so the next send's
         # history had a dangling "summarize…" user prompt with no answer. Mirrors the degraded branch.
         if final_text:
-            await self._append_message(self._assistant_message(final_resp, final_text), round_index=round_idx)
+            await self._append_message(
+                self._assistant_message(final_resp, final_text),
+                round_index=round_idx,
+                executed_rounds=max(0, round_idx - getattr(self, "_initial_round_index", 0)),
+            )
         await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
                              rounds=round_idx)
         return self._make_result("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",

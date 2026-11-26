@@ -223,3 +223,198 @@ async def test_lock_connection_loss_stops_admission(registry_store, active):
                 with path.open('x') as stream:
                     json.dump(evidence, stream, indent=2)
                     stream.write('\n')
+
+
+async def test_mysql_startup_lock_release_confirms_server_unlock_and_enforces_mutual_exclusion(
+    registry_store,
+):
+    """Real MySQL independent connection verifies:
+    - While held (including after non-final shared release), contender immediately fails GET_LOCK(key,0).
+    - Only the final await release() runs SELECT RELEASE_LOCK(%s); immediately after it returns,
+      the contender acquires the lock on the first attempt with zero delay.
+    - While contender holds the lock, a fresh guard.acquire() fails immediately and closes its
+      connection without issuing RELEASE_LOCK.
+    """
+    from contextlib import asynccontextmanager
+
+    from power_loop.runtime.store.process_guard import ProcessStoreGuard, _entries
+
+    store, _ = registry_store
+    if store._db.dialect.name != 'mysql':
+        pytest.skip('MySQL startup lock RELEASE_LOCK verification')
+
+    coordinator = MemorySessionOwnershipCoordinator()
+    transport = MemoryMessageTransport()
+    guard1 = ProcessStoreGuard(store, coordinator, transport)
+    guard2 = ProcessStoreGuard(store, coordinator, transport)
+    contender = await store._db.open_lock_connection()
+    sql_log: list[str] = []
+
+    try:
+        await guard1.acquire()
+        await guard2.acquire()
+        assert guard1.entry is guard2.entry and guard1.entry.users == 2
+        lock_key = guard1.entry.lock_key
+
+        orig_conn = guard1.entry.connection
+        orig_cursor = orig_conn.cursor
+
+        @asynccontextmanager
+        async def _spied_cursor():
+            async with orig_cursor() as cur:
+                class _SpyCursor:
+                    async def execute(self, sql, args=None):
+                        sql_log.append(sql)
+                        return await cur.execute(sql, args)
+
+                    async def fetchone(self):
+                        return await cur.fetchone()
+
+                yield _SpyCursor()
+
+        orig_conn.cursor = _spied_cursor  # type: ignore[method-assign]
+
+        # 1. While held by 2 shared users, independent contender immediately fails GET_LOCK(key, 0).
+        async with contender.cursor() as cur:
+            await cur.execute('SELECT GET_LOCK(%s,0)', (lock_key,))
+            assert (await cur.fetchone())[0] == 0
+
+        # 2. First (non-last) release does NOT execute RELEASE_LOCK; contender still fails immediately.
+        await guard1.release()
+        assert sql_log == []
+        assert guard2.entry is not None and guard2.entry.users == 1
+        async with contender.cursor() as cur:
+            await cur.execute('SELECT GET_LOCK(%s,0)', (lock_key,))
+            assert (await cur.fetchone())[0] == 0
+
+        # 3. Final release executes SELECT RELEASE_LOCK(%s) once and confirms unlock BEFORE returning;
+        #    contender immediately succeeds on the very first GET_LOCK(key, 0) without sleeping.
+        await guard2.release()
+        assert sql_log == ['SELECT RELEASE_LOCK(%s)']
+        assert guard2.entry is None and guard2.key not in _entries
+        assert orig_conn.closed
+
+        async with contender.cursor() as cur:
+            await cur.execute('SELECT GET_LOCK(%s,0)', (lock_key,))
+            assert (await cur.fetchone())[0] == 1
+            await cur.execute('SELECT CONNECTION_ID()')
+            contender_cid = (await cur.fetchone())[0]
+
+        # 4. While contender holds the lock, a fresh guard.acquire() fails immediately and cleans up
+        #    its connection directly WITHOUT calling RELEASE_LOCK.
+        failed_sql: list[str] = []
+        opened_failed_conns: list = []
+        orig_open = store._db.open_lock_connection
+
+        async def _spied_open():
+            conn = await orig_open()
+            opened_failed_conns.append(conn)
+            raw_cursor = conn.cursor
+
+            @asynccontextmanager
+            async def _log_cursor():
+                async with raw_cursor() as cur:
+                    class _LogCursor:
+                        async def execute(self, sql, args=None):
+                            failed_sql.append(sql)
+                            return await cur.execute(sql, args)
+
+                        async def fetchone(self):
+                            return await cur.fetchone()
+
+                    yield _LogCursor()
+
+            conn.cursor = _log_cursor  # type: ignore[method-assign]
+            return conn
+
+        store._db.open_lock_connection = _spied_open  # type: ignore[method-assign]
+        try:
+            guard3 = ProcessStoreGuard(store, MemorySessionOwnershipCoordinator(), transport)
+            with pytest.raises(RuntimeRequestError, match='already owned by another default runtime'):
+                await guard3.acquire()
+            assert failed_sql == ['SELECT GET_LOCK(%s,0)']
+            assert guard3.entry is None and guard3.key not in _entries
+            assert len(opened_failed_conns) == 1 and opened_failed_conns[0].closed
+        finally:
+            store._db.open_lock_connection = orig_open  # type: ignore[method-assign]
+
+        # Contender still holds the lock; release it, then confirm fast restart succeeds immediately.
+        async with contender.cursor() as cur:
+            await cur.execute('SELECT IS_USED_LOCK(%s)', (lock_key,))
+            assert (await cur.fetchone())[0] == contender_cid
+            await cur.execute('SELECT RELEASE_LOCK(%s)', (lock_key,))
+            assert (await cur.fetchone())[0] == 1
+
+        guard4 = ProcessStoreGuard(store, MemorySessionOwnershipCoordinator(), transport)
+        await guard4.acquire()
+        await guard4.check()
+        await guard4.release()
+    finally:
+        await guard1.release()
+        await guard2.release()
+        contender.close()
+        await transport.aclose()
+
+
+@pytest.mark.parametrize('failure_mode', ['zero', 'null', 'query_error'])
+async def test_mysql_startup_lock_release_errors_and_closes_connection_on_failure(
+    registry_store, failure_mode,
+):
+    """Real MySQL 8.4 returns 0 (held by another connection), NULL (lock does not exist), or
+    raises InterfaceError (broken connection). release() must raise an explicit error preserving
+    query failures, never report false success, and still close the connection and drop the entry.
+    """
+    store, _ = registry_store
+    if store._db.dialect.name != 'mysql':
+        pytest.skip('MySQL startup lock RELEASE_LOCK failure-path verification')
+
+    import pymysql
+
+    from power_loop.runtime.store.process_guard import ProcessStoreGuard, _entries
+
+    transport = MemoryMessageTransport()
+    guard = ProcessStoreGuard(store, MemorySessionOwnershipCoordinator(), transport)
+    contender = None
+    lock_key = None
+    try:
+        await guard.acquire()
+        entry = guard.entry
+        assert entry is not None and entry.connection is not None
+        conn = entry.connection
+        lock_key = entry.lock_key
+
+        if failure_mode == 'query_error':
+            conn.close()
+            with pytest.raises(pymysql.err.InterfaceError):
+                await guard.release()
+        elif failure_mode == 'null':
+            # Release early on the holding connection so real MySQL RELEASE_LOCK returns NULL.
+            async with conn.cursor() as cur:
+                await cur.execute('SELECT RELEASE_LOCK(%s)', (lock_key,))
+                assert (await cur.fetchone())[0] == 1
+            with pytest.raises(RuntimeError, match='RELEASE_LOCK returned None'):
+                await guard.release()
+        else:
+            # Release early and let an independent contender acquire the lock so real MySQL
+            # RELEASE_LOCK on the original connection returns 0.
+            async with conn.cursor() as cur:
+                await cur.execute('SELECT RELEASE_LOCK(%s)', (lock_key,))
+                assert (await cur.fetchone())[0] == 1
+            contender = await store._db.open_lock_connection()
+            async with contender.cursor() as cur:
+                await cur.execute('SELECT GET_LOCK(%s,0)', (lock_key,))
+                assert (await cur.fetchone())[0] == 1
+            with pytest.raises(RuntimeError, match='RELEASE_LOCK returned 0'):
+                await guard.release()
+
+        assert guard.entry is None
+        assert entry.connection is None
+        assert conn.closed
+        assert guard.key not in _entries
+    finally:
+        if contender is not None:
+            if lock_key is not None and not contender.closed:
+                async with contender.cursor() as cur:
+                    await cur.execute('SELECT RELEASE_LOCK(%s)', (lock_key,))
+            contender.close()
+        await transport.aclose()

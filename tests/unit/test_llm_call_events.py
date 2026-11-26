@@ -99,9 +99,9 @@ async def test_stream_events_balanced_across_unknown_result_and_new_requests(run
                 system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
                 retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
             ))
-        outcomes = [await loop.send("hi", message_id=f"new-request-{i}") for i in range(3)]
-        assert [r.status for r in outcomes] == ['failed', 'failed', 'completed']
-        # Unknown results are not retried. Three explicit inputs each emit a balanced pair.
+        outcome = await loop.send("hi", message_id="retry-run")
+        assert outcome.status == "completed"
+        # 2 transient failures + 1 success under explicit retry_policy -> 3 balanced stream pairs.
         assert counts[AgentEventType.STREAM_STARTED] == 3
         assert counts[AgentEventType.STREAM_COMPLETED] == 3
     finally:
@@ -121,13 +121,13 @@ async def test_new_requests_after_unknown_result_are_individually_visible(runtim
                 system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
                 retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
             ))
-        outcomes = [await loop.send("hi", message_id=f"new-request-{i}") for i in range(3)]
-        assert [r.status for r in outcomes] == ['failed', 'failed', 'completed']
+        outcome = await loop.send("hi", message_id="retry-run")
+        assert outcome.status == "completed"
 
         completed = seen[AgentEventType.LLM_CALL_COMPLETED]
         assert len(seen[AgentEventType.LLM_CALL_STARTED]) == 3
         assert len(completed) == 3
-        assert len({c.model_attempt_id for c in completed}) == 3       # distinct per attempt
+        assert len({c.call_id for c in completed}) == 3  # distinct per attempt
         assert [c.success for c in completed] == [False, False, True]
         assert [c.error_type for c in completed[:2]] == ["RuntimeError", "RuntimeError"]
     finally:

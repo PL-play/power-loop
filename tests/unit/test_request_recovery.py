@@ -86,8 +86,19 @@ async def test_recovery_stops_within_original_budget(ending, kind, delays, expec
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, total_timeout=timeout)))
     try:
         sid = loop.target.session_id
-        await store.append_message(sid, role="user", content="old details " * 200)
-        await store.append_message(sid, role="assistant", content="done")
+        seed_msgs = [
+            {"role": "user", "content": "old details " * 200},
+            {"role": "assistant", "content": "done"},
+        ]
+        for m in seed_msgs:
+            await store.append_message(sid, send_index=1, **m)
+        await store.upsert_project_message(
+            sid, send_index=1, kind="repaired",
+            content={"messages": seed_msgs, "repaired": True},
+        )
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET send_index=1 WHERE session_id=?", (sid,)
+        )
         from power_loop.agent.runtime_store import now_ms
         receipt = await loop.runtime.client.send(loop.target, "continue", message_id="repair", actor=loop.actor)
         task = asyncio.create_task(loop.runtime.client.wait(receipt.input_ref, actor=loop.actor,
@@ -119,9 +130,20 @@ async def test_rejected_history_recovers_once(registry_store, kind, fails_twice,
             retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, give_up_on=None)))
     try:
         sid = loop.target.session_id
-        for msg in [{"role": "user", "content": "old details " * 200}, assistant(call("old")),
-                    {"role": "tool", "tool_call_id": "old", "content": "known"}]:
-            await store.append_message(sid, **msg)
+        seed_msgs = [
+            {"role": "user", "content": "old details " * 200},
+            assistant(call("old")),
+            {"role": "tool", "tool_call_id": "old", "content": "known"},
+        ]
+        for msg in seed_msgs:
+            await store.append_message(sid, send_index=1, **msg)
+        await store.upsert_project_message(
+            sid, send_index=1, kind="repaired",
+            content={"messages": seed_msgs, "repaired": True},
+        )
+        await store._db.execute(
+            f"UPDATE {store.t.sessions} SET send_index=1 WHERE session_id=?", (sid,)
+        )
         before = await store.load_active_messages(sid)
         result = await loop.send("continue")
         if fails_twice:
@@ -171,8 +193,19 @@ async def test_uncompressible_request_fails_without_identical_retry(tmp_path, ol
     try:
         sid = loop.target.session_id
         if old_history:
-            await loop.runtime.store.append_message(sid, role="user", content="old " * 200)
-            await loop.runtime.store.append_message(sid, role="assistant", content="done")
+            seed_msgs = [
+                {"role": "user", "content": "old " * 200},
+                {"role": "assistant", "content": "done"},
+            ]
+            for m in seed_msgs:
+                await loop.runtime.store.append_message(sid, send_index=1, **m)
+            await loop.runtime.store.upsert_project_message(
+                sid, send_index=1, kind="repaired",
+                content={"messages": seed_msgs, "repaired": True},
+            )
+            await loop.runtime.store._db.execute(
+                f"UPDATE {loop.runtime.store.t.sessions} SET send_index=1 WHERE session_id=?", (sid,)
+            )
         result = await loop.send("new")
         assert result.status == "failed" and result.error_code == "internal_error", result
         assert len(model.main_requests) == 1

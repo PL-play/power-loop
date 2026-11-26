@@ -78,8 +78,11 @@ async def test_close_session_clears_normal_descendant_resources() -> None:
             await store.set_runtime_state(target, "resource", {"value": 1})
             await store.create_timer(target, due_at=2**50, note="future")
         await store.close_session(sid, cascade=True)
-        for table in (store.t.sessions, store.t.messages, store.t.notes,
-                      store.t.session_runtime_state, store.t.timers):
+        for table in (store.t.sessions, store.t.messages, store.t.session_runtime_state,
+                      store.t.project_messages, store.t.follow_up_queue):
             assert not await store._db.fetchall(f"SELECT * FROM {table} WHERE session_id IN (?,?)", (sid, child))
+        for target in (sid, child):
+            assert await store.list_notes(target) == []
+            assert await store.list_timers(target) == []
     finally:
         await store.close()

@@ -99,4 +99,23 @@ def is_duplicate_key_error(exc: BaseException) -> bool:
     return False
 
 
-__all__ = ["Database", "Transaction", "Row", "Params", "is_duplicate_key_error"]
+def is_mysql_deadlock_error(exc: BaseException) -> bool:
+    """True only for a confirmed MySQL driver InnoDB 1213 deadlock error."""
+    args = getattr(exc, "args", ())
+    if not args or type(args[0]) is not int or args[0] != 1213:
+        return False
+    try:
+        import pymysql
+    except ImportError:
+        return False
+    return isinstance(exc, pymysql.err.OperationalError)
+
+
+__all__ = [
+    "Database",
+    "Transaction",
+    "Row",
+    "Params",
+    "is_duplicate_key_error",
+    "is_mysql_deadlock_error",
+]

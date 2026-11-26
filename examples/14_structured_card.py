@@ -37,9 +37,9 @@ import time
 from _runtime import demo_runtime
 
 from power_loop import (
+    AgentLoopConfig,
     LLMResponse,
     LLMService,
-    RequestOptions,
     StructuredOutputError,
     StructuredOutputSpec,
     parse_structured,
@@ -68,7 +68,11 @@ SPEC = StructuredOutputSpec(
 
 
 class CardModel(LLMService):
+    def __init__(self) -> None:
+        self.seen_response_formats: list[dict | None] = []
+
     async def complete(self, request, **kwargs):
+        self.seen_response_formats.append(request.response_format)
         assert request.response_format == SPEC.to_openai_response_format()
         return LLMResponse(raw_text='{"name":"Alan","favorite_number":37,"city":"Shanghai","tags":["hiking"]}')
 
@@ -77,11 +81,21 @@ class CardModel(LLMService):
 
 
 async def extract_card(user_text: str) -> dict:
-    async with demo_runtime(CardModel()) as (runtime, loop, target, actor):
-        result = await loop.send(target, user_text, message_id='card', actor=actor,
-            deadline_ms=int(time.time()*1000)+10000,
-            options=RequestOptions(response_format=SPEC.to_openai_response_format()))
-        assert result.status == 'completed'
+    model = CardModel()
+    config = AgentLoopConfig(
+        context_budget_tokens=10**9,
+        response_format=SPEC.to_openai_response_format(),
+    )
+    async with demo_runtime(model, config=config) as (runtime, loop, target, actor):
+        result = await loop.send(
+            target,
+            user_text,
+            message_id="card",
+            actor=actor,
+            deadline_ms=int(time.time() * 1000) + 10000,
+        )
+        assert result.status == "completed"
+        assert model.seen_response_formats == [SPEC.to_openai_response_format()]
         return parse_structured(result.final_text, schema=SCHEMA)
 
 
@@ -91,6 +105,7 @@ async def main() -> None:
         "My name is Alan, I live in Shanghai, my favorite number is 37. "
         "Hobbies: hiking, coding, cooking."
     )
+    assert card["name"] == "Alan" and card["favorite_number"] == 37
     print("[ok] card =", json.dumps(card, ensure_ascii=False, indent=2))
 
     # ── 2. 演示 parse_structured 的修复能力（不走 LLM）────────────────
@@ -105,7 +120,9 @@ async def main() -> None:
         "```\n"
         "Hope this helps!"
     )
-    print("[repair] parsed =", parse_structured(noisy, schema=SCHEMA))
+    repaired = parse_structured(noisy, schema=SCHEMA)
+    assert repaired == {"name": "Xiao Ming", "favorite_number": 7}
+    print("[repair] parsed =", repaired)
 
     # ── 3. Schema mismatch：原文里就没数字，靠 parse_structured 报错 ─
     #    Schema mismatch: no number in source — parse_structured catches it
@@ -113,7 +130,11 @@ async def main() -> None:
     try:
         parse_structured(bad, schema=SCHEMA)
     except StructuredOutputError as exc:
+        assert exc.reason == "missing_required:favorite_number"
+        assert exc.raw_text == bad
         print(f"[caught] reason={exc.reason!r} raw_text={exc.raw_text!r}")
+    else:
+        raise AssertionError("expected StructuredOutputError for missing favorite_number")
 
 
 if __name__ == "__main__":

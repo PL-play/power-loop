@@ -272,6 +272,8 @@ class SQLiteSink:
             if not tool_calls and "_cumulative_usage" in message and message["_cumulative_usage"] is not None:
                 from .runtime_types import plain
                 meta = {**(meta or {}), "usage": plain(message["_cumulative_usage"])}
+            if not tool_calls and "_executed_rounds" in message and message["_executed_rounds"] is not None:
+                meta = {**(meta or {}), "rounds": int(message["_executed_rounds"])}
             from power_loop.runtime.task_runtime import atomic_pending_required
             hook_injected = message.get("hook_injected")
             options = dict(usage_options)

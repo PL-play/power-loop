@@ -85,7 +85,19 @@ class ProcessStoreGuard:
         entry.users -= 1
         if entry.users == 0:
             _entries.pop(self.key, None)
-            await entry._close()
+            try:
+                if entry.kind == 'mysql' and entry.connection is not None:
+                    async with entry.connection.cursor() as cursor:
+                        await cursor.execute('SELECT RELEASE_LOCK(%s)', (entry.lock_key,))
+                        row = await cursor.fetchone()
+                    released = row[0] if row is not None else None
+                    if released != 1:
+                        raise RuntimeError(
+                            f'failed to release MySQL startup lock {entry.lock_key!r}: '
+                            f'RELEASE_LOCK returned {released!r}'
+                        )
+            finally:
+                await entry._close()
 
     async def _close(self):
         if self.file is not None:

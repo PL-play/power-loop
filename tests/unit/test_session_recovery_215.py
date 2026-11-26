@@ -237,16 +237,15 @@ async def test_recovering_with_followup_terminates_old_then_claims_new(registry_
 
 
 async def test_partial_result_and_abort_preserve_pending_source(registry_store):
-    from power_loop import AgentLoopConfig
     from power_loop.agent.sink import SQLiteSink
-    from power_loop.agent.stateful_loop import _ExecutionLoop
     from power_loop.runtime.tool_archive import recall_original
-    from tests.runtime_fixture import ScriptedModel
-
-    from .session_native_fixture import DESCRIPTOR
 
     store = registry_store[0]
-    sid = await store.create_session(DESCRIPTOR, actor=ACTOR)
+    port = RuntimeInputStore(store)
+    root = await target(port)
+    sid = root.session_id
+    await port.accept(root, 'go', message_id='m1', actor=ACTOR)
+    await port.claim(root, node_id='old', boot_id='old')
     calls = [{'id': cid, 'function': {'name': 'echo', 'arguments': '{"text":"original"}'}}
              for cid in ('completed', 'aborted')]
     sink = SQLiteSink(store, sid)
@@ -254,16 +253,15 @@ async def test_partial_result_and_abort_preserve_pending_source(registry_store):
     source = sink.persisted_assistant_seq
     await sink.on_assistant_tool_calls(assistant_seq=source, tool_calls=calls, round_index=0)
     await store.set_runtime_state(sid, 'send_index', 99)
-    model = ScriptedModel()
-    loop = _ExecutionLoop(llm=model, store=store, config=AgentLoopConfig(delegation_policy="single_level"))
     await sink.on_message_appended({'role': 'tool', 'tool_call_id': 'completed',
                                    'content': 'known result', 'send_index': 1}, round_index=0)
     assert (await store.get_state(sid)).pending == {'assistant_seq': source}
     assert len([r for r in await store.load_all_messages(sid) if r.role == 'tool']) == 1
-    assert await loop.abort_pending(sid) == 1
+    await _expire(store, sid)
+    await port.recover(root, node_id='new', boot_id='new')
     rows = await store.load_all_messages(sid)
     tools = [r for r in rows if r.role == 'tool']
-    assert len(tools) == 2 and model._idx == 0
+    assert len(tools) == 2
     assert all(r.meta['_assistant_seq'] == source for r in tools)
     assert (await store.get_state(sid)).pending is None
     for row in tools:
@@ -369,12 +367,8 @@ async def test_tool_result_ack_loss_is_not_replayed_or_duplicated(registry_store
     assert all(r.meta['_assistant_seq'] == source for r in tools)
 
 
-@pytest.mark.parametrize('entry', ['recover', 'abort'])
+@pytest.mark.parametrize('entry', ['recover', 'repair'])
 async def test_all_results_present_only_clears_marker(registry_store, entry):
-    from power_loop import AgentLoopConfig
-    from power_loop.agent.stateful_loop import _ExecutionLoop
-    from tests.runtime_fixture import ScriptedModel
-
     store = registry_store[0]
     port = RuntimeInputStore(store)
     root = await target(port)
@@ -389,24 +383,20 @@ async def test_all_results_present_only_clears_marker(registry_store, entry):
         await _expire(store, root.session_id)
         await port.recover(root, node_id='new', boot_id='new')
     else:
-        loop = _ExecutionLoop(llm=ScriptedModel(), store=store, config=AgentLoopConfig(delegation_policy='single_level'))
-        assert await loop.get_pending(root.session_id) == {'assistant_seq': source}
-        assert await loop.abort_pending(root.session_id) == 0
+        await port.final(batch, status='interrupted', error='crash')
+        assert (await store.get_state(root.session_id)).pending == {'assistant_seq': source}
+        rep = await port.repair(root, mode='heal_broken', actor=ACTOR)
+        assert rep.repaired_messages == 0
     assert (await store.get_state(root.session_id)).pending is None
     assert [r for r in await store.load_all_messages(root.session_id) if r.role == 'tool'] == before
 
 
-@pytest.mark.parametrize('entry', ['claim', 'abort'])
+@pytest.mark.parametrize('entry', ['claim', 'recover'])
 async def test_unavailable_pending_source_is_explicit_and_unchanged(registry_store, monkeypatch, entry):
-    from power_loop import AgentLoopConfig
     from power_loop.agent.runtime_types import RuntimeRequestError
-    from power_loop.agent.stateful_loop import _ExecutionLoop
-    from tests.runtime_fixture import ScriptedModel
 
     store = registry_store[0]
     port = RuntimeInputStore(store)
-    model = ScriptedModel()
-    loop = _ExecutionLoop(llm=model, store=store, config=AgentLoopConfig(delegation_policy='single_level'))
     unknown_checks = []
 
     async def no_unknown(*args):
@@ -419,7 +409,10 @@ async def test_unavailable_pending_source_is_explicit_and_unchanged(registry_sto
         await port.accept(root, 'old', message_id='m1', actor=ACTOR)
         batch = await port.claim(root, node_id='old', boot_id='old')
         source = await _assistant_with_pending(store, port, batch, ['t1'])
-        await port.final(batch, status='interrupted', error='crash')
+        if entry == 'claim':
+            await port.final(batch, status='interrupted', error='crash')
+        else:
+            await _expire(store, root.session_id)
         if kind == 'missing':
             await store._db.execute(f'DELETE FROM {store.t.messages} WHERE session_id=? AND seq=?', (root.session_id, source))
         elif kind == 'not-assistant':
@@ -434,11 +427,11 @@ async def test_unavailable_pending_source_is_explicit_and_unchanged(registry_sto
             if entry == 'claim':
                 await port.claim(root, node_id='new', boot_id='new')
             else:
-                await loop.abort_pending(root.session_id)
+                await port.recover(root, node_id='new', boot_id='new')
         assert error.value.code == 'pending_source_unavailable'
         assert (await store.get_state(root.session_id)).pending == {'assistant_seq': source}
         assert await store._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=? ORDER BY seq', (root.session_id,)) == before
-    assert model._idx == 0 and not unknown_checks
+    assert not unknown_checks
 
 
 async def test_replaced_runtime_owner_rejects_old_sink(registry_store):

@@ -23,10 +23,14 @@ def _bound(setter, value, reset):
         reset(token)
 
 
-async def run_session(loop, ctx, command):
+async def run_session(loop, ctx, command, *, effective_tools: frozenset[str] | None = None):
     name, arguments = command
     registered = loop.tool_registry.get(name) if loop.tool_registry is not None else None
-    if registered is None or ctx.options.tools is not None and name not in ctx.options.tools:
+    if (
+        registered is None
+        or (ctx.options.tools is not None and name not in ctx.options.tools)
+        or (effective_tools is not None and name not in effective_tools)
+    ):
         raise RuntimeRequestError("forbidden", "host command outside the frozen tool grant")
     if type(registered.definition.pricing) is not Free:
         raise RuntimeRequestError("invalid_options", "host command router must be explicitly free")
@@ -62,7 +66,7 @@ async def run_session(loop, ctx, command):
                     (agent_context.set_current_loop, loop, agent_context.reset_current_loop),
                     (agent_context.set_session_id, sid, agent_context.reset_session_id),
                     (agent_context.set_effective_tools,
-                     frozenset(ctx.options.tools) if ctx.options.tools is not None else None,
+                     effective_tools,
                      agent_context.reset_effective_tools),
                     (agent_context.set_current_cancel_token, ctx.stop,
                      agent_context.reset_current_cancel_token),

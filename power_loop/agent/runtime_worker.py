@@ -13,6 +13,9 @@ import contextvars
 import json
 import logging
 import time
+from asyncio import tasks as _asyncio_tasks
+from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 from power_loop.contracts.events import AgentEventType
@@ -36,6 +39,166 @@ from .runtime_types import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class _FiberTaskHandle(asyncio.Future):
+    """Per-fiber Task-compatible handle exposed via ``asyncio.current_task()``.
+
+    Being an ``asyncio.Future`` (not an ``asyncio.Task``), it never registers in
+    ``asyncio.all_tasks()`` yet supports ``await`` / ``asyncio.gather`` /
+    ``add_done_callback`` and gives each multiplexed fiber its own isolated
+    ``cancel()`` / ``cancelling()`` / ``uncancel()`` state. Any ``asyncio.Timeout``
+    (including external ``reschedule()`` from another task/context), ``AsyncExitStack``,
+    ``asyncio.TaskGroup``, or waiter cleanup targets only the owning fiber without
+    cancelling the shared worker ``asyncio.Task`` or sibling fibers.
+    """
+
+    def __init__(self, real_task: asyncio.Task, fiber: _SessionFiber, on_cancel) -> None:
+        super().__init__(loop=real_task.get_loop())
+        self._real_task = real_task
+        self._fiber = fiber
+        self._on_cancel = on_cancel
+        self._cancelling = 0
+
+    def cancel(self, msg=None) -> bool:
+        if self.done():
+            return False
+        self._cancelling += 1
+        exc = asyncio.CancelledError() if msg is None else asyncio.CancelledError(msg)
+        self._on_cancel(self._fiber, exc)
+        return True
+
+    def cancelling(self) -> int:
+        return self._cancelling
+
+    def uncancel(self) -> int:
+        if self._cancelling > 0:
+            self._cancelling -= 1
+        return self._cancelling
+
+    def _finish(
+        self,
+        cancel_exc: asyncio.CancelledError | None = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        if self.done():
+            return
+        if cancel_exc is not None:
+            super().cancel(*(cancel_exc.args if cancel_exc.args else ()))
+        elif exc is not None:
+            super().set_exception(exc)
+            # Mark retrieved so unawaited handles never emit "Future exception was never retrieved"
+            # while awaiting / calling result() / exception() still exposes ``exc``.
+            super().exception()
+        else:
+            super().set_result(None)
+
+    @property
+    def _must_cancel(self) -> bool:
+        return self._fiber.pending_exc is not None
+
+    @property
+    def _fut_waiter(self) -> asyncio.Future | None:
+        return self._fiber.yielded
+
+    @property
+    def _num_cancels_requested(self) -> int:
+        return self._cancelling
+
+    @property
+    def _cancel_message(self):
+        exc = self._fiber.pending_exc
+        return exc.args[0] if exc is not None and exc.args else None
+
+    @property
+    def _coro(self):
+        return self._fiber.coro
+
+    @property
+    def _context(self):
+        return self._fiber.ctx
+
+    def get_coro(self):
+        return self._fiber.coro
+
+    def get_context(self):
+        return self._fiber.ctx
+
+    def get_name(self):
+        return self._real_task.get_name()
+
+    def set_name(self, value):
+        return self._real_task.set_name(value)
+
+    def get_stack(self, *, limit=None):
+        return self._real_task.get_stack(limit=limit)
+
+    def print_stack(self, *, limit=None, file=None):
+        return self._real_task.print_stack(limit=limit, file=file)
+
+
+class _SessionFiber:
+    """One session coroutine multiplexed inside a RuntimeWorker._run_session Task."""
+
+    __slots__ = (
+        "sid",
+        "coro",
+        "ctx",
+        "handle",
+        "yielded",
+        "is_primary",
+        "done",
+        "pending_exc",
+        "cancel_exc",
+        "exc",
+    )
+
+    def __init__(
+        self,
+        sid: str,
+        coro,
+        ctx: contextvars.Context,
+        *,
+        real_task: asyncio.Task | None,
+        on_cancel,
+        is_primary: bool,
+    ) -> None:
+        self.sid = sid
+        self.coro = coro
+        self.ctx = ctx
+        self.handle: _FiberTaskHandle | None = (
+            _FiberTaskHandle(real_task, self, on_cancel)
+            if real_task is not None
+            else None
+        )
+        self.yielded: asyncio.Future | None = None
+        self.is_primary = is_primary
+        self.done = False
+        self.pending_exc: BaseException | None = None
+        self.cancel_exc: asyncio.CancelledError | None = None
+        self.exc: BaseException | None = None
+
+
+class _TaskHandoffHost:
+    """Per-worker-Task handoff channel for running awaited children in-place at the 1024 task cap."""
+
+    __slots__ = ("queue", "accepting", "active_handoffs", "on_enqueue")
+
+    def __init__(self, on_enqueue) -> None:
+        self.queue: deque[tuple[str, object]] = deque()
+        self.accepting: bool = True
+        self.active_handoffs: int = 0
+        self.on_enqueue = on_enqueue
+
+    def __len__(self) -> int:
+        return len(self.queue) + self.active_handoffs
+
+    def can_accept(self) -> bool:
+        return self.accepting and not self.queue and self.active_handoffs == 0
+
+    def enqueue(self, sid: str, preclaimed_batch) -> None:
+        self.queue.append((sid, preclaimed_batch))
+        self.on_enqueue()
 
 
 class _NotifyingCancellationToken(CancellationToken):
@@ -74,6 +237,8 @@ class _SessionExecution:
         self.finalizing = False
         self.finalized = False
         self.shutdown_interrupted = False
+        self.slot_suspended = False
+        self._slot_suspend_depth = 0
         self._lost_notified = False
         self._lost_hook_task = None
         # The ordinary LLM boundary extends this same run-local list. None means
@@ -130,7 +295,13 @@ class RuntimeWorker:
         self._subscriptions, self._listeners = [], []
         self._bindings = []
         self._pending = {}
+        self._ready_awaited: dict[str, int] = {}
+        self._awaited_children: dict[str, int] = {}
+        self._awaited_handoffs: dict[str, asyncio.Task] = {}
+        self._deferred_handoffs: dict[asyncio.Task, _TaskHandoffHost] = {}
+        self._claimed_pending: dict[str, object] = {}
         self._active = {}
+        self._slot_waiters: deque[tuple[_SessionExecution, asyncio.Future[bool]]] = deque()
         self._fusing: dict[str, int] = {}
         self._reserved_wakes: set[str] = set()
         self._pending_claims: dict[tuple[str, int], asyncio.Task | None] = {}
@@ -141,7 +312,10 @@ class RuntimeWorker:
         self._started, self._closing, self._closed = False, False, False
         self._lifecycle_lock = asyncio.Lock()
         self._overflow = False
+        self._queued_cursor: str | None = None
+        self._recover_cursor: tuple[str, int | None, str] | None = None
         self._guard_monitor = None
+        self._guard_lost = False
         self.last_error = None
         # Local health: definitions this node cannot build. Never persisted as a task
         # registry; an incapable node simply leaves the session for a capable one.
@@ -231,8 +405,199 @@ class RuntimeWorker:
     def _active_llm_count(self) -> int:
         return sum(
             1 for ctx in self._active.values()
-            if ctx is None or ctx.descriptor.kind != "workflow_driver"
+            if ctx is None or (ctx.descriptor.kind != "workflow_driver" and not ctx.slot_suspended)
         )
+
+    def _suspended_llm_count(self) -> int:
+        return sum(
+            1 for ctx in self._active.values()
+            if ctx is not None and ctx.slot_suspended
+        )
+
+    def available_llm_slots(self) -> int:
+        if self._slot_waiters or self._ready_awaited or self._claimed_pending:
+            return 0
+        return max(0, self.runtime.capacity - self._active_llm_count())
+
+    def _on_slot_released(self) -> None:
+        """Grant freed execution slots to waiting parents (FIFO), then wake _dispatch."""
+        while self._slot_waiters and self._active_llm_count() < self.runtime.capacity:
+            ctx, fut = self._slot_waiters.popleft()
+            if fut.done():
+                continue
+            if (
+                self._active.get(ctx.session_id) is not ctx
+                or ctx.closing
+                or ctx.stop.is_cancelled()
+                or ctx._slot_suspend_depth > 0
+            ):
+                fut.set_result(False)
+                continue
+            ctx.slot_suspended = False
+            fut.set_result(True)
+        if not self._closing and self._active_llm_count() < self.runtime.capacity:
+            self._wake.set()
+
+    async def _reacquire_slot(self, ctx: _SessionExecution, *, cancel_token=None) -> None:
+        from power_loop.contracts.errors import CancellationRequested
+
+        if not ctx.slot_suspended:
+            return
+        if ctx.closing or self._active.get(ctx.session_id) is not ctx:
+            return
+        if cancel_token is not None and cancel_token.is_cancelled():
+            raise CancellationRequested(cancel_token.reason or "cancelled")
+        if ctx.stop.is_cancelled():
+            raise CancellationRequested(ctx.stop.reason or "cancelled")
+        if not self._slot_waiters and self._active_llm_count() < self.runtime.capacity:
+            ctx.slot_suspended = False
+            return
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[bool] = loop.create_future()
+        entry = (ctx, fut)
+        self._slot_waiters.append(entry)
+        stop_tasks = []
+        if not ctx.stop.is_never:
+            stop_tasks.append(asyncio.create_task(ctx.stop.wait()))
+        if cancel_token is not None and cancel_token is not ctx.stop and not cancel_token.is_never:
+            stop_tasks.append(asyncio.create_task(cancel_token.wait()))
+        try:
+            if stop_tasks:
+                done, _ = await asyncio.wait(
+                    {fut, *stop_tasks}, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if fut not in done:
+                    if not fut.done():
+                        fut.cancel()
+                    try:
+                        self._slot_waiters.remove(entry)
+                    except ValueError:
+                        pass
+                    reason = (
+                        cancel_token.reason if cancel_token is not None and cancel_token.is_cancelled()
+                        else ctx.stop.reason
+                    )
+                    raise CancellationRequested(reason or "cancelled")
+                granted = fut.result()
+            else:
+                granted = await fut
+        except BaseException:
+            if not fut.done():
+                fut.cancel()
+            try:
+                self._slot_waiters.remove(entry)
+            except ValueError:
+                pass
+            if not fut.cancelled() and fut.done() and fut.exception() is None and fut.result():
+                if ctx.stop.is_cancelled() or ctx.closing:
+                    ctx.slot_suspended = True
+                    self._on_slot_released()
+            raise
+        finally:
+            for st in stop_tasks:
+                if not st.done():
+                    st.cancel()
+            if stop_tasks:
+                await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+        if (cancel_token is not None and cancel_token.is_cancelled()) or ctx.stop.is_cancelled():
+            if granted and not ctx.slot_suspended:
+                ctx.slot_suspended = True
+                self._on_slot_released()
+            reason = (
+                cancel_token.reason if cancel_token is not None and cancel_token.is_cancelled()
+                else ctx.stop.reason
+            )
+            raise CancellationRequested(reason or "cancelled")
+
+    @asynccontextmanager
+    async def suspend_execution_slot(
+        self, ctx: _SessionExecution | None, *, cancel_token=None, child_sids: tuple[str, ...] = (),
+    ):
+        """Yield this session's execution slot while waiting for child completion.
+
+        Session ownership in ``_active`` (lease renewal, cancel delivery, single-owner
+        fencing) stays intact. Awaited child sessions are queued with priority ahead of
+        new top-level work so suspended parents drain instead of saturating ``_tasks``.
+        At the 1024 task cap, ``_dispatch()`` hands off an awaited child directly to the
+        parent's worker ``_run_session`` Task, decoupling child execution from the tool
+        task so ``interrupt="abort"`` and arbitrary wrappers (e.g. ``asyncio.gather``)
+        cancel the parent tool cleanly while an independent child continues on its Task.
+        On normal exit of the outermost wait, the session re-acquires a worker slot
+        before resuming model execution.
+        """
+        if (
+            ctx is None
+            or ctx.descriptor.kind == "workflow_driver"
+            or self._active.get(ctx.session_id) is not ctx
+        ):
+            yield
+            return
+        tracked_children: list[str] = []
+        registered_handoffs: list[str] = []
+        parent_task = ctx.task
+        for child_sid in child_sids:
+            if not child_sid:
+                continue
+            tracked_children.append(child_sid)
+            self._awaited_children[child_sid] = self._awaited_children.get(child_sid, 0) + 1
+            if not self._closing and child_sid not in self._active:
+                self._pending.pop(child_sid, None)
+                self._ready_awaited.setdefault(child_sid, now_ms())
+                if parent_task is not None and child_sid not in self._awaited_handoffs:
+                    self._awaited_handoffs[child_sid] = parent_task
+                    registered_handoffs.append(child_sid)
+        ctx._slot_suspend_depth += 1
+        if self._slot_waiters:
+            kept = deque()
+            for waiting_ctx, fut in self._slot_waiters:
+                if waiting_ctx is ctx:
+                    if not fut.done():
+                        fut.set_result(False)
+                else:
+                    kept.append((waiting_ctx, fut))
+            self._slot_waiters = kept
+        if not ctx.slot_suspended:
+            ctx.slot_suspended = True
+            self._on_slot_released()
+        elif tracked_children and not self._closing:
+            self._wake.set()
+        cancelled_out = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            cancelled_out = True
+            raise
+        finally:
+            for child_sid in registered_handoffs:
+                if self._awaited_handoffs.get(child_sid) is parent_task:
+                    self._awaited_handoffs.pop(child_sid, None)
+            for child_sid in tracked_children:
+                count = self._awaited_children.get(child_sid, 0) - 1
+                if count <= 0:
+                    self._awaited_children.pop(child_sid, None)
+                    still_queued = self._ready_awaited.pop(child_sid, None) is not None
+                    if still_queued and not self._closing and child_sid not in self._active:
+                        self._activate(child_sid)
+                else:
+                    self._awaited_children[child_sid] = count
+            ctx._slot_suspend_depth -= 1
+            if (
+                ctx._slot_suspend_depth == 0
+                and ctx.slot_suspended
+                and not cancelled_out
+                and not ctx.closing
+                and not ctx.stop.is_cancelled()
+                and (cancel_token is None or not cancel_token.is_cancelled())
+                and self._active.get(ctx.session_id) is ctx
+            ):
+                await self._reacquire_slot(ctx, cancel_token=cancel_token)
+
+    def _reserved_fuse_slots(self) -> int:
+        return sum(1 for sid in self._fusing if self._active.get(sid) is None)
+
+    def _live_task_budget_used(self) -> int:
+        return len(self._tasks) + self._reserved_fuse_slots()
 
     def can_fuse_locally(self, sid: str) -> bool:
         from .stateful_loop import _ExecutionLoop
@@ -240,8 +605,12 @@ class RuntimeWorker:
             not self._closing
             and sid not in self._active
             and sid not in self._pending
+            and sid not in self._claimed_pending
             and not _ExecutionLoop._session_busy(sid)
-            and len(self._tasks) < 1024
+            and self._live_task_budget_used() < 1024
+            and not self._slot_waiters
+            and not self._ready_awaited
+            and not self._claimed_pending
             and self._active_llm_count() < self.runtime.capacity
         )
 
@@ -273,7 +642,7 @@ class RuntimeWorker:
                 self._active.pop(sid, None)
             if missed_wake and not self._closing:
                 self._activate(sid)
-            self._wake.set()
+            self._on_slot_released()
 
     def _note_local_claim(
         self, node_id: str, boot_id: str, claims: list[tuple[str, int]],
@@ -348,14 +717,39 @@ class RuntimeWorker:
         """Schedule a locally fused accept_and_claim or pre-claimed batch without re-claiming.
 
         Returns False and releases the claimed lease when the worker is already closing.
+        When the session does not already hold a local reservation and capacity or the
+        task ceiling is currently full, the already-claimed batch is queued in
+        ``_claimed_pending`` and started by ``_dispatch()`` as soon as a slot frees.
         """
         sid = batch.target.session_id
         self._pending_claims.pop((sid, int(batch.owner_epoch)), None)
         if self._closing or self._closed:
             if self._active.get(sid) is None:
                 self._active.pop(sid, None)
+                self._on_slot_released()
             self._schedule_closing_lease_release(batch)
             return False
+        already_reserved = sid in self._active and self._active.get(sid) is None
+        is_driver = batch.descriptor.kind == "workflow_driver"
+        if not already_reserved and (
+            self._live_task_budget_used() >= 1024
+            or (
+                not is_driver
+                and (
+                    self._slot_waiters
+                    or self._ready_awaited
+                    or self._active_llm_count() >= self.runtime.capacity
+                )
+            )
+        ):
+            self._pending.pop(sid, None)
+            self._claimed_pending[sid] = batch
+            if self._live_task_budget_used() < 1024 and (
+                is_driver
+                or (not self._slot_waiters and not self._ready_awaited and self._active_llm_count() < self.runtime.capacity)
+            ):
+                self._wake.set()
+            return True
         self._active[sid] = None
         task = asyncio.create_task(
             self._run_session(sid, preclaimed_batch=batch),
@@ -377,12 +771,13 @@ class RuntimeWorker:
                 await self.runtime.process_guard.check()
             except Exception as exc:
                 self.last_error = "store_lock_lost: " + str(exc)[:500]
+                self._guard_lost = True
                 await self.shutdown(timeout_s=0, release_leases=False)
                 return
 
     def _activate(
         self, sid, input_ref=None, *, cancelled=False, cancel_reason=None,
-        cancel_verified=False, cancel_by=None,
+        cancel_verified=False, cancel_by=None, is_driver=False,
     ):
         if self._closing:
             return
@@ -415,9 +810,23 @@ class RuntimeWorker:
                     and input_ref not in ctx.consumed:
                 ctx.wake_pending = True
             return
+        if sid in self._claimed_pending:
+            if cancelled and cancel_verified:
+                self._claimed_pending[sid] = replace(
+                    self._claimed_pending[sid],
+                    reclaimed_cancelled=True,
+                    cancel_by=cancel_by or self._claimed_pending[sid].cancel_by,
+                )
+                self._wake.set()
+            return
+        if sid in self._ready_awaited:
+            self._wake.set()
+            return
         if len(self._pending) >= 1024 and sid not in self._pending:
             self._overflow = True
             return
+        if is_driver:
+            self._drivers.add(sid)
         self._pending.setdefault(sid, now_ms())
         self._wake.set()
 
@@ -433,6 +842,14 @@ class RuntimeWorker:
     async def batch_renew(self):
         """Node-level 1-SQL (MySQL 2-SQL) lease renewal + cancel/close check for all active sessions."""
         r = self.runtime
+        owned_at_start: dict[str, int] = {}
+        for sid, ctx in self._active.items():
+            if ctx is not None:
+                owned_at_start[sid] = int(ctx.batch.owner_epoch)
+        for sid, b in self._claimed_pending.items():
+            owned_at_start[sid] = max(owned_at_start.get(sid, 0), int(b.owner_epoch))
+        for sid, epoch in self._pending_claims:
+            owned_at_start[sid] = max(owned_at_start.get(sid, 0), int(epoch))
         started = time.monotonic()
         rows = await self.inputs.batch_renew(
             node_id=r.node_id, boot_id=r.boot_id, ttl_s=r.session_lease_ttl_s,
@@ -448,31 +865,60 @@ class RuntimeWorker:
                 or (ctx.ownership is not None and ctx.ownership.released)
             ):
                 continue
+            local_epoch = int(ctx.batch.owner_epoch)
+            if ctx.ownership is not None and ctx.ownership.expires_at <= started:
+                ctx.ownership.lose()
+                continue
             row = by_sid.get(sid)
-            if (
-                row is None
-                or int(row["owner_epoch"]) != ctx.batch.owner_epoch
-                or (ctx.ownership is not None and ctx.ownership.expires_at <= started)
-            ):
+            if row is not None:
+                row_epoch = int(row["owner_epoch"])
+                if row_epoch == local_epoch:
+                    if ctx.ownership is not None:
+                        ctx.ownership.expires_at = now_mono
+                    if row["lifecycle"] == "closing" or int(row["cancel_seq"]) > ctx.batch.cancel_seq:
+                        cby = row.get("cancel_by") or ("removed" if row["lifecycle"] in ("closing", "closed") else "user")
+                        ctx.cancel_by = cby
+                        if ctx.descriptor.kind == "workflow_driver":
+                            self.inputs.notify_driver_cancel(
+                                sid, cancel_by=cby, reason=row.get("cancel_reason") or "cancelled",
+                            )
+                        ctx.stop.cancel(row.get("cancel_reason") or "cancelled")
+                elif row_epoch > local_epoch:
+                    if ctx.ownership is not None:
+                        ctx.ownership.lose()
+                # row_epoch < local_epoch: newly claimed during scan; keep claim-time lease.
+                continue
+            if owned_at_start.get(sid) == local_epoch:
                 if ctx.ownership is not None:
                     ctx.ownership.lose()
+            # Otherwise newly claimed during scan and not covered by this round; keep claim-time lease.
+        for sid, queued_batch in list(self._claimed_pending.items()):
+            local_epoch = int(queued_batch.owner_epoch)
+            row = by_sid.get(sid)
+            if row is not None:
+                row_epoch = int(row["owner_epoch"])
+                if row_epoch == local_epoch:
+                    updated = replace(queued_batch, claimed_at_mono=started)
+                    if row["lifecycle"] == "closing" or int(row["cancel_seq"]) > queued_batch.cancel_seq:
+                        cby = row.get("cancel_by") or ("removed" if row["lifecycle"] in ("closing", "closed") else "user")
+                        updated = replace(updated, reclaimed_cancelled=True, cancel_by=cby)
+                    self._claimed_pending[sid] = updated
+                elif row_epoch > local_epoch:
+                    self._claimed_pending.pop(sid, None)
+                # row_epoch < local_epoch: newly claimed during scan; keep claim-time lease.
                 continue
-            if ctx.ownership is not None:
-                ctx.ownership.expires_at = now_mono
-            if row["lifecycle"] == "closing" or int(row["cancel_seq"]) > ctx.batch.cancel_seq:
-                cby = row.get("cancel_by") or ("removed" if row["lifecycle"] in ("closing", "closed") else "user")
-                ctx.cancel_by = cby
-                if ctx.descriptor.kind == "workflow_driver":
-                    self.inputs.notify_driver_cancel(
-                        sid, cancel_by=cby, reason=row.get("cancel_reason") or "cancelled",
-                    )
-                ctx.stop.cancel(row.get("cancel_reason") or "cancelled")
+            if owned_at_start.get(sid) == local_epoch:
+                self._claimed_pending.pop(sid, None)
+            # Otherwise newly claimed during scan and not covered by this round; keep claim-time lease.
         # Slow path (P0-1): expire orphan running leases owned by this (node_id, boot_id)
         # that are absent from local active/fusing/pending-claim sets or have a mismatched owner_epoch.
         for row in rows:
             sid = str(row["session_id"])
             epoch = int(row["owner_epoch"])
             if sid in self._fusing:
+                continue
+            queued_batch = self._claimed_pending.get(sid)
+            if queued_batch is not None and int(queued_batch.owner_epoch) >= epoch:
                 continue
             pending_key = (sid, epoch)
             if pending_key in self._pending_claims:
@@ -483,6 +929,8 @@ class RuntimeWorker:
             if sid in self._active:
                 ctx = self._active[sid]
                 if ctx is None:
+                    continue
+                if ctx.batch.owner_epoch > epoch:
                     continue
                 if epoch == ctx.batch.owner_epoch:
                     if ctx.finalized or (
@@ -502,12 +950,21 @@ class RuntimeWorker:
         """One periodic node maintenance tick: batch_renew + discover_queued + discover_expired_leases (3/3/4 SQL)."""
         r = self.runtime
         renewed = await self.batch_renew()
-        queued = await self.inputs.discover_queued(limit=limit)
+        queued_entries = await self.inputs.discover_queued(
+            limit=limit,
+            after_session_id=self._queued_cursor,
+            _with_kind=True,
+        )
+        queued = [sid for sid, _ in queued_entries]
         expired_rows = await self.inputs.discover_expired_leases(limit=limit)
-        for sid in queued:
-            self._activate(sid)
-        if len(queued) < limit:
-            self._overflow = False
+        for sid, session_kind in queued_entries:
+            self._activate(sid, is_driver=(session_kind == "workflow_driver"))
+        if len(queued_entries) < limit:
+            self._queued_cursor = None
+            if len(self._pending) < 1024:
+                self._overflow = False
+        else:
+            self._queued_cursor = queued_entries[-1][0]
         reclaimed = []
         for row in expired_rows:
             sid = str(row["session_id"])
@@ -519,13 +976,20 @@ class RuntimeWorker:
                 and row["cancel_by"] is None
             )
             if needs_model_slot:
-                if self._active_llm_count() >= r.capacity:
+                if (
+                    self._live_task_budget_used() >= 1024
+                    or self._slot_waiters
+                    or self._ready_awaited
+                    or self._claimed_pending
+                    or self._active_llm_count() >= r.capacity
+                ):
                     # Respect Worker capacity: queue for _dispatch() instead of bypassing concurrency!
                     self._activate(sid)
                     continue
                 # Reserve the capacity slot BEFORE awaiting reclaim_running so neither _dispatch()
                 # nor locally fused accept_and_claim can exceed runtime.capacity.
                 self._active[sid] = None
+                self._begin_fuse(sid)
                 dispatched = False
                 try:
                     batch = await self.inputs.reclaim_running(
@@ -556,9 +1020,10 @@ class RuntimeWorker:
                         if recovered.execution_state == "queued":
                             self._activate(sid)
                 finally:
+                    self._end_fuse(sid)
                     if not dispatched:
                         self._active.pop(sid, None)
-                        self._wake.set()
+                        self._on_slot_released()
             elif row["session_kind"] == "workflow_driver":
                 self._drivers.add(sid)
                 self._begin_fuse(sid)
@@ -580,7 +1045,7 @@ class RuntimeWorker:
                 reclaimed.append(recovered)
                 await self._notify_results(recovered)
                 if recovered.execution_state == "queued":
-                    self._activate(sid)
+                    self._activate(sid, is_driver=True)
                 if sid not in self._pending and sid not in self._active:
                     self._drivers.discard(sid)
             else:
@@ -633,7 +1098,7 @@ class RuntimeWorker:
             await asyncio.sleep(interval)
             if self._closing:
                 return
-            if not self._active:
+            if not self._active and not self._claimed_pending:
                 continue
             try:
                 await self.batch_renew()
@@ -646,11 +1111,19 @@ class RuntimeWorker:
         # The ONLY discovery path: bounded scan of unfinished sessions. No job scan, no
         # pending-inbox-only discovery — a running-expired session with no pending input
         # is still found here so its old wait can be terminated (design 215 §9.3).
-        page = await self.inputs.discover_unfinished(limit=self.runtime.claim_limit)
-        for ref in page:
-            self._activate(ref.session_id)
+        page = await self.inputs.discover_unfinished(
+            limit=self.runtime.claim_limit,
+            after=self._recover_cursor,
+            _with_kind=True,
+        )
+        for ref, session_kind, _cursor in page:
+            self._activate(ref.session_id, is_driver=(session_kind == "workflow_driver"))
         if len(page) < self.runtime.claim_limit:
-            self._overflow = False
+            self._recover_cursor = None
+            if len(self._pending) < 1024:
+                self._overflow = False
+        else:
+            self._recover_cursor = page[-1][2]
 
     async def _recover_periodically(self):
         while True:
@@ -697,20 +1170,74 @@ class RuntimeWorker:
             self._wake.clear()
             if self._overflow and len(self._pending) < 924:
                 await self.recover()
-            while self._pending and len(self._tasks) < 1024 and not self._closing:
-                used = sum(
-                    1 for ctx in self._active.values()
-                    if ctx is None or ctx.descriptor.kind != "workflow_driver"
+            while not self._closing:
+                can_run_llm = (
+                    not self._slot_waiters
+                    and self._active_llm_count() < self.runtime.capacity
                 )
-                if used < self.runtime.capacity:
-                    sid = next(iter(self._pending))
-                else:
-                    sid = next((value for value in self._pending if value in self._drivers), None)
-                    if sid is None:
+                if self._live_task_budget_used() >= 1024:
+                    # Task ceiling reached: hand off an awaited child directly to its
+                    # already-allocated parent worker Task without adding to _tasks.
+                    if not (can_run_llm and self._ready_awaited):
                         break
-                self._pending.pop(sid)
+                    handoff_sid = None
+                    handoff_host = None
+                    for s in self._ready_awaited:
+                        ptask = self._awaited_handoffs.get(s)
+                        host = self._deferred_handoffs.get(ptask) if ptask is not None else None
+                        if host is not None and host.can_accept():
+                            handoff_sid = s
+                            handoff_host = host
+                            break
+                    if handoff_sid is None or handoff_host is None:
+                        break
+                    self._ready_awaited.pop(handoff_sid, None)
+                    self._pending.pop(handoff_sid, None)
+                    self._awaited_handoffs.pop(handoff_sid, None)
+                    batch = self._claimed_pending.pop(handoff_sid, None)
+                    self._active[handoff_sid] = None
+                    handoff_host.enqueue(handoff_sid, batch)
+                    continue
+                batch = None
+                if can_run_llm and self._ready_awaited:
+                    sid = next(iter(self._ready_awaited))
+                    self._ready_awaited.pop(sid)
+                    self._pending.pop(sid, None)
+                    self._awaited_handoffs.pop(sid, None)
+                    batch = self._claimed_pending.pop(sid, None)
+                elif self._claimed_pending:
+                    if can_run_llm:
+                        sid, batch = next(iter(self._claimed_pending.items()))
+                    else:
+                        sid = next(
+                            (s for s, b in self._claimed_pending.items() if b.descriptor.kind == "workflow_driver"),
+                            None,
+                        )
+                        if sid is None:
+                            sid = next((value for value in self._pending if value in self._drivers), None)
+                            if sid is None:
+                                break
+                            self._pending.pop(sid)
+                        else:
+                            batch = self._claimed_pending[sid]
+                    if batch is not None:
+                        self._claimed_pending.pop(sid)
+                        self._pending.pop(sid, None)
+                elif self._pending:
+                    if can_run_llm:
+                        sid = next(iter(self._pending))
+                    else:
+                        sid = next((value for value in self._pending if value in self._drivers), None)
+                        if sid is None:
+                            break
+                    self._pending.pop(sid)
+                else:
+                    break
                 self._active[sid] = None
-                task = asyncio.create_task(self._run_session(sid), context=contextvars.Context())
+                task = asyncio.create_task(
+                    self._run_session(sid, preclaimed_batch=batch),
+                    context=contextvars.Context(),
+                )
                 self._tasks.add(task)
                 task.add_done_callback(self._task_finished)
             if self._overflow and len(self._pending) < 924:
@@ -722,7 +1249,7 @@ class RuntimeWorker:
             log.error("runtime execution failed", exc_info=task.exception())
         self._wake.set()
 
-    async def _run_session(self, sid, *, preclaimed_batch=None):
+    async def _run_one_session(self, sid, *, preclaimed_batch=None):
         from .stateful_loop import _ExecutionLoop, _session_sync
         entry = _session_sync(sid)
         entry.users += 1
@@ -735,6 +1262,204 @@ class RuntimeWorker:
         finally:
             entry.users -= 1
             _ExecutionLoop._release_idle_sync(sid)
+
+    async def _run_session(self, sid, *, preclaimed_batch=None):
+        """Run the primary session and any full-capacity handed-off children on this Task.
+
+        Multiplexing handed-off children directly on the parent's worker ``_run_session``
+        Task keeps total live session tasks <= 1024, preserves each child's single
+        ``asyncio.Task`` binding (so child ``asyncio.timeout`` deadlines fire on time),
+        and isolates child execution from parent tool cancellation (``interrupt="abort"``
+        or ``asyncio.gather``).
+        """
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        wake: list[asyncio.Future | None] = [None]
+
+        def _signal_wake() -> None:
+            w = wake[0]
+            if w is not None and not w.done():
+                w.set_result(None)
+
+        def _on_fut_done(_f) -> None:
+            _signal_wake()
+
+        host = _TaskHandoffHost(_signal_wake)
+        if task is not None:
+            self._deferred_handoffs[task] = host
+
+        def _cancel_fiber(fiber: _SessionFiber, exc: asyncio.CancelledError) -> None:
+            if fiber.done:
+                return
+            fut = fiber.yielded
+            if fut is not None and not fut.done():
+                msg = exc.args[0] if exc.args else None
+                if fut.cancel(msg):
+                    _signal_wake()
+                    return
+            fiber.pending_exc = exc
+            _signal_wake()
+
+        fibers: list[_SessionFiber] = [
+            _SessionFiber(
+                sid,
+                self._run_one_session(sid, preclaimed_batch=preclaimed_batch),
+                contextvars.copy_context(),
+                real_task=task,
+                on_cancel=_cancel_fiber,
+                is_primary=True,
+            )
+        ]
+
+        def _step(fiber: _SessionFiber, exc: BaseException | None = None) -> None:
+            fiber.yielded = None
+            swapped = False
+            if task is not None and fiber.handle is not None:
+                _asyncio_tasks._leave_task(loop, task)
+                _asyncio_tasks._enter_task(loop, fiber.handle)
+                swapped = True
+            try:
+                if exc is not None:
+                    yielded = fiber.ctx.run(fiber.coro.throw, exc)
+                else:
+                    yielded = fiber.ctx.run(fiber.coro.send, None)
+            except StopIteration:
+                fiber.done = True
+                fiber.yielded = None
+                return
+            except asyncio.CancelledError as c_exc:
+                fiber.done = True
+                fiber.yielded = None
+                fiber.cancel_exc = c_exc
+                return
+            except BaseException as err:
+                fiber.done = True
+                fiber.yielded = None
+                fiber.exc = err
+                if fiber.is_primary:
+                    raise
+                log.error("handed-off runtime execution failed for %s", fiber.sid, exc_info=err)
+                return
+            finally:
+                if swapped:
+                    _asyncio_tasks._leave_task(loop, fiber.handle)
+                    _asyncio_tasks._enter_task(loop, task)
+            if yielded is None:
+                fut = loop.create_future()
+                loop.call_soon(lambda _f=fut: None if _f.done() else _f.set_result(None))
+                fiber.yielded = fut
+                return
+            if not isinstance(yielded, asyncio.Future):
+                raise RuntimeError(f"unexpected yielded value from coroutine: {yielded!r}")
+            yielded._asyncio_future_blocking = False
+            fiber.yielded = yielded
+
+        external_cancel: asyncio.CancelledError | None = None
+
+        try:
+            while True:
+                while host.queue:
+                    h_sid, h_batch = host.queue.popleft()
+                    host.active_handoffs += 1
+                    fibers.append(
+                        _SessionFiber(
+                            h_sid,
+                            self._run_one_session(h_sid, preclaimed_batch=h_batch),
+                            contextvars.Context(),
+                            real_task=task,
+                            on_cancel=_cancel_fiber,
+                            is_primary=False,
+                        )
+                    )
+
+                progressed = False
+                for fiber in list(fibers):
+                    if fiber.done:
+                        continue
+                    if fiber.pending_exc is not None:
+                        exc_to_throw = fiber.pending_exc
+                        fiber.pending_exc = None
+                        fut = fiber.yielded
+                        if fut is not None and not fut.done():
+                            msg = exc_to_throw.args[0] if exc_to_throw.args else None
+                            if fut.cancel(msg):
+                                progressed = True
+                                continue
+                        _step(fiber, exc_to_throw)
+                        progressed = True
+                    elif fiber.yielded is None or fiber.yielded.done():
+                        _step(fiber)
+                        progressed = True
+
+                still_alive: list[_SessionFiber] = []
+                for fiber in fibers:
+                    if not fiber.done:
+                        still_alive.append(fiber)
+                        continue
+                    if fiber.handle is not None:
+                        fiber.handle._finish(fiber.cancel_exc, fiber.exc)
+                    if fiber.is_primary:
+                        host.accepting = False
+                    else:
+                        host.active_handoffs -= 1
+                        if not self._closing:
+                            self._wake.set()
+                fibers = still_alive
+
+                if not fibers and not host.queue:
+                    break
+                if progressed or host.queue:
+                    continue
+
+                w = loop.create_future()
+                wake[0] = w
+                attached: list[asyncio.Future] = []
+                for fiber in fibers:
+                    fut = fiber.yielded
+                    if fut is not None:
+                        if fut.done():
+                            _signal_wake()
+                            break
+                        fut.add_done_callback(_on_fut_done)
+                        attached.append(fut)
+                try:
+                    await w
+                except asyncio.CancelledError as exc:
+                    # Per-fiber timeouts / TaskGroups target fiber.handle.cancel() directly,
+                    # so a CancelledError on the real worker Task is always an external
+                    # cancellation (e.g. worker.shutdown() or explicit task.cancel()).
+                    external_cancel = exc
+                    msg = exc.args[0] if exc.args else None
+                    for fiber in fibers:
+                        if fiber.handle is not None:
+                            fiber.handle.cancel(msg)
+                        else:
+                            _cancel_fiber(fiber, exc)
+                finally:
+                    wake[0] = None
+                    for fut in attached:
+                        fut.remove_done_callback(_on_fut_done)
+
+            if external_cancel is not None and (task is None or task.cancelling() > 0):
+                raise external_cancel
+        finally:
+            host.accepting = False
+            if task is not None and self._deferred_handoffs.get(task) is host:
+                self._deferred_handoffs.pop(task, None)
+            while host.queue:
+                h_sid, h_batch = host.queue.popleft()
+                if self._active.get(h_sid) is None:
+                    self._active.pop(h_sid, None)
+                    self._on_slot_released()
+                if h_batch is not None:
+                    self.dispatch_claimed(h_batch)
+                elif not self._closing:
+                    self._activate(h_sid)
+            for fiber in fibers:
+                if not fiber.done:
+                    fiber.ctx.run(fiber.coro.close)
+                if fiber.handle is not None:
+                    fiber.handle._finish(fiber.cancel_exc, fiber.exc)
 
     # ── one send on a fixed node ──────────────────────────────────────────────
 
@@ -863,9 +1588,12 @@ class RuntimeWorker:
             ctx = _SessionExecution(
                 r, sid, descriptor, batch, actor, batch.parent_session_id
             )
-            ctx.task = asyncio.current_task()
+            cur_task = asyncio.current_task()
+            ctx.task = getattr(cur_task, "_real_task", cur_task)
             ctx.ownership = ownership
             self._active[sid] = ctx
+            if descriptor.kind == "workflow_driver":
+                self._on_slot_released()
 
             def _on_ownership_lost() -> None:
                 ctx.stop.cancel("session ownership lost")
@@ -932,6 +1660,7 @@ class RuntimeWorker:
                     from power_loop.runtime.env import runtime_env_context
                     env_ctx = runtime_env_context(env.runtime_env)
                     env_ctx.__enter__()
+                tools_filtered = ctx.options.tools is not None
                 if ctx.options.tools is not None and env.tool_registry is not None:
                     env.tool_registry = env.tool_registry.subset(ctx.options.tools)
                 if (
@@ -949,6 +1678,12 @@ class RuntimeWorker:
                         env.tool_registry = env.tool_registry.subset(
                             role_tools(env.tool_registry.names(), leaf_role, registry=env.tool_registry)
                         )
+                        tools_filtered = True
+                effective_tools = (
+                    (frozenset(env.tool_registry.names()) if env.tool_registry is not None else frozenset())
+                    if tools_filtered
+                    else None
+                )
                 config = self._config(env, descriptor)
                 if descriptor.kind == "workflow_driver":
                     from power_loop.workflow.runner import run_driver
@@ -1032,7 +1767,7 @@ class RuntimeWorker:
 
                 if env.command is not None:
                     from power_loop.runtime.host_commands import run_session
-                    result = await run_session(loop, ctx, env.command)
+                    result = await run_session(loop, ctx, env.command, effective_tools=effective_tools)
                     consumed = None
                 else:
                     consumed = ctx.consumed = list(batch.input_refs)
@@ -1043,6 +1778,7 @@ class RuntimeWorker:
                         max_rounds=ctx.options.max_rounds, response_format=ctx.options.response_format,
                         with_history=ctx.options.history,
                         boundary=self._boundary(batch, ownership, ctx, consumed),
+                        effective_tools=effective_tools,
                     )
                 status, error, error_code = self._map_result(result, ctx)
                 structured = None
@@ -1061,6 +1797,7 @@ class RuntimeWorker:
                         error=error, error_code=error_code, result_seq=result.result_seq,
                         assistant_meta=getattr(result, "result_meta", None),
                         next_seq=getattr(result, "next_seq", None),
+                        rounds=getattr(result, "rounds", None),
                         projection=getattr(result, "pending_projection", None) if status == "completed" else None,
                         _on_committed=_mark_finalized,
                     )
@@ -1134,13 +1871,14 @@ class RuntimeWorker:
                 await notify(r.hooks, HookPoint.EXECUTION_FINISHED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
                 ctx.loop = None
             self._active.pop(sid, None)
+            self._on_slot_released()
             if env is not None:
                 await env.aclose()
             # A normal final reports its pending snapshot; real new notifications
             # bridge the interval after that snapshot and before active.pop. After
             # pop the ordinary dispatcher waits on the same session lock for aclose.
             if driver_requeue:
-                self._activate(sid)
+                self._activate(sid, is_driver=True)
             elif normal_final is not None and ctx is not None and ctx.consumed is not None:
                 if normal_final.execution_state == "queued" or ctx.wake_pending:
                     self._activate(sid)
@@ -1309,6 +2047,8 @@ class RuntimeWorker:
         async def boundary(*, final=False):
             if ctx.stop.is_cancelled():
                 return []
+            if not final and ctx.slot_suspended:
+                await self._reacquire_slot(ctx)
             holding = self.runtime.store._reads_for(target.session_id)
             # Consume any diagnostic boundary row already read by a piggyback miss (0 extra SQL).
             if holding is not None and holding.piggyback_boundary is not None:
@@ -1531,6 +2271,11 @@ class RuntimeWorker:
         self._closing = True
         self.runtime.client._accepting = False
         self._pending.clear()
+        self._ready_awaited.clear()
+        self._awaited_handoffs.clear()
+        for claimed_batch in tuple(self._claimed_pending.values()):
+            self._schedule_closing_lease_release(claimed_batch)
+        self._claimed_pending.clear()
         self._pending_claims.clear()
         if self.runtime.timer_driver is not None:
             await self.runtime.timer_driver.stop()
@@ -1562,6 +2307,7 @@ class RuntimeWorker:
                     )
                 except Exception:
                     log.warning("graceful_release failed during shutdown", exc_info=True)
+            self._deferred_handoffs.clear()
             await self.drain_closing_releases()
             for sub in self._subscriptions:
                 await sub.aclose()
@@ -1572,6 +2318,11 @@ class RuntimeWorker:
             self._guard_monitor.cancel()
             await asyncio.gather(self._guard_monitor, return_exceptions=True)
         if self.runtime.process_guard is not None:
-            await self.runtime.process_guard.release()
+            try:
+                await self.runtime.process_guard.release()
+            except Exception:
+                if not self._guard_lost:
+                    raise
+                log.warning("process_guard release failed after store_lock_lost", exc_info=True)
         self._closed = True
         return self.shutdown_result

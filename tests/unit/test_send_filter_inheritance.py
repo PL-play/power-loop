@@ -250,3 +250,69 @@ async def test_workflow_submission_freezes_grant_and_clamps_leaf(store, runtime_
     assert result.status == 'completed'
     assert model.seen_tools == [expected]
     await runner.drain()
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_filter_differs_from_unset_and_resets_between_sends(
+    store: SessionStore, runtime_agent,
+) -> None:
+    """Explicit tools=[] publishes frozenset(), explicit subset publishes only registered effective
+    tools, unset tools publishes None, and context resets cleanly between sends.
+    """
+    observed_in_llm: list[frozenset[str] | None] = []
+    observed_in_tool: list[frozenset[str] | None] = []
+
+    def probe(**_kw: Any) -> str:
+        observed_in_tool.append(get_effective_tools())
+        return "probed"
+
+    class ProbeLLM(_Capturing):
+        async def complete(self, request, **kwargs):
+            observed_in_llm.append(get_effective_tools())
+            return await super().complete(request, **kwargs)
+
+    reg = _registry("a", "b")
+    reg.register(_tool_def("probe"), probe)
+    llm = ProbeLLM(responses=[
+        LLMResponse(raw_text="empty-done"),
+        _tool_call("t1", "probe"),
+        LLMResponse(raw_text="subset-done"),
+        _tool_call("t2", "probe"),
+        LLMResponse(raw_text="unset-done"),
+    ])
+    runner = await runtime_agent(model=llm, store=store, registry=reg, config=AgentLoopConfig(max_rounds=3))
+
+    # 1) Explicit empty filter: tools=[] -> frozenset() (not None), no business tools advertised.
+    await runner.new_session(options=RequestOptions(tools=[]))
+    r_empty = await runner.send("empty")
+    assert r_empty.status == "completed"
+    assert get_effective_tools() is None
+
+    # 2) Explicit filter with an unregistered name -> actual effective grant frozenset({'probe'}).
+    await runner.new_session(options=RequestOptions(tools=["probe", "not_registered"]))
+    r_sub = await runner.send("subset")
+    assert r_sub.status == "completed"
+    assert get_effective_tools() is None
+
+    # 3) Unset filter (tools=None) -> None, all registered tools executable.
+    await runner.new_session(options=RequestOptions(tools=None))
+    r_unset = await runner.send("unset")
+    assert r_unset.status == "completed"
+    assert get_effective_tools() is None
+
+    assert llm.seen_tools == [
+        [],
+        ["probe"],
+        ["probe"],
+        ["a", "b", "probe"],
+        ["a", "b", "probe"],
+    ]
+    assert observed_in_llm == [
+        frozenset(),
+        frozenset({"probe"}),
+        frozenset({"probe"}),
+        None,
+        None,
+    ]
+    assert observed_in_tool == [frozenset({"probe"}), None]
+    await runner.drain()
