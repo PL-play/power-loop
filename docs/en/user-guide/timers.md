@@ -46,7 +46,3 @@ DeepTalk uses `ApiTimerBackend` and dispatcher readiness. The API retains busine
 authorization, limits, and a new run/budget for each wake; SDK timers are unused.
 See [runnable example 26](../../../examples/26_timers.py) and
 [the runtime contract](../../runtime-12.md).
-
-Register finite child review explicitly with `register_wait_handoff_tool(registry, policy=WaitPolicy(deadline_at_ms=...))`.
-The factory freezes the deadline. The original main can continue, cancel or defer the child, within its original deadline.
-Review reuses the persisted interaction and current TimerBackend; an unknown timer creation is never replayed automatically.

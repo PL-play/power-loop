@@ -4,7 +4,7 @@
 
 `_runtime.py` 展示本地工厂装配。宿主在示例中持有模型，执行期间借用；部署工厂应按稳定 profile 重新取得自己的模型、工具与资源。Runtime 负责启动默认定时 driver，纯 Client 不启动。
 
-从 SDK 目录运行 `python examples/00_hello_world.py`。可执行入口由 `tests/unit/test_examples_run_208.py` 检查；真实模型的格式、摘要、结构化回归在 `tests/real/test_delivery_203.py`。
+从 SDK 目录运行 `python examples/00_hello_world.py`。可执行入口由 `tests/unit/test_examples_run_208.py` 检查；真实模型用例在 `tests/real/`。
 
 | 编号 | 文件 | 能力 |
 |---|---|---|

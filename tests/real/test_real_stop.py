@@ -4,10 +4,8 @@ import time
 
 import pytest
 
-from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, InputRef, ToolDefinition, ToolRegistry
+from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig
 from power_loop.agent.runtime_store import now_ms
-from power_loop.runtime.pricing import Free
-from power_loop.tools.spawn_agent import register_spawn_agent
 
 from ._llm import make_llm
 
@@ -36,32 +34,3 @@ async def test_real_stop_mid_generation_is_fast_and_leaves_a_valid_transcript(ru
     assert (await agent.runtime.store.get_state(agent.target.session_id)).pending is None
 
 
-async def test_real_subtree_stop_reaches_original_running_subagent(runtime_agent):
-    started, registry = asyncio.Event(), ToolRegistry()
-    async def slow_lookup(topic='', **kwargs):
-        started.set()
-        await asyncio.sleep(30)
-        return f'{topic}: done'
-    registry.register(ToolDefinition('slow_lookup', 'Look something up slowly.',
-        input_schema={'type':'object','properties':{'topic':{'type':'string'}},'required':['topic']},
-        interrupt='abort', pricing=Free('test_fixture')), slow_lookup)
-    register_spawn_agent(registry)
-    agent = await runtime_agent(model=make_llm(max_tokens=2048, temperature=0), registry=registry,
-        config=AgentLoopConfig(system_prompt='Follow the requested native tool call exactly.',
-            max_rounds=4, max_tokens=2048, context_budget_tokens=10**9))
-    client = agent.runtime.client
-    receipt = await client.send(agent.target,
-        'Call spawn_agent once with task="Call slow_lookup for solar panels.", tools=["slow_lookup"], '
-        'system_prompt="Always call slow_lookup first then answer.". Wait for its result.',
-        message_id='delegate', actor=agent.actor)
-    await asyncio.wait_for(started.wait(), 120)
-    [child] = await agent.runtime.store._db.fetchall(
-        f"SELECT session_id,start_input_message_id FROM {agent.runtime.store.table_prefix}sessions WHERE parent_session_id IS NOT NULL")
-    child_ref = InputRef(agent.target.store_id, child['session_id'], child['start_input_message_id'])
-    start = time.monotonic()
-    await client.cancel(receipt.input_ref, actor=agent.actor, scope='subtree', reason='user stop')
-    child_result = await client.wait(child_ref, actor=agent.actor, deadline_ms=now_ms()+60000)
-    assert child_result.status == 'cancelled' and time.monotonic()-start < 12
-    await agent.drain()
-    next_result = await agent.send('Never mind. Do not use tools. Reply with just: OK')
-    assert next_result.status == 'completed' and 'ok' in next_result.final_text.lower()

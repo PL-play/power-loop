@@ -40,7 +40,7 @@ async def test_hit_round_limit_returns_and_persists_summary(runtime_agent) -> No
         r = await loop.send("Begin the multi-step job and keep going.", )
 
         # round 0 makes a tool call → max_rounds=1 is exhausted → wrap-up summary path
-        assert r.status == "interrupted"
+        assert r.status == "failed" and r.error_code == "hit_round_limit"
         assert r.final_text.strip()
         # The summary is recorded as an assistant turn (not just returned to the caller).
         msgs = [{'role':row.role,'content':row.content,'tool_calls':row.tool_calls} for row in await store.load_all_messages(sid)]

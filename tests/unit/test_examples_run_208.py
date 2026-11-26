@@ -1,10 +1,9 @@
 """Execute current examples with their behavior assertions and actual local ports.
 
-18 demonstrates live providers; remote format/summary/structured behavior is in
-real/test_delivery_203.py. Docker and MCP are explicit required dependencies for
+18 demonstrates live providers; real-model behavior is covered under tests/real/. Docker and MCP are explicit required dependencies for
 their examples; failures cannot turn into skips. The old per-leaf private-store
 SubprocessExecutor example is retired; current workflow process execution is
-covered by real/test_real_subprocess.py and unit runtime/workflow tests.
+covered by unit runtime/workflow tests.
 """
 import subprocess
 import sys

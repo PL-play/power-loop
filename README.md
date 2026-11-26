@@ -1,14 +1,14 @@
-# power-loop 12.0.0
+# power-loop 14.1.0
 
 An embeddable agent runtime. Main agents, children, background work and workflows
 use one ID-addressed client/worker execution path. The default composition is
 single-process, with no Redis dependency. Shared execution requires explicit
 shared ownership and messaging adapters.
 
-Current schema: **17**. Protocol: **43**. Descriptor schema: **2**.
+Current schema: **18**. Protocol: **43**. Descriptor schema: **2**.
 Use a fresh SDK database or table prefix; historical tasks are not imported.
-This branch is a source delivery, not a published or deployed release. See the
-P7 delivery report for the full regression status.
+Published on PyPI as `power-loop==14.1.0` and used by the DeepTalk `agent` service.
+The SDK is feature-frozen: changes are driven by issues found in real business use.
 
 - [Current API and startup guide](docs/runtime-12.md)
 - [Runnable single-process example](examples/design215_single_process.py)
@@ -31,10 +31,5 @@ handle and cannot start more work. Memory and Store coordinators remain supporte
 An acceptance receipt is not completion: wait for its original `InputRef`.
 Normal authorization, accounting, context and cleanup remain required. Failures
 may leave interrupted/unknown results; unknown external actions are not replayed.
-
-Finite child waits use `WaitPolicy` and `register_wait_handoff_tool`: the factory
-sets a deadline, the child releases capacity, and its original main explicitly
-continues, defers or cancels the same session. Configure the timer backend/driver in
-the Runtime; see [the contract and assembly](docs/runtime-12.md#children-background-work-and-workflows).
 
 Shared example: [design215_shared.py](examples/design215_shared.py).

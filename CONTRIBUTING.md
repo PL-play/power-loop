@@ -78,7 +78,7 @@ surface is a minor; a pure fix is a patch. Provisional symbols may still change 
 
 ## Where to Start
 
-- [ROADMAP_1.0.md](ROADMAP_1.0.md) — the road to 1.0 (current); [ROADMAP.md](ROADMAP.md) — historical M0–M3 plan
+- [docs/history/](docs/history/) — historical roadmaps, hardening plans and bug reviews
 - [docs/README.md](docs/README.md) — documentation index
 - [examples/](examples/) — runnable examples, each covering one concept
 - [SECURITY.md](SECURITY.md) — security model + how to report a vulnerability

@@ -35,10 +35,8 @@ the current tool's interrupt policy. No notification payload is the durable auth
 Use `inspect(InputRef)`, `wait(InputRef)`, `messages(TargetRef)` and `list_children(TargetRef)`.
 `cancel(InputRef)` addresses that input; `cancel(TargetRef, scope="subtree")` follows linked children.
 Independent children retain their own work. New input to an existing child uses ordinary `send`.
-An optional finite child review uses the existing `WaitPolicy` and handoff tool: the parent receives
-an input and explicitly continues, defers or cancels. It does not recreate an execution identity.
 
-Accept, claim and final each have one atomic transaction. `session_state` owns the execution state,
+Accept, claim and final each have one atomic transaction. The `sessions` row owns the execution state,
 active send and ownership fence. Final writes an ordinary result message and terminalizes inputs.
 Results route as ordinary parent/driver inputs, with `result_message_id` deriving their stable ID.
 Unknown external effects are queried or reported unknown; they are not replayed automatically.
@@ -79,7 +77,7 @@ dual read/write or old-result fallback. Initialize a fresh isolated store or pre
 current schema verifies it. `SchemaPolicy.VERIFY` does not create missing tables.
 
 `SessionStore.close_if_idle` and bounded deletion read lifecycle from `sessions` and serialize on
-`session_state`. Running/queued/recovering work, valid ownership, unfinished inputs and unclosed tools
+the `sessions` row. Running/queued/recovering work, valid ownership, unfinished inputs and unclosed tools
 protect the session. Linked children participate in close/delete; independent children survive.
 Resource guards must also allow deletion. A partial delete leaves the session closing and rejects input.
 

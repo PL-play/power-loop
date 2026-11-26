@@ -4,7 +4,7 @@ Default examples use fixed model responses but execute the actual Runtime, tools
 
 `_runtime.py` composes a local factory. The demo host owns and lends its model; deployment factories should resolve their own provider, tools and resources by stable profile. Runtime starts the default timer driver; pure clients do not.
 
-Run from the SDK directory: `python examples/00_hello_world.py`. Runnable entries are checked by `tests/unit/test_examples_run_208.py`; real format/summary/structured cases are in `tests/real/test_delivery_203.py`.
+Run from the SDK directory: `python examples/00_hello_world.py`. Runnable entries are checked by `tests/unit/test_examples_run_208.py`; real-model cases are in `tests/real/`.
 
 | Number | File | Behavior |
 |---|---|---|

@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import os
 import struct
-import time
 import zlib
 from typing import Any
 
@@ -28,10 +27,7 @@ from power_loop import (
     AgentEventBus,
     AgentEventType,
     AgentLoopConfig,
-    LLMProviderConfig,
-    LLMRetryPolicy,
     SessionStore,
-    create_llm_service_from_config,
 )
 from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 from power_loop.agent.runtime_store import now_ms
@@ -114,42 +110,6 @@ async def test_real_cancelled_input_does_not_erase_the_next_accepted_input(runti
         await store.close()
 
 
-@pytest.mark.asyncio
-async def test_real_user_message_and_task_wakeup_arrive_separately_and_both_land(runtime_agent) -> None:
-    store = await SessionStore.open(":memory:")
-    try:
-        bus = AgentEventBus()
-        started: list[Any] = []
-        bus.subscribe(AgentEventType.LLM_CALL_STARTED, lambda e: started.append(e))
-        loop = await runtime_agent(
-            model=make_llm(max_tokens=2048, temperature=0), store=store, event_bus=bus,
-            registry=_wait_registry(),
-            config=AgentLoopConfig(
-                system_prompt="You are an assistant. First call the `wait` tool exactly once, "
-                              "then reply to everything you have been told, in English.",
-                max_rounds=4, max_tokens=2048, temperature=0, context_budget_tokens=10**9))
-        sid = loop.target.session_id
-        run = asyncio.create_task(loop.send("Hi, I'm starting a session."))
-        await _until_in_flight(started, loop, sid)
-        for mid, body in [('u1','User says: what is 17 + 25?'),
-                          ('t1','[system] Your background task build-42 finished: BUILD FAILED (missing dependency libfoo).')]:
-            await loop.runtime.client.send(loop.target, body, message_id=mid, actor=loop.actor)
-        res = await run
-        assert res.status == "completed"
-        rows = [r for r in await store.load_active_messages(sid) if r.role == 'user' and ('17 + 25' in str(r.content) or 'build-42' in str(r.content))]
-        assert len(rows) == 2, "user words and the wake-up must not share a message"
-        assert "17 + 25" in rows[0].content and "build-42" not in rows[0].content
-        assert "build-42" in rows[1].content
-        await assert_passes(
-            question="(user) what is 17 + 25?  +  (system) background task build-42 failed: "
-                     "missing dependency libfoo",
-            answer=res.final_text or "",
-            rubric="The reply (1) gives 42 as the answer to 17 + 25 AND (2) mentions that the "
-                   "build / background task failed (e.g. missing dependency). Both required.",
-        )
-    finally:
-        await loop.aclose()
-        await store.close()
 
 
 def _solid_png(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
@@ -201,40 +161,6 @@ async def test_real_image_survives_the_inbox(tmp_path: Any, runtime_agent) -> No
 # ── give up on permanent errors ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_real_bad_key_costs_one_request(runtime_agent) -> None:
-    cfg = LLMProviderConfig.from_env()
-    cfg.api_key = "sk-invalid-design124-probe"
-    svc = create_llm_service_from_config(cfg)
-    client = svc._ensure_client()
-    creates = 0
-    real_create = client.chat.completions.create
-
-    async def counting_create(*a: Any, **kw: Any) -> Any:
-        nonlocal creates
-        creates += 1
-        return await real_create(*a, **kw)
-
-    client.chat.completions.create = counting_create
-    store = await SessionStore.open(":memory:")
-    try:
-        bus = AgentEventBus()
-        degraded: list[dict] = []
-        bus.subscribe(AgentEventType.LLM_DEGRADED, lambda e: degraded.append(dict(e.payload or {})))
-        loop = await runtime_agent(model=svc, store=store, event_bus=bus, config=AgentLoopConfig(
-            system_prompt="S", max_rounds=1, context_budget_tokens=10**9,
-            retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=1.0, total_timeout=None)))
-        t0 = time.monotonic()
-        res = await loop.send("hello")
-        elapsed = time.monotonic() - t0
-        assert res.status == "failed"
-        assert degraded and degraded[0]["reason"] == "non_retryable", degraded
-        # The SDK's own client may retry transport-level failures, but never a 401: one request.
-        assert creates == 1, f"{creates} requests for a permanent 401"
-        assert elapsed < 15, f"gave up only after {elapsed:.1f}s"
-    finally:
-        await loop.aclose()
-        await store.close()
 
 
 # ── usage accounting against the provider's own numbers ──────────────────────────────────

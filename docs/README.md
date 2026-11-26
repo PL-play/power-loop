@@ -21,5 +21,5 @@
 
 - [GitHub Repository](https://github.com/PL-play/power-loop)
 - [Changelog](../CHANGELOG.md)
-- [Roadmap](../ROADMAP.md)
+- [Historical plans and reviews](history/)
 - [Examples](../examples/)

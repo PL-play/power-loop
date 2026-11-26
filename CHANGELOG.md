@@ -1,16 +1,31 @@
-# 12.0.0 — session-native runtime
-
-- Freeze schema 17, protocol 43, descriptor 2 and the complete v12 STABLE_API.
-- Remove the task execution modules and public identities. Use TargetRef/InputRef, session send,
-  ordinary result messages and direct parent/child sessions throughout.
-- Close/delete and retention use session ownership, unfinished inputs and tool/resource guards.
-- Older stores and descriptors are rejected; use a fresh store. No online migration or compatibility path.
-- Refresh examples, public runtime documentation and dependency consumers. Local source delivery;
-  publishing, deployment and the final multi-node/full-suite validation remain separate.
-
 # Changelog
 
-# 13.0.0 — Design 216 projection-only history
+## 14.1.0 — Design 218 / 219 hardening (published)
+
+- Design 218 H4–H8: control-store concurrency, reply routing and lock order; pipeline loop,
+  history sanitizing, steer and prompt fixes; workflow `create_many` / `foreach`, background,
+  subagent and timer fixes; bash cancellation and output bounds, tool symlink scope, LLM client
+  fixes; dead code removal and bounds on unbounded in-memory containers.
+- Design 219: compaction keeps history added during repair and the previous summary; a parent
+  waiting on a child no longer exhausts worker capacity; one model attempt sends one HTTP
+  request; runtime recovery, cancellation, child event reporting and workflow recovery fixes;
+  MySQL startup lock is released; broken examples updated to the current API.
+- Schema 18 and protocol 43 unchanged. Send SQL budgets unchanged
+  (fused `7/7/8`, standard `10/10/11`, per tool round `+0`).
+
+## 14.0.1 — Design 218 Phase 1 (not published; included in 14.1.0)
+
+- Fix the 10 P0 defects: lease fencing and store writes, workflow recovery and cancel,
+  Anthropic protocol adaptation, bash command policy bypasses and `schedule_wakeup`.
+
+## 14.0.0 — Design 217 Session-Core (published)
+
+- Breaking: schema 18. `session_state` merged into `sessions`; accept / claim / final control
+  uses conditional writes on the session row; `WakeTransport` interface with in-memory and
+  database-polling defaults. Older stores are rejected; use a fresh store.
+- Send SQL budgets frozen on SQLite / PostgreSQL 16 / MySQL 8.4 (see the workspace `AGENTS.md`).
+
+## 13.0.0 — Design 216 projection-only history
 
 - Breaking (unpublished 13.0.0): remove the standalone ownership installation
   chain, including `SessionStore.session_owner_epoch`, `install_session_owner`
@@ -36,6 +51,14 @@
 - MySQL DDL now actually creates the `messages`, `follow_up_queue` and `project_messages` unique
   keys (the previous whitespace-sensitive marker dropped them, turning upserts into inserts);
   this fixes the three MySQL projection-fold statistics failures.
+
+## 12.0.0 — session-native runtime
+
+- Freeze schema 17, protocol 43, descriptor 2 and the complete v12 STABLE_API.
+- Remove the task execution modules and public identities. Use TargetRef/InputRef, session send,
+  ordinary result messages and direct parent/child sessions throughout.
+- Close/delete and retention use session ownership, unfinished inputs and tool/resource guards.
+- Older stores and descriptors are rejected; use a fresh store. No online migration or compatibility path.
 
 ## 11.0.0 — Design 203 (source delivery; not published)
 

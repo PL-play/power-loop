@@ -34,7 +34,3 @@ status() 提供就绪、最近扫描/错误和最近一批到期待办，查询�
 终态记录沿用七天保留期。
 DeepTalk 使用 API backend 和 dispatcher；API 负责业务授权、限额以及每次新 run/预算，不写 SDK 定时表。
 参见[可运行的编号例子 26](../../../examples/26_timers.py)和[当前 Runtime 合同](../../runtime-12.md)。
-
-有限子任务可显式注册 `register_wait_handoff_tool(registry, policy=WaitPolicy(deadline_at_ms=...))`。
-期限由宿主工厂冻结；子任务请求等待，原主 Agent 可继续、取消或延后。延后不能越过原期限。
-等待复用原任务交互及当前 TimerBackend，不另建调度账本；未知创建只查询原结果，不自动重放。

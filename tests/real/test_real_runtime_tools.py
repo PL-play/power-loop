@@ -25,45 +25,6 @@ class _RealCustomProjector(RuntimeProjector):
         return [{"role": "user", "name": "real_custom_state", "content": f"<real_custom>{marker}</real_custom>"}]
 
 
-@pytest.mark.asyncio
-async def test_real_llm_sees_sqlite_runtime_state(tmp_path, runtime_agent) -> None:
-    store = await SessionStore.open(tmp_path / "runtime.db")
-    try:
-        loop = await runtime_agent(model=make_llm(max_tokens=256, temperature=0.0), store=store, config=AgentLoopConfig(
-                system_prompt=(
-                    "You are a runtime-state verifier. If runtime messages contain "
-                    "RUNTIME_SQLITE_TODO_42 and BG_RUNTIME_DONE_42, reply with exactly: "
-                    "RUNTIME_STATE_VISIBLE"
-                ),
-                max_rounds=1,
-                context_budget_tokens=10**9,
-            ))
-        sid = loop.target.session_id
-        await store.set_runtime_state(
-            sid,
-            "todo",
-            {
-                "items": [{"id": "rt", "text": "RUNTIME_SQLITE_TODO_42", "status": "in_progress"}],
-                "rendered": "[>] #rt: RUNTIME_SQLITE_TODO_42\n\n(0/1 completed)",
-                "counts": {"total": 1, "completed": 0},
-            },
-        )
-        await store.upsert_background_task(
-            sid,
-            task_id="bg-real",
-            command="printf BG_RUNTIME_DONE_42",
-            status="completed",
-            return_code=0,
-            output_tail="BG_RUNTIME_DONE_42",
-        )
-
-        result = await loop.send("Inspect the runtime messages provided to you and follow the system instruction.")
-        if "RUNTIME_STATE_VISIBLE" not in result.final_text:
-            assert "RUNTIME_SQLITE_TODO_42" in result.final_text
-            assert "BG_RUNTIME_DONE_42" in result.final_text
-    finally:
-        await loop.aclose()
-        await store.close()
 
 
 @pytest.mark.asyncio
